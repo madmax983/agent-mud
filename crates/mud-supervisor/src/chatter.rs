@@ -35,7 +35,7 @@ pub const fn chatter_step(turns: u8, input: ChatterInput, max: u8) -> (u8, bool)
         ChatterInput::AgentWithHuman | ChatterInput::World => (turns, true),
         ChatterInput::AgentAlone => {
             let next = turns.saturating_add(1);
-            (next, next <= max)
+            (next, turns < max)
         }
     }
 }
@@ -76,6 +76,15 @@ mod tests {
         assert!(r.step(ChatterInput::Human, 2));
         assert_eq!(r.agent_only_turns, 0);
         assert!(r.step(ChatterInput::AgentAlone, 2));
+    }
+
+    #[test]
+    fn a_saturated_count_still_blocks_at_the_top_bound() {
+        // Regression: with `next <= max`, max = 255 let every event through.
+        let mut r = RoomChatter { agent_only_turns: 254 };
+        assert!(r.step(ChatterInput::AgentAlone, 255));
+        assert!(!r.step(ChatterInput::AgentAlone, 255));
+        assert!(!r.step(ChatterInput::AgentAlone, 255));
     }
 
     #[test]

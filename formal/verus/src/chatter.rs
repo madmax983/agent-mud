@@ -3,9 +3,9 @@
 //! Mirrors `crates/mud-supervisor/src/chatter.rs`. The text between the
 //! mirror markers must match the Rust source; only the spec clauses differ.
 //!
-//! No bound for the step itself. The safety theorem needs `max < 255`: at
-//! `max == 255` the saturating count sticks at 255 and every further
-//! agent-only event is allowed (see [`lemma_run_allows_at_most_max`]).
+//! No bound is needed. An agent-only event is allowed iff the count before
+//! it is under `max`, so the saturating count cannot let events through at
+//! `max == 255` (the proof found that hole in an earlier `next <= max`).
 
 use vstd::prelude::*;
 
@@ -35,7 +35,7 @@ pub open spec fn spec_step(turns: u8, input: ChatterInput, max: u8) -> (u8, bool
         ChatterInput::AgentWithHuman | ChatterInput::World => (turns, true),
         ChatterInput::AgentAlone => {
             let next: u8 = if turns == 255 { 255 } else { (turns + 1) as u8 };
-            (next, next <= max)
+            (next, turns < max)
         },
     }
 }
@@ -52,16 +52,16 @@ pub const fn chatter_step(turns: u8, input: ChatterInput, max: u8) -> (r: (u8, b
         // allows.
         (input is AgentWithHuman || input is World) ==> r.0 == turns && r.1,
         // An agent alone counts one more (saturating) and is allowed iff
-        // the new count is at most `max`.
+        // the count before it is under `max`.
         input is AgentAlone ==> r.0 as int == (if turns == 255 { 255 } else { turns + 1 })
-            && (r.1 <==> r.0 <= max),
+            && (r.1 <==> turns < max),
 {
     match input {
         ChatterInput::Human | ChatterInput::MacroTick => (0, true),
         ChatterInput::AgentWithHuman | ChatterInput::World => (turns, true),
         ChatterInput::AgentAlone => {
             let next = turns.saturating_add(1);
-            (next, next <= max)
+            (next, turns < max)
         }
     }
 }
@@ -91,8 +91,6 @@ pub open spec fn run(inputs: Seq<ChatterInput>, max: u8) -> (u8, int)
 /// agent-only events allowed since the last reset number exactly
 /// `min(turns, max)`, so never more than `max`.
 pub proof fn lemma_run_allows_at_most_max(inputs: Seq<ChatterInput>, max: u8)
-    requires
-        max < 255,
     ensures
         run(inputs, max).1 == (if run(inputs, max).0 <= max { run(inputs, max).0 as int } else { max as int }),
         0 <= run(inputs, max).1 <= max,
