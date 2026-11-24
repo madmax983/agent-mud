@@ -241,13 +241,15 @@ impl World {
         Ok((k.id.clone(), shop))
     }
 
+    /// What `buyer` pays for `item`: its value at the markup, less a
+    /// haggle, but never less than what the keeper paid for it, so selling
+    /// and buying back cannot drain a keeper.
     fn sale_price(&self, shop: &ShopDef, item: ItemId, buyer: &EntityId, keeper: &EntityId) -> i64 {
-        let value = self
-            .state
-            .items
-            .get(&item)
+        let it = self.state.items.get(&item);
+        let value = it
             .and_then(|it| self.pack.items.get(&it.proto))
             .map_or(0, |d| d.value);
+        let paid = it.and_then(|it| it.paid).unwrap_or(0);
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_precision_loss,
@@ -262,7 +264,7 @@ impl World {
         {
             price = price * 9 / 10;
         }
-        price.max(1)
+        price.max(paid).max(1)
     }
 
     fn buy_price(&self, shop: &ShopDef, item: ItemId) -> Option<i64> {
@@ -357,6 +359,7 @@ impl World {
         self.change_currency(ctx, &kid, price);
         if let Some(it) = self.state.items.get_mut(&item) {
             it.stock = false;
+            it.paid = None;
         }
         self.relocate_item(
             ctx,
@@ -422,6 +425,7 @@ impl World {
         );
         if let Some(it) = self.state.items.get_mut(&item) {
             it.stock = true;
+            it.paid = Some(price);
         }
         let me = self.me(actor)?.clone();
         let mut tags = vec!["trade".to_owned(), "coin".to_owned()];
@@ -549,6 +553,14 @@ impl World {
         }
         if !carried {
             return Err(Fail::new(ErrorCode::CannotUse, "pick it up first"));
+        }
+        // Using up merchandise would hand out its worth without a sale.
+        let consumed = def.currency.is_some() || def.heal_dice().is_some();
+        if consumed && me.shop.is_some() && self.state.items.get(&item).is_some_and(|i| i.stock) {
+            return Err(Fail::new(
+                ErrorCode::PolicyTradeRequired,
+                "that is merchandise; it leaves the shop only through a completed sale",
+            ));
         }
         // Money sealed in an item.
         if let Some(n) = def.currency {

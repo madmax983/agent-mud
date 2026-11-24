@@ -677,3 +677,62 @@ fn wounds_show_in_look_and_sheets_list_traits() {
     assert!(sheet.contains("greedy(12)"));
     assert_eq!(v["wound_state"], "staggered");
 }
+
+#[test]
+fn a_shopkeeper_cannot_use_merchandise_without_a_sale() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    ok(&mut w, &ada, "e");
+    let marta = id("marta");
+    w.state.entities.get_mut(&ada).unwrap().pools.hp = 3;
+    assert_eq!(
+        err(&mut w, &marta, "use draught on ada"),
+        ErrorCode::PolicyTradeRequired
+    );
+    assert_eq!(
+        err(&mut w, &marta, "use draught"),
+        ErrorCode::PolicyTradeRequired
+    );
+    assert_eq!(w.entity(&ada).unwrap().pools.hp, 3, "nobody was healed");
+    let list = ok(&mut w, &ada, "list");
+    assert!(list.narrative.contains("healing draught"), "still for sale");
+    // Bought in a sale, the same draught is the buyer's to use.
+    w.state.entities.get_mut(&ada).unwrap().currency = 100;
+    ok(&mut w, &ada, "buy draught");
+    ok(&mut w, &ada, "use draught");
+}
+
+#[test]
+fn selling_and_buying_back_never_makes_money() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    ok(&mut w, &ada, "w");
+    give_item(&mut w, &ada, "iron_ore");
+    let start = w.entity(&ada).unwrap().currency;
+    let torin_start = w.entity(&id("torin")).unwrap().currency;
+    for _ in 0..3 {
+        let sold = ok(&mut w, &ada, "sell ore");
+        assert_eq!(sold.resolution["price"], 15);
+        let bought = ok(&mut w, &ada, "buy ore");
+        assert_eq!(
+            bought.resolution["price"], 15,
+            "torin resells at least at what he paid"
+        );
+    }
+    assert_eq!(w.entity(&ada).unwrap().currency, start);
+    assert_eq!(w.entity(&id("torin")).unwrap().currency, torin_start);
+    // A haggle does not take the price below what he paid either.
+    ok(&mut w, &ada, "sell ore");
+    w.fix_dice([1, 1, 1, 6, 6, 6]);
+    ok(&mut w, &ada, "attempt merchant on torin");
+    let bought = ok(&mut w, &ada, "buy ore");
+    assert_eq!(bought.resolution["price"], 15);
+    assert_eq!(w.entity(&ada).unwrap().currency, start);
+    // His own stock keeps its usual price.
+    let r = ok(&mut w, &ada, "list");
+    assert!(
+        r.narrative.contains("brass lantern - 15s"),
+        "{}",
+        r.narrative
+    );
+}

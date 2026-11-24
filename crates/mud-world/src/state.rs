@@ -147,6 +147,10 @@ pub struct Item {
     pub locked: bool,
     /// Merchandise of a shop: its keeper may not give it away.
     pub stock: bool,
+    /// What the keeper paid for it, for stock bought from a player. The
+    /// keeper never resells it for less.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid: Option<i64>,
 }
 
 /// One notice on a board.
@@ -290,6 +294,7 @@ impl WorldState {
                 contents: Vec::new(),
                 locked: def.is_some_and(|d| d.lock.is_some()),
                 stock: false,
+                paid: None,
             },
         );
         id
