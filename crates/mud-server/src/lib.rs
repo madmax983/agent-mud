@@ -61,6 +61,29 @@ pub struct Built {
     pub littleguy: Vec<Arc<LittleguyMind>>,
     /// The supervisor step interval.
     pub step: Duration,
+    /// Whether the admin token was made at startup (and so may be logged)
+    /// rather than given by the operator.
+    pub admin_token_generated: bool,
+}
+
+/// The observer token: the operator's, if given and at least 16 bytes
+/// long, or a fresh random one. Returns it and whether it was generated.
+fn admin_token(given: Option<String>) -> anyhow::Result<(String, bool)> {
+    match given {
+        Some(t) if t.len() >= 16 => Ok((t, false)),
+        _ => Ok((random_hex(16)?, true)),
+    }
+}
+
+/// The observer URL for the startup log. It carries the token only when
+/// the server generated it; an operator's token stays out of the logs.
+#[must_use]
+pub fn observer_log_url(bind: std::net::SocketAddr, token: &str, generated: bool) -> String {
+    if generated {
+        format!("http://{bind}/observer?token={}", web::url_escape(token))
+    } else {
+        format!("http://{bind}/observer")
+    }
 }
 
 fn random_hex(bytes: usize) -> anyhow::Result<String> {
@@ -117,10 +140,8 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         Arc::new(FallbackMind::from_cast(&pack.cast)),
         sup_cfg,
     );
-    let admin_token = match std::env::var(&cfg.server.admin_token_env) {
-        Ok(t) if t.len() >= 16 => t,
-        _ => random_hex(16)?,
-    };
+    let (admin_token, admin_token_generated) =
+        admin_token(std::env::var(&cfg.server.admin_token_env).ok())?;
     Ok(Built {
         mud: Arc::new(Mud {
             game,
@@ -128,6 +149,7 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             presence: Arc::new(Presence::default()),
             admin_token,
         }),
+        admin_token_generated,
         tokens,
         littleguy: minds.littleguy,
         step: Duration::from_millis(s.step_ms.max(10)),
@@ -199,7 +221,8 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
     let settings = settings(&cfg)?;
     tracing::info!(
         terminal = %format!("http://{}/", cfg.server.bind),
-        observer = %format!("http://{}/observer?token={}", cfg.server.bind, built.mud.admin_token),
+        observer = %observer_log_url(cfg.server.bind, &built.mud.admin_token, built.admin_token_generated),
+        admin_token_from = if built.admin_token_generated { "generated" } else { cfg.server.admin_token_env.as_str() },
         mcp = %cfg.server.mcp_url(),
         "the MUD is up"
     );
@@ -234,5 +257,33 @@ pub fn load_config(path: &Path) -> anyhow::Result<MudConfig> {
         MudConfig::load(path)
     } else {
         Ok(MudConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_operator_token_is_kept_and_a_short_or_missing_one_replaced() {
+        let given = "abcdefabcdef0123+xyz".to_owned();
+        assert_eq!(admin_token(Some(given.clone())).unwrap(), (given, false));
+        for given in [None, Some("short".to_owned())] {
+            let (t, generated) = admin_token(given).unwrap();
+            assert!(generated);
+            assert_eq!(t.len(), 32);
+        }
+    }
+
+    #[test]
+    fn only_a_generated_token_is_logged_and_it_is_encoded() {
+        let bind: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        assert_eq!(
+            observer_log_url(bind, "abc+def&x", true),
+            "http://127.0.0.1:4000/observer?token=abc%2Bdef%26x"
+        );
+        let url = observer_log_url(bind, "operator-secret-123", false);
+        assert_eq!(url, "http://127.0.0.1:4000/observer");
+        assert!(!url.contains("operator-secret"));
     }
 }
