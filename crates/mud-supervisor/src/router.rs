@@ -129,6 +129,10 @@ struct Pending {
     due_ms: u64,
     reason: String,
     macro_tick: bool,
+    /// The longest cooldown its non-urgent events asked for, in ms.
+    cooldown_ms: u64,
+    /// The latest distracted spell its non-urgent events saw.
+    afk_until_ms: Option<u64>,
 }
 
 /// The router.
@@ -359,6 +363,7 @@ impl Router {
                 Priority::MacroTick => now,
             };
             let mut floor = 0;
+            let mut cooldown_ms = 0;
             if priority < Priority::Immediate {
                 let range = world
                     .pack()
@@ -370,6 +375,7 @@ impl Router {
                 if state.budget == Some(BudgetLevel::Soft) {
                     cooldown *= 2;
                 }
+                cooldown_ms = cooldown;
                 if let Some(end) = self.last_wake_end.get(r) {
                     floor = end + cooldown;
                 }
@@ -389,8 +395,14 @@ impl Router {
                     ev.actor.as_ref().map_or("world", |a| a.name.as_str())
                 ),
                 macro_tick: false,
+                cooldown_ms: 0,
+                afk_until_ms: None,
             });
             p.seqs.push(ev.seq);
+            if priority < Priority::Immediate {
+                p.cooldown_ms = p.cooldown_ms.max(cooldown_ms);
+                p.afk_until_ms = p.afk_until_ms.max(state.afk_until_ms);
+            }
             if priority > p.priority {
                 p.priority = priority;
                 p.due_ms = p.due_ms.min(due);
@@ -450,6 +462,8 @@ impl Router {
                 due_ms: now,
                 reason: "macro-tick".into(),
                 macro_tick: true,
+                cooldown_ms: 0,
+                afk_until_ms: None,
             });
         // The tick keeps its identity even inside a more urgent wake.
         p.macro_tick = true;
@@ -475,6 +489,8 @@ impl Router {
                 due_ms: now,
                 reason: reason.to_owned(),
                 macro_tick: false,
+                cooldown_ms: 0,
+                afk_until_ms: None,
             });
         if priority >= p.priority {
             p.priority = priority;
@@ -508,10 +524,17 @@ impl Router {
         out
     }
 
-    /// Marks a wake finished; its cooldown starts now.
+    /// Marks a wake finished; its cooldown starts now. A non-urgent wake
+    /// queued meanwhile waits out that cooldown (and any distracted spell).
     pub fn finish(&mut self, entity: &EntityId, now: u64) {
         self.busy.remove(entity);
         self.last_wake_end.insert(entity.clone(), now);
+        if let Some(p) = self.pending.get_mut(entity)
+            && p.priority < Priority::Immediate
+        {
+            let floor = (now + p.cooldown_ms).max(p.afk_until_ms.unwrap_or(0));
+            p.due_ms = p.due_ms.max(floor);
+        }
     }
 
     /// Forgets every waiting wake of an entity (it logged out).

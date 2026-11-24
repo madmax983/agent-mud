@@ -360,6 +360,45 @@ fn busy_entities_wait_and_cooldowns_apply() {
 }
 
 #[test]
+fn a_wake_queued_while_busy_waits_out_the_cooldown() {
+    // Regression: the floor was computed when the event came in, from the
+    // wake before, so a wake queued mid-wake fired right after finish().
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    assert!(r.due(5_000).iter().any(|w| w.entity == id("marta")));
+    run(&mut w, &mut r, &rt, &ada, "say again", 5_000);
+    r.finish(&id("marta"), 60_000);
+    assert!(
+        r.due(60_001).iter().all(|w| w.entity != id("marta")),
+        "the cooldown starts when the wake ends"
+    );
+    let due = r
+        .pending()
+        .into_iter()
+        .find(|(e, _, _)| e == &id("marta"))
+        .unwrap()
+        .2;
+    assert!((63_000..=68_000).contains(&due), "{due}");
+    assert!(r.due(due).iter().any(|w| w.entity == id("marta")));
+}
+
+#[test]
+fn an_urgent_wake_queued_while_busy_still_goes_at_once() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    assert!(r.due(5_000).iter().any(|w| w.entity == id("marta")));
+    run(&mut w, &mut r, &rt, &ada, "say marta, an ale", 5_000);
+    r.finish(&id("marta"), 60_000);
+    assert!(r.due(60_000).iter().any(|w| w.entity == id("marta")));
+}
+
+#[test]
 fn names_match_whole_words() {
     assert!(names("yo Kestrel, you in?", "kestrel", &[]));
     assert!(names("ask the barkeep", "Marta", &["barkeep".into()]));
