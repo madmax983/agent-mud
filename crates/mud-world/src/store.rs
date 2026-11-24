@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::event::Event;
 use crate::ids::EntityId;
+use crate::rewards::MintRecord;
 use crate::state::WorldState;
 
 /// A store failure.
@@ -59,6 +60,14 @@ CREATE TABLE IF NOT EXISTS events (
     body TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_room ON events (room, seq);
+CREATE TABLE IF NOT EXISTS mints (
+    seq INTEGER PRIMARY KEY,
+    pool TEXT NOT NULL,
+    period INTEGER NOT NULL,
+    entity TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mints_pool ON mints (pool, period);
 CREATE TABLE IF NOT EXISTS script_memory (
     entity TEXT PRIMARY KEY,
     schema INTEGER NOT NULL,
@@ -95,7 +104,8 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Saves the state and appends events, atomically.
+    /// Saves the state and appends events and ledger rows, atomically. A
+    /// row saved before (by `seq`) is kept as it was.
     ///
     /// # Errors
     /// SQLite or JSON encoding fails; nothing is written then.
@@ -104,6 +114,7 @@ impl Store {
         pack: &str,
         state: &WorldState,
         events: &[Event],
+        mints: &[MintRecord],
         now_ms: u64,
     ) -> Result<(), StoreError> {
         let state_json = serde_json::to_string(state)?;
@@ -124,6 +135,18 @@ impl Store {
                     e.room.as_ref().map(crate::ids::RoomId::as_str),
                     e.kind.name(),
                     serde_json::to_string(e)?,
+                ])?;
+            }
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO mints (seq, pool, period, entity, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for m in mints {
+                ins.execute(params![
+                    i64::try_from(m.seq.0).unwrap_or(i64::MAX),
+                    m.pool.as_str(),
+                    i64::try_from(m.period).unwrap_or(i64::MAX),
+                    m.entity.as_str(),
+                    serde_json::to_string(m)?,
                 ])?;
             }
         }
@@ -184,6 +207,20 @@ impl Store {
             ],
             |r| r.get::<_, String>(0),
         )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    /// The whole ledger, oldest first: every mint since the world began.
+    ///
+    /// # Errors
+    /// SQLite fails or a row does not decode.
+    pub fn mints(&self) -> Result<Vec<MintRecord>, StoreError> {
+        let mut q = self.conn.prepare("SELECT body FROM mints ORDER BY seq")?;
+        let rows = q.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(serde_json::from_str(&r?)?);

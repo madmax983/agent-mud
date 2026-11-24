@@ -435,7 +435,7 @@ fn hook_faults_survive_a_store_round_trip() {
     run(&mut w, &ada, "pry");
     let mut store = crate::store::Store::open_in_memory().unwrap();
     store
-        .save("crypt-v01", &w.snapshot(), &w.drain_fresh(), 5)
+        .save("crypt-v01", &w.snapshot(), &w.drain_fresh(), &[], 5)
         .unwrap();
     let loaded = store.load(10).unwrap().unwrap();
     assert_eq!(loaded.state.hook_faults["verbs.pry"], 1);
@@ -679,13 +679,13 @@ fn heal_never_exceeds_hp_max() {
 // ------------------------------------------------------------ flags and marks
 
 #[test]
-fn flags_and_marks_at_capacity_are_skipped_not_faults() {
+fn flags_and_marks_past_capacity_decline_the_whole_list_without_a_fault() {
     let h = Arc::new(FakeHooks::new(
         vec![verb("pry")],
         effects(vec![
+            ScriptEffect::SetFlag("f0".into(), FlagValue::Int(9)),
             ScriptEffect::SetFlag("one_more".into(), FlagValue::Int(1)),
             ScriptEffect::Mark("one_more".into(), FlagValue::Int(1)),
-            ScriptEffect::SetFlag("f0".into(), FlagValue::Int(9)),
         ]),
     ));
     let mut w = world_with(&h);
@@ -702,16 +702,37 @@ fn flags_and_marks_at_capacity_are_skipped_not_faults() {
             .insert(format!("m{i}"), FlagValue::Int(0));
     }
     let r = run(&mut w, &ada, "pry");
-    assert!(r.ok);
+    assert_eq!(r.error_code, Some(ErrorCode::Refused));
+    assert_eq!(r.narrative, DECLINED);
     assert!(!w.state.flags.contains_key("one_more"));
     assert_eq!(
         w.state.flags["f0"],
-        FlagValue::Int(9),
-        "an existing flag still changes"
+        FlagValue::Int(0),
+        "all or nothing: the flag that fits is not set either"
     );
     assert_eq!(w.entity(&ada).unwrap().marks.len(), MARK_CAP);
-    assert!(w.state.hook_faults.is_empty());
+    assert!(w.state.hook_faults.is_empty(), "a full table is no fault");
+    assert!(w.drain_audit().iter().any(|a| matches!(
+        a,
+        Audit::ScriptLog { line, .. } if line == "declined: flags full (256); one_more would not be kept"
+    )));
     assert_eq!(w.state.check(), Vec::<String>::new());
+    // With room for the flag, the full mark table declines the list.
+    w.state.flags.remove("f255");
+    assert_eq!(
+        run(&mut w, &ada, "pry").error_code,
+        Some(ErrorCode::Refused)
+    );
+    assert!(w.drain_audit().iter().any(|a| matches!(
+        a,
+        Audit::ScriptLog { line, .. } if line == "declined: marks full (32); one_more would not be kept"
+    )));
+    // With room for both, it applies.
+    w.state.entities.get_mut(&ada).unwrap().marks.remove("m0");
+    assert!(run(&mut w, &ada, "pry").ok);
+    assert_eq!(w.state.flags["f0"], FlagValue::Int(9));
+    assert_eq!(w.state.flags.len(), FLAG_CAP);
+    assert_eq!(w.entity(&ada).unwrap().marks.len(), MARK_CAP);
 }
 
 #[test]
@@ -1133,10 +1154,17 @@ fn old_snapshots_without_script_fields_load() {
     obj.remove("hook_faults");
     obj.remove("scripts_version");
     obj.remove("pool_spent");
-    obj.remove("mints");
-    let back: crate::state::WorldState = serde_json::from_value(v).unwrap();
+    obj.remove("minted");
+    let back: crate::state::WorldState = serde_json::from_value(v.clone()).unwrap();
     assert!(back.flags.is_empty() && back.hook_faults.is_empty() && back.scripts_version.is_none());
-    assert!(back.pool_spent.is_empty() && back.mints.is_empty());
+    assert!(back.pool_spent.is_empty() && back.minted.is_empty());
+    assert_eq!(back, w.snapshot());
+    // A snapshot from before the ledger moved to its own table still
+    // loads; its rows are not kept in the state.
+    v.as_object_mut()
+        .unwrap()
+        .insert("mints".into(), serde_json::json!([]));
+    let back: crate::state::WorldState = serde_json::from_value(v).unwrap();
     assert_eq!(back, w.snapshot());
 }
 

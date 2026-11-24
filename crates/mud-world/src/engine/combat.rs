@@ -206,6 +206,9 @@ impl World {
             status: "dead".into(),
             value: true,
         });
+        if let Some(e) = self.state.entities.get_mut(victim) {
+            e.deaths = e.deaths.saturating_add(1);
+        }
         if v.kind == EntityKind::Mob {
             for item in v.inventory.clone() {
                 let hidden = self

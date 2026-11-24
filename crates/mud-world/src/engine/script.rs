@@ -5,7 +5,7 @@
 //! another: effects are applied with the engine's own helpers, which run
 //! no hooks, and login, respawn and ticks run none either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -24,8 +24,30 @@ use crate::hooks::{
 use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId};
 use crate::pack::{Direction, EntityKind};
 use crate::parser::{Command, forbidden_in_text};
-use crate::rewards::{MintRecord, MintedItem, PoolFacts};
+use crate::rewards::{AskError, MintRecord, MintedItem, PoolFacts};
 use crate::state::{Entity, Holder};
+
+/// What the actor reads when a verb or `use` hook declines: server text.
+pub const DECLINED: &str = "Nothing comes of that just now.";
+
+/// Why an effect list cannot be applied.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Inadmissible {
+    /// A script bug: the hook faults, and its breaker counts it.
+    #[error("{0}")]
+    Fault(String),
+    /// The world cannot take it now (a pool spent for the period, marks or
+    /// flags full): the hook declines, nothing applies, and its breaker
+    /// does not move, so no player can take a hook down by asking again.
+    #[error("{0}")]
+    Declined(String),
+}
+
+impl From<String> for Inadmissible {
+    fn from(message: String) -> Self {
+        Self::Fault(message)
+    }
+}
 
 /// The breaker state of one hook, for the observer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -47,6 +69,9 @@ pub enum HookRun {
     Skipped,
     /// It faulted; nothing was applied.
     Faulted,
+    /// The world could not take its effects now; nothing was applied, and
+    /// its breaker did not move.
+    Declined,
     /// Its effects were applied.
     Applied {
         /// The lines for the actor, in order.
@@ -301,6 +326,7 @@ impl World {
                         room: present.then(|| e.room.clone()),
                         alive: e.dead_until_ms.is_none(),
                         present,
+                        deaths: e.deaths,
                     },
                 )
             })
@@ -388,6 +414,7 @@ impl World {
             last_attacked_by: None,
             haggle_with: None,
             marks: BTreeMap::new(),
+            deaths: 0,
         };
         let actor = ActorFacts {
             id: probe.id.clone(),
@@ -434,18 +461,27 @@ impl World {
     // ------------------------------------------------------------ admission
 
     /// Checks each effect against the world at game time `now_ms`, before
-    /// any is applied.
+    /// any is applied. The list is applied whole or not at all, so a mark
+    /// or a flag that could not be kept (its table full) declines the whole
+    /// list: a reward never pays when its once-per-player guard is lost.
     ///
     /// # Errors
-    /// The first effect that cannot apply, and why.
+    /// The first effect that cannot apply, and why: a fault, or a decline.
     pub fn check_effects(
         &self,
         room: &RoomId,
         actor: &EntityId,
         effects: &[ScriptEffect],
         now_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), Inadmissible> {
         let def = self.pack.rooms.get(room);
+        let mut marks: BTreeSet<&str> = self
+            .state
+            .entities
+            .get(actor)
+            .map(|e| e.marks.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut flags: BTreeSet<&str> = self.state.flags.keys().map(String::as_str).collect();
         for fx in effects {
             match fx {
                 ScriptEffect::Msg(t) | ScriptEffect::Narrate(t) | ScriptEffect::Refuse(t) => {
@@ -458,10 +494,10 @@ impl World {
                         } else {
                             "lock"
                         };
-                        return Err(format!(
+                        return Err(Inadmissible::Fault(format!(
                             "{which}({:?}): no lock on that exit here",
                             d.short()
-                        ));
+                        )));
                     }
                 }
                 ScriptEffect::SetFlag(n, v) | ScriptEffect::Mark(n, v) => {
@@ -469,18 +505,38 @@ impl World {
                     if let FlagValue::Text(t) = v
                         && t.chars().count() > FLAG_TEXT_MAX
                     {
-                        return Err(format!(
+                        return Err(Inadmissible::Fault(format!(
                             "the value of {n} is over {FLAG_TEXT_MAX} characters"
-                        ));
+                        )));
                     }
+                    let (table, cap, what) = if matches!(fx, ScriptEffect::Mark(..)) {
+                        (&mut marks, MARK_CAP, "marks")
+                    } else {
+                        (&mut flags, FLAG_CAP, "flags")
+                    };
+                    if !table.contains(n.as_str()) && table.len() >= cap {
+                        return Err(Inadmissible::Declined(format!(
+                            "{what} full ({cap}); {n} would not be kept"
+                        )));
+                    }
+                    table.insert(n);
                 }
-                ScriptEffect::ClearFlag(n) | ScriptEffect::Unmark(n) => check_name(n)?,
+                ScriptEffect::ClearFlag(n) => {
+                    check_name(n)?;
+                    flags.remove(n.as_str());
+                }
+                ScriptEffect::Unmark(n) => {
+                    check_name(n)?;
+                    marks.remove(n.as_str());
+                }
                 ScriptEffect::Heal(_) | ScriptEffect::Hurt(_) => {
                     if matches!(fx, ScriptEffect::Hurt(_)) && def.is_some_and(|r| r.safe) {
-                        return Err("hurt() is not allowed in a safe room".to_owned());
+                        return Err(Inadmissible::Fault(
+                            "hurt() is not allowed in a safe room".to_owned(),
+                        ));
                     }
                     if !self.state.entities.get(actor).is_some_and(Entity::present) {
-                        return Err("the actor is not here".to_owned());
+                        return Err(Inadmissible::Fault("the actor is not here".to_owned()));
                     }
                 }
                 ScriptEffect::Reward {
@@ -488,14 +544,18 @@ impl World {
                     currency,
                     items,
                 } => {
-                    let def =
-                        self.pack.economy.rewards.get(pool).ok_or_else(|| {
-                            format!("reward({pool}): no such pool in economy.toml")
-                        })?;
+                    let def = self.pack.economy.rewards.get(pool).ok_or_else(|| {
+                        Inadmissible::Fault(format!("reward({pool}): no such pool in economy.toml"))
+                    })?;
                     def.admit(self.state.pool_spent.get(pool), now_ms, *currency, items)
-                        .map_err(|e| format!("reward({pool}): {e}"))?;
+                        .map_err(|e| match e {
+                            AskError::Bad(m) => Inadmissible::Fault(format!("reward({pool}): {m}")),
+                            AskError::Spent(m) => {
+                                Inadmissible::Declined(format!("reward({pool}): {m}"))
+                            }
+                        })?;
                     if !self.state.entities.get(actor).is_some_and(Entity::present) {
-                        return Err("the actor is not here".to_owned());
+                        return Err(Inadmissible::Fault("the actor is not here".to_owned()));
                     }
                 }
             }
@@ -539,14 +599,21 @@ impl World {
                 at_ms: ctx.now,
             });
         }
-        let checked = reply.outcome.and_then(|(fx, dice)| {
-            let t = tally(&fx);
-            if !tally_admissible(t, limits.max_effects, call.hook.is_command()) {
-                return Err(tally_reason(t, limits.max_effects, call.hook.is_command()));
-            }
-            self.check_effects(&call.room, actor, &fx, ctx.now)?;
-            Ok((fx, dice))
-        });
+        let checked = reply
+            .outcome
+            .map_err(Inadmissible::Fault)
+            .and_then(|(fx, dice)| {
+                let t = tally(&fx);
+                if !tally_admissible(t, limits.max_effects, call.hook.is_command()) {
+                    return Err(Inadmissible::Fault(tally_reason(
+                        t,
+                        limits.max_effects,
+                        call.hook.is_command(),
+                    )));
+                }
+                self.check_effects(&call.room, actor, &fx, ctx.now)?;
+                Ok((fx, dice))
+            });
         match checked {
             Ok((fx, dice)) => {
                 self.dice = dice;
@@ -560,7 +627,15 @@ impl World {
                 });
                 self.apply_effects(ctx, actor, call, &key, fx)
             }
-            Err(message) => {
+            Err(Inadmissible::Declined(message)) => {
+                // Not the script's fault: nothing applies, the dice are
+                // untouched, and the breaker stays where it was.
+                let (next, _) = hook_step(faults, HookOutcome::Declined, limits.max_faults);
+                self.store_faults(&key, next);
+                self.script_log(ctx, &key, actor, format!("declined: {}", capped(&message)));
+                HookRun::Declined
+            }
+            Err(Inadmissible::Fault(message)) => {
                 let (next, allowed) = hook_step(faults, HookOutcome::Faulted, limits.max_faults);
                 self.store_faults(&key, next);
                 self.audit.push(Audit::ScriptFault {
@@ -760,7 +835,7 @@ impl World {
             items: made.iter().map(|i| i.proto.clone()).collect(),
             at_ms: ctx.now,
         });
-        self.state.mints.push(MintRecord {
+        let record = MintRecord {
             seq,
             pool: m.pool.clone(),
             period,
@@ -769,7 +844,10 @@ impl World {
             currency: m.currency,
             items: made,
             at_ms: ctx.now,
-        });
+        };
+        let totals = self.state.minted.entry(m.pool.clone()).or_default();
+        *totals = totals.with(&record);
+        self.mints.push(record);
         Some(line)
     }
 
@@ -955,6 +1033,7 @@ impl World {
                 };
                 Ok((narrative, json!({ "script": key })))
             }
+            HookRun::Declined => Err(Fail::new(ErrorCode::Refused, DECLINED)),
             HookRun::Absent | HookRun::Skipped | HookRun::Faulted => {
                 Err(Fail::new(ErrorCode::ScriptFailed, "Nothing happens."))
             }
@@ -1015,7 +1094,7 @@ impl World {
         };
         match self.run_hook(ctx, actor, &call) {
             HookRun::Applied { msgs, .. } => msgs,
-            HookRun::Absent | HookRun::Skipped | HookRun::Faulted => Vec::new(),
+            HookRun::Absent | HookRun::Skipped | HookRun::Faulted | HookRun::Declined => Vec::new(),
         }
     }
 }

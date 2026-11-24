@@ -334,11 +334,17 @@ fn a_dead_mob_drops_loot_and_respawns() {
     assert!(r.ok, "{r:?}");
     let rat = w.entity(&id("giant_rat_2")).unwrap();
     assert!(rat.dead_until_ms.is_some());
+    assert_eq!(rat.deaths, 1, "each death is counted");
     let floor = &w.state.rooms[&RoomId::from("rat_warren")].items;
     assert_eq!(floor.len(), 1, "the tail drops, the teeth do not");
     assert_eq!(w.look_view(&ada)["entities"], serde_json::json!([]));
     w.tick(10_000 + 31 * 60_000);
     assert!(w.entity(&id("giant_rat_2")).unwrap().present());
+    assert_eq!(
+        w.entity(&id("giant_rat_2")).unwrap().deaths,
+        1,
+        "kept on respawn"
+    );
     assert_eq!(w.state.check(), Vec::<String>::new());
 }
 
@@ -621,7 +627,8 @@ proptest! {
                 money + w.state.minted_currency(),
                 "money is conserved except for ledgered mints"
             );
-            prop_assert!(w.state.mints.is_empty(), "no scripts, no mints");
+            prop_assert!(w.fresh_mints().is_empty(), "no scripts, no mints");
+            prop_assert!(w.state.minted.is_empty());
         }
     }
 }

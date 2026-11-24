@@ -17,7 +17,7 @@ use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId, Seq, ShopId, SkillId
 use crate::pack::{
     CastDef, Direction, EntityKind, RoomDef, RoomItem, SELF_WORDS, Slot, Tier, TraitRef, WorldPack,
 };
-use crate::rewards::{MintRecord, PoolSpent};
+use crate::rewards::{MintRecord, MintTotals, PoolSpent};
 
 /// One entity.
 #[expect(
@@ -87,6 +87,18 @@ pub struct Entity {
     /// Marks that world scripts keep on it. No view shows them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub marks: BTreeMap<String, FlagValue>,
+    /// How many times it has died. A script tells one death of a mob from
+    /// the next by it (`ctx.cast.<id>.deaths`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deaths: u64,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+const fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Entity {
@@ -219,10 +231,12 @@ pub struct WorldState {
     /// What each reward pool has given in the period it counts in.
     #[serde(default)]
     pub pool_spent: BTreeMap<PoolId, PoolSpent>,
-    /// The ledger: every reward a script was ever given, in order. Money
-    /// and items are conserved except for these mints.
+    /// What each pool has given since the world began. The ledger's rows
+    /// (every [`MintRecord`]) live in the store's `mints` table, appended
+    /// with the events of their command, so the snapshot never grows with
+    /// them. Money and items are conserved except for ledgered mints.
     #[serde(default)]
-    pub mints: Vec<MintRecord>,
+    pub minted: BTreeMap<PoolId, MintTotals>,
 }
 
 mod pairs {
@@ -358,7 +372,7 @@ impl WorldState {
             hook_faults: BTreeMap::new(),
             scripts_version: None,
             pool_spent: BTreeMap::new(),
-            mints: Vec::new(),
+            minted: BTreeMap::new(),
         };
         for (rid, def) in &pack.rooms {
             s.place_room_items(rid, def, pack);
@@ -471,8 +485,8 @@ impl WorldState {
                 self.entities.insert(id.clone(), e);
             }
         }
-        // A pool the pack dropped gives nothing more; the ledger keeps
-        // what it gave.
+        // A pool the pack dropped gives nothing more; its totals and the
+        // ledger keep what it gave.
         self.pool_spent
             .retain(|p, _| pack.economy.rewards.contains_key(p));
     }
@@ -561,6 +575,7 @@ impl WorldState {
             last_attacked_by: None,
             haggle_with: None,
             marks: BTreeMap::new(),
+            deaths: 0,
         }
     }
 
@@ -616,6 +631,7 @@ impl WorldState {
             last_attacked_by: None,
             haggle_with: None,
             marks: BTreeMap::new(),
+            deaths: 0,
         };
         self.entities.insert(id.clone(), e);
         &self.entities[id]
@@ -711,16 +727,20 @@ impl WorldState {
     /// The currency every ledgered mint made.
     #[must_use]
     pub fn minted_currency(&self) -> i64 {
-        self.mints.iter().map(|m| m.currency).sum()
+        self.minted.values().map(|t| t.currency).sum()
     }
 
-    /// Checks the ledger against the pack's pools. Returns each violation.
+    /// Checks the counts against the pack's pools and against `ledger`,
+    /// every mint since the world began (the store's `mints` table, or what
+    /// a test collected). Returns each violation.
     ///
     /// - No pool has given more than its budget in the period it counts in.
     /// - What a pool counts as given in its period is exactly the sum of
     ///   its ledger entries for that period.
+    /// - Each pool's running totals are exactly the sums of its entries.
+    /// - Every item the ledger names was made once, below `next_item`.
     #[must_use]
-    pub fn check_rewards(&self, pack: &WorldPack) -> Vec<String> {
+    pub fn check_rewards(&self, pack: &WorldPack, ledger: &[MintRecord]) -> Vec<String> {
         let mut bad = Vec::new();
         for (id, spent) in &self.pool_spent {
             let Some(pool) = pack.economy.rewards.get(id) else {
@@ -730,12 +750,11 @@ impl WorldState {
             if i64::try_from(spent.currency).map_or(true, |c| c > pool.currency) {
                 bad.push(format!("pool {id} gave {} currency", spent.currency));
             }
-            let ledger: Vec<&MintRecord> = self
-                .mints
+            let period: Vec<&MintRecord> = ledger
                 .iter()
                 .filter(|m| &m.pool == id && m.period == spent.period)
                 .collect();
-            let money: i64 = ledger.iter().map(|m| m.currency).sum();
+            let money: i64 = period.iter().map(|m| m.currency).sum();
             if i64::try_from(spent.currency).ok() != Some(money) {
                 bad.push(format!(
                     "pool {id} counts {} currency; its ledger {money}",
@@ -747,7 +766,7 @@ impl WorldState {
                 if used > u64::from(*budget) {
                     bad.push(format!("pool {id} made {used} {proto}"));
                 }
-                let made = ledger
+                let made = period
                     .iter()
                     .flat_map(|m| &m.items)
                     .filter(|i| &i.proto == proto)
@@ -759,6 +778,31 @@ impl WorldState {
                 }
             }
         }
+        let mut sums: BTreeMap<&PoolId, MintTotals> = BTreeMap::new();
+        for m in ledger {
+            let t = sums.entry(&m.pool).or_default();
+            *t = t.with(m);
+        }
+        let pools: BTreeSet<&PoolId> = sums.keys().copied().chain(self.minted.keys()).collect();
+        for id in pools {
+            let have = self.minted.get(id).copied().unwrap_or_default();
+            let sum = sums.get(id).copied().unwrap_or_default();
+            if have != sum {
+                bad.push(format!(
+                    "pool {id} totals {} mints, {} currency, {} items; its ledger {}, {}, {}",
+                    have.mints, have.currency, have.items, sum.mints, sum.currency, sum.items
+                ));
+            }
+        }
+        let mut minted = BTreeSet::new();
+        for item in ledger.iter().flat_map(|m| &m.items) {
+            if item.id.0 >= self.next_item || !minted.insert(item.id) {
+                bad.push(format!(
+                    "the ledger names {} twice or ahead of time",
+                    item.id
+                ));
+            }
+        }
         bad
     }
 
@@ -768,7 +812,6 @@ impl WorldState {
     /// - Every equipped item is carried by the entity that equips it.
     /// - Every entity stands in a known room.
     /// - No entity has negative money.
-    /// - Every item the ledger names was made once, below `next_item`.
     #[must_use]
     pub fn check(&self) -> Vec<String> {
         let mut seen: BTreeMap<ItemId, usize> = BTreeMap::new();
@@ -817,15 +860,6 @@ impl WorldState {
                     "{} holds {} marks; the cap is {MARK_CAP}",
                     e.id,
                     e.marks.len()
-                ));
-            }
-        }
-        let mut minted = BTreeSet::new();
-        for item in self.mints.iter().flat_map(|m| &m.items) {
-            if item.id.0 >= self.next_item || !minted.insert(item.id) {
-                bad.push(format!(
-                    "the ledger names {} twice or ahead of time",
-                    item.id
                 ));
             }
         }

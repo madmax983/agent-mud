@@ -5,7 +5,8 @@
 //! markers must match the Rust source; only the spec clauses differ.
 //!
 //! The breaker: a hook runs at most `max` consecutive times that fault,
-//! for every `max` (255 included), and stays tripped until a reload.
+//! for every `max` (255 included), and stays tripped until a reload. A
+//! decline (the world could not take the effects now) never moves it.
 //!
 //! Admission: the saturating tally admits exactly the effect lists of at
 //! most `max` effects with at most one heal/hurt and at most one reward
@@ -27,6 +28,10 @@ pub enum HookOutcome {
     Faulted,
     /// The scripts were loaded or reloaded.
     Reloaded,
+    /// The hook ran, but the world could not take its effects now (a pool
+    /// spent for the period, marks or flags full): nothing applied, and
+    /// the count stays where it was.
+    Declined,
 }
 // mirror-end hook_outcome
 
@@ -50,6 +55,7 @@ pub open spec fn spec_hook_step(faults: u8, outcome: HookOutcome, max: u8) -> (u
             let next: u8 = if faults == 255 { 255 } else { (faults + 1) as u8 };
             (next, next < max)
         },
+        HookOutcome::Declined => (faults, faults < max),
     }
 }
 
@@ -69,6 +75,8 @@ pub const fn hook_step(faults: u8, outcome: HookOutcome, max: u8) -> (r: (u8, bo
         (faults >= max && !(outcome is Reloaded)) ==> !r.1 && r.0 >= faults,
         // A fault counts one more, saturating.
         outcome is Faulted ==> r.0 as int == (if faults == 255 { 255 } else { faults + 1 }),
+        // A decline neither counts nor clears: the breaker does not move.
+        outcome is Declined ==> r == (faults, faults < max),
 {
     match outcome {
         HookOutcome::Reloaded => (0, 0 < max),
@@ -83,6 +91,7 @@ pub const fn hook_step(faults: u8, outcome: HookOutcome, max: u8) -> (r: (u8, bo
             let next = faults.saturating_add(1);
             (next, next < max)
         }
+        HookOutcome::Declined => (faults, faults < max),
     }
 }
 // mirror-end hook_step
@@ -117,6 +126,52 @@ pub proof fn lemma_at_most_max_consecutive_faults(n: nat, max: u8)
         (faults_after(n) < max) <==> (n < max),
 {
     lemma_faults_after(n);
+}
+
+/// The count after a run of outcomes from a fresh breaker.
+pub open spec fn count_after(s: Seq<HookOutcome>, max: u8) -> u8
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        0
+    } else {
+        spec_hook_step(count_after(s.drop_last(), max), s.last(), max).0
+    }
+}
+
+/// The faults in a run of outcomes.
+pub open spec fn faults_in(s: Seq<HookOutcome>) -> nat
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        0
+    } else {
+        faults_in(s.drop_last()) + (if s.last() is Faulted { 1nat } else { 0nat })
+    }
+}
+
+/// Declines never trip a breaker: over any run of faults and declines
+/// (no clean run, no reload), the count is the faults alone, saturating at
+/// 255, whatever the declines. So a player who makes a hook decline on
+/// purpose (asking an empty pool again and again) never takes it down for
+/// everyone: after such a run the hook may run iff its faults are under
+/// `max`.
+pub proof fn lemma_declines_never_trip(s: Seq<HookOutcome>, max: u8)
+    requires
+        forall|i: int| 0 <= i < s.len() ==> (#[trigger] s[i] is Faulted || s[i] is Declined),
+    ensures
+        count_after(s, max) as int == (if faults_in(s) <= 255 { faults_in(s) as int } else { 255 }),
+        (count_after(s, max) < max) <==> (faults_in(s) < max),
+    decreases s.len(),
+{
+    if s.len() > 0 {
+        let p = s.drop_last();
+        assert forall|i: int| 0 <= i < p.len() implies (#[trigger] p[i] is Faulted || p[i] is Declined) by {
+            assert(p[i] == s[i]);
+        }
+        lemma_declines_never_trip(p, max);
+        assert(s.last() == s[s.len() - 1]);
+    }
 }
 
 #[derive(Clone, Copy)]

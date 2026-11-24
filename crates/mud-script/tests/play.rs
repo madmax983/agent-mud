@@ -124,7 +124,7 @@ proptest! {
             last = last.max(w.last_seq());
             let bad = w.state().check();
             prop_assert!(bad.is_empty(), "{:?} after {}", bad, LINES[line]);
-            let bad = w.state().check_rewards(w.pack());
+            let bad = w.state().check_rewards(w.pack(), w.fresh_mints());
             prop_assert!(bad.is_empty(), "{:?} after {}", bad, LINES[line]);
             prop_assert_eq!(
                 w.state().total_currency(w.pack()),
@@ -132,8 +132,7 @@ proptest! {
                 "scripts mint money only through the ledger"
             );
             let ledger: Vec<ItemId> = w
-                .state()
-                .mints
+                .fresh_mints()
                 .iter()
                 .flat_map(|m| m.items.iter().map(|i| i.id))
                 .collect();
@@ -170,6 +169,7 @@ fn the_same_play_twice_gives_the_same_snapshot_and_log() {
         la.iter().any(|e| e.tags.iter().any(|t| t == "script")),
         "scripts ran"
     );
-    assert!(!a.state().mints.is_empty(), "the bounty was paid");
+    assert!(!a.fresh_mints().is_empty(), "the bounty was paid");
+    assert_eq!(a.fresh_mints(), b.fresh_mints());
     assert!(a.last_seq() > Seq(10));
 }

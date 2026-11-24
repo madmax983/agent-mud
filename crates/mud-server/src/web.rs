@@ -756,17 +756,11 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
     };
     let status = app.game.read(mud_world::World::hook_status);
     let now = app.game.now_ms();
-    let (pools, ledger) = app.game.read(|w| {
-        let mut minted: std::collections::BTreeMap<mud_world::PoolId, (usize, i64, usize)> =
-            std::collections::BTreeMap::new();
-        for m in &w.state().mints {
-            let e = minted.entry(m.pool.clone()).or_default();
-            e.0 += 1;
-            e.1 += m.currency;
-            e.2 += m.items.len();
-        }
-        (w.pool_facts(now), minted)
-    });
+    // The running totals in the state, not the ledger's rows: a read that
+    // costs the same however long the world has run.
+    let (pools, ledger) = app
+        .game
+        .read(|w| (w.pool_facts(now), w.state().minted.clone()));
     let compiled = host.current();
     let max = compiled.limits.max_consecutive_faults;
     html! {
@@ -810,14 +804,14 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
             table {
                 tr { th { "reward pool" } th { "left this period" } th { "ledger" } }
                 @for (id, left) in &pools {
-                    @let (mints, money, items) = ledger.get(id).copied().unwrap_or_default();
+                    @let total = ledger.get(id).copied().unwrap_or_default();
                     tr {
                         td { (id) " (per " (left.per.name()) ")" }
                         td {
                             "currency " (left.currency)
                             @for (proto, n) in &left.items { ", " (proto) " " (n) }
                         }
-                        td { (mints) " mints: currency " (money) ", " (items) " items" }
+                        td { (total.mints) " mints: currency " (total.currency) ", " (total.items) " items" }
                     }
                 }
             }

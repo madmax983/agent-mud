@@ -329,6 +329,9 @@ pub struct CastFacts {
     pub alive: bool,
     /// In the world, alive and not hidden.
     pub present: bool,
+    /// How many times it has died: one death of a respawning mob from the
+    /// next, so a bounty can pay once per kill.
+    pub deaths: u64,
 }
 
 /// Everything a world hook reads. Built by the engine; never holds player
@@ -477,6 +480,10 @@ pub enum HookOutcome {
     Faulted,
     /// The scripts were loaded or reloaded.
     Reloaded,
+    /// The hook ran, but the world could not take its effects now (a pool
+    /// spent for the period, marks or flags full): nothing applied, and
+    /// the count stays where it was.
+    Declined,
 }
 // mirror-end hook_outcome
 
@@ -505,6 +512,7 @@ pub const fn hook_step(faults: u8, outcome: HookOutcome, max: u8) -> (u8, bool) 
             let next = faults.saturating_add(1);
             (next, next < max)
         }
+        HookOutcome::Declined => (faults, faults < max),
     }
 }
 // mirror-end hook_step
@@ -619,7 +627,7 @@ mod tests {
     use proptest::prelude::*;
 
     use EffectClass::{Body, Mint, Refuse, State, Text};
-    use HookOutcome::{Faulted, Ran, Reloaded};
+    use HookOutcome::{Declined, Faulted, Ran, Reloaded};
 
     #[test]
     fn hook_step_matches_its_spec_table() {
@@ -631,6 +639,13 @@ mod tests {
         assert_eq!(hook_step(255, Faulted, 255), (255, false));
         assert_eq!(hook_step(9, Reloaded, 3), (0, true));
         assert_eq!(hook_step(9, Reloaded, 0), (0, false));
+        assert_eq!(
+            hook_step(2, Declined, 3),
+            (2, true),
+            "a decline does not count"
+        );
+        assert_eq!(hook_step(3, Declined, 3), (3, false), "nor reopen");
+        assert_eq!(hook_step(0, Declined, 3), (0, true));
         assert!(hook_allowed(2, 3));
         assert!(!hook_allowed(3, 3));
     }
@@ -741,7 +756,7 @@ mod tests {
     }
 
     fn outcome() -> impl Strategy<Value = HookOutcome> {
-        prop::sample::select(vec![Ran, Faulted, Reloaded])
+        prop::sample::select(vec![Ran, Faulted, Reloaded, Declined])
     }
 
     proptest! {
@@ -752,6 +767,21 @@ mod tests {
             cmd in any::<bool>(),
         ) {
             prop_assert_eq!(admit(&s, max, cmd), admissible_spec(&s, max, cmd));
+        }
+
+        #[test]
+        fn declines_never_trip_a_breaker(
+            steps in prop::collection::vec(prop::sample::select(vec![Faulted, Declined]), 0..300),
+            max in 0u8..=255,
+        ) {
+            // lemma_declines_never_trip: the count is the faults alone.
+            let mut faults = 0u8;
+            for s in &steps {
+                faults = hook_step(faults, *s, max).0;
+            }
+            let n = steps.iter().filter(|s| **s == Faulted).count();
+            prop_assert_eq!(usize::from(faults), n.min(255));
+            prop_assert_eq!(hook_allowed(faults, max), n < usize::from(max));
         }
 
         #[test]

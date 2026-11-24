@@ -4,9 +4,11 @@
 //! `[rewards.<pool>]`): a budget of currency and of item prototypes per
 //! period, a UTC day of the game clock or ever. A hook asks for a reward
 //! with `ScriptEffect::Reward`; the engine admits the ask whole and only
-//! within what is left of the period, and records every mint in
-//! `WorldState.mints`, so money and items are conserved except for
-//! ledgered mints.
+//! within what is left of the period, and records every mint in the
+//! ledger: a [`MintRecord`] the store appends to its `mints` table with
+//! the command's events, while the snapshot keeps only bounded counts
+//! (`WorldState.pool_spent` and the per-pool [`MintTotals`]). Money and
+//! items are conserved except for ledgered mints.
 //!
 //! Three kernels here are mirrored in `formal/verus/src/rewards.rs`:
 //! [`pool_period`], [`pool_roll`] and [`pool_admit`].
@@ -138,54 +140,62 @@ impl RewardPool {
     /// what the pool has spent after it.
     ///
     /// # Errors
-    /// The ask is empty, negative, too large for one reward, names an item
-    /// the pool does not offer, or passes what is left of any budget.
+    /// [`AskError::Bad`] when the ask could never be paid: it is empty,
+    /// negative, too large for one reward, names an item the pool does not
+    /// offer, or passes a whole period's budget. [`AskError::Spent`] when
+    /// it fits a period's budget but not what is left of this one.
     pub fn admit(
         &self,
         spent: Option<&PoolSpent>,
         now_ms: u64,
         currency: i64,
         items: &BTreeMap<ProtoId, u32>,
-    ) -> Result<PoolSpent, String> {
+    ) -> Result<PoolSpent, AskError> {
         let Ok(want) = u64::try_from(currency) else {
-            return Err(format!("currency {currency} is negative"));
+            return Err(AskError::Bad(format!("currency {currency} is negative")));
         };
         if want == 0 && items.values().all(|n| *n == 0) {
-            return Err("it asks for nothing".to_owned());
+            return Err(AskError::Bad("it asks for nothing".to_owned()));
         }
         let count: u64 = items.values().map(|n| u64::from(*n)).sum();
         if count > u64::from(REWARD_ITEMS_MAX) {
-            return Err(format!(
+            return Err(AskError::Bad(format!(
                 "{count} items; one reward makes at most {REWARD_ITEMS_MAX}"
-            ));
+            )));
         }
-        let left = |what: &str, budget: u64, used: u64| {
-            format!(
-                "{what}: {} left {}",
-                budget.saturating_sub(used),
-                self.left_when()
-            )
+        let refused = |what: &str, ask: u64, budget: u64, used: u64| {
+            if ask > budget {
+                AskError::Bad(format!(
+                    "asks {ask} {what}; the pool gives at most {budget} {}",
+                    self.per_word()
+                ))
+            } else {
+                AskError::Spent(format!(
+                    "asks {ask} {what}; {what}: {} left {}",
+                    budget.saturating_sub(used),
+                    self.left_when()
+                ))
+            }
         };
         let mut next = PoolSpent::rolled(spent, self.period(now_ms));
         let (fits, after) = pool_admit(next.currency, self.currency_budget(), want);
         if !fits {
-            return Err(format!(
-                "asks {want} currency; {}",
-                left("currency", self.currency_budget(), next.currency)
+            return Err(refused(
+                "currency",
+                want,
+                self.currency_budget(),
+                next.currency,
             ));
         }
         next.currency = after;
         for (proto, n) in items.iter().filter(|(_, n)| **n > 0) {
             let Some(budget) = self.items.get(proto).map(|b| u64::from(*b)) else {
-                return Err(format!("the pool offers no {proto}"));
+                return Err(AskError::Bad(format!("the pool offers no {proto}")));
             };
             let used = next.items.get(proto).copied().unwrap_or(0);
             let (fits, after) = pool_admit(used, budget, u64::from(*n));
             if !fits {
-                return Err(format!(
-                    "asks {n} {proto}; {}",
-                    left(proto.as_str(), budget, used)
-                ));
+                return Err(refused(proto.as_str(), u64::from(*n), budget, used));
             }
             next.items.insert(proto.clone(), after);
         }
@@ -196,6 +206,52 @@ impl RewardPool {
         match self.per {
             RewardPeriod::Day => "today",
             RewardPeriod::Ever => "ever",
+        }
+    }
+
+    const fn per_word(&self) -> &'static str {
+        match self.per {
+            RewardPeriod::Day => "a day",
+            RewardPeriod::Ever => "ever",
+        }
+    }
+}
+
+/// Why a pool refuses an ask.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AskError {
+    /// The ask could never be paid: a script bug, which counts as a fault.
+    #[error("{0}")]
+    Bad(String),
+    /// The ask fits the pool, but not what is left of this period. That is
+    /// the world's state, not a script bug: the hook declines, and its
+    /// breaker does not move.
+    #[error("{0}")]
+    Spent(String),
+}
+
+/// What a pool has given since the world began. The snapshot keeps these
+/// running counts, not the ledger's rows, so it never grows with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintTotals {
+    /// Mints.
+    pub mints: u64,
+    /// Currency made.
+    pub currency: i64,
+    /// Items made.
+    pub items: u64,
+}
+
+impl MintTotals {
+    /// These totals with one more mint.
+    #[must_use]
+    pub fn with(self, m: &MintRecord) -> Self {
+        Self {
+            mints: self.mints.saturating_add(1),
+            currency: self.currency.saturating_add(m.currency),
+            items: self
+                .items
+                .saturating_add(u64::try_from(m.items.len()).unwrap_or(u64::MAX)),
         }
     }
 }
@@ -339,12 +395,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             p.admit(Some(&s), day + 9, 1, &BTreeMap::new()).unwrap_err(),
-            "asks 1 currency; currency: 0 left today"
+            AskError::Spent("asks 1 currency; currency: 0 left today".into())
         );
         assert_eq!(
             p.admit(Some(&s), day + 9, 0, &ask(&[("healing_draught", 1)]))
                 .unwrap_err(),
-            "asks 1 healing_draught; healing_draught: 0 left today"
+            AskError::Spent("asks 1 healing_draught; healing_draught: 0 left today".into())
+        );
+        // An ask past a whole day's budget can never be paid: a bug.
+        assert_eq!(
+            p.admit(None, day, 61, &BTreeMap::new()).unwrap_err(),
+            AskError::Bad("asks 61 currency; the pool gives at most 60 a day".into())
+        );
+        assert_eq!(
+            p.admit(None, day, 0, &ask(&[("healing_draught", 4)]))
+                .unwrap_err()
+                .to_string(),
+            "asks 4 healing_draught; the pool gives at most 3 a day"
         );
         let facts = p.facts(Some(&s), day + 9);
         assert_eq!(
@@ -373,23 +440,31 @@ mod tests {
         assert_eq!(
             e.admit(Some(&s), DAY_MS * 400, 1, &BTreeMap::new())
                 .unwrap_err(),
-            "asks 1 currency; currency: 0 left ever"
+            AskError::Spent("asks 1 currency; currency: 0 left ever".into())
         );
         assert_eq!(
-            e.admit(None, 0, -1, &BTreeMap::new()).unwrap_err(),
+            e.admit(None, 0, 11, &BTreeMap::new()).unwrap_err(),
+            AskError::Bad("asks 11 currency; the pool gives at most 10 ever".into())
+        );
+        let bad = |r: Result<PoolSpent, AskError>| match r {
+            Err(AskError::Bad(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            bad(e.admit(None, 0, -1, &BTreeMap::new())),
             "currency -1 is negative"
         );
         assert_eq!(
-            e.admit(None, 0, 0, &ask(&[("x", 0)])).unwrap_err(),
+            bad(e.admit(None, 0, 0, &ask(&[("x", 0)]))),
             "it asks for nothing"
         );
         assert_eq!(
-            e.admit(None, 0, 1, &ask(&[("x", 1)])).unwrap_err(),
+            bad(e.admit(None, 0, 1, &ask(&[("x", 1)]))),
             "the pool offers no x"
         );
         let big = pool(0, &[("ale", 100)], RewardPeriod::Day);
         assert_eq!(
-            big.admit(None, 0, 0, &ask(&[("ale", 17)])).unwrap_err(),
+            bad(big.admit(None, 0, 0, &ask(&[("ale", 17)]))),
             "17 items; one reward makes at most 16"
         );
         assert!(valid_pool_id("warden_bounty"));
