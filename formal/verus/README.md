@@ -7,7 +7,7 @@ VERUS=/home/user/tools/verus-x86-linux/verus   # any Verus 0.2026.10.04.426d8b0 
 "$VERUS" formal/verus/src/lib.rs --crate-type=lib
 ```
 
-Expect `verification results:: 32 verified, 0 errors`. The release links
+Expect `verification results:: 36 verified, 0 errors`. The release links
 against rustup toolchain `1.98.1-x86_64-unknown-linux-gnu`, which must be
 installed.
 
@@ -19,6 +19,7 @@ installed.
 | `src/schedule.rs` `shift_minute` | `crates/mud-world/src/schedule.rs` | Result always in `0..1440`; shifting by `k` then `-k` returns any minute `< 1440` |
 | `src/chatter.rs` `chatter_step` | `crates/mud-supervisor/src/chatter.rs` | Human/MacroTick reset to 0 and allow; AgentWithHuman/World keep the count and allow; AgentAlone adds 1 (saturating) and allows iff the count before it is `< max`. Safety (`lemma_run_allows_at_most_max`): for every input sequence from a fresh counter and every `max`, the AgentAlone events allowed since the last reset number exactly `min(turns, max)`, so at most `max` |
 | `src/budget.rs` `budget_level` | `crates/mud-supervisor/src/budget.rs` | Hard iff `limit == 0 \|\| used >= limit`; Soft iff not Hard and `used*5 >= limit*4` (exact, `u128`); otherwise Normal; non-decreasing in `used` |
+| `src/connections.rs` `conn_step` | `crates/mud-server/src/limits.rs` | An open is admitted iff `total < max_total && here < max_here` and adds one to each; a close takes effect iff `here > 0 && total > 0` and takes one from each; a refused step changes nothing; the step never overflows; `here <= total <= max_total && here <= max_here` survives every step. Safety (`lemma_run_keeps_caps`): every sequence of opens and closes from a fresh limiter keeps that invariant |
 | `src/typing.rs` `typing_delay_ms` | `crates/mud-supervisor/src/turing.rs` | No overflow; equals `reaction + (chars*12000/max(wpm,1))*jitter/1000`; `>= reaction`; non-decreasing in `chars` |
 
 Each executable function also proves it never overflows.

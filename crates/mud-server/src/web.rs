@@ -10,13 +10,17 @@
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use autumn_web::AppState;
 use autumn_web::htmx::HTMX_JS_PATH;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::Extension;
+use autumn_web::reexports::axum::extract::ConnectInfo;
 use autumn_web::reexports::axum::http::StatusCode;
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
+use autumn_web::security::ResolvedClientIdentity;
 use autumn_web::sse::{Event as SseEvent, Sse};
 use autumn_web::ws::{Message, WebSocket, WsHandler};
 use futures::{Stream, StreamExt};
@@ -28,6 +32,7 @@ use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config::Timeouts;
+use crate::limits::{ConnLimiter, client_addr};
 use crate::session::{Line, LineKind, Presence, Session};
 
 /// What every route reads: the world, the supervisor, and the admin token.
@@ -43,6 +48,8 @@ pub struct Mud {
     pub admin_token: String,
     /// How long a terminal may wait for a name, and stay silent after.
     pub timeouts: Timeouts,
+    /// Connection slots, shared with telnet.
+    pub limiter: Arc<ConnLimiter>,
 }
 
 impl Mud {
@@ -216,10 +223,32 @@ async fn send_lines(socket: &mut WebSocket, lines: &[Line]) -> bool {
 }
 
 #[ws("/ws")]
-async fn terminal(state: AppState) -> impl WsHandler {
+async fn terminal(
+    state: AppState,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    resolved: Option<Extension<ResolvedClientIdentity>>,
+) -> impl WsHandler {
     let app = mud(&state);
+    let addr = client_addr(
+        resolved.and_then(|Extension(r)| r.addr),
+        peer.map(|Extension(ConnectInfo(p))| p),
+    );
+    // Taken at upgrade time; the socket closure owns it until it ends.
+    let slot = app.as_ref().map(|a| a.limiter.try_acquire(addr));
     move |mut socket: WebSocket| async move {
         let Some(app) = app else { return };
+        let _slot = match slot {
+            Some(Ok(s)) => s,
+            Some(Err(refusal)) => {
+                let l = Line {
+                    kind: LineKind::Error,
+                    text: refusal.to_string(),
+                };
+                let _ = socket.send(encode(&l)).await;
+                return;
+            }
+            None => return,
+        };
         // Log in first, in time.
         let session = loop {
             let Some(incoming) = Timeouts::within(app.timeouts.login, socket.recv()).await else {

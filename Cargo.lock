@@ -2168,6 +2168,7 @@ dependencies = [
  "mud-mcp",
  "mud-supervisor",
  "mud-world",
+ "proptest",
  "reqwest 0.13.5",
  "rustls",
  "serde",

@@ -47,6 +47,17 @@ pub struct ServerConfig {
     /// How long a logged-in player may send nothing before the connection
     /// closes, in ms. `0`: no limit.
     pub idle_timeout_ms: u64,
+    /// The most open terminal and telnet connections at once. `0`: no
+    /// limit.
+    pub max_connections: usize,
+    /// The most open connections from one client address (an IPv6 `/64`
+    /// counts as one). `0`: no limit.
+    pub max_connections_per_address: usize,
+    /// Reverse proxies (IPs or CIDR ranges) whose `X-Forwarded-For` names
+    /// the real client of a web connection. Empty: the TCP peer is the
+    /// client. Behind a proxy, set this, or every player shares the
+    /// proxy's per-address share.
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +69,9 @@ impl Default for ServerConfig {
             admin_token_env: "MUD_ADMIN_TOKEN".into(),
             login_timeout_ms: 60_000,
             idle_timeout_ms: 3_600_000,
+            max_connections: crate::MAX_CONNECTIONS,
+            max_connections_per_address: crate::MAX_CONNECTIONS_PER_ADDRESS,
+            trusted_proxies: Vec::new(),
         }
     }
 }

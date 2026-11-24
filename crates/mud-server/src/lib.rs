@@ -7,6 +7,7 @@
 //! thinks.
 
 pub mod config;
+pub mod limits;
 pub mod minds;
 pub mod session;
 pub mod smoke;
@@ -32,14 +33,18 @@ use mud_supervisor::scripted::FallbackMind;
 use mud_world::{CommandResult, EntityId, Game, SystemClock, WorldPack};
 
 use crate::config::MudConfig;
+use crate::limits::ConnLimiter;
 use crate::session::Presence;
 use crate::web::Mud;
 
 /// The largest WebSocket message a terminal may send, in bytes.
 pub const MAX_WS_MESSAGE_BYTES: usize = 4_096;
 
-/// The most open terminal (or telnet) connections at once.
+/// The default cap on open terminal and telnet connections together.
 pub const MAX_CONNECTIONS: usize = 512;
+
+/// The default cap on open connections from one client address.
+pub const MAX_CONNECTIONS_PER_ADDRESS: usize = 8;
 
 /// The MCP command gate: every `mud_command` from an agent passes the
 /// Turing typing gate, as in-process minds do.
@@ -152,6 +157,10 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             presence: Arc::new(Presence::default()),
             admin_token,
             timeouts: cfg.server.timeouts(),
+            limiter: ConnLimiter::new(
+                cfg.server.max_connections,
+                cfg.server.max_connections_per_address,
+            ),
         }),
         admin_token_generated,
         tokens,
@@ -199,7 +208,15 @@ pub fn settings(cfg: &MudConfig) -> anyhow::Result<AutumnConfig> {
     c.security.signing_secret.secret = Some(random_hex(32)?);
     // A terminal line is one command; nothing legitimate is near 4 KiB.
     c.realtime.max_message_bytes = Some(MAX_WS_MESSAGE_BYTES);
-    c.realtime.max_connections = Some(MAX_CONNECTIONS);
+    // A backstop: the shared limiter in `Mud` admits terminal sockets.
+    c.realtime.max_connections = Some(cfg.server.max_connections);
+    if !cfg.server.trusted_proxies.is_empty() {
+        c.security
+            .trusted_proxies
+            .ranges
+            .clone_from(&cfg.server.trusted_proxies);
+        c.security.trusted_proxies.trust_forwarded_headers = true;
+    }
     Ok(c)
 }
 
@@ -264,7 +281,7 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
             .with_context(|| format!("binding telnet on {addr}"))?;
         tracing::info!(%addr, "telnet is up");
         tasks.push(tokio::spawn(telnet::serve_limited(
-            MAX_CONNECTIONS,
+            Arc::clone(&built.mud.limiter),
             cfg.server.timeouts(),
             listener,
             Arc::clone(&built.mud.game),
@@ -320,6 +337,20 @@ mod tests {
             budgets(&pack, &good).unwrap(),
             HashMap::from([(EntityId::new("pc_kestrel"), 600_000)])
         );
+    }
+
+    #[test]
+    fn trusted_proxies_turn_on_forwarded_client_addresses() {
+        let mut cfg = MudConfig::default();
+        let plain = settings(&cfg).unwrap();
+        assert!(!plain.security.trusted_proxies.trust_forwarded_headers);
+        assert_eq!(plain.realtime.max_connections, Some(MAX_CONNECTIONS));
+        cfg.server.trusted_proxies = vec!["10.0.0.0/8".into()];
+        cfg.server.max_connections = 40;
+        let proxied = settings(&cfg).unwrap();
+        assert!(proxied.security.trusted_proxies.trust_forwarded_headers);
+        assert_eq!(proxied.security.trusted_proxies.ranges, ["10.0.0.0/8"]);
+        assert_eq!(proxied.realtime.max_connections, Some(40));
     }
 
     #[test]

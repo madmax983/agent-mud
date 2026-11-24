@@ -60,9 +60,13 @@ async fn boot_cfg(
 }
 
 async fn axum_serve(listener: TcpListener, router: autumn_web::reexports::axum::Router) {
-    autumn_web::reexports::axum::serve(listener, router)
-        .await
-        .ok();
+    // The peer address reaches handlers as it does under autumn's server.
+    autumn_web::reexports::axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .ok();
 }
 
 type Ws =
@@ -191,6 +195,31 @@ async fn a_terminal_that_gives_no_name_is_closed() {
     let mut ws = ws(addr).await;
     assert_eq!(until(&mut ws, "Too slow").await["kind"], "error");
     closed(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_address_gets_its_share_of_terminals() {
+    let (addr, built) = boot_cfg(None, |c| c.server.max_connections_per_address = 1).await;
+    let mut first = ws(addr).await;
+    send(&mut first, json!({ "login": "ada" })).await;
+    until(&mut first, "Town Square").await;
+    let mut second = ws(addr).await;
+    let refused = until(&mut second, "Too many connections from your address").await;
+    assert_eq!(refused["kind"], "error");
+    closed(&mut second).await;
+    assert_eq!(built.mud.limiter.open(), 1);
+    drop(first);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while built.mud.limiter.open() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slot was never freed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut third = ws(addr).await;
+    send(&mut third, json!({ "login": "bo" })).await;
+    until(&mut third, "Town Square").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

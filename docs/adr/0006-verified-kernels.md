@@ -17,8 +17,9 @@ verbatim in `formal/verus/src/`, where Verus proves their properties:
 | `chatter_step` | mud-supervisor | at most `max` agent-only wakes between resets, for every `max` |
 | `budget_level` | mud-supervisor | Hard/Soft/Normal exactly at the thresholds, monotonic |
 | `typing_delay_ms` | mud-supervisor | no overflow, at least the reaction time, monotonic |
+| `conn_step` | mud-server | an open is admitted only under both caps; no underflow; caps hold for every sequence |
 
-The `verus_mirror` tests in `mud-rules` and `mud-supervisor` fail when the
+The `verus_mirror` tests in `mud-rules`, `mud-supervisor` and `mud-server` fail when the
 Rust and Verus bodies drift. CI downloads the pinned Verus release, checks
 its SHA-256, and requires `0 errors`.
 

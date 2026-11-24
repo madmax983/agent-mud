@@ -51,7 +51,7 @@ jobs:
           ./verus-x86-linux/verus formal/verus/src/lib.rs --crate-type=lib | tee verus.out
           grep -Eq '^verification results:: [1-9][0-9]* verified, 0 errors$' verus.out
       - name: Mirror tests (Rust and Verus bodies match)
-        run: cargo test -p mud-rules -p mud-supervisor --test verus_mirror
+        run: cargo test -p mud-rules -p mud-supervisor -p mud-server --test verus_mirror
 
   littleguy:
     name: real littleguy end to end

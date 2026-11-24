@@ -24,8 +24,9 @@ scripts. Then:
   wake decisions, self-control rolls and token burn;
 - or `telnet 127.0.0.1 4000` after setting `[server] telnet` in `mud.toml`.
   Both close a client that gives no name within `login_timeout_ms` (60 s)
-  or stays silent for `idle_timeout_ms` (1 h), and both cap open
-  connections at 512.
+  or stays silent for `idle_timeout_ms` (1 h). Together they admit at most
+  `max_connections` (512) clients, `max_connections_per_address` (8) from
+  one address; behind a reverse proxy set `trusted_proxies`.
 
 The v0.1 done criteria run headless:
 
