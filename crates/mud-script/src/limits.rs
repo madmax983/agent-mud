@@ -6,6 +6,13 @@
 use mud_world::hooks::{HookLimits, MAX_EFFECTS_CEILING};
 use serde::{Deserialize, Serialize};
 
+/// The most operations a pack may allow per call.
+///
+/// The worst known script
+/// at this limit runs in about 10 ms in a release build (`tests/cost.rs`
+/// holds it under 25 ms); at 20 000 a plain copy loop took about 30 ms.
+pub const MAX_OPERATIONS_CEILING: u64 = 10_000;
+
 /// The `[limits]` table as written; every key is optional.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -86,7 +93,7 @@ impl LimitsDef {
                 "max_operations",
                 self.max_operations,
                 1_000,
-                20_000,
+                i64::try_from(MAX_OPERATIONS_CEILING).unwrap_or(i64::MAX),
                 d.max_operations,
                 problems,
             ),
@@ -136,6 +143,16 @@ mod tests {
         let mut p = Vec::new();
         assert_eq!(LimitsDef::default().check(&mut p), Limits::default());
         assert_eq!(p, Vec::<String>::new());
+        let over = LimitsDef {
+            max_operations: Some(10_001),
+            ..LimitsDef::default()
+        };
+        let _ = over.check(&mut p);
+        assert_eq!(
+            p,
+            ["scripts.toml limits.max_operations = 10001 is outside 1000..=10000"]
+        );
+        p.clear();
         let bad = LimitsDef {
             max_operations: Some(999),
             max_effects: Some(17),
@@ -147,14 +164,14 @@ mod tests {
         assert_eq!(
             p,
             [
-                "scripts.toml limits.max_operations = 999 is outside 1000..=20000",
+                "scripts.toml limits.max_operations = 999 is outside 1000..=10000",
                 "scripts.toml limits.max_effects = 17 is outside 1..=16",
                 "scripts.toml limits.max_lines_per_wake = 0 is outside 1..=8",
                 "scripts.toml limits.max_consecutive_faults = 11 is outside 1..=10",
             ]
         );
         let good = LimitsDef {
-            max_operations: Some(20_000),
+            max_operations: Some(10_000),
             max_effects: Some(16),
             max_lines_per_wake: Some(8),
             max_consecutive_faults: Some(1),
@@ -162,7 +179,7 @@ mod tests {
         let mut none = Vec::new();
         let l = good.check(&mut none);
         assert_eq!(none, Vec::<String>::new());
-        assert_eq!(l.max_operations, 20_000);
+        assert_eq!(l.max_operations, MAX_OPERATIONS_CEILING);
         assert_eq!(l.hook_limits().max_effects, 16);
         assert_eq!(l.hook_limits().max_faults, 1);
     }

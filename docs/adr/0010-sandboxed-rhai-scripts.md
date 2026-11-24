@@ -76,14 +76,22 @@ set off nothing. A scripted death skips every remaining effect but `msg`.
   `eval`, `print`, `debug` are disabled; closures are off.
 - Fixed limits: 16 call levels, expression depth 64/32, strings 1024
   bytes, arrays and maps 64 (aggregate when built), 128 variables, 256
-  functions. Pack limits: `max_operations` (1 000 to 20 000), which is
+  functions. Pack limits: `max_operations` (1 000 to 10 000), which is
   also the budget of a deterministic **work counter** that natives whose
   cost grows with their input charge. No wall clock, no `on_progress`.
 - Rhai checks the size of a map it builds or a function returns, not of
-  one grown in place by index assignment. That growth is bounded by the
-  operation limit; `tests/cost.rs` measures it with the other hostile
-  loops. Worst case at the default limits, release build: about 8 ms; the
-  shipped hooks run in about 20 µs.
+  one grown in place by index assignment, and a copy (`let b = m`, a
+  function argument) costs one operation whatever its size. So the
+  sandbox's `on_var` hook charges every read of a variable whose value is
+  over the caps one work unit per entry and per 64 string bytes; reads
+  within the caps are free. `this` is disabled, since a method call binds
+  it without a variable read. A map of 300 arrays copied in a loop, which
+  took 0.8 s per call before, now runs out of work in under 1 ms.
+  `tests/cost.rs` runs the hostile loops at the `max_operations`
+  ceiling; the worst, a copy loop over a 63-entry map, takes about 10 ms
+  in a release build (CI asserts under 25 ms). The ceiling was 20 000
+  until that loop measured about 30 ms there. The shipped hooks run in
+  about 20 µs.
 - Views (`View`) are O(1)-clone, read-only JSON views; reading a missing
   key faults, so a dry run finds typos. Top-level code is refused: a
   script file is functions only. Every call runs under `catch_unwind`.

@@ -25,7 +25,7 @@ if a `scripts/` folder exists without one).
 lib = "lib.rhai"                    # optional; a file's own functions win
 
 [limits]                            # optional; pack data, since they change outcomes
-max_operations = 10000              # per call, 1000..=20000 (also the work budget)
+max_operations = 10000              # per call, 1000..=10000 (also the work budget)
 max_effects = 8                     # per hook call, 1..=16
 max_lines_per_wake = 4              # 1..=8
 max_consecutive_faults = 3          # 1..=10: then the hook's breaker trips
@@ -116,13 +116,18 @@ counts a fault.
 | time (UTC) | `hour_utc(ms)`, `day_utc(ms)`, `minute_of_day_utc(ms)` |
 | other | `log(text)` (16 lines of 200 chars, observer only), `type_of(x)` |
 
-There are no floats, no `eval`, `print` or `debug`, no imports, no
+There are no floats, no `eval`, `print`, `debug` or `this`, no imports, no
 closures, no `sleep` or clock, and none of Rhai's standard library beyond
 this list (`map`, `filter`, `sort`, `split`, `index_of`, `==` on arrays or
 maps are "function not found"). Each call has `max_operations` operations
 and as many work units; natives whose cost grows with their input charge
 work. Arrays and maps a script builds hold at most 64 entries, strings
-1024 bytes, and calls nest 16 deep.
+1024 bytes, and calls nest 16 deep. A map or array grown past those caps
+in place (`m[k] = v` in a loop) is not refused, but every read of a
+variable over the caps costs one work unit per entry and per 64 bytes of
+string, so keep tables small. A mind's `ctx` with many events is over the
+caps: read what you need from it once (`let mem = ctx.memory;`) rather
+than copying `ctx` in a loop.
 
 ## You can test player words; you can never quote them
 

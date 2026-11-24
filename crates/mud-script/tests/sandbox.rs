@@ -194,14 +194,69 @@ fn string_array_and_map_growth_are_capped() {
         "{e}"
     );
     // Rhai checks the size of a map it builds or a function returns, not
-    // of one that grows in place by index assignment: that growth is
-    // bounded by the operation limit (tests/cost.rs measures it).
+    // of one that grows in place by index assignment. Every read of a
+    // variable over the caps charges its size, so such growth runs out of
+    // work long before it runs out of operations.
     let e = fault("let m = #{}; let i = 0; loop { m[`k${i}`] = i; i += 1; }");
-    assert!(e.contains("Too many operations"), "{e}");
+    assert!(e.contains("the script did too much work"), "{e}");
     let e = fault("let m = #{}; for i in 0..70 { m[`k${i}`] = i; } let n = #{ a: m }; []");
     assert!(e.contains("Size of object map too large"), "{e}");
     let e = fault("let m = #{}; for i in 0..70 { m[`k${i}`] = i; } m.len(); []");
     assert!(e.contains("Size of object map too large"), "{e}");
+}
+
+/// A map grown in place to 300 keys, each holding a 60-element array.
+const ARRAY_VALUED_MAP: &str = "let a = []; for i in 0..60 { a.push(i); } let m = #{}; let i = 0; while i < 300 { m[`${i}`] = a; i += 1; }";
+
+#[test]
+fn reading_a_variable_over_the_caps_charges_its_size() {
+    // Copying the grown map, or passing it to a function, used to clone
+    // about 18 000 values per operation without charging anything.
+    for tail in [
+        "loop { let b = m; }",
+        "loop { pass(m); }",
+        "for r in 0..700 { let b = m; } [msg(\"ok\")]",
+        "m.len(); []",
+    ] {
+        let r = run_with_text(
+            &format!("{ARRAY_VALUED_MAP} {tail}"),
+            "fn pass(x) { 1 }",
+            "",
+        );
+        let e = r.outcome.unwrap_err();
+        assert!(e.contains("the script did too much work"), "{tail}: {e}");
+    }
+    // A method call binds `this` without a variable read, so `this` is
+    // not part of the language.
+    let p = refused("fn grow() { this.x = 1; }\nfn on_probe(ctx) { [] }");
+    assert!(p[0].starts_with("probe.rhai:1:"), "{p:?}");
+    // Values within the caps are read for free, however often.
+    let fx = effects(
+        "let m = #{}; for i in 0..60 { m[`k${i}`] = i; } for r in 0..2000 { let b = m; } [msg(\"ok\")]",
+    );
+    assert_eq!(fx, [ScriptEffect::Msg("ok".into())]);
+}
+
+#[test]
+fn a_mind_ctx_over_the_caps_is_charged_but_usable() {
+    // 32 events make a ctx far over the map cap; Hale-style reads of it
+    // stay well inside the work budget.
+    let host = mind_host(
+        "let n = 0; for ev in ctx.events { if ev.kind == \"speech\" { n += 1; } } let m = ctx.memory; [`say ${n} ${ctx.now_ms > 0}`]",
+    );
+    let events = (0..32).map(|i| speech(i, "hello")).collect();
+    let reply = host.current().on_wake(&wake(events, Vec::new(), 1));
+    let plan: MindPlan = reply.outcome.unwrap();
+    assert_eq!(plan.lines, ["say 32 true"]);
+    // ...but copying it in a loop runs out of work.
+    let host = mind_host("loop { let c = ctx; }");
+    let events = (0..32).map(|i| speech(i, "hello")).collect();
+    let e = host
+        .current()
+        .on_wake(&wake(events, Vec::new(), 1))
+        .outcome
+        .unwrap_err();
+    assert!(e.contains("the script did too much work"), "{e}");
 }
 
 #[test]

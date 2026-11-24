@@ -9,6 +9,12 @@
 //! - Every call is bounded by the operation limit and by a deterministic
 //!   work counter that the natives whose cost grows with their input
 //!   charge. There is no wall-clock deadline.
+//! - Rhai checks the size of a value it builds, not of a map or array
+//!   grown in place by index assignment (`m[k] = v`), and copying a value
+//!   (`let b = m`, a function argument) costs one operation whatever its
+//!   size. So every read of a variable whose value is over the caps
+//!   charges the work counter by its size ([`charge_read`]). `this` is
+//!   disabled: a method call binds it without a variable read.
 //! - `eval`, `print` and `debug` are disabled; floats, time, modules and
 //!   custom syntax are compiled out (see the workspace `Cargo.toml`).
 //! - Every call runs under `catch_unwind`: a panic is a fault.
@@ -20,7 +26,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use mud_world::hooks::WorldDice;
 use rhai::packages::{ArithmeticPackage, BasicIteratorPackage, LogicPackage, Package};
 use rhai::{
-    AST, CallFnOptions, Dynamic, Engine, EvalAltResult, NativeCallContext, Position, Scope,
+    AST, CallFnOptions, Dynamic, Engine, EvalAltResult, EvalContext, NativeCallContext, Position,
+    Scope,
 };
 
 use crate::limits::Limits;
@@ -111,6 +118,17 @@ pub fn fault(message: impl Into<String>) -> Box<EvalAltResult> {
     EvalAltResult::ErrorRuntime(Dynamic::from(message.into()), Position::NONE).into()
 }
 
+fn with_tag<R>(
+    tag: Option<&Dynamic>,
+    f: impl FnOnce(&mut CallState) -> Result<R, String>,
+) -> RhaiResult<R> {
+    let handle = tag
+        .and_then(|t| t.clone().try_cast::<StateHandle>())
+        .ok_or_else(|| fault("this function needs a script call"))?;
+    let mut state = handle.0.lock().unwrap_or_else(PoisonError::into_inner);
+    f(&mut state).map_err(fault)
+}
+
 /// Runs `f` on the call state of `ctx`.
 ///
 /// # Errors
@@ -119,12 +137,16 @@ pub fn with_state<R>(
     ctx: &NativeCallContext,
     f: impl FnOnce(&mut CallState) -> Result<R, String>,
 ) -> RhaiResult<R> {
-    let handle = ctx
-        .tag()
-        .and_then(|t| t.clone().try_cast::<StateHandle>())
-        .ok_or_else(|| fault("this function needs a script call"))?;
-    let mut state = handle.0.lock().unwrap_or_else(PoisonError::into_inner);
-    f(&mut state).map_err(fault)
+    with_tag(ctx.tag(), f)
+}
+
+fn charge_state(s: &mut CallState, n: usize) -> Result<(), String> {
+    s.work = s.work.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    if s.work > s.work_limit {
+        Err(format!("the script did too much work ({} units)", s.work))
+    } else {
+        Ok(())
+    }
 }
 
 /// Charges `n` work units.
@@ -132,14 +154,120 @@ pub fn with_state<R>(
 /// # Errors
 /// The call has done more work than its limit.
 pub fn charge(ctx: &NativeCallContext, n: usize) -> RhaiResult<()> {
-    with_state(ctx, |s| {
-        s.work = s.work.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-        if s.work > s.work_limit {
-            Err(format!("the script did too much work ({} units)", s.work))
+    with_state(ctx, |s| charge_state(s, n))
+}
+
+/// The bytes of string one work unit pays for.
+pub const STRING_BYTES_PER_UNIT: usize = 64;
+
+/// The aggregate sizes of a value, as Rhai counts them for its caps.
+///
+/// Array elements, map entries and string bytes, nested ones included.
+/// The walk stops once it has visited more than `stop` containers' entries,
+/// so it never costs much more than the caller can charge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sizes {
+    /// Array elements.
+    pub arrays: usize,
+    /// Map entries.
+    pub maps: usize,
+    /// String bytes.
+    pub strings: usize,
+}
+
+impl Sizes {
+    /// The sizes of `v`, walking at most about `stop` entries.
+    #[must_use]
+    pub fn of(v: &Dynamic, stop: usize) -> Self {
+        let mut s = Self::default();
+        if v.is_shared() {
+            if let Some(inner) = v.read_lock::<Dynamic>() {
+                s.add(&inner, stop);
+            }
         } else {
-            Ok(())
+            s.add(v, stop);
         }
-    })
+        s
+    }
+
+    const fn entries(&self) -> usize {
+        self.arrays.saturating_add(self.maps)
+    }
+
+    fn add(&mut self, v: &Dynamic, stop: usize) {
+        if self.entries() > stop {
+            return;
+        }
+        if v.is_map() {
+            if let Ok(m) = v.as_map_ref() {
+                self.maps = self.maps.saturating_add(m.len());
+                for x in m.values().filter(|x| Self::sized(x)) {
+                    self.add(x, stop);
+                }
+            }
+        } else if v.is_array() {
+            if let Ok(a) = v.as_array_ref() {
+                self.arrays = self.arrays.saturating_add(a.len());
+                for x in a.iter().filter(|x| Self::sized(x)) {
+                    self.add(x, stop);
+                }
+            }
+        } else if let Ok(t) = v.as_immutable_string_ref() {
+            self.strings = self.strings.saturating_add(t.len());
+        }
+    }
+
+    /// Whether `v` has a size: a map, an array or a string.
+    fn sized(v: &Dynamic) -> bool {
+        v.is_map() || v.is_array() || v.is_string()
+    }
+
+    /// Whether every size is within the sandbox caps.
+    #[must_use]
+    pub const fn within_caps(&self) -> bool {
+        self.arrays <= MAX_ARRAY_SIZE
+            && self.maps <= MAX_MAP_SIZE
+            && self.strings <= MAX_STRING_SIZE
+    }
+
+    /// The work units a read of a value this size costs: nothing within
+    /// the caps, else one per entry and one per
+    /// [`STRING_BYTES_PER_UNIT`] bytes of string.
+    #[must_use]
+    pub const fn read_cost(&self) -> usize {
+        if self.within_caps() {
+            0
+        } else {
+            self.entries()
+                .saturating_add(self.strings.div_ceil(STRING_BYTES_PER_UNIT))
+        }
+    }
+}
+
+/// Charges a read of the variable `name` by the size of its value (see
+/// [`Sizes::read_cost`]). Never resolves the variable itself.
+///
+/// # Errors
+/// The read takes the call over its work limit.
+fn charge_read(name: &str, ctx: &EvalContext) -> RhaiResult<Option<Dynamic>> {
+    let Some(v) = ctx
+        .scope()
+        .get(name)
+        .filter(|v| Sizes::sized(v) || v.is_shared())
+    else {
+        return Ok(None);
+    };
+    // Within the caps a read is free, and the walk is short: the caps
+    // bound it. Over them, the walk stops a little past what is left.
+    let within = Sizes::of(v, MAX_ARRAY_SIZE + MAX_MAP_SIZE);
+    if within.within_caps() {
+        return Ok(None);
+    }
+    with_tag(Some(ctx.tag()), |s| {
+        let left = usize::try_from(s.work_limit.saturating_sub(s.work)).unwrap_or(usize::MAX);
+        charge_state(s, Sizes::of(v, left).read_cost())
+    })?;
+    Ok(None)
 }
 
 /// The sandboxed engine.
@@ -149,7 +277,7 @@ pub fn engine(limits: &Limits) -> Engine {
     ArithmeticPackage::new().register_into_engine(&mut e);
     LogicPackage::new().register_into_engine(&mut e);
     BasicIteratorPackage::new().register_into_engine(&mut e);
-    for symbol in ["eval", "print", "debug"] {
+    for symbol in ["eval", "print", "debug", "this"] {
         e.disable_symbol(symbol);
     }
     e.set_strict_variables(true);
@@ -168,6 +296,11 @@ pub fn engine(limits: &Limits) -> Engine {
     e.set_max_variables(MAX_VARIABLES);
     e.set_max_functions(MAX_FUNCTIONS);
     e.set_max_operations(limits.max_operations);
+    #[expect(
+        deprecated,
+        reason = "rhai marks on_var volatile, not deprecated; rhai is pinned to =1.27.0"
+    )]
+    e.on_var(|name, _, ctx| charge_read(name, &ctx));
     crate::api::register(&mut e);
     e
 }
@@ -241,4 +374,38 @@ pub fn call(engine: &Engine, ast: &AST, name: &str, arg: Dynamic, state: CallSta
             .clone(),
     };
     CallOutput { result, state }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rhai::{Array, Map};
+
+    #[test]
+    fn sizes_count_nested_entries_and_string_bytes() {
+        let inner: Array = (0..60).map(Dynamic::from_int).collect();
+        let mut m = Map::new();
+        m.insert("a".into(), Dynamic::from_array(inner.clone()));
+        m.insert("b".into(), Dynamic::from_array(inner));
+        m.insert("s".into(), Dynamic::from("x".repeat(100)));
+        let v = Dynamic::from_map(m);
+        let s = Sizes::of(&v, usize::MAX);
+        assert_eq!(
+            s,
+            Sizes {
+                arrays: 120,
+                maps: 3,
+                strings: 100
+            }
+        );
+        assert!(!s.within_caps());
+        assert_eq!(s.read_cost(), 123 + 2);
+        // The walk stops early, and a shared value is read through.
+        assert!(Sizes::of(&v, 10).arrays < 120);
+        assert_eq!(Sizes::of(&v.into_shared(), usize::MAX), s);
+        let small = Sizes::of(&Dynamic::from("abc"), usize::MAX);
+        assert!(small.within_caps());
+        assert_eq!(small.read_cost(), 0);
+        assert_eq!(Sizes::of(&Dynamic::from_int(1), 0), Sizes::default());
+    }
 }
