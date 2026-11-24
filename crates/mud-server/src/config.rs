@@ -26,6 +26,30 @@ pub struct MudConfig {
     pub littleguy: LittleguySection,
     /// Budgets and timings.
     pub supervisor: SupervisorSection,
+    /// World scripts.
+    pub scripts: ScriptsSection,
+}
+
+/// `[scripts]`. The limits that change outcomes are pack data, in the
+/// pack's `scripts.toml`; this says only whether scripts run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScriptsSection {
+    /// Whether the pack's scripts run. Off: no hook, no custom verb, no
+    /// Rhai mind; the version `none` is recorded.
+    pub enabled: bool,
+    /// Whether a mind binding's `runtime = "rhai"` may put its entity on
+    /// its Rhai script whatever `[minds]` maps its tier to.
+    pub allow_runtime_override: bool,
+}
+
+impl Default for ScriptsSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_runtime_override: true,
+        }
+    }
 }
 
 /// `[server]`.
@@ -294,5 +318,15 @@ mod tests {
         assert_eq!(d.minds.persistent, Runtime::Scripted);
         assert_eq!(d.server.mcp_url(), "http://127.0.0.1:3000/mcp");
         assert!(toml::from_str::<MudConfig>("[server]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn scripts_section_defaults_and_rejects_unknown_keys() {
+        let d = MudConfig::default();
+        assert!(d.scripts.enabled && d.scripts.allow_runtime_override);
+        let off: MudConfig =
+            toml::from_str("[scripts]\nenabled = false\nallow_runtime_override = false").unwrap();
+        assert!(!off.scripts.enabled && !off.scripts.allow_runtime_override);
+        assert!(toml::from_str::<MudConfig>("[scripts]\nmax_operations = 5").is_err());
     }
 }

@@ -19,6 +19,6 @@ mod stats;
 pub use combat::{AttackInput, AttackResolution, DefenseKind, resolve_attack};
 pub use damage::{DamageDice, DamageType, ParseDamageError, injury, swing, thrust};
 pub use dice::{DiceRng, FixedDice, SeededDice};
-pub use roll::{Outcome, SuccessRoll, classify, success_roll};
+pub use roll::{EFFECTIVE_LIMIT, Outcome, SuccessRoll, classify, success_roll};
 pub use self_control::{SelfControlRoll, self_control_roll};
 pub use stats::{Attributes, Pools, WoundState, basic_dodge, defense_from_skill, wound_state};

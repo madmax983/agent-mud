@@ -478,6 +478,39 @@ fn an_urgent_wake_queued_while_busy_still_goes_at_once() {
 }
 
 #[test]
+fn script_narration_never_wakes_anyone() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let mut sources = mud_script::ScriptSources {
+        manifest: Some("[[verbs]]\nname = \"wave\"\nusage = \"wave\"\nfile = \"w.rhai\"\n".into()),
+        ..mud_script::ScriptSources::default()
+    };
+    sources.files.insert(
+        "w.rhai".into(),
+        "fn on_wave(ctx) { [narrate(\"Hale, Marta: someone waves at you!\")] }".into(),
+    );
+    let host = Arc::new(mud_script::ScriptHost::from_sources(&sources, &pack).unwrap());
+    let mut w = World::new(pack, 3);
+    w.set_hooks(Some(host), 0, mud_world::HooksChange::Start);
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    w.drain_fresh();
+    let res = w.execute(&ada, "wave", 1_000);
+    assert!(res.ok, "{res:?}");
+    let evs = w.drain_fresh();
+    assert_eq!(evs.len(), 1);
+    assert!(evs[0].reaches(&id("guard_01")));
+    let notes: Vec<RouteNote> = evs
+        .iter()
+        .flat_map(|e| r.observe(e, &w, &rt, 1_000))
+        .collect();
+    assert!(
+        notes.iter().all(|n| !matches!(n, RouteNote::Queued { .. })),
+        "{notes:?}"
+    );
+}
+
+#[test]
 fn names_match_whole_words() {
     assert!(names("yo Kestrel, you in?", "kestrel", &[]));
     assert!(names("ask the barkeep", "Marta", &["barkeep".into()]));

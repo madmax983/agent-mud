@@ -8,13 +8,14 @@ use autumn_harvest_agent::AgentModel;
 use autumn_harvest_agent::openai::OpenAiModel;
 use autumn_plugin_agent::{LlmClient, OpenAiCompatibleClient};
 use mud_mcp::TokenRegistry;
+use mud_script::{MindRuntime, ScriptHost};
 use mud_supervisor::ambient::AmbientMind;
 use mud_supervisor::harvest::{HarvestMind, HarvestPersona};
 use mud_supervisor::littleguy::{LittleguyConfig, LittleguyMind, Persona};
 use mud_supervisor::mind::Mind;
 use mud_supervisor::scripted::ScriptedMind;
 use mud_world::pack::{CastDef, Tier};
-use mud_world::{EntityId, WorldPack};
+use mud_world::{EntityId, Game, WorldPack};
 
 use crate::config::{ModelConfig, MudConfig, Runtime};
 
@@ -86,18 +87,65 @@ fn littleguy_mind(
     Ok(LittleguyMind::new(config, personas))
 }
 
-/// Builds every mind. Littleguy entities get a fresh MCP token each.
+/// The world's scripts, for the minds: the host and the game it reads.
+#[derive(Debug, Clone, Copy)]
+pub struct MindScripts<'a> {
+    /// The scripts.
+    pub host: &'a Arc<ScriptHost>,
+    /// The world.
+    pub game: &'a Arc<Game>,
+}
+
+/// The runtime of an entity: its tier's, unless its mind binding asks for
+/// `runtime = "rhai"` and the config allows it.
+fn effective_runtime(
+    cfg: &MudConfig,
+    id: &EntityId,
+    tier_runtime: Runtime,
+    scripts: Option<MindScripts<'_>>,
+) -> Runtime {
+    let Some(s) = scripts else {
+        return tier_runtime;
+    };
+    if s.host.mind_runtime(id) == Some(MindRuntime::Rhai) {
+        if cfg.scripts.allow_runtime_override {
+            return Runtime::Scripted;
+        }
+        tracing::warn!(
+            "{id}: runtime = \"rhai\" ignored ([scripts] allow_runtime_override = false)"
+        );
+    } else if s.host.has_mind(id) && tier_runtime != Runtime::Scripted {
+        tracing::info!("{id}: runs on {tier_runtime:?}; its rhai mind script is unused");
+    }
+    tier_runtime
+}
+
+/// Builds every mind.
+///
+/// Littleguy entities get a fresh MCP token each. With
+/// scripts, the scripted mind runs Rhai mind scripts too, and an entity
+/// whose binding asks for `runtime = "rhai"` runs on it whatever its tier.
 ///
 /// # Errors
 /// A model alias is missing, a key variable is unset, or a client fails.
-pub fn build(cfg: &MudConfig, pack: &WorldPack, tokens: &TokenRegistry) -> anyhow::Result<Minds> {
-    let scripted: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
+pub fn build(
+    cfg: &MudConfig,
+    pack: &WorldPack,
+    tokens: &TokenRegistry,
+    scripts: Option<MindScripts<'_>>,
+) -> anyhow::Result<Minds> {
+    let mut mind = ScriptedMind::from_cast(&pack.cast);
+    if let Some(s) = scripts {
+        mind = mind.with_scripts(Arc::clone(s.host), Arc::clone(s.game), cfg.world.seed);
+    }
+    let scripted: Arc<dyn Mind> = Arc::new(mind);
     let mut by_entity: HashMap<EntityId, Arc<dyn Mind>> = HashMap::new();
     let mut groups: HashMap<(Runtime, String), Vec<(&EntityId, &CastDef)>> = HashMap::new();
     for (id, c) in &pack.cast {
         let Some(rt) = runtime_for(cfg, c.mind.tier) else {
             continue;
         };
+        let rt = effective_runtime(cfg, id, rt, scripts);
         match rt {
             Runtime::Scripted => {
                 by_entity.insert(id.clone(), Arc::clone(&scripted));
@@ -182,11 +230,69 @@ pub fn build(cfg: &MudConfig, pack: &WorldPack, tokens: &TokenRegistry) -> anyho
 mod tests {
     use super::*;
 
+    fn scripts_of(pack: &Arc<WorldPack>) -> (Arc<ScriptHost>, Arc<Game>) {
+        let host = Arc::new(ScriptHost::bundled_crypt_v01(pack).unwrap());
+        let game = Game::new(
+            mud_world::World::new(Arc::clone(pack), 1),
+            None,
+            Arc::new(mud_world::ManualClock::new(0)),
+        );
+        (host, game)
+    }
+
+    #[test]
+    fn minds_build_honours_runtime_rhai() {
+        let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+        let (host, game) = scripts_of(&pack);
+        let mut cfg = MudConfig::default();
+        cfg.minds.ambient = Runtime::PluginAgent;
+        // No model key is needed: Hale, the only ambient NPC, runs on Rhai.
+        cfg.models.clear();
+        let s = MindScripts {
+            host: &host,
+            game: &game,
+        };
+        let m = build(&cfg, &pack, &TokenRegistry::new(), Some(s)).unwrap();
+        assert_eq!(m.by_entity[&EntityId::from("guard_01")].kind(), "scripted");
+        assert!(
+            build(&cfg, &pack, &TokenRegistry::new(), None).is_err(),
+            "without scripts Hale needs a model"
+        );
+    }
+
+    #[test]
+    fn runtime_override_can_be_refused_by_config() {
+        let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+        let (host, game) = scripts_of(&pack);
+        let mut cfg = MudConfig::default();
+        cfg.minds.ambient = Runtime::PluginAgent;
+        cfg.scripts.allow_runtime_override = false;
+        let s = MindScripts {
+            host: &host,
+            game: &game,
+        };
+        let id = EntityId::from("guard_01");
+        assert_eq!(
+            effective_runtime(&cfg, &id, Runtime::PluginAgent, Some(s)),
+            Runtime::PluginAgent
+        );
+        cfg.scripts.allow_runtime_override = true;
+        assert_eq!(
+            effective_runtime(&cfg, &id, Runtime::PluginAgent, Some(s)),
+            Runtime::Scripted
+        );
+        let torin = EntityId::from("torin");
+        assert_eq!(
+            effective_runtime(&cfg, &torin, Runtime::Littleguy, Some(s)),
+            Runtime::Littleguy
+        );
+    }
+
     #[test]
     fn defaults_script_every_agent_and_issue_no_tokens() {
         let pack = WorldPack::crypt_v01().unwrap();
         let tokens = TokenRegistry::new();
-        let m = build(&MudConfig::default(), &pack, &tokens).unwrap();
+        let m = build(&MudConfig::default(), &pack, &tokens, None).unwrap();
         let mut ids: Vec<&str> = m.by_entity.keys().map(EntityId::as_str).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["guard_01", "marta", "pc_kestrel", "torin", "vich"]);
@@ -200,7 +306,7 @@ mod tests {
         let tokens = TokenRegistry::new();
         let mut cfg = MudConfig::default();
         cfg.minds.persistent = Runtime::Littleguy;
-        let m = build(&cfg, &pack, &tokens).unwrap();
+        let m = build(&cfg, &pack, &tokens, None).unwrap();
         assert_eq!(tokens.len(), 3, "marta, torin, vich");
         assert_eq!(m.by_entity[&EntityId::from("torin")].kind(), "littleguy");
         assert_eq!(
@@ -215,9 +321,9 @@ mod tests {
         let pack = WorldPack::crypt_v01().unwrap();
         let mut cfg = MudConfig::default();
         cfg.minds.persistent = Runtime::Harvest;
-        let e = build(&cfg, &pack, &TokenRegistry::new()).unwrap_err();
+        let e = build(&cfg, &pack, &TokenRegistry::new(), None).unwrap_err();
         assert!(e.to_string().contains("[models.flash]"), "{e}");
         cfg.minds.persistent = Runtime::PluginAgent;
-        assert!(build(&cfg, &pack, &TokenRegistry::new()).is_err());
+        assert!(build(&cfg, &pack, &TokenRegistry::new(), None).is_err());
     }
 }

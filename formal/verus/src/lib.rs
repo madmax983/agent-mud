@@ -10,6 +10,7 @@ pub mod budget;
 pub mod chatter;
 pub mod classify;
 pub mod connections;
+pub mod hooks;
 pub mod injury;
 pub mod schedule;
 pub mod typing;

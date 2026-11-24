@@ -156,7 +156,9 @@ fn tools() -> Vec<Tool> {
                 "Act as your character: run one command line, as a human player types it, \
                  e.g. `look`, `north`, `say hello`, `tell marta hi`, `take lamp`, `buy bread`, \
                  `attack rat`, `flee`, `help`. Returns whether it worked, an `error_code` when \
-                 it did not, the narrative you see, and what changed. {UNTRUSTED}"
+                 it did not (such as `NO_SUCH_TARGET`, `NOT_HERE`, `REFUSED` or \
+                 `SCRIPT_FAILED`), the narrative you see, and what changed. Some places have \
+                 verbs of their own; `mud_look` lists them under `verbs`. {UNTRUSTED}"
             ),
             object(json!({
                 "type": "object",

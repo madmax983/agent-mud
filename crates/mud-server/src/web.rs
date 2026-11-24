@@ -56,6 +56,8 @@ pub struct Mud {
     pub shutdown: tokio_util::sync::CancellationToken,
     /// The littleguy minds, for the observer's links to their pages.
     pub littleguy: Vec<Arc<mud_supervisor::littleguy::LittleguyMind>>,
+    /// The world's scripts, unless `[scripts] enabled = false`.
+    pub scripts: Option<Arc<mud_script::ScriptHost>>,
 }
 
 impl Mud {
@@ -97,6 +99,9 @@ pub fn routes() -> Vec<autumn_web::Route> {
         observer_entities,
         observer_feed,
         observer_littleguy,
+        observer_scripts,
+        scripts_reload,
+        scripts_memory_reset,
         macro_tick,
         healthz,
         terminal_js,
@@ -148,10 +153,11 @@ function fmt(k,m){
     return `typing  ${m.entity}  line dropped: combat broke out`;
   }
   if(k==='roll')return `roll    ${m.entity}  ${m.trait_name}(${m.roll.target_number}) rolled ${m.roll.total} → ${m.nudged?'FAILED, nudged':'resisted'}`;
+  if(k==='script')return `script  ${m.text}`;
   if(k==='session')return m.kind==='afk'?`afk     ${m.entity}  until ${new Date(m.until_ms).toLocaleTimeString()}`:`session ${m.entity}  ${m.online?'logged in':'logged out'}`;
   return `world   [${m.room||'-'}] ${m.who}${m.human?' (human)':''}: ${m.text}`;
 }
-['route','wake','roll','world','session'].forEach(k=>es.addEventListener(k,e=>row(k==='roll'?'soft':(k==='world'?'muted':''),fmt(k,JSON.parse(e.data)))));
+['route','wake','roll','world','session','script'].forEach(k=>es.addEventListener(k,e=>row(k==='roll'?'soft':(k==='world'?'muted':''),fmt(k,JSON.parse(e.data)))));
 ";
 
 /// The page scripts are files, not inline: the app's CSP allows
@@ -356,6 +362,8 @@ async fn observer(State(state): State<AppState>, Query(q): Query<Admin>) -> Resp
             h1 { "Observer — private" }
             p.muted { "Agent goals, wake triggers, self-control rolls and token burn. Never show this to players." }
             div hx-get=(format!("/observer/entities?token={token}")) hx-trigger="load, every 2s" {}
+            h1 { "Scripts" }
+            div hx-get=(format!("/observer/scripts?token={token}")) hx-trigger="load, every 5s" {}
             h1 { "Live feed" }
             div #feed .feed {}
         },
@@ -456,6 +464,110 @@ async fn observer_littleguy(
     }
 }
 
+/// The Scripts panel: the version, each hook's breaker, the mind scripts
+/// with their memory, Reload and Reset memory. Everything is rendered by
+/// maud, which escapes it.
+#[get("/observer/scripts")]
+async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    let token = url_escape(&app.admin_token);
+    let Some(host) = &app.scripts else {
+        return html! { p.muted { "Scripts are off ([scripts] enabled = false)." } }
+            .into_response();
+    };
+    let status = app.game.read(mud_world::World::hook_status);
+    let compiled = host.current();
+    let max = compiled.limits.max_consecutive_faults;
+    html! {
+        p { "Version " strong { (compiled.version) } " · " (compiled.summary())
+            " "
+            form style="display:inline" hx-post=(format!("/observer/scripts/reload?token={token}")) hx-swap="none" {
+                button type="submit" { "Reload" }
+            }
+            @if !host.reloadable() {
+                span.muted { " (bundled: Reload re-arms these scripts and reopens their breakers)" }
+            }
+            span.muted { " A refused reload shows its problems in the feed." }
+        }
+        table {
+            tr { th { "hook" } th { "faults" } th { "state" } }
+            @for key in host.hook_keys() {
+                @let s = status.iter().find(|s| s.key == key);
+                tr {
+                    td { (key) }
+                    td { (s.map_or(0, |s| s.faults)) "/" (max) }
+                    td {
+                        @if s.is_some_and(|s| s.tripped) { span.hard { "TRIPPED" } } @else { "OK" }
+                    }
+                }
+            }
+            @for id in host.minds() {
+                @let faults = host.mind_faults(&id);
+                tr {
+                    td { "minds." (id) ".on_wake" }
+                    td { (faults) "/" (max) }
+                    td {
+                        @if mud_world::hooks::hook_allowed(faults, max) { "OK " } @else { span.hard { "TRIPPED" } " (runs its TOML plan) " }
+                        form style="display:inline" hx-post=(format!("/observer/scripts/memory/{}/reset?token={token}", url_escape(id.as_str()))) hx-swap="none" {
+                            button type="submit" { "Reset memory" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .into_response()
+}
+
+/// Reloads the scripts from the pack folder, or re-arms the bundled ones.
+/// 200 with the new version, 422 with every problem (the old scripts keep
+/// running, and the feed shows the problems), 409 when scripts are off.
+#[post("/observer/scripts/reload")]
+async fn scripts_reload(State(state): State<AppState>, Query(q): Query<Admin>) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    match crate::reload_scripts(&app).await {
+        Ok(ok) => Json(json!({
+            "ok": true,
+            "version": ok.version,
+            "previous": ok.previous,
+            "files": ok.files,
+        }))
+        .into_response(),
+        Err(crate::ReloadError::Invalid { version, problems }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "version": version, "problems": problems })),
+        )
+            .into_response(),
+        Err(crate::ReloadError::Disabled) => (
+            StatusCode::CONFLICT,
+            "scripts are disabled ([scripts] enabled = false)",
+        )
+            .into_response(),
+    }
+}
+
+/// Clears one mind's script memory.
+#[post("/observer/scripts/memory/{id}/reset")]
+async fn scripts_memory_reset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<Admin>,
+) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    let entity = EntityId::new(id);
+    if !app.scripts.as_ref().is_some_and(|h| h.has_mind(&entity)) {
+        return (StatusCode::NOT_FOUND, "no mind script for that entity").into_response();
+    }
+    app.game.reset_script_memory(&entity);
+    Json(json!({ "ok": true, "entity": entity })).into_response()
+}
+
 #[post("/observer/macro-tick/{id}")]
 async fn macro_tick(
     State(state): State<AppState>,
@@ -493,6 +605,7 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
         match &*r.ok()? {
             a @ Audit::SelfControl { .. } => Some(sse("roll", &serde_json::to_value(a).ok()?)),
             Audit::Command { .. } => None,
+            a => Some(sse("script", &json!({ "text": script_line(a)? }))),
         }
     });
     let world = BroadcastStream::new(app.game.subscribe()).filter_map(|r| async move {
@@ -504,6 +617,55 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
     futures::stream::select(sup, futures::stream::select(audit, world))
         .map(Ok::<_, Infallible>)
         .take_until(app.shutdown.clone().cancelled_owned())
+}
+
+/// One script entry as the observer's feed line. Script logs and fault
+/// messages are server or pack text; the observer still renders them with
+/// `textContent`.
+#[must_use]
+pub fn script_line(a: &mud_world::Audit) -> Option<String> {
+    use mud_world::Audit;
+    Some(match a {
+        Audit::ScriptFault {
+            hook,
+            entity,
+            message,
+            faults,
+            tripped,
+            ..
+        } => format!(
+            "{hook} FAULT {faults}{} ({entity}) · {message}",
+            if *tripped { " TRIPPED" } else { "" }
+        ),
+        Audit::ScriptLog {
+            hook, entity, line, ..
+        } => format!("{hook} log ({entity}) · {line}"),
+        Audit::ScriptEffects {
+            hook,
+            entity,
+            effects,
+            ..
+        } => format!("{hook} ran ({entity}) · {}", effects.join(", ")),
+        Audit::ScriptsLoaded {
+            version,
+            previous,
+            why,
+            ..
+        } => format!(
+            "scripts loaded {version} ({why}; was {})",
+            previous.as_deref().unwrap_or("nothing")
+        ),
+        Audit::ScriptsReloadRefused {
+            version, problems, ..
+        } => format!(
+            "scripts reload refused (still {version}): {} problem{} · {}",
+            problems.len(),
+            if problems.len() == 1 { "" } else { "s" },
+            problems.join(" · ")
+        ),
+        Audit::MindMemoryReset { entity, .. } => format!("memory reset for {entity}"),
+        Audit::SelfControl { .. } | Audit::Command { .. } => return None,
+    })
 }
 
 /// One world event as the observer's feed line, or `None` for an event

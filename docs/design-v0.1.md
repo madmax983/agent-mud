@@ -134,6 +134,12 @@ Flooded Cistern, Ossuary Crypt. The alley grate is locked (lockpicking −2
 or the key). Giant rats in the vault and warren, a rusted lockbox in the
 cistern, a skeletal warden and a dwarven iron-ore cache in the ossuary.
 
+Since v0.2 the pack also ships Rhai world scripts (`scripts.toml`,
+`scripts/`): `pray` in the ossuary, `listen` in the alley and on the
+cellar stair, the fence's curtain, the warden's blade over the ore, the
+bone charm, and Hale's mind. See [docs/scripting.md](scripting.md) and ADR
+0010.
+
 | Entity | Role and tier | ST/DX/IQ/HT | Key skills | Traits | Seeded goal |
 |---|---|---|---|---|---|
 | marta | barkeep, persistent | 10/10/12/11 | fast_talk-13, detect_lies-12, merchant-11 | gossip(12), pacifist_self_defense | track who enters the cellar; sell rumors |

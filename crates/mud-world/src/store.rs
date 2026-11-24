@@ -4,12 +4,14 @@
 //! rows' worth of JSON) and the events it emitted. A crash loses at most
 //! the command in flight, and a restart resumes the same dice stream.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::event::Event;
+use crate::ids::EntityId;
 use crate::state::WorldState;
 
 /// A store failure.
@@ -57,7 +59,16 @@ CREATE TABLE IF NOT EXISTS events (
     body TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_room ON events (room, seq);
+CREATE TABLE IF NOT EXISTS script_memory (
+    entity TEXT PRIMARY KEY,
+    schema INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    saved_ms INTEGER NOT NULL
+);
 ";
+
+/// The script memory of every mind: its schema and its body, by entity.
+pub type ScriptMemory = BTreeMap<EntityId, (u32, serde_json::Value)>;
 
 impl Store {
     /// Opens or creates the database at `path`.
@@ -178,6 +189,71 @@ impl Store {
             out.push(serde_json::from_str(&r?)?);
         }
         Ok(out)
+    }
+
+    /// Every mind's script memory.
+    ///
+    /// # Errors
+    /// SQLite fails or a row does not decode.
+    pub fn load_script_memory(&self) -> Result<ScriptMemory, StoreError> {
+        let mut q = self
+            .conn
+            .prepare("SELECT entity, schema, body FROM script_memory ORDER BY entity")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (entity, schema, body) = row?;
+            out.insert(
+                EntityId::new(entity),
+                (
+                    u32::try_from(schema).unwrap_or(0),
+                    serde_json::from_str(&body)?,
+                ),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Saves one mind's script memory.
+    ///
+    /// # Errors
+    /// SQLite or JSON encoding fails.
+    pub fn save_script_memory(
+        &mut self,
+        entity: &EntityId,
+        schema: u32,
+        body: &serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO script_memory (entity, schema, body, saved_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (entity) DO UPDATE SET schema = ?2, body = ?3, saved_ms = ?4",
+            params![
+                entity.as_str(),
+                i64::from(schema),
+                serde_json::to_string(body)?,
+                i64::try_from(now_ms).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets one mind's script memory.
+    ///
+    /// # Errors
+    /// SQLite fails.
+    pub fn clear_script_memory(&mut self, entity: &EntityId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM script_memory WHERE entity = ?1",
+            params![entity.as_str()],
+        )?;
+        Ok(())
     }
 
     /// The number of stored events.

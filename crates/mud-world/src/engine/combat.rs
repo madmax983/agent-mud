@@ -35,7 +35,7 @@ impl World {
             })
     }
 
-    fn armor_dr(&self, e: &Entity) -> i32 {
+    pub(crate) fn armor_dr(&self, e: &Entity) -> i32 {
         e.dr + e
             .equipped
             .values()
@@ -130,7 +130,7 @@ impl World {
     }
 
     /// Applies injury: HP, consciousness and survival rolls, death.
-    fn wound(&mut self, ctx: &mut Ctx, target: &EntityId, injury: i32, by: &EntityId) {
+    pub(crate) fn wound(&mut self, ctx: &mut Ctx, target: &EntityId, injury: i32, by: &EntityId) {
         let Some(t) = self.state.entities.get_mut(target) else {
             return;
         };
