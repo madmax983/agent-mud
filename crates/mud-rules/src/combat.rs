@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::damage::INJURY_LIMIT;
 use crate::{DamageDice, DamageType, DiceRng, Outcome, SuccessRoll, injury, success_roll};
 
 /// Which active defense the target uses.
@@ -81,7 +82,11 @@ pub fn resolve_attack(rng: &mut dyn DiceRng, input: &AttackInput) -> AttackResol
         defense,
         hit: true,
         raw_damage: raw,
-        injury: injury(raw, input.dr, input.kind),
+        injury: injury(
+            raw.clamp(-INJURY_LIMIT, INJURY_LIMIT),
+            input.dr.clamp(-INJURY_LIMIT, INJURY_LIMIT),
+            input.kind,
+        ),
         kind: input.kind,
     }
 }

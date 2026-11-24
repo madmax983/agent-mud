@@ -69,15 +69,30 @@ impl Pools {
     }
 
     /// The current wound state.
+    ///
+    /// HP above [`HP_LIMIT`] and a maximum above [`HP_MAX_LIMIT`] are clamped
+    /// first, as the Verus proof of [`wound_state`] assumes. Only inputs on
+    /// which the unclamped kernel would overflow are affected.
     #[must_use]
     pub const fn wound_state(&self) -> WoundState {
-        wound_state(self.hp, self.hp_max)
+        let hp = if self.hp > HP_LIMIT {
+            HP_LIMIT
+        } else {
+            self.hp
+        };
+        let hp_max = if self.hp_max > HP_MAX_LIMIT {
+            HP_MAX_LIMIT
+        } else {
+            self.hp_max
+        };
+        wound_state(hp, hp_max)
     }
 }
 
 /// How hurt an entity is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// mirror-begin wound_state_enum
 pub enum WoundState {
     /// At least a third of HP left.
     Healthy,
@@ -90,6 +105,15 @@ pub enum WoundState {
     /// At -5×HP or below.
     Dead,
 }
+// mirror-end wound_state_enum
+
+/// The largest HP that [`wound_state`] is proved for: `3 * hp` fits an
+/// `i32`. Any HP at or above it is Healthy for every allowed maximum.
+pub const HP_LIMIT: i32 = i32::MAX / 3;
+
+/// The largest maximum HP that [`wound_state`] is proved for: `-5 * max`
+/// fits an `i32`.
+pub const HP_MAX_LIMIT: i32 = i32::MAX / 5;
 
 // mirror-begin wound_state
 /// The wound state for `hp` out of `hp_max` (`hp_max` is at least 1).
@@ -142,6 +166,13 @@ mod tests {
         assert_eq!(wound_state(-12, 12), WoundState::Dying);
         assert_eq!(wound_state(-60, 12), WoundState::Dead);
         assert_eq!(wound_state(1, 0), WoundState::Healthy);
+        let huge = Pools {
+            hp: i32::MAX,
+            hp_max: i32::MAX,
+            fp: 1,
+            fp_max: 1,
+        };
+        assert_eq!(huge.wound_state(), WoundState::Healthy);
     }
 
     #[test]
@@ -176,6 +207,12 @@ mod tests {
         #[test]
         fn losing_hp_never_improves_the_state(hp in -200i32..50, max in 1i32..40) {
             prop_assert!(wound_state(hp - 1, max) >= wound_state(hp, max));
+        }
+
+        #[test]
+        fn the_pool_clamp_changes_nothing_in_range(hp in -1_000_000i32..1_000_000, max in -5i32..100_000) {
+            let p = Pools { hp, hp_max: max, fp: 10, fp_max: 10 };
+            prop_assert_eq!(p.wound_state(), wound_state(hp, max));
         }
     }
 }
