@@ -24,6 +24,7 @@ use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
 use crate::router::{EntityRuntime, Priority, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::FallbackMind;
 use crate::turing::{Afk, in_session, mix, pick};
+use crate::wakes::WakeBook;
 
 /// The supervisor settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,6 +148,8 @@ pub struct Supervisor {
     /// Spend minds could not put in a reply (failed or timed-out wakes).
     usage: Arc<UsageSink>,
     last_world_tick: AtomicU64,
+    /// The wakes each agent booked for itself.
+    wakes: Arc<WakeBook>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -198,6 +201,7 @@ impl Supervisor {
             observer,
             last_world_tick: AtomicU64::new(now),
             usage: Arc::default(),
+            wakes: Arc::default(),
         })
     }
 
@@ -211,6 +215,29 @@ impl Supervisor {
     #[must_use]
     pub const fn gate(&self) -> &Arc<Gate> {
         &self.gate
+    }
+
+    /// The wakes agents booked for themselves (`mud_wake_me`).
+    #[must_use]
+    pub const fn wakes(&self) -> &Arc<WakeBook> {
+        &self.wakes
+    }
+
+    /// Queues each booked wake that came due, for an agent that is in the
+    /// world. One that is not (a Turing PC between sessions) keeps its
+    /// booking until it is back.
+    fn booked_wakes(&self, now: u64) {
+        let online: std::collections::HashSet<EntityId> = self.game.read(|w| {
+            self.minds
+                .keys()
+                .filter(|id| w.entity(id).is_some_and(|e| e.online))
+                .cloned()
+                .collect()
+        });
+        for (entity, bookings) in self.wakes.take_due(now, |e| online.contains(e)) {
+            let note = lock(&self.router).deliver_booked(&entity, bookings, now);
+            self.publish(ObserverEvent::Route(note));
+        }
     }
 
     /// Subscribes to the observer feed.
@@ -382,6 +409,7 @@ impl Supervisor {
         self.charge_late_spend(now);
         self.turing_sessions(now);
         self.macro_ticks(now);
+        self.booked_wakes(now);
         let wakes = lock(&self.router).due(now);
         wakes
             .into_iter()
@@ -423,6 +451,7 @@ impl Supervisor {
                     now_ms
                 ),
                 now_ms,
+                booked: wake.booked.clone(),
             }
         })
     }
@@ -480,7 +509,8 @@ impl Supervisor {
             Arc::clone(&self.gate),
             wake.entity.clone(),
         )
-        .with_usage_sink(Arc::clone(&self.usage));
+        .with_usage_sink(Arc::clone(&self.usage))
+        .with_wakes(Arc::clone(&self.wakes));
         let res = tokio::time::timeout(
             Duration::from_millis(self.cfg.wake_timeout_ms),
             mind.wake(ctx, tools),
@@ -596,6 +626,7 @@ impl Supervisor {
             .iter()
             .map(|(id, _)| (*id, self.gate.is_holding(id)))
             .collect();
+        let booked = self.wakes.all();
         let mut st = lock(&self.state);
         let entities: Vec<Value> = seen
             .into_iter()
@@ -617,6 +648,7 @@ impl Supervisor {
                     "next_macro_ms": s.next_macro_ms,
                     "afk_until_ms": s.afk_until,
                     "typing": typing.get(id).copied().unwrap_or(false),
+                    "booked": booked.get(id).map_or(&[][..], Vec::as_slice),
                 });
                 if let (Some(obj), Value::Object(more)) = (v.as_object_mut(), extra) {
                     obj.extend(more);

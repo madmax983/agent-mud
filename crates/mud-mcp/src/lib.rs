@@ -42,9 +42,11 @@ use mud_world::Game;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 
-pub use gate::{CommandGate, DirectGate};
+pub use gate::{CommandGate, DirectGate, NoWakes, WakeBooker};
 pub use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
-pub use server::{COMMAND, DEFAULT_EVENTS, EVENTS, LOOK, MAX_EVENTS, SHEET, TOOLS};
+pub use server::{
+    CANCEL_WAKE, COMMAND, DEFAULT_EVENTS, EVENTS, LOOK, MAX_EVENTS, SHEET, TOOLS, WAKE_ME,
+};
 pub use tokens::{TokenError, TokenRegistry};
 
 use server::{Caller, MudServer};
@@ -86,10 +88,12 @@ where
 /// and a graceful HTTP shutdown waits for every open response. Cancel
 /// `stop` when shutdown begins, or the server cannot drain until each
 /// client goes away on its own.
+/// `wakes` books the wakes of `mud_wake_me`.
 pub fn router_until<S>(
     game: Arc<Game>,
     tokens: Arc<TokenRegistry>,
     command_gate: Arc<dyn CommandGate>,
+    wakes: Arc<dyn WakeBooker>,
     stop: tokio_util::sync::CancellationToken,
 ) -> Router<S>
 where
@@ -97,10 +101,11 @@ where
 {
     let mut config = default_config();
     config.cancellation_token = stop;
-    router_with_config(game, tokens, command_gate, config)
+    router_full(game, tokens, command_gate, wakes, config)
 }
 
-/// [`router`] with a streamable HTTP configuration of the caller's.
+/// [`router`] with a streamable HTTP configuration of the caller's, and
+/// no wake booking.
 pub fn router_with_config<S>(
     game: Arc<Game>,
     tokens: Arc<TokenRegistry>,
@@ -110,10 +115,25 @@ pub fn router_with_config<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
+    router_full(game, tokens, command_gate, Arc::new(NoWakes), config)
+}
+
+/// The MCP endpoint with every part given.
+pub fn router_full<S>(
+    game: Arc<Game>,
+    tokens: Arc<TokenRegistry>,
+    command_gate: Arc<dyn CommandGate>,
+    wakes: Arc<dyn WakeBooker>,
+    config: StreamableHttpServerConfig,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let handler = MudServer {
         game,
         tokens: Arc::clone(&tokens),
         gate: command_gate,
+        wakes,
     };
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),

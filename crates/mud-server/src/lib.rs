@@ -62,6 +62,23 @@ impl CommandGate for TypingGate {
     }
 }
 
+/// The MCP wake booker: `mud_wake_me` books in the supervisor's
+/// [`mud_supervisor::wakes::WakeBook`], on the game clock, as in-process
+/// minds do.
+#[derive(Debug, Clone)]
+pub struct SupervisorWakes(pub Arc<Supervisor>);
+
+impl mud_mcp::WakeBooker for SupervisorWakes {
+    fn wake_me(&self, entity: &EntityId, minutes: u32, note: &str) -> serde_json::Value {
+        let now = self.0.game().now_ms();
+        mud_supervisor::mind::book_wake(self.0.wakes(), entity, now, minutes, note)
+    }
+
+    fn cancel_wake(&self, entity: &EntityId, id: u64) -> serde_json::Value {
+        mud_supervisor::mind::cancel_wake(self.0.wakes(), entity, id)
+    }
+}
+
 /// Everything a running server holds.
 #[derive(Debug)]
 pub struct Built {
@@ -254,6 +271,7 @@ pub fn app(built: &Built, settings: AutumnConfig) -> AppBuilder {
         Arc::clone(&built.mud.game),
         Arc::clone(&built.tokens),
         Arc::new(TypingGate(Arc::clone(built.mud.sup.gate()))),
+        Arc::new(SupervisorWakes(Arc::clone(&built.mud.sup))),
         built.mud.shutdown.child_token(),
     );
     autumn_web::app()
@@ -400,6 +418,34 @@ mod tests {
         assert!(proxied.security.trusted_proxies.trust_forwarded_headers);
         assert_eq!(proxied.security.trusted_proxies.ranges, ["10.0.0.0/8"]);
         assert_eq!(proxied.realtime.max_connections, Some(40));
+    }
+
+    #[tokio::test]
+    async fn mcp_wakes_book_in_the_supervisor_on_the_game_clock() {
+        use mud_mcp::WakeBooker as _;
+        let mut cfg = MudConfig::default();
+        cfg.world.db = None;
+        let built = build(&cfg).unwrap();
+        let torin = EntityId::from("torin");
+        let wakes = SupervisorWakes(Arc::clone(&built.mud.sup));
+        let before = built.mud.game.now_ms();
+        let r = wakes.wake_me(&torin, 30, "is the ore in yet?");
+        let after = built.mud.game.now_ms();
+        assert_eq!(r["ok"], true, "{r}");
+        let pending = built.mud.sup.wakes().pending(&torin);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].note, "is the ore in yet?");
+        assert!(
+            (before + 30 * 60_000..=after + 30 * 60_000).contains(&pending[0].due_ms),
+            "30 minutes on the game clock"
+        );
+        let id = r["booked"]["id"].as_u64().unwrap();
+        assert_eq!(wakes.cancel_wake(&torin, id)["ok"], true);
+        assert!(
+            built.mud.sup.wakes().pending(&torin).is_empty(),
+            "cancelled"
+        );
+        assert_eq!(wakes.wake_me(&torin, 0, "x")["ok"], false);
     }
 
     #[tokio::test]

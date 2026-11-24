@@ -43,3 +43,29 @@ impl CommandGate for DirectGate {
         Box::pin(async move { game.execute(&entity, &line) })
     }
 }
+
+/// Books the wakes of `mud_wake_me` and `mud_cancel_wake`.
+///
+/// The supervisor owns the schedule; the MCP server only passes the
+/// caller's request on, as the caller's own entity. Each answer is the
+/// JSON the tool returns.
+pub trait WakeBooker: Send + Sync + 'static {
+    /// Books a wake for `entity`, `minutes` from now, with `note`.
+    fn wake_me(&self, entity: &EntityId, minutes: u32, note: &str) -> serde_json::Value;
+    /// Cancels `entity`'s booked wake `id`.
+    fn cancel_wake(&self, entity: &EntityId, id: u64) -> serde_json::Value;
+}
+
+/// No wake booking: each call says so. For a server with no supervisor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoWakes;
+
+impl WakeBooker for NoWakes {
+    fn wake_me(&self, _: &EntityId, _: u32, _: &str) -> serde_json::Value {
+        serde_json::json!({ "ok": false, "error": "booking wakes is off on this server" })
+    }
+
+    fn cancel_wake(&self, _: &EntityId, _: u64) -> serde_json::Value {
+        serde_json::json!({ "ok": false, "error": "booking wakes is off on this server" })
+    }
+}

@@ -7,8 +7,9 @@ Status: accepted
 `mud-mcp` serves MCP over streamable HTTP (rmcp 3.x, the transport
 littleguy's client speaks) at `/mcp`, merged into the autumn-web app.
 
-- Four tools only: `mud_look`, `mud_sheet`, `mud_events(since_seq?,
-  limit?)`, `mud_command(cmd)`. No tool takes an entity argument.
+- Six tools only: `mud_look`, `mud_sheet`, `mud_events(since_seq?,
+  limit?)`, `mud_command(cmd)`, and `mud_wake_me(minutes, note)` /
+  `mud_cancel_wake(id)` (ADR 0008). No tool takes an entity argument.
 - An axum layer resolves `Authorization: Bearer <token>` to an entity on
   every request and returns 401 otherwise. The handler reads the caller
   from the request parts rmcp forwards, so a session opened with one token

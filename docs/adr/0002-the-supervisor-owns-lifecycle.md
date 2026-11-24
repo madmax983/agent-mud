@@ -75,7 +75,7 @@ sequenceDiagram
 ## Alternatives
 
 - **In-process harvest agent** (`HarvestMind`): the same durable agent
-  loop on autumn-harvest-agent's SQLite runtime, with the four tools as
+  loop on autumn-harvest-agent's SQLite runtime, with the MUD tools as
   in-process `FnTool`s. It needs no `lg` binary and is what CI exercises
   with a scripted model. Pick it with `[minds] persistent = "harvest"`.
 - **Ambient NPCs** (`AmbientMind`) use autumn-plugin-agent: a bounded

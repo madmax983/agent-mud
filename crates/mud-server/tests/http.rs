@@ -51,10 +51,12 @@ async fn boot_full(
     }
     let built = Arc::new(built);
     let mud = Arc::clone(&built.mud);
-    let mcp = mud_mcp::router(
+    let mcp = mud_mcp::router_full(
         Arc::clone(&built.mud.game),
         Arc::clone(&built.tokens),
         Arc::new(TypingGate(Arc::clone(built.mud.sup.gate()))),
+        Arc::new(mud_server::SupervisorWakes(Arc::clone(&built.mud.sup))),
+        mud_mcp::default_config(),
     );
     let router = TestApp::new()
         .config(settings(&cfg).unwrap())

@@ -104,6 +104,7 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         login: false,
         wake_id: "wake-torin-0-1".into(),
         now_ms: 0,
+        booked: Vec::new(),
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
     let r = mind.wake(ctx.clone(), tools.clone()).await.unwrap();
@@ -124,7 +125,14 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         .collect();
     assert_eq!(
         names,
-        ["mud_look", "mud_sheet", "mud_events", "mud_command"]
+        [
+            "mud_look",
+            "mud_sheet",
+            "mud_events",
+            "mud_command",
+            "mud_wake_me",
+            "mud_cancel_wake"
+        ]
     );
 
     // The same wake again is a duplicate: no new model calls, no new post.
@@ -223,6 +231,7 @@ async fn a_timed_out_wake_is_charged_when_its_job_ends() {
         login: false,
         wake_id: id.into(),
         now_ms: 0,
+        booked: Vec::new(),
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
     let cut = tokio::time::timeout(

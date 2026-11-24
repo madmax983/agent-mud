@@ -476,3 +476,106 @@ async fn a_timed_out_wake_is_still_charged() {
     drop(r.sup.step());
     assert_eq!(spent(&r, "torin"), 750, "and what came in after it");
 }
+
+/// Remembers the booked notes of each wake, and books one itself.
+#[derive(Debug, Default)]
+struct Booker {
+    seen: std::sync::Mutex<Vec<(Priority, Vec<String>)>>,
+}
+
+impl Mind for Booker {
+    fn kind(&self) -> &'static str {
+        "booker"
+    }
+
+    fn wake(
+        &self,
+        ctx: WakeContext,
+        tools: MudTools,
+    ) -> crate::mind::BoxFuture<'_, Result<MindReply, crate::mind::MindError>> {
+        Box::pin(async move {
+            let notes = ctx.booked.iter().map(|b| b.note.clone()).collect();
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push((ctx.priority, notes));
+                seen.len() == 1
+            };
+            if first {
+                let r = tools
+                    .call(
+                        "mud_wake_me",
+                        &serde_json::json!({ "minutes": 2, "note": "post the bounty again" }),
+                    )
+                    .await;
+                assert_eq!(r["ok"], true, "{r}");
+            }
+            Ok(MindReply::default())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_wake_an_agent_booked_comes_back_and_can_act() {
+    let torin = EntityId::from("torin");
+    let booker = Arc::new(Booker::default());
+    let r = rig_with(
+        quiet(),
+        HashMap::from([(torin.clone(), Arc::clone(&booker) as Arc<dyn Mind>)]),
+    );
+    let mut rx = r.game.subscribe();
+    r.sup.fire_macro_tick(&torin);
+    r.run_for(1_000, 250, &mut rx).await;
+    assert_eq!(
+        r.sup.wakes().pending(&torin).len(),
+        1,
+        "booked through its tools"
+    );
+    let snap = r.sup.snapshot();
+    let row = snap["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "torin")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        row["booked"][0]["note"], "post the bounty again",
+        "the observer sees it"
+    );
+    // Not yet: two minutes have not passed.
+    r.run_for(60_000, 1_000, &mut rx).await;
+    assert_eq!(booker.seen.lock().unwrap().len(), 1);
+    r.run_for(70_000, 1_000, &mut rx).await;
+    let seen = booker.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(seen[1].0, Priority::Booked);
+    assert_eq!(seen[1].1, ["post the bounty again"]);
+    assert!(r.sup.wakes().pending(&torin).is_empty(), "delivered once");
+}
+
+#[tokio::test]
+async fn an_agent_out_of_the_world_keeps_its_booked_wake_until_it_is_back() {
+    let torin = EntityId::from("torin");
+    let booker = Arc::new(Booker::default());
+    let r = rig_with(
+        quiet(),
+        HashMap::from([(torin.clone(), Arc::clone(&booker) as Arc<dyn Mind>)]),
+    );
+    let mut rx = r.game.subscribe();
+    let now = r.game.now_ms();
+    r.sup
+        .wakes()
+        .book(&torin, now, 1, "check the grate")
+        .unwrap();
+    r.game.take_offline(&torin);
+    r.run_for(120_000, 5_000, &mut rx).await;
+    assert!(booker.seen.lock().unwrap().is_empty(), "no wake while away");
+    assert_eq!(r.sup.wakes().pending(&torin).len(), 1, "kept");
+    r.game.bring_online(&torin);
+    r.run_for(5_000, 1_000, &mut rx).await;
+    let seen = booker.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(|s| s.1.clone()),
+        Some(vec!["check the grate".to_owned()])
+    );
+}

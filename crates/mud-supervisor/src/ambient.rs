@@ -296,6 +296,7 @@ mod tests {
             login: false,
             wake_id: "w1".into(),
             now_ms: 0,
+            booked: Vec::new(),
         };
         let r = mind
             .wake(ctx, MudTools::new(Arc::clone(&game), typing, guard.clone()))
@@ -384,6 +385,7 @@ mod tests {
             login: false,
             wake_id: "w1".into(),
             now_ms: 0,
+            booked: Vec::new(),
         };
         let tools = MudTools::new(Arc::clone(&game), typing, guard.clone());
         let cut = tokio::time::timeout(
