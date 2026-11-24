@@ -226,3 +226,48 @@ async fn sessions_end_outside_the_window() {
         r.game.now_ms()
     ));
 }
+
+/// Regression: `snapshot` held `state` while it waited for the world, and
+/// `macro_ticks` held the world while it waited for `state`. Run together,
+/// they deadlocked the whole game.
+#[test]
+fn snapshot_and_step_never_deadlock() {
+    // A runtime of its own: on a deadlock it is leaked rather than dropped,
+    // so the test fails instead of hanging on shutdown.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = rt.handle().clone();
+    let r = {
+        let _rt = handle.enter();
+        rig(quiet())
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+    let sup = Arc::clone(&r.sup);
+    let tx = done_tx.clone();
+    std::thread::spawn(move || {
+        for _ in 0..3_000 {
+            let _ = sup.snapshot();
+        }
+        let _ = tx.send("snapshot");
+    });
+    let sup = Arc::clone(&r.sup);
+    let clock = Arc::clone(&r.clock);
+    std::thread::spawn(move || {
+        let _rt = handle.enter();
+        for _ in 0..3_000 {
+            drop(sup.step());
+            clock.advance(10);
+        }
+        let _ = done_tx.send("step");
+    });
+    for _ in 0..2 {
+        let Ok(who) = done_rx.recv_timeout(std::time::Duration::from_secs(30)) else {
+            std::mem::forget(rt);
+            panic!("snapshot() and step() deadlocked");
+        };
+        assert!(["snapshot", "step"].contains(&who));
+    }
+}

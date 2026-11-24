@@ -128,6 +128,12 @@ struct EntityState {
 }
 
 /// The supervisor.
+///
+/// Lock order: the world (`Game::read`, `Game::write` and every other
+/// `Game` call) comes first. The supervisor's own `router` and `state`
+/// locks may be taken inside a world closure, one at a time, but are never
+/// held while calling into `Game`, never nested in each other, and the
+/// gate's lock is a leaf. Breaking this order deadlocks the whole world.
 #[derive(Debug)]
 pub struct Supervisor {
     game: Arc<Game>,
@@ -525,49 +531,68 @@ impl Supervisor {
     #[must_use]
     pub fn snapshot(&self) -> Value {
         let now = self.game.now_ms();
-        let mut st = lock(&self.state);
         let pending: HashMap<EntityId, (Priority, u64)> = lock(&self.router)
             .pending()
             .into_iter()
             .map(|(e, p, d)| (e, (p, d)))
             .collect();
-        let entities: Vec<Value> = self.game.read(|w| {
-            let mut ids: Vec<&EntityId> = self.minds.keys().collect();
-            ids.sort();
+        // The world first, with no supervisor lock held (see the lock order).
+        let mut ids: Vec<&EntityId> = self.minds.keys().collect();
+        ids.sort();
+        let seen: Vec<(&EntityId, Value)> = self.game.read(|w| {
             ids.into_iter()
                 .filter_map(|id| {
                     let e = w.entity(id)?;
                     let cast = w.pack().cast.get(id)?;
-                    let s = st.get_mut(id)?;
-                    let level = s.budget.level(now);
-                    Some(json!({
-                        "id": id,
-                        "name": e.name,
-                        "tier": e.tier,
-                        "mind": self.minds.get(id).map(|m| m.kind()),
-                        "online": e.online,
-                        "room": e.room,
-                        "hp": e.pools.hp,
-                        "currency": e.currency,
-                        "goal": cast.goal,
-                        "budget": {
-                            "level": level,
-                            "tokens": s.budget.tokens,
-                            "limit": s.budget.limit,
-                            "cost_usd_micros": s.budget.cost_usd_micros,
-                            "calls": s.budget.calls,
-                        },
-                        "wakes": s.wakes,
-                        "last_wake": s.last_wake.as_ref().map(|(p, r, at)| json!({ "priority": p, "reason": r, "at_ms": at })),
-                        "pending": pending.get(id).map(|(p, d)| json!({ "priority": p, "due_ms": d })),
-                        "macro_ticks": s.macro_ticks,
-                        "next_macro_ms": s.next_macro_ms,
-                        "afk_until_ms": s.afk_until,
-                        "typing": self.gate.is_holding(id),
-                    }))
+                    Some((
+                        id,
+                        json!({
+                            "id": id,
+                            "name": e.name,
+                            "tier": e.tier,
+                            "mind": self.minds.get(id).map(|m| m.kind()),
+                            "online": e.online,
+                            "room": e.room,
+                            "hp": e.pools.hp,
+                            "currency": e.currency,
+                            "goal": cast.goal,
+                        }),
+                    ))
                 })
                 .collect()
         });
+        let typing: HashMap<&EntityId, bool> = seen
+            .iter()
+            .map(|(id, _)| (*id, self.gate.is_holding(id)))
+            .collect();
+        let mut st = lock(&self.state);
+        let entities: Vec<Value> = seen
+            .into_iter()
+            .filter_map(|(id, mut v)| {
+                let s = st.get_mut(id)?;
+                let level = s.budget.level(now);
+                let extra = json!({
+                    "budget": {
+                        "level": level,
+                        "tokens": s.budget.tokens,
+                        "limit": s.budget.limit,
+                        "cost_usd_micros": s.budget.cost_usd_micros,
+                        "calls": s.budget.calls,
+                    },
+                    "wakes": s.wakes,
+                    "last_wake": s.last_wake.as_ref().map(|(p, r, at)| json!({ "priority": p, "reason": r, "at_ms": at })),
+                    "pending": pending.get(id).map(|(p, d)| json!({ "priority": p, "due_ms": d })),
+                    "macro_ticks": s.macro_ticks,
+                    "next_macro_ms": s.next_macro_ms,
+                    "afk_until_ms": s.afk_until,
+                    "typing": typing.get(id).copied().unwrap_or(false),
+                });
+                if let (Some(obj), Value::Object(more)) = (v.as_object_mut(), extra) {
+                    obj.extend(more);
+                }
+                Some(v)
+            })
+            .collect();
         let tokens: u64 = st.values().map(|s| s.budget.tokens).sum();
         let cost: u64 = st.values().map(|s| s.budget.cost_usd_micros).sum();
         drop(st);
