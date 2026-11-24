@@ -1,0 +1,26 @@
+[package]
+name = "mud-script"
+description = "Sandboxed Rhai world scripts for the littleguy MUD: world hooks that return admitted effects, and mind scripts that return command lines."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mud-rules.workspace = true
+mud-world.workspace = true
+rhai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

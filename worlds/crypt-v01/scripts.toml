@@ -1,0 +1,55 @@
+# World scripts of crypt-v01 (ADR 0010, docs/scripting.md).
+#
+# Each binding names a .rhai file under scripts/. Rooms, items and verbs
+# return effects the engine checks and applies; minds return command lines.
+
+[scripts]
+lib = "lib.rhai"
+
+[limits]
+max_operations = 10000
+max_effects = 8
+max_lines_per_wake = 4
+max_consecutive_faults = 3
+
+# Hale runs on his script whatever [minds] maps ambient NPCs to. Delete
+# `runtime` to give him back to his tier's runtime; his TOML enter rule in
+# cast.toml stays the fallback either way.
+[minds.guard_01]
+file = "minds/hale.rhai"
+runtime = "rhai"
+memory_schema = 1
+config = { night_from = 20, night_to = 6 }
+
+[rooms.ossuary_crypt]
+file = "rooms/ossuary.rhai"
+on_enter = true
+
+[rooms.dark_alley]
+file = "rooms/alley.rhai"
+on_speech = true
+
+[items.iron_ore]
+file = "items/iron_ore.rhai"
+on_take = true
+config = { modifier = 0 }
+
+[items.bone_charm]
+file = "items/bone_charm.rhai"
+on_use = true
+
+[[verbs]]
+name = "pray"
+usage = "pray"
+rooms = ["ossuary_crypt"]
+file = "rooms/ossuary.rhai"
+fn = "on_pray"
+config = { modifier = -2 }
+
+[[verbs]]
+name = "listen"
+usage = "listen"
+rooms = ["dark_alley", "cellar_landing"]
+file = "rooms/alley.rhai"
+fn = "on_listen"
+config = { modifier = 0 }
