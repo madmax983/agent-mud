@@ -18,7 +18,7 @@ fn rig(cfg: SupervisorConfig) -> Rig {
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
     let clock = Arc::new(ManualClock::new(20 * 3_600_000));
     let game = Game::new(World::new(Arc::clone(&pack), 5), None, clock.clone());
-    let gate = Gate::new(Arc::clone(&game), 5, 0.0);
+    let typing = Gate::new(Arc::clone(&game), 5, 0.0);
     let scripted: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
     let minds: HashMap<EntityId, Arc<dyn Mind>> = pack
         .cast
@@ -27,7 +27,7 @@ fn rig(cfg: SupervisorConfig) -> Rig {
         .map(|(id, _)| (id.clone(), Arc::clone(&scripted)))
         .collect();
     let fallback = Arc::new(FallbackMind::from_cast(&pack.cast));
-    let sup = Supervisor::new(Arc::clone(&game), gate, minds, fallback, cfg);
+    let sup = Supervisor::new(Arc::clone(&game), typing, minds, fallback, cfg);
     Rig { sup, game, clock }
 }
 

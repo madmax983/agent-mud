@@ -94,11 +94,11 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
     fn kind(&self) -> &'static str;
 
     /// Thinks about one wake and acts through `tools`.
-    fn wake<'a>(
-        &'a self,
+    fn wake(
+        &self,
         ctx: WakeContext,
         tools: MudTools,
-    ) -> BoxFuture<'a, Result<MindReply, MindError>>;
+    ) -> BoxFuture<'_, Result<MindReply, MindError>>;
 }
 
 /// The four MUD tools, in process, scoped to one entity.
@@ -116,8 +116,12 @@ pub struct MudTools {
 impl MudTools {
     /// Tools for `entity`.
     #[must_use]
-    pub const fn new(game: Arc<Game>, gate: Arc<Gate>, entity: EntityId) -> Self {
-        Self { game, gate, entity }
+    pub const fn new(game: Arc<Game>, typing: Arc<Gate>, entity: EntityId) -> Self {
+        Self {
+            game,
+            gate: typing,
+            entity,
+        }
     }
 
     /// The entity.

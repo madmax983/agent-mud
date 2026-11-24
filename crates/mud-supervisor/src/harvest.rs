@@ -180,6 +180,7 @@ impl HarvestMind {
             }
         });
         workers.insert(entity.clone(), tx.clone());
+        drop(workers);
         Ok(tx)
     }
 }
@@ -189,11 +190,11 @@ impl Mind for HarvestMind {
         "harvest"
     }
 
-    fn wake<'a>(
-        &'a self,
+    fn wake(
+        &self,
         ctx: WakeContext,
         tools: MudTools,
-    ) -> BoxFuture<'a, Result<MindReply, MindError>> {
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
         Box::pin(async move {
             let tx = self.worker(&ctx.entity, &tools).await?;
             let (reply_tx, reply_rx) = oneshot::channel();

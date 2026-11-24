@@ -62,7 +62,7 @@ impl Default for SupervisorConfig {
 }
 
 /// One entry of the observer feed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObserverEvent {
     /// A routing decision.
@@ -150,7 +150,7 @@ impl Supervisor {
     #[must_use]
     pub fn new(
         game: Arc<Game>,
-        gate: Arc<Gate>,
+        typing: Arc<Gate>,
         minds: HashMap<EntityId, Arc<dyn Mind>>,
         fallback: Arc<FallbackMind>,
         cfg: SupervisorConfig,
@@ -178,7 +178,7 @@ impl Supervisor {
         Arc::new(Self {
             router: Mutex::new(Router::new(cfg.router.clone())),
             game,
-            gate,
+            gate: typing,
             cfg,
             minds,
             fallback,
@@ -526,8 +526,7 @@ impl Supervisor {
     pub fn snapshot(&self) -> Value {
         let now = self.game.now_ms();
         let mut st = lock(&self.state);
-        let router = lock(&self.router);
-        let pending: HashMap<EntityId, (Priority, u64)> = router
+        let pending: HashMap<EntityId, (Priority, u64)> = lock(&self.router)
             .pending()
             .into_iter()
             .map(|(e, p, d)| (e, (p, d)))
@@ -571,6 +570,7 @@ impl Supervisor {
         });
         let tokens: u64 = st.values().map(|s| s.budget.tokens).sum();
         let cost: u64 = st.values().map(|s| s.budget.cost_usd_micros).sum();
+        drop(st);
         json!({ "now_ms": now, "entities": entities, "tokens_today": tokens, "cost_usd_micros_today": cost })
     }
 

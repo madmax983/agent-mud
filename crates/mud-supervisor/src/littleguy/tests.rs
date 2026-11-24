@@ -38,8 +38,8 @@ fn the_config_points_littleguy_at_the_mud() {
     );
 }
 
-async fn fake_daemon(path: PathBuf, answer: &'static str) -> tokio::task::JoinHandle<String> {
-    let listener = UnixListener::bind(&path).unwrap();
+fn fake_daemon(path: &Path, answer: &'static str) -> tokio::task::JoinHandle<String> {
+    let listener = UnixListener::bind(path).unwrap();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut reader = BufReader::new(stream);
@@ -61,10 +61,9 @@ async fn chat_speaks_the_socket_protocol() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("lg.sock");
     let server = fake_daemon(
-        sock.clone(),
+        &sock,
         r#"{"kind":"reply","text":"posted the bounty","usage":{"calls":2,"input_tokens":900,"output_tokens":40,"cost_usd_micros":12,"unpriced_calls":0}}"#,
-    )
-    .await;
+    );
     let r = chat(&sock, "wake-torin-1", "hello").await.unwrap();
     assert_eq!(r.text.as_deref(), Some("posted the bounty"));
     assert_eq!(r.usage.tokens(), 940);
@@ -78,7 +77,7 @@ async fn chat_speaks_the_socket_protocol() {
 async fn waiting_for_an_approval_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("lg.sock");
-    let _s = fake_daemon(sock.clone(), r#"{"kind":"waiting","approval":7}"#).await;
+    let _s = fake_daemon(&sock, r#"{"kind":"waiting","approval":7}"#);
     let e = chat(&sock, "w", "x").await.unwrap_err();
     assert!(e.to_string().contains("approval 7"));
     assert!(chat(&dir.path().join("none.sock"), "w", "x").await.is_err());
@@ -106,7 +105,7 @@ async fn a_real_lg_serve_answers_a_wake() {
     let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
     let game = Game::new(World::new(pack, 1), None, Arc::new(ManualClock::new(1)));
-    let gate = Gate::new(Arc::clone(&game), 1, 0.0);
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
     let ctx = WakeContext {
         entity: torin.clone(),
         name: "Torin".into(),
@@ -120,7 +119,7 @@ async fn a_real_lg_serve_answers_a_wake() {
         wake_id: "wake-torin-0-1".into(),
     };
     let r = mind
-        .wake(ctx, MudTools::new(game, gate, torin.clone()))
+        .wake(ctx, MudTools::new(game, typing, torin.clone()))
         .await;
     let log = std::fs::read_to_string(dir.path().join("torin/lg.log")).unwrap_or_default();
     let r = r.unwrap_or_else(|e| panic!("{e}\n--- lg.log ---\n{log}"));

@@ -13,6 +13,9 @@ use mud_world::{EntityId, Event, EventKind};
 use crate::mind::{BoxFuture, Mind, MindError, MindReply, MudTools, WakeContext};
 use crate::router::Priority;
 
+/// The placeholder a script fills with the triggering entity's name.
+const ACTOR_SLOT: &str = concat!("{", "actor", "}");
+
 /// Runs the cast's script rules.
 #[derive(Debug, Default)]
 pub struct ScriptedMind {
@@ -73,9 +76,11 @@ impl ScriptedMind {
 
     fn take_turn(&self, me: &EntityId, idx: usize, rule: &ScriptRule) -> bool {
         let mut fired = self.fired.lock().unwrap_or_else(PoisonError::into_inner);
-        let n = fired.entry((me.clone(), idx)).or_default();
-        *n += 1;
-        rule.nth.is_none_or(|want| want == *n)
+        let count = fired.entry((me.clone(), idx)).or_default();
+        *count += 1;
+        let n = *count;
+        drop(fired);
+        rule.nth.is_none_or(|want| want == n)
     }
 
     /// The commands a wake should run, in order.
@@ -103,7 +108,7 @@ impl ScriptedMind {
                             && self.take_turn(&ctx.entity, idx, rule)
                         {
                             let actor = ev.actor.as_ref().map_or("you", |a| a.name.as_str());
-                            out.extend(rule.commands.iter().map(|c| c.replace("{actor}", actor)));
+                            out.extend(rule.commands.iter().map(|c| c.replace(ACTOR_SLOT, actor)));
                             // One answer per rule per wake.
                             break;
                         }
@@ -120,11 +125,11 @@ impl Mind for ScriptedMind {
         "scripted"
     }
 
-    fn wake<'a>(
-        &'a self,
+    fn wake(
+        &self,
         ctx: WakeContext,
         tools: MudTools,
-    ) -> BoxFuture<'a, Result<MindReply, MindError>> {
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
         Box::pin(async move {
             let room = tools.look()["room_id"].as_str().map(str::to_owned);
             let plan = self.plan(&ctx, room.as_deref());
@@ -178,11 +183,11 @@ impl Mind for FallbackMind {
         "fallback"
     }
 
-    fn wake<'a>(
-        &'a self,
+    fn wake(
+        &self,
         ctx: WakeContext,
         tools: MudTools,
-    ) -> BoxFuture<'a, Result<MindReply, MindError>> {
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
         Box::pin(async move {
             if ctx.priority != Priority::Immediate {
                 return Ok(MindReply::default());
@@ -220,8 +225,8 @@ mod tests {
             None,
             Arc::new(ManualClock::new(1_000)),
         );
-        let gate = Gate::new(Arc::clone(&game), 1, 0.0);
-        (game, gate, pack)
+        let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+        (game, typing, pack)
     }
 
     fn ctx(entity: &str, priority: Priority, events: Vec<Event>) -> WakeContext {
@@ -241,9 +246,9 @@ mod tests {
 
     #[tokio::test]
     async fn torin_posts_the_bounty_on_the_first_macro_tick_only() {
-        let (game, gate, pack) = setup();
+        let (game, typing, pack) = setup();
         let mind = ScriptedMind::from_cast(&pack.cast);
-        let tools = MudTools::new(Arc::clone(&game), gate, EntityId::from("torin"));
+        let tools = MudTools::new(Arc::clone(&game), typing, EntityId::from("torin"));
         let r = mind
             .wake(ctx("torin", Priority::MacroTick, vec![]), tools.clone())
             .await
@@ -268,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn kestrel_recruits_a_human_who_walks_in() {
-        let (game, gate, pack) = setup();
+        let (game, typing, pack) = setup();
         let k = EntityId::from("kestrel");
         game.bring_online(&k);
         let mind = ScriptedMind::from_cast(&pack.cast);
@@ -282,7 +287,7 @@ mod tests {
         let r = mind
             .wake(
                 ctx("kestrel", Priority::RoomBatch, evs),
-                MudTools::new(Arc::clone(&game), gate, k.clone()),
+                MudTools::new(Arc::clone(&game), typing, k.clone()),
             )
             .await
             .unwrap();
@@ -303,13 +308,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_fallback_answers_only_direct_interactions() {
-        let (game, gate, pack) = setup();
+        let (game, typing, pack) = setup();
         let fb = FallbackMind::from_cast(&pack.cast);
         assert_eq!(
             fb.emote_for(&EntityId::from("torin")).as_deref(),
             Some("emote grunts and keeps hammering.")
         );
-        let tools = MudTools::new(Arc::clone(&game), gate, EntityId::from("torin"));
+        let tools = MudTools::new(Arc::clone(&game), typing, EntityId::from("torin"));
         let r = fb
             .wake(ctx("torin", Priority::Ambient, vec![]), tools.clone())
             .await

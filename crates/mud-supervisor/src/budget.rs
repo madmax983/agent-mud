@@ -78,7 +78,7 @@ impl Budget {
     }
 
     /// Records a spend.
-    pub fn spend(&mut self, now_ms: u64, tokens: u64, cost_usd_micros: u64, calls: u64) {
+    pub const fn spend(&mut self, now_ms: u64, tokens: u64, cost_usd_micros: u64, calls: u64) {
         self.roll(now_ms);
         self.tokens = self.tokens.saturating_add(tokens);
         self.cost_usd_micros = self.cost_usd_micros.saturating_add(cost_usd_micros);

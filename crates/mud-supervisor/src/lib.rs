@@ -7,6 +7,7 @@
 //! wakes, the budgets decide whether a model may be called, and the
 //! Turing gate makes hidden agent PCs behave like people at keyboards.
 
+pub mod ambient;
 pub mod budget;
 pub mod chatter;
 pub mod gate;

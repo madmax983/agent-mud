@@ -64,6 +64,10 @@ pub fn in_session(spec: &TuringSpec, seed: u64, entity: &str, now_ms: u64) -> bo
 
 /// What a room batch looks like to the attention filter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent salience signals"
+)]
 pub struct Salience {
     /// The PC was named.
     pub named: bool,

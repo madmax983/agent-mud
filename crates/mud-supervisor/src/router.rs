@@ -7,9 +7,9 @@
 //! | Priority  | Triggers | Debounce |
 //! |-----------|----------|----------|
 //! | Immediate | attack on it, a tell, a nudge, speech naming it | 0–500 ms |
-//! | RoomBatch | human speech, emotes, arrivals, drops | 2–4 s rolling |
+//! | `RoomBatch` | human speech, emotes, arrivals, drops | 2–4 s rolling |
 //! | Ambient   | agent activity while a human is present | 5–10 s + cooldown |
-//! | MacroTick | the slow timer, only with no human in the room | none |
+//! | `MacroTick` | the slow timer, only with no human in the room | none |
 //!
 //! It also runs the per-room anti-chatter counter, the budget breakers,
 //! the Turing attention filter and distracted spells.
@@ -64,7 +64,7 @@ impl Default for RouterConfig {
             ambient_ms: [5_000, 10_000],
             cooldown_ms: [3_000, 8_000],
             max_agent_only_turns: MAX_AGENT_ONLY_TURNS,
-            seed: 0x6d75_64,
+            seed: 0x006d_7564,
         }
     }
 }
@@ -233,8 +233,7 @@ impl Router {
         let actor_is_agent = actor.is_some_and(|a| {
             !a.human && matches!(a.tier, Tier::Ambient | Tier::Persistent | Tier::Turing)
         });
-        let mut allow_cross = true;
-        if let Some(room) = &ev.room
+        let allow_cross = if let Some(room) = &ev.room
             && ev.kind != EventKind::SelfControlNudge
         {
             let input = if ev.human_actor {
@@ -248,12 +247,13 @@ impl Router {
             } else {
                 ChatterInput::World
             };
-            allow_cross = self
-                .rooms
+            self.rooms
                 .entry(room.clone())
                 .or_default()
-                .step(input, self.cfg.max_agent_only_turns);
-        }
+                .step(input, self.cfg.max_agent_only_turns)
+        } else {
+            true
+        };
         let haystack = format!(
             "{} {}",
             ev.untrusted_text.as_deref().unwrap_or(""),
@@ -442,7 +442,7 @@ impl Router {
             });
         if priority >= p.priority {
             p.priority = priority;
-            p.reason = reason.to_owned();
+            reason.clone_into(&mut p.reason);
         }
         p.due_ms = p.due_ms.min(now);
     }
@@ -467,7 +467,7 @@ impl Router {
                 });
             }
         }
-        out.sort_by(|a, b| b.priority.cmp(&a.priority));
+        out.sort_by_key(|w| std::cmp::Reverse(w.priority));
         out
     }
 

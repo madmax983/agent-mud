@@ -81,7 +81,9 @@ mod tests {
     #[test]
     fn a_saturated_count_still_blocks_at_the_top_bound() {
         // Regression: with `next <= max`, max = 255 let every event through.
-        let mut r = RoomChatter { agent_only_turns: 254 };
+        let mut r = RoomChatter {
+            agent_only_turns: 254,
+        };
         assert!(r.step(ChatterInput::AgentAlone, 255));
         assert!(!r.step(ChatterInput::AgentAlone, 255));
         assert!(!r.step(ChatterInput::AgentAlone, 255));

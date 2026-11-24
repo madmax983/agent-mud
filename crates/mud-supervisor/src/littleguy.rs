@@ -278,6 +278,10 @@ impl LittleguyMind {
     ///
     /// # Errors
     /// The files cannot be written, or the daemon does not start in time.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held through start-up so one entity never gets two daemons"
+    )]
     pub async fn ensure(&self, entity: &EntityId) -> Result<PathBuf, MindError> {
         let mut daemons = self.daemons.lock().await;
         if let Some(d) = daemons.get_mut(entity) {
@@ -369,11 +373,11 @@ impl Mind for LittleguyMind {
         "littleguy"
     }
 
-    fn wake<'a>(
-        &'a self,
+    fn wake(
+        &self,
         ctx: WakeContext,
         _tools: MudTools,
-    ) -> BoxFuture<'a, Result<MindReply, MindError>> {
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
         Box::pin(async move {
             let socket = self.ensure(&ctx.entity).await?;
             chat(&socket, &ctx.wake_id, &wake_message(&ctx)).await

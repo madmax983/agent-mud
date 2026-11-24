@@ -31,7 +31,7 @@ impl AgentModel for Scripted {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(ChatResponse {
+            .unwrap_or_else(|| ChatResponse {
                 content: vec![ContentPart::Text("done".into())],
                 stop_reason: StopReason::EndTurn,
                 usage: TokenUsage::new(1, 1),
@@ -60,7 +60,7 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         None,
         Arc::new(ManualClock::new(1_000)),
     );
-    let gate = Gate::new(Arc::clone(&game), 1, 0.0);
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
     let model = Arc::new(Scripted::default());
     model.replies.lock().unwrap().extend([
         call("c1", "mud_look", json!({})),
@@ -103,7 +103,7 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         login: false,
         wake_id: "wake-torin-0-1".into(),
     };
-    let tools = MudTools::new(Arc::clone(&game), gate, torin.clone());
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
     let r = mind.wake(ctx.clone(), tools.clone()).await.unwrap();
     assert_eq!(r.text.as_deref(), Some("posted the bounty"));
     assert!(r.usage.tokens() > 0, "{r:?}");
@@ -115,13 +115,16 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
     assert_eq!(board.len(), 1);
     assert_eq!(board[0].text, "Ore wanted, 15s a chunk. -T");
     // The tools went out with schemas, and the wake text carried the room.
-    let seen = model.seen.lock().unwrap();
-    let names: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
+    let names: Vec<String> = model.seen.lock().unwrap()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
     assert_eq!(
         names,
         ["mud_look", "mud_sheet", "mud_events", "mud_command"]
     );
-    drop(seen);
+
     // The same wake again is a duplicate: no new model calls, no new post.
     let calls = model.seen.lock().unwrap().len();
     let _ = mind.wake(ctx, tools).await.unwrap();
