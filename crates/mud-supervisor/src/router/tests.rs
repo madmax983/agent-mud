@@ -255,6 +255,20 @@ fn macro_ticks_wait_for_an_empty_room() {
 }
 
 #[test]
+fn a_macro_tick_keeps_its_identity_inside_a_merged_wake() {
+    let w = world();
+    let mut r = Router::new(RouterConfig::default());
+    r.force(&id("torin"), Priority::RoomBatch, "leave by ada", 0);
+    r.macro_tick(&id("torin"), &w, 5);
+    let wakes = r.due(5);
+    assert_eq!(wakes[0].priority, Priority::RoomBatch);
+    assert!(wakes[0].macro_tick, "{wakes:?}");
+    r.finish(&id("torin"), 6);
+    r.force(&id("torin"), Priority::Immediate, "login", 10);
+    assert!(!r.due(10)[0].macro_tick, "an ordinary wake is not a tick");
+}
+
+#[test]
 fn a_turing_pc_misses_some_chatter_but_not_its_goals() {
     let mut w = world();
     let mut r = Router::new(RouterConfig::default());

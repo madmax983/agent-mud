@@ -99,6 +99,7 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         events: vec![],
         event_views: vec![],
         look: game.look(&torin),
+        macro_tick: true,
         macro_ticks: 1,
         login: false,
         wake_id: "wake-torin-0-1".into(),

@@ -160,6 +160,66 @@ async fn macro_ticks_come_on_their_own_and_wait_for_empty_rooms() {
     assert_eq!(ticks("guard_01"), 0, "ambient NPCs have no macro-tick");
 }
 
+fn board_len(r: &Rig) -> usize {
+    r.game
+        .read(|w| w.state().rooms[&RoomId::from("notice_market")].board.len())
+}
+
+fn torin_ticks(r: &Rig) -> u64 {
+    r.sup.snapshot()["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "torin")
+        .unwrap()["macro_ticks"]
+        .as_u64()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_macro_tick_merged_into_a_pending_wake_still_runs() {
+    // Regression: the tick merged into torin's pending RoomBatch wake, was
+    // counted, but ran as a RoomBatch, so the `nth = 1` bounty never posted.
+    let r = rig(quiet());
+    let mut rx = r.game.subscribe();
+    let ada = r.game.login("ada").unwrap();
+    r.game.execute(&ada, "w");
+    r.game.execute(&ada, "e");
+    while let Ok(ev) = rx.try_recv() {
+        r.sup.observe(&ev);
+    }
+    let torin = EntityId::from("torin");
+    assert!(
+        lock(&r.sup.router)
+            .pending()
+            .iter()
+            .any(|(e, p, _)| e == &torin && *p == Priority::RoomBatch),
+        "torin has a pending room batch"
+    );
+    r.sup.fire_macro_tick(&torin);
+    r.run_for(10_000, 250, &mut rx).await;
+    assert_eq!(board_len(&r), 1, "torin posted the bounty");
+    assert_eq!(torin_ticks(&r), 1);
+}
+
+#[tokio::test]
+async fn two_macro_ticks_merged_while_busy_count_once() {
+    let r = rig(quiet());
+    let torin = EntityId::from("torin");
+    lock(&r.sup.router).force(&torin, Priority::RoomBatch, "x", 0);
+    let wakes = lock(&r.sup.router).due(r.game.now_ms());
+    assert_eq!(wakes.len(), 1);
+    r.sup.fire_macro_tick(&torin);
+    r.sup.fire_macro_tick(&torin);
+    assert_eq!(torin_ticks(&r), 0, "nothing delivered yet");
+    let now = r.game.now_ms();
+    lock(&r.sup.router).finish(&torin, now);
+    let mut rx = r.game.subscribe();
+    r.run_for(1_000, 250, &mut rx).await;
+    assert_eq!(torin_ticks(&r), 1, "one delivered tick");
+    assert_eq!(board_len(&r), 1, "and it is the first");
+}
+
 #[tokio::test]
 async fn a_spent_budget_falls_back_to_canned_flavor() {
     let mut cfg = quiet();

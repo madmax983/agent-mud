@@ -91,7 +91,7 @@ impl ScriptedMind {
         let mut out = Vec::new();
         for (idx, rule) in rules.iter().enumerate() {
             match rule.on {
-                ScriptTrigger::MacroTick if ctx.priority == Priority::MacroTick && !ctx.login => {
+                ScriptTrigger::MacroTick if ctx.macro_tick && !ctx.login => {
                     if rule.nth.is_none_or(|n| n == ctx.macro_ticks) {
                         out.extend(rule.commands.iter().cloned());
                     }
@@ -238,6 +238,7 @@ mod tests {
             events,
             event_views: Vec::new(),
             look: Value::Null,
+            macro_tick: priority == Priority::MacroTick,
             macro_ticks: 1,
             login: false,
             wake_id: "w".into(),

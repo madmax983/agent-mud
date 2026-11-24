@@ -114,6 +114,7 @@ async fn a_real_lg_serve_answers_a_wake() {
         events: vec![],
         event_views: vec![],
         look: game.look(&torin),
+        macro_tick: true,
         macro_ticks: 1,
         login: false,
         wake_id: "wake-torin-0-1".into(),

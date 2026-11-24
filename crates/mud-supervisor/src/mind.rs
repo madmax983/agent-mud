@@ -80,6 +80,9 @@ pub struct WakeContext {
     pub event_views: Vec<Value>,
     /// The room as the entity sees it (the `mud_look` wire form).
     pub look: Value,
+    /// Whether this wake delivers a macro-tick. A tick can merge into a
+    /// more urgent wake, so this is not the same as `priority`.
+    pub macro_tick: bool,
     /// How many macro-ticks this entity has had, this one included.
     pub macro_ticks: u32,
     /// Whether this wake is a session start (a login).
@@ -242,10 +245,15 @@ pub fn wake_message(ctx: &WakeContext) -> String {
     let look = serde_json::to_string(&ctx.look).unwrap_or_else(|_| "{}".into());
     let why = if ctx.login {
         "You just logged in.".to_owned()
-    } else if ctx.priority == Priority::MacroTick {
+    } else if ctx.macro_tick && ctx.priority == Priority::MacroTick {
         format!(
             "Time passes (macro-tick {}). No player is near. Advance your goals.",
             ctx.macro_ticks
+        )
+    } else if ctx.macro_tick {
+        format!(
+            "Something happened ({}), and time passes (macro-tick {}). Advance your goals.",
+            ctx.reason, ctx.macro_ticks
         )
     } else {
         format!("Something happened ({}).", ctx.reason)

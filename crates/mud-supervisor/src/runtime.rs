@@ -255,14 +255,11 @@ impl Supervisor {
     /// Fires a macro-tick for `entity` now (the admin page and tests).
     pub fn fire_macro_tick(&self, entity: &EntityId) -> RouteNote {
         let now = self.game.now_ms();
+        // The tick is counted when its wake is delivered (`run_wake`), not
+        // here: two ticks can merge into one wake.
         let note = self
             .game
             .read(|w| lock(&self.router).macro_tick(entity, w, now));
-        if matches!(note, RouteNote::Queued { .. })
-            && let Some(s) = lock(&self.state).get_mut(entity)
-        {
-            s.macro_ticks += 1;
-        }
         self.publish(ObserverEvent::Route(note.clone()));
         note
     }
@@ -404,6 +401,7 @@ impl Supervisor {
                 event_views: events.iter().map(|ev| ev.view_for(&wake.entity)).collect(),
                 events,
                 look: w.look_view(&wake.entity),
+                macro_tick: wake.macro_tick,
                 macro_ticks,
                 login: wake.reason == "login",
                 wake_id: format!(
@@ -443,6 +441,11 @@ impl Supervisor {
             mind: mind.kind().to_owned(),
             at_ms: start,
         });
+        if wake.macro_tick
+            && let Some(s) = lock(&self.state).get_mut(&wake.entity)
+        {
+            s.macro_ticks += 1;
+        }
         let ctx = self.context(&wake);
         let tools = MudTools::new(
             Arc::clone(&self.game),

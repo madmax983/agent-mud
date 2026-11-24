@@ -89,6 +89,10 @@ pub struct Wake {
     pub seqs: Vec<Seq>,
     /// Why, for the observer.
     pub reason: String,
+    /// Whether a macro-tick is part of it, whatever its priority (a tick
+    /// can merge into a more urgent wake).
+    #[serde(default)]
+    pub macro_tick: bool,
 }
 
 /// A routing decision, for the observer.
@@ -124,6 +128,7 @@ struct Pending {
     first_ms: u64,
     due_ms: u64,
     reason: String,
+    macro_tick: bool,
 }
 
 /// The router.
@@ -383,6 +388,7 @@ impl Router {
                     ev.kind.name(),
                     ev.actor.as_ref().map_or("world", |a| a.name.as_str())
                 ),
+                macro_tick: false,
             });
             p.seqs.push(ev.seq);
             if priority > p.priority {
@@ -443,7 +449,10 @@ impl Router {
                 first_ms: now,
                 due_ms: now,
                 reason: "macro-tick".into(),
+                macro_tick: true,
             });
+        // The tick keeps its identity even inside a more urgent wake.
+        p.macro_tick = true;
         p.due_ms = p.due_ms.min(now);
         RouteNote::Queued {
             entity: entity.clone(),
@@ -465,6 +474,7 @@ impl Router {
                 first_ms: now,
                 due_ms: now,
                 reason: reason.to_owned(),
+                macro_tick: false,
             });
         if priority >= p.priority {
             p.priority = priority;
@@ -490,6 +500,7 @@ impl Router {
                     priority: p.priority,
                     seqs: p.seqs,
                     reason: p.reason,
+                    macro_tick: p.macro_tick,
                 });
             }
         }

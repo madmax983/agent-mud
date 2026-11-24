@@ -238,6 +238,7 @@ mod tests {
             events: vec![],
             event_views: vec![],
             look: game.look(&guard),
+            macro_tick: false,
             macro_ticks: 0,
             login: false,
             wake_id: "w1".into(),
