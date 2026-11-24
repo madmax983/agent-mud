@@ -318,10 +318,16 @@ impl LittleguyMind {
             cmd.arg("--base-url").arg(url);
         }
         cmd.env_clear();
-        for var in ["PATH", "HOME", "RUST_LOG"].iter().chain(MODEL_KEYS.iter()) {
+        for var in ["PATH", "HOME", "RUST_LOG", "LG_LOG"]
+            .iter()
+            .chain(MODEL_KEYS.iter())
+        {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
             }
+        }
+        if std::env::var_os("LG_LOG").is_none() {
+            cmd.env("LG_LOG", "info");
         }
         cmd.env(TOKEN_ENV, &persona.token)
             .env("XDG_CONFIG_HOME", dir.join("config"))

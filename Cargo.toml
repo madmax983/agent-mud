@@ -5,7 +5,7 @@ members = [
     "crates/mud-world",
     "crates/mud-mcp",
     "crates/mud-supervisor",
-    # "crates/mud-server",
+    "crates/mud-server",
 ]
 
 [workspace.package]

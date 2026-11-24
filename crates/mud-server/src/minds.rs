@@ -1,0 +1,219 @@
+//! Builds the mind of every agent entity from the config and the cast.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::Context as _;
+use autumn_harvest_agent::AgentModel;
+use autumn_harvest_agent::openai::OpenAiModel;
+use autumn_plugin_agent::{LlmClient, OpenAiCompatibleClient};
+use mud_mcp::TokenRegistry;
+use mud_supervisor::ambient::AmbientMind;
+use mud_supervisor::harvest::{HarvestMind, HarvestPersona};
+use mud_supervisor::littleguy::{LittleguyConfig, LittleguyMind, Persona};
+use mud_supervisor::mind::Mind;
+use mud_supervisor::scripted::ScriptedMind;
+use mud_world::pack::{CastDef, Tier};
+use mud_world::{EntityId, WorldPack};
+
+use crate::config::{ModelConfig, MudConfig, Runtime};
+
+/// The minds of a world, and the littleguy daemons to stop at exit.
+#[derive(Debug)]
+pub struct Minds {
+    /// One mind per agent entity.
+    pub by_entity: HashMap<EntityId, Arc<dyn Mind>>,
+    /// The littleguy minds, one per model alias.
+    pub littleguy: Vec<Arc<LittleguyMind>>,
+}
+
+const fn runtime_for(cfg: &MudConfig, tier: Tier) -> Option<Runtime> {
+    match tier {
+        Tier::Persistent => Some(cfg.minds.persistent),
+        Tier::Turing => Some(cfg.minds.turing),
+        Tier::Ambient => Some(cfg.minds.ambient),
+        Tier::None | Tier::Mob => None,
+    }
+}
+
+fn model_alias(c: &CastDef) -> String {
+    c.mind.model.clone().unwrap_or_else(|| "default".into())
+}
+
+fn model<'a>(cfg: &'a MudConfig, alias: &str) -> anyhow::Result<&'a ModelConfig> {
+    cfg.models
+        .get(alias)
+        .or_else(|| cfg.models.get("default"))
+        .with_context(|| format!("no [models.{alias}] (or [models.default]) in the config"))
+}
+
+fn littleguy_mind(
+    cfg: &MudConfig,
+    alias: &str,
+    members: &[(&EntityId, &CastDef)],
+    tokens: &TokenRegistry,
+) -> anyhow::Result<LittleguyMind> {
+    let lg = &cfg.littleguy;
+    let config = LittleguyConfig {
+        bin: lg.bin.clone(),
+        data_dir: lg.data_dir.clone(),
+        mcp_url: cfg.server.mcp_url(),
+        provider: lg.provider.clone(),
+        model_name: lg
+            .model_names
+            .get(alias)
+            .or_else(|| lg.model_names.get("default"))
+            .cloned(),
+        base_url: lg.base_url.clone(),
+        ..LittleguyConfig::default()
+    };
+    let mut personas = HashMap::new();
+    for (id, c) in members {
+        let token = tokens
+            .issue((*id).clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        personas.insert(
+            (*id).clone(),
+            Persona {
+                name: c.name.clone(),
+                persona: c.persona.clone(),
+                goal: c.goal.clone(),
+                token,
+            },
+        );
+    }
+    Ok(LittleguyMind::new(config, personas))
+}
+
+/// Builds every mind. Littleguy entities get a fresh MCP token each.
+///
+/// # Errors
+/// A model alias is missing, a key variable is unset, or a client fails.
+pub fn build(cfg: &MudConfig, pack: &WorldPack, tokens: &TokenRegistry) -> anyhow::Result<Minds> {
+    let scripted: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
+    let mut by_entity: HashMap<EntityId, Arc<dyn Mind>> = HashMap::new();
+    let mut groups: HashMap<(Runtime, String), Vec<(&EntityId, &CastDef)>> = HashMap::new();
+    for (id, c) in &pack.cast {
+        let Some(rt) = runtime_for(cfg, c.mind.tier) else {
+            continue;
+        };
+        match rt {
+            Runtime::Scripted => {
+                by_entity.insert(id.clone(), Arc::clone(&scripted));
+            }
+            Runtime::PluginAgent if c.mind.tier != Tier::Ambient => {
+                anyhow::bail!(
+                    "{id}: plugin-agent is for ambient NPCs; pick harvest or littleguy for {:?}",
+                    c.mind.tier
+                );
+            }
+            _ => groups
+                .entry((rt, model_alias(c)))
+                .or_default()
+                .push((id, c)),
+        }
+    }
+    let mut littleguy = Vec::new();
+    for ((rt, alias), members) in groups {
+        let mind: Arc<dyn Mind> = match rt {
+            Runtime::Harvest => {
+                let m = model(cfg, &alias)?;
+                let client: Arc<dyn AgentModel> = Arc::new(
+                    OpenAiModel::with_key_from(&m.base_url, m.model.clone(), &m.key_env)
+                        .map_err(|e| anyhow::anyhow!("model {alias}: {e}"))?,
+                );
+                let personas = members
+                    .iter()
+                    .map(|(id, c)| {
+                        (
+                            (*id).clone(),
+                            HarvestPersona {
+                                name: c.name.clone(),
+                                persona: c.persona.clone(),
+                                goal: c.goal.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                Arc::new(HarvestMind::new(
+                    client,
+                    Some(cfg.littleguy.data_dir.clone()),
+                    personas,
+                ))
+            }
+            Runtime::PluginAgent => {
+                let m = model(cfg, &alias)?;
+                let key = std::env::var(&m.key_env)
+                    .with_context(|| format!("{} is not set (model {alias})", m.key_env))?;
+                let client: Arc<dyn LlmClient> = Arc::new(
+                    OpenAiCompatibleClient::new(m.base_url.clone(), m.model.clone(), key)
+                        .map_err(|e| anyhow::anyhow!("model {alias}: {e}"))?,
+                );
+                let cards = members
+                    .iter()
+                    .map(|(id, c)| {
+                        (
+                            (*id).clone(),
+                            (c.name.clone(), c.persona.clone(), c.goal.clone()),
+                        )
+                    })
+                    .collect();
+                Arc::new(AmbientMind::new(client, cards))
+            }
+            Runtime::Littleguy => {
+                let m = Arc::new(littleguy_mind(cfg, &alias, &members, tokens)?);
+                littleguy.push(Arc::clone(&m));
+                m
+            }
+            Runtime::Scripted => continue,
+        };
+        for (id, _) in members {
+            by_entity.insert(id.clone(), Arc::clone(&mind));
+        }
+    }
+    Ok(Minds {
+        by_entity,
+        littleguy,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_script_every_agent_and_issue_no_tokens() {
+        let pack = WorldPack::crypt_v01().unwrap();
+        let tokens = TokenRegistry::new();
+        let m = build(&MudConfig::default(), &pack, &tokens).unwrap();
+        let mut ids: Vec<&str> = m.by_entity.keys().map(EntityId::as_str).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["guard_01", "kestrel", "marta", "torin", "vich"]);
+        assert!(m.by_entity.values().all(|m| m.kind() == "scripted"));
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn littleguy_entities_get_one_token_each() {
+        let pack = WorldPack::crypt_v01().unwrap();
+        let tokens = TokenRegistry::new();
+        let mut cfg = MudConfig::default();
+        cfg.minds.persistent = Runtime::Littleguy;
+        let m = build(&cfg, &pack, &tokens).unwrap();
+        assert_eq!(tokens.len(), 3, "marta, torin, vich");
+        assert_eq!(m.by_entity[&EntityId::from("torin")].kind(), "littleguy");
+        assert_eq!(m.by_entity[&EntityId::from("kestrel")].kind(), "scripted");
+        assert_eq!(m.littleguy.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_model_alias_is_reported() {
+        let pack = WorldPack::crypt_v01().unwrap();
+        let mut cfg = MudConfig::default();
+        cfg.minds.persistent = Runtime::Harvest;
+        let e = build(&cfg, &pack, &TokenRegistry::new()).unwrap_err();
+        assert!(e.to_string().contains("[models.flash]"), "{e}");
+        cfg.minds.persistent = Runtime::PluginAgent;
+        assert!(build(&cfg, &pack, &TokenRegistry::new()).is_err());
+    }
+}
