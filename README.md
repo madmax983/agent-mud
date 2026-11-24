@@ -21,7 +21,11 @@ scripts. Then:
 
 - open <http://127.0.0.1:3000/>, type a name, and play (`help` lists the verbs);
 - open the observer link printed in the log (`/observer?token=…`) to watch
-  wake decisions, self-control rolls and token burn;
+  wake decisions, self-control rolls and token burn. For an agent played by
+  littleguy, its **littleguy ↗** link signs you in to that daemon's own
+  pages (goals, notes, skills, memory, history). Those pages listen on
+  loopback, so open the link on the MUD's machine (or through an SSH
+  tunnel);
 - or `telnet 127.0.0.1 4000` after setting `[server] telnet` in `mud.toml`.
   Both close a client that gives no name within `login_timeout_ms` (60 s)
   or stays silent for `idle_timeout_ms` (1 h). Together they admit at most

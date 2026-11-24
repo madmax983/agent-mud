@@ -22,7 +22,7 @@ fn persona() -> Persona {
 #[test]
 fn the_config_points_littleguy_at_the_mud() {
     let cfg = LittleguyConfig::default();
-    let text = render_config(&cfg, &persona());
+    let text = render_config(&cfg, &persona(), 4123);
     let v: toml::Table = toml::from_str(&text).unwrap();
     assert_eq!(v["owner"].as_str(), Some("mud"));
     assert!(v["system"].as_str().unwrap().contains("Get ore."));
@@ -30,7 +30,11 @@ fn the_config_points_littleguy_at_the_mud() {
     assert_eq!(server["url"].as_str(), Some("http://127.0.0.1:3000/mcp"));
     assert_eq!(server["bearer_env"].as_str(), Some(TOKEN_ENV));
     assert_eq!(server["labels"][0].as_str(), Some("untrusted_input"));
-    assert_eq!(v["ui"]["bind"].as_str(), Some("127.0.0.1:0"));
+    assert_eq!(
+        v["ui"]["bind"].as_str(),
+        Some("127.0.0.1:4123"),
+        "a real port: littleguy's sign-in link is built from it"
+    );
     assert_eq!(v["tools"]["web_fetch"].as_bool(), Some(false));
     assert!(
         !text.contains("secret-token"),
@@ -46,7 +50,7 @@ fn zero_max_steps_leaves_a_wake_unbounded() {
         max_steps: 0,
         ..LittleguyConfig::default()
     };
-    let v: toml::Table = toml::from_str(&render_config(&cfg, &persona())).unwrap();
+    let v: toml::Table = toml::from_str(&render_config(&cfg, &persona(), 4123)).unwrap();
     assert!(!v.contains_key("max_steps"));
 }
 
@@ -83,6 +87,66 @@ async fn chat_speaks_the_socket_protocol() {
     let req: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
     assert_eq!(req["kind"], "chat");
     assert_eq!(req["message_id"], "wake-torin-1");
+}
+
+#[tokio::test]
+async fn ui_link_returns_a_loopback_sign_in_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let _s = fake_daemon_raw(
+        &sock,
+        r#"{"kind":"connect_link","link":"http://127.0.0.1:4123/login?token=abc"}"#,
+    );
+    assert_eq!(
+        ui_link(&sock).await.unwrap(),
+        "http://127.0.0.1:4123/login?token=abc"
+    );
+    let sock = dir.path().join("evil.sock");
+    let _s = fake_daemon_raw(
+        &sock,
+        r#"{"kind":"connect_link","link":"https://evil.example/login"}"#,
+    );
+    assert!(
+        ui_link(&sock).await.is_err(),
+        "never a link off this machine"
+    );
+    let sock = dir.path().join("off.sock");
+    let _s = fake_daemon_raw(
+        &sock,
+        r#"{"kind":"error","message":"the web pages do not serve in this daemon"}"#,
+    );
+    let e = ui_link(&sock).await.unwrap_err();
+    assert!(e.to_string().contains("do not serve"), "{e}");
+}
+
+#[tokio::test]
+async fn a_daemon_that_is_not_running_has_no_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LittleguyConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    assert!(mind.serves(&torin));
+    assert!(!mind.serves(&EntityId::from("marta")));
+    let e = mind.ui_link(&torin).await.unwrap_err();
+    assert!(e.to_string().contains("not running yet"), "{e}");
+}
+
+/// A daemon that answers one request with `answer`, and nothing else.
+fn fake_daemon_raw(path: &Path, answer: &'static str) -> tokio::task::JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut req = String::new();
+        reader.read_line(&mut req).await.unwrap();
+        assert_eq!(req.trim(), r#"{"kind":"ui_link"}"#);
+        let mut stream = reader.into_inner();
+        stream.write_all(answer.as_bytes()).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+    })
 }
 
 #[tokio::test]
@@ -402,6 +466,26 @@ async fn a_real_lg_serve_answers_a_wake() {
     assert!(
         matches!(live.charge(NOW), Ok(Some(_))),
         "the ledger of a running lg serve is readable"
+    );
+    // The observer's link signs a browser in to the daemon's pages.
+    let link = mind.ui_link(&torin).await.unwrap();
+    let rest = link.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, path) = rest.split_once('/').unwrap();
+    assert_ne!(port, "0", "a link to a real port: {link}");
+    let mut http = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    http.write_all(
+        format!("GET /{path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut status = String::new();
+    BufReader::new(http).read_line(&mut status).await.unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 2") || status.starts_with("HTTP/1.1 3"),
+        "the sign-in link works: {status}"
     );
     let pid: u32 = std::fs::read_to_string(dir.path().join("torin").join(PID_FILE))
         .unwrap()

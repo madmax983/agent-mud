@@ -95,9 +95,10 @@ pub struct Persona {
     pub token: String,
 }
 
-/// Renders the `lg.toml` of one entity.
+/// Renders the `lg.toml` of one entity, its pages served on loopback
+/// `ui_port`.
 #[must_use]
-pub fn render_config(cfg: &LittleguyConfig, p: &Persona) -> String {
+pub fn render_config(cfg: &LittleguyConfig, p: &Persona, ui_port: u16) -> String {
     let mut root = toml::Table::new();
     root.insert("owner".into(), "mud".into());
     root.insert(
@@ -126,8 +127,9 @@ pub fn render_config(cfg: &LittleguyConfig, p: &Persona) -> String {
     memory.insert("reflect".into(), true.into());
     root.insert("memory".into(), memory.into());
     let mut ui = toml::Table::new();
-    // Port 0: each daemon's private pages take a free port.
-    ui.insert("bind".into(), "127.0.0.1:0".into());
+    // A concrete port: littleguy builds its sign-in link from this address,
+    // so port 0 would hand out links to port 0.
+    ui.insert("bind".into(), format!("127.0.0.1:{ui_port}").into());
     root.insert("ui".into(), ui.into());
     if cfg.heartbeat_minutes > 0 {
         let mut hb = toml::Table::new();
@@ -321,6 +323,54 @@ pub(crate) async fn chat_charged(
         .map_err(|_| MindError::Unavailable("the daemon did not answer in time".into()))?
 }
 
+/// A loopback port that was free a moment ago, for a daemon's pages.
+fn free_loopback_port() -> std::io::Result<u16> {
+    Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?
+        .local_addr()?
+        .port())
+}
+
+/// Asks the daemon at `socket` for a one-time sign-in link to its pages.
+///
+/// # Errors
+/// The socket does not answer, or the daemon refuses.
+pub async fn ui_link(socket: &Path) -> Result<String, MindError> {
+    let unavailable =
+        |e: std::io::Error| MindError::Unavailable(format!("{}: {e}", socket.display()));
+    let mut stream = UnixStream::connect(socket).await.map_err(unavailable)?;
+    stream
+        .write_all(b"{\"kind\":\"ui_link\"}\n")
+        .await
+        .map_err(unavailable)?;
+    let mut answer = String::new();
+    BufReader::new(stream)
+        .read_line(&mut answer)
+        .await
+        .map_err(unavailable)?;
+    let v: Value =
+        serde_json::from_str(answer.trim()).map_err(|e| MindError::Failed(e.to_string()))?;
+    match (v["kind"].as_str(), v["link"].as_str()) {
+        (Some("connect_link"), Some(link)) if is_loopback_link(link) => Ok(link.to_owned()),
+        (Some("connect_link"), _) => Err(MindError::Failed(
+            "littleguy gave a sign-in link that is not on loopback".into(),
+        )),
+        _ => Err(MindError::Failed(
+            v["message"]
+                .as_str()
+                .unwrap_or("unexpected answer from lg serve")
+                .to_owned(),
+        )),
+    }
+}
+
+/// Whether `link` points at this machine's loopback, so the observer never
+/// redirects anywhere else.
+fn is_loopback_link(link: &str) -> bool {
+    ["http://127.0.0.1:", "http://[::1]:"]
+        .iter()
+        .any(|p| link.starts_with(p))
+}
+
 /// The file in an entity's folder that holds its daemon's process id.
 const PID_FILE: &str = "lg.pid";
 
@@ -442,7 +492,8 @@ impl LittleguyMind {
         let io = |e: std::io::Error| MindError::Unavailable(format!("{}: {e}", dir.display()));
         std::fs::create_dir_all(&dir).map_err(io)?;
         let config = dir.join("lg.toml");
-        std::fs::write(&config, render_config(&self.cfg, persona)).map_err(io)?;
+        let ui_port = free_loopback_port().map_err(io)?;
+        std::fs::write(&config, render_config(&self.cfg, persona, ui_port)).map_err(io)?;
         let socket = dir.join("lg.sock");
         reap_orphan(&dir, &socket).await;
         let _ = std::fs::remove_file(&socket);
@@ -525,6 +576,33 @@ impl LittleguyMind {
             let _ = std::fs::remove_file(self.entity_dir(&entity).join(PID_FILE));
             let _ = std::fs::remove_file(&d.socket);
         }
+    }
+
+    /// Whether `entity` is one of this mind's.
+    #[must_use]
+    pub fn serves(&self, entity: &EntityId) -> bool {
+        self.personas.contains_key(entity)
+    }
+
+    /// A one-time sign-in link to the pages of `entity`'s daemon (its
+    /// goals, notes, skills, memory and history), for the observer. The
+    /// pages listen on loopback only. The daemon is not started for this.
+    ///
+    /// # Errors
+    /// The daemon is not running yet, or does not answer.
+    pub async fn ui_link(&self, entity: &EntityId) -> Result<String, MindError> {
+        let socket = {
+            let mut daemons = self.daemons.lock().await;
+            daemons
+                .get_mut(entity)
+                .and_then(|d| matches!(d.child.try_wait(), Ok(None)).then(|| d.socket.clone()))
+        };
+        let Some(socket) = socket else {
+            return Err(MindError::Unavailable(format!(
+                "{entity}'s littleguy is not running yet; it starts on its first wake"
+            )));
+        };
+        ui_link(&socket).await
     }
 
     /// Whether [`LittleguyMind::shutdown`] has run.

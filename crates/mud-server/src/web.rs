@@ -54,6 +54,8 @@ pub struct Mud {
     /// responses (the observer feed, MCP sessions) end on it so the server
     /// can drain.
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// The littleguy minds, for the observer's links to their pages.
+    pub littleguy: Vec<Arc<mud_supervisor::littleguy::LittleguyMind>>,
 }
 
 impl Mud {
@@ -94,6 +96,7 @@ pub fn routes() -> Vec<autumn_web::Route> {
         observer,
         observer_entities,
         observer_feed,
+        observer_littleguy,
         macro_tick,
         healthz,
         terminal_js,
@@ -387,7 +390,11 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
             @for e in snap["entities"].as_array().into_iter().flatten() {
                 tr {
                     td { strong { (e["name"].as_str().unwrap_or("")) } br; span.muted { (e["id"].as_str().unwrap_or("")) } }
-                    td { (e["tier"].as_str().unwrap_or("")) " / " (e["mind"].as_str().unwrap_or("")) }
+                    td { (e["tier"].as_str().unwrap_or("")) " / " (e["mind"].as_str().unwrap_or(""))
+                        @if e["mind"] == "littleguy" {
+                            br; a href=(format!("/observer/agents/{}/littleguy?token={token}", url_escape(e["id"].as_str().unwrap_or("")))) target="_blank" rel="noopener" { "littleguy ↗" }
+                        }
+                    }
                     td { (e["room"].as_str().unwrap_or("")) br; span.muted { "hp " (e["hp"]) " · " (e["currency"]) "s" } }
                     td class=(budget_class(&e["budget"]["level"])) {
                         (e["budget"]["level"].as_str().unwrap_or("")) br;
@@ -416,6 +423,32 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
         }
     }
     .into_response()
+}
+
+/// Opens an agent's littleguy pages (goals, notes, skills, memory,
+/// history): a fresh one-time sign-in link from its daemon. The pages
+/// listen on this machine's loopback, so the browser must run here too.
+#[get("/observer/agents/{id}/littleguy")]
+async fn observer_littleguy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<Admin>,
+) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    let entity = EntityId::new(id);
+    let Some(mind) = app.littleguy.iter().find(|m| m.serves(&entity)) else {
+        return (StatusCode::NOT_FOUND, "no littleguy plays that entity").into_response();
+    };
+    match mind.ui_link(&entity).await {
+        Ok(link) => (
+            StatusCode::SEE_OTHER,
+            [(autumn_web::reexports::axum::http::header::LOCATION, link)],
+        )
+            .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
 }
 
 #[post("/observer/macro-tick/{id}")]

@@ -38,6 +38,12 @@ process lifecycle; littleguy owns the mind.
   Prompt caching makes a long wake cheap; the daily budget is the guard.
 - littleguy's own heartbeat is kept for quiet reflection and memory
   consolidation only.
+- **Its pages.** Each daemon serves littleguy's pages on a loopback port
+  that the MUD picks free at start (`[ui] bind`; not port 0, because
+  littleguy builds its sign-in link from that address). The observer's
+  `/observer/agents/{id}/littleguy` asks the daemon for a one-time sign-in
+  link (`{"kind":"ui_link"}`) and redirects there, never to a link off
+  loopback.
 - **Shutdown.** Each daemon holds an MCP session open (an SSE response),
   and a graceful HTTP shutdown waits for every open response. So the MUD
   stops its minds when shutdown *begins*, not after it drains: autumn's
