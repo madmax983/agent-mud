@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use mud_world::engine::{Fail, refusal};
 use mud_world::pack::Tier;
-use mud_world::{CommandResult, EntityId, ErrorCode, Game, parse};
+use mud_world::{Command, CommandResult, EntityId, ErrorCode, Game, parse_with};
 use tokio::sync::Notify;
 
 use crate::turing::{action_delay_ms, mix, speech_delay_ms};
@@ -82,7 +82,10 @@ impl Gate {
                 .flatten()
         });
         let Some(spec) = spec else { return 0 };
-        let Ok(cmd) = parse(line) else { return 0 };
+        // A custom verb is typed like any action: no delay would be a tell.
+        let Ok(cmd) = self.parse(line) else {
+            return 0;
+        };
         let h = mix(
             self.seed,
             &[entity.as_str().as_bytes(), &nonce.to_le_bytes(), b"typing"],
@@ -102,6 +105,12 @@ impl Gate {
         )]
         let scaled = (raw as f64 * self.scale).round() as u64;
         scaled
+    }
+
+    /// Parses `line` as the world will, custom verbs included.
+    fn parse(&self, line: &str) -> Result<Command, mud_world::parser::ParseError> {
+        self.game
+            .read(|w| parse_with(line, &|v| w.is_custom_verb(v)))
     }
 
     /// Whether `entity` has a line held right now.
@@ -151,9 +160,9 @@ impl Gate {
             };
             drop(guard);
             if interrupted {
-                let verb = parse(line).ok().map(|c| c.verb());
+                let cmd = self.parse(line).ok();
                 return refusal(
-                    verb,
+                    cmd.as_ref().map(Command::display_verb),
                     &Fail::new(
                         ErrorCode::Interrupted,
                         "combat broke out before you finished typing",
@@ -193,6 +202,40 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(800));
         let fast = Gate::new(Arc::clone(&g), 9, 0.0);
         assert_eq!(fast.hold_ms(&k, "say a long line here", 5), 0);
+    }
+
+    fn game_with_scripts() -> Arc<Game> {
+        let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+        let host = Arc::new(mud_script::ScriptHost::bundled_crypt_v01(&pack).unwrap());
+        let mut w = World::new(pack, 1);
+        w.set_hooks(Some(host), 0, mud_world::HooksChange::Start);
+        Game::new(w, None, Arc::new(ManualClock::new(1_000)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_custom_verb_is_held_like_any_action() {
+        let g = game_with_scripts();
+        let k = EntityId::from("pc_kestrel");
+        g.bring_online(&k);
+        let gate = Gate::new(Arc::clone(&g), 9, 1.0);
+        let held = gate.hold_ms(&k, "listen", 1);
+        assert!((600..=1_400).contains(&held), "{held}");
+        assert_eq!(gate.hold_ms(&k, "dance", 2), 0, "a typo is not typed out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupted_custom_verb_names_the_verb() {
+        let g = game_with_scripts();
+        let k = EntityId::from("pc_kestrel");
+        g.bring_online(&k);
+        let gate = Gate::new(Arc::clone(&g), 9, 1.0);
+        let (g2, k2) = (Arc::clone(&gate), k.clone());
+        let task = tokio::spawn(async move { g2.run(&k2, "listen").await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(gate.interrupt(&k));
+        let r = task.await.unwrap();
+        assert_eq!(r.error_code, Some(ErrorCode::Interrupted));
+        assert_eq!(r.verb.as_deref(), Some("listen"));
     }
 
     #[tokio::test(start_paused = true)]
