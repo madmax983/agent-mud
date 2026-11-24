@@ -54,3 +54,12 @@ first_macro_tick_secs = [30, 120]
 step_ms = 250
 [supervisor.budgets]                 # by entity id; 0 is unlimited
 pc_kestrel = 600000
+
+# World scripts (ADR 0010, docs/scripting.md). The limits are pack data, in
+# the pack's scripts.toml. Reload with:
+#   curl -X POST "http://127.0.0.1:3000/observer/scripts/reload?token=$MUD_ADMIN_TOKEN"
+[scripts]
+enabled = true
+# A mind binding with runtime = "rhai" (Hale in crypt-v01) runs on its Rhai
+# script whatever [minds] says; false keeps every entity on its tier's runtime.
+allow_runtime_override = true

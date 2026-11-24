@@ -8,19 +8,23 @@
 mod combat;
 mod items;
 mod look;
+mod script;
 mod social;
+
+pub use script::HookStatus;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use mud_rules::{DiceRng, FixedDice, SeededDice, self_control_roll};
+use mud_rules::self_control_roll;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::event::{ActorRef, Event, EventKind};
+use crate::hooks::{WorldDice, WorldHooks};
 use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WorldPack};
-use crate::parser::{Command, ParseError, parse};
+use crate::parser::{Command, MAX_TEXT_CHARS, ParseError, forbidden_in_text, parse_with};
 use crate::state::{Entity, Holder, WorldState};
 
 /// How many events the world keeps in memory for `mud_events`.
@@ -97,6 +101,12 @@ pub enum ErrorCode {
     BadName,
     /// Something urgent happened before a typed command committed.
     Interrupted,
+    /// A custom verb that does not work in this room.
+    NotHere,
+    /// A world script refused the command.
+    Refused,
+    /// A world script failed; nothing happened.
+    ScriptFailed,
 }
 
 /// A refused command.
@@ -188,6 +198,13 @@ pub enum StateChange {
         /// The exit.
         dir: Direction,
     },
+    /// An exit was locked.
+    Locked {
+        /// The room.
+        room: RoomId,
+        /// The exit.
+        dir: Direction,
+    },
     /// A container was unlocked.
     ContainerUnlocked {
         /// The container.
@@ -262,27 +279,88 @@ pub enum Audit {
         /// When.
         at_ms: u64,
     },
+    /// A world hook or a mind script faulted.
+    ScriptFault {
+        /// The hook key, such as `verbs.pray` or `minds.guard_01.on_wake`.
+        hook: String,
+        /// Who set it off, or whose mind it is.
+        entity: EntityId,
+        /// What went wrong (at most 300 characters).
+        message: String,
+        /// Its consecutive faults now.
+        faults: u8,
+        /// Whether its breaker is now open.
+        tripped: bool,
+        /// When.
+        at_ms: u64,
+    },
+    /// A line a script logged.
+    ScriptLog {
+        /// The hook key.
+        hook: String,
+        /// Who set it off.
+        entity: EntityId,
+        /// The line.
+        line: String,
+        /// When.
+        at_ms: u64,
+    },
+    /// The effects a world hook applied.
+    ScriptEffects {
+        /// The hook key.
+        hook: String,
+        /// Who set it off.
+        entity: EntityId,
+        /// Each effect, described.
+        effects: Vec<String>,
+        /// When.
+        at_ms: u64,
+    },
+    /// A script version was loaded.
+    ScriptsLoaded {
+        /// The new version.
+        version: String,
+        /// The one before, if any.
+        previous: Option<String>,
+        /// `start` or `reload`.
+        why: String,
+        /// When.
+        at_ms: u64,
+    },
+    /// An operator's reload was refused; the old scripts keep running.
+    ScriptsReloadRefused {
+        /// The version still running.
+        version: String,
+        /// Every problem found.
+        problems: Vec<String>,
+        /// When.
+        at_ms: u64,
+    },
+    /// An operator cleared a mind's script memory.
+    MindMemoryReset {
+        /// Whose.
+        entity: EntityId,
+        /// When.
+        at_ms: u64,
+    },
 }
 
-/// The dice of a world: seeded in play, fixed in tests.
-#[derive(Debug, Clone)]
-enum Dice {
-    Seeded(SeededDice),
-    Fixed(FixedDice),
+/// Why the scripts of a world changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HooksChange {
+    /// The server started.
+    Start,
+    /// An operator reloaded them.
+    Reload,
 }
 
-impl DiceRng for Dice {
-    fn d6(&mut self) -> u8 {
+impl HooksChange {
+    /// `start` or `reload`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
-            Self::Seeded(d) => d.d6(),
-            Self::Fixed(d) => d.d6(),
-        }
-    }
-
-    fn below(&mut self, n: u32) -> u32 {
-        match self {
-            Self::Seeded(d) => d.below(n),
-            Self::Fixed(d) => d.below(n),
+            Self::Start => "start",
+            Self::Reload => "reload",
         }
     }
 }
@@ -316,6 +394,8 @@ pub(crate) struct Emit {
     pub extra: Vec<EntityId>,
     /// Only these perceive it (instead of the room).
     pub only: Option<Vec<EntityId>>,
+    /// This one does not perceive it, though it is in the room.
+    pub except: Option<EntityId>,
 }
 
 impl Emit {
@@ -332,6 +412,7 @@ impl Emit {
             data: Value::Null,
             extra: Vec::new(),
             only: None,
+            except: None,
         }
     }
 
@@ -377,10 +458,11 @@ type Done = Result<(String, Value), Fail>;
 pub struct World {
     pack: Arc<WorldPack>,
     state: WorldState,
-    dice: Dice,
+    dice: WorldDice,
     log: VecDeque<Event>,
     fresh: Vec<Event>,
     audit: Vec<Audit>,
+    hooks: Option<Arc<dyn WorldHooks>>,
 }
 
 impl World {
@@ -405,7 +487,7 @@ impl World {
             e.online = false;
             e.hidden = false;
         }
-        let dice = Dice::Seeded(SeededDice::new(state.dice_state));
+        let dice = WorldDice::seeded(state.dice_state);
         Self {
             pack,
             state,
@@ -413,12 +495,13 @@ impl World {
             log: recent.into_iter().collect(),
             fresh: Vec::new(),
             audit: Vec::new(),
+            hooks: None,
         }
     }
 
     /// Replaces the dice with fixed faces, for tests.
     pub fn fix_dice(&mut self, faces: impl IntoIterator<Item = u8>) {
-        self.dice = Dice::Fixed(FixedDice::new(faces));
+        self.dice = WorldDice::fixed(faces);
     }
 
     /// The pack.
@@ -437,8 +520,8 @@ impl World {
     #[must_use]
     pub fn snapshot(&self) -> WorldState {
         let mut s = self.state.clone();
-        if let Dice::Seeded(d) = &self.dice {
-            s.dice_state = d.state();
+        if let Some(d) = self.dice.seeded_state() {
+            s.dice_state = d;
         }
         s
     }
@@ -506,7 +589,7 @@ impl World {
 
     /// Parses and runs one line for `actor`.
     pub fn execute(&mut self, actor: &EntityId, line: &str, now_ms: u64) -> CommandResult {
-        let result = match parse(line) {
+        let result = match parse_with(line, &|v| self.is_custom_verb(v)) {
             Ok(cmd) => self.execute_command(actor, &cmd, now_ms),
             Err(e) => refusal(None, &Fail::from(e)),
         };
@@ -527,15 +610,39 @@ impl World {
         cmd: &Command,
         now_ms: u64,
     ) -> CommandResult {
+        // `Command` and this method are public, so a custom command built
+        // by hand is checked as the parser would check it.
+        if let Command::Custom { name, args } = cmd {
+            let fail = if !self.is_custom_verb(name) {
+                Some(Fail::from(ParseError::UnknownVerb(name.clone())))
+            } else if args.chars().count() > MAX_TEXT_CHARS {
+                Some(Fail::from(ParseError::TooLong))
+            } else if args.chars().any(forbidden_in_text) {
+                Some(Fail::from(ParseError::ControlCharacter))
+            } else {
+                None
+            };
+            if let Some(fail) = fail {
+                return refusal(Some(cmd.display_verb()), &fail);
+            }
+        }
         let mut ctx = Ctx {
             now: now_ms,
             ..Ctx::default()
         };
-        let outcome = self.dispatch(&mut ctx, actor, cmd);
+        let mut outcome = self.dispatch(&mut ctx, actor, cmd);
+        if let Ok((narrative, resolution)) = &mut outcome {
+            for line in self.event_hook(&mut ctx, actor, cmd, resolution) {
+                if !narrative.is_empty() {
+                    narrative.push('\n');
+                }
+                narrative.push_str(&line);
+            }
+        }
         match outcome {
             Ok((narrative, resolution)) => CommandResult {
                 ok: true,
-                verb: Some(cmd.verb().to_owned()),
+                verb: Some(cmd.display_verb().to_owned()),
                 error_code: None,
                 narrative,
                 resolution,
@@ -543,7 +650,7 @@ impl World {
                 events: ctx.events,
             },
             Err(fail) => {
-                let mut r = refusal(Some(cmd.verb()), &fail);
+                let mut r = refusal(Some(cmd.display_verb()), &fail);
                 r.state_changes = ctx.changes;
                 r.events = ctx.events;
                 r
@@ -586,10 +693,10 @@ impl World {
             Command::Inventory => Ok(self.inventory(actor)),
             Command::Sheet => Ok(self.sheet(actor)),
             Command::Who => Ok(self.who()),
-            Command::Help => Ok((
-                crate::parser::HELP.to_owned(),
-                json!({ "help": crate::parser::HELP }),
-            )),
+            Command::Help => {
+                let help = self.help_text(actor);
+                Ok((help.clone(), json!({ "help": help })))
+            }
             Command::Move { dir } => self.walk(ctx, actor, *dir, false),
             Command::Flee { dir } => self.flee(ctx, actor, *dir),
             Command::Say { text } => self.say(ctx, actor, text),
@@ -609,6 +716,7 @@ impl World {
             Command::Attack { target } => self.attack(ctx, actor, target),
             Command::Defend => Ok(self.defend(ctx, actor)),
             Command::Attempt { skill, on } => self.attempt(ctx, actor, skill, on.as_deref()),
+            Command::Custom { name, args } => self.custom_verb(ctx, actor, name, args),
         }
     }
 
@@ -756,6 +864,9 @@ impl World {
             if !recipients.contains(&x) {
                 recipients.push(x);
             }
+        }
+        if let Some(x) = &spec.except {
+            recipients.retain(|r| r != x);
         }
         let actor = spec.actor.as_ref().and_then(|a| self.state.entities.get(a));
         let human_actor = actor.is_some_and(|e| e.human);
@@ -1036,3 +1147,6 @@ pub fn refusal(verb: Option<&str>, fail: &Fail) -> CommandResult {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod script_tests;

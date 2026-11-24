@@ -11,6 +11,7 @@ use mud_rules::{Attributes, Pools};
 use serde::{Deserialize, Serialize};
 
 use crate::event::ActorRef;
+use crate::hooks::{FLAG_CAP, FlagValue, MARK_CAP};
 use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, ShopId, SkillId};
 use crate::pack::{
     CastDef, Direction, EntityKind, RoomDef, RoomItem, Slot, Tier, TraitRef, WorldPack,
@@ -81,6 +82,9 @@ pub struct Entity {
     pub last_attacked_by: Option<(EntityId, u64)>,
     /// A haggle discount on the next purchase from this keeper.
     pub haggle_with: Option<EntityId>,
+    /// Marks that world scripts keep on it. No view shows them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub marks: BTreeMap<String, FlagValue>,
 }
 
 impl Entity {
@@ -199,6 +203,17 @@ pub struct WorldState {
     pub nudge_rolled_ms: BTreeMap<(EntityId, String), u64>,
     /// When regeneration last ran.
     pub last_regen_ms: u64,
+    /// World flags that scripts set. No view shows them.
+    #[serde(default)]
+    pub flags: BTreeMap<String, FlagValue>,
+    /// The consecutive faults of each world hook, by hook key. A hook at
+    /// zero has no entry.
+    #[serde(default)]
+    pub hook_faults: BTreeMap<String, u8>,
+    /// The version of the scripts last loaded (`none` when scripts are
+    /// off), so history says which version ran from which event.
+    #[serde(default)]
+    pub scripts_version: Option<String>,
 }
 
 mod pairs {
@@ -259,6 +274,9 @@ impl WorldState {
             dice_state: seed,
             nudge_rolled_ms: BTreeMap::new(),
             last_regen_ms: 0,
+            flags: BTreeMap::new(),
+            hook_faults: BTreeMap::new(),
+            scripts_version: None,
         };
         for (rid, def) in &pack.rooms {
             s.place_room_items(rid, def, pack);
@@ -456,6 +474,7 @@ impl WorldState {
             hidden: false,
             last_attacked_by: None,
             haggle_with: None,
+            marks: BTreeMap::new(),
         }
     }
 
@@ -510,6 +529,7 @@ impl WorldState {
             hidden: false,
             last_attacked_by: None,
             haggle_with: None,
+            marks: BTreeMap::new(),
         };
         self.entities.insert(id.clone(), e);
         &self.entities[id]
@@ -651,6 +671,19 @@ impl WorldState {
             if e.currency < 0 {
                 bad.push(format!("{} has negative money", e.id));
             }
+            if e.marks.len() > MARK_CAP {
+                bad.push(format!(
+                    "{} holds {} marks; the cap is {MARK_CAP}",
+                    e.id,
+                    e.marks.len()
+                ));
+            }
+        }
+        if self.flags.len() > FLAG_CAP {
+            bad.push(format!(
+                "flags hold {} entries; the cap is {FLAG_CAP}",
+                self.flags.len()
+            ));
         }
         bad
     }

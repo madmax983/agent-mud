@@ -7,7 +7,7 @@ VERUS=/home/user/tools/verus-x86-linux/verus   # any Verus 0.2026.10.04.426d8b0 
 "$VERUS" formal/verus/src/lib.rs --crate-type=lib
 ```
 
-Expect `verification results:: 36 verified, 0 errors`. The release links
+Expect `verification results:: 52 verified, 0 errors`. The release links
 against rustup toolchain `1.98.1-x86_64-unknown-linux-gnu`, which must be
 installed.
 
@@ -21,6 +21,8 @@ installed.
 | `src/budget.rs` `budget_level` | `crates/mud-supervisor/src/budget.rs` | Hard iff `limit == 0 \|\| used >= limit`; Soft iff not Hard and `used*5 >= limit*4` (exact, `u128`); otherwise Normal; non-decreasing in `used` |
 | `src/connections.rs` `conn_step` | `crates/mud-server/src/limits.rs` | An open is admitted iff `total < max_total && here < max_here` and adds one to each; a close takes effect iff `here > 0 && total > 0` and takes one from each; a refused step changes nothing; the step never overflows; `here <= total <= max_total && here <= max_here` survives every step. Safety (`lemma_run_keeps_caps`): every sequence of opens and closes from a fresh limiter keeps that invariant |
 | `src/typing.rs` `typing_delay_ms` | `crates/mud-supervisor/src/turing.rs` | No overflow; equals `reaction + (chars*12000/max(wpm,1))*jitter/1000`; `>= reaction`; non-decreasing in `chars` |
+| `src/hooks.rs` `hook_step`, `hook_allowed` | `crates/mud-world/src/hooks.rs` | The flag is exactly `count < max`; a reload resets to 0; a good run under the limit clears the count; a tripped hook (`faults >= max`) stays tripped until a reload; a fault adds 1, saturating. Safety (`lemma_at_most_max_consecutive_faults`): after `n` consecutive faults the hook may run iff `n < max`, for every `max`, 255 included |
+| `src/hooks.rs` `tally_step`, `tally_admissible` | `crates/mud-world/src/hooks.rs` | The saturating tally of a list counts its effects, refuses and heal/hurts exactly up to 255 (`lemma_tally_counts`); for `max <= 16` it admits a list iff the list has at most `max` effects, at most one heal/hurt, and a refuse only alone in a command hook (`lemma_admission_is_exact`); `tally_exec` folds a list to `tally_of` |
 
 Each executable function also proves it never overflows.
 
@@ -35,6 +37,8 @@ Each executable function also proves it never overflows.
 | `chatter_step` | none | an earlier `next <= max` let every event through at `max == 255` once the count saturated; the proof found it, and the rule is now `turns < max` |
 | `budget_level` | none | the 80% test runs in `u128` |
 | `typing_delay_ms` | `chars <= 100_000`, `reaction_ms <= 10_000`, `jitter_permille <= 2_000`, any `wpm` | `speech_delay_ms` clamps `chars` to `MAX_TYPED_CHARS` (the parser already rejects lines over 500 characters) and passes reaction 800..=2200, jitter 850..=1150. Only the `chars` bound is needed for no overflow |
+| `hook_step` | none | the count saturates at 255 |
+| `tally_admissible` | `max <= 16` (the exactness lemma) | `scripts.toml` `limits.max_effects` is checked to `1..=16` (`MAX_EFFECTS_CEILING`) |
 
 ## Mirror guard
 
@@ -45,7 +49,8 @@ Each executable function also proves it never overflows.
 Verus module, white space removed. On the Verus side it drops only the
 `requires`/`ensures` clauses and the return name in `-> (r: T)`. Doc
 comments, signatures and the enums (`Outcome`, `DamageType`, `WoundState`,
-`ChatterInput`, `BudgetLevel`) are mirrored too. Proof steps a body needs
+`ChatterInput`, `BudgetLevel`, `HookOutcome`, `EffectClass`, `Tally`) are
+mirrored too. Proof steps a body needs
 live outside it (`typing.rs` broadcasts its arithmetic lemmas), so no
 `proof { }` block sits inside a mirrored region. Every module in `src/` must
 be listed in the guard's `PAIRS`.

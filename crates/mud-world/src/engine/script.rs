@@ -1,0 +1,869 @@
+//! World hooks in the engine: building a hook's view, running it, and
+//! admitting, validating and applying its effects.
+//!
+//! At most one hook runs per command, and nothing a hook does sets off
+//! another: effects are applied with the engine's own helpers, which run
+//! no hooks, and login, respawn and ticks run none either.
+
+use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+
+use mud_rules::{DamageType, injury};
+use serde_json::{Value, json};
+
+use super::look::{kind_word, wound_word};
+use super::{Audit, Ctx, Done, Emit, ErrorCode, Fail, HooksChange, StateChange, World};
+use crate::event::EventKind;
+use crate::hooks::{
+    ActorFacts, CastFacts, EFFECT_TEXT_MAX, ExitFacts, FAULT_MESSAGE_MAX, FLAG_CAP, FLAG_TEXT_MAX,
+    FlagValue, HookId, HookInput, HookOutcome, HookReply, ItemFacts, MARK_CAP, RoomFacts,
+    ScriptEffect, TargetFacts, VIEW_LIST_CAP, WorldHooks, hook_allowed, hook_step, tally,
+    tally_admissible, tally_reason, valid_flag_name,
+};
+use crate::ids::{EntityId, ItemId, RoomId};
+use crate::pack::{Direction, EntityKind};
+use crate::parser::{Command, forbidden_in_text};
+use crate::state::Entity;
+
+/// The breaker state of one hook, for the observer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookStatus {
+    /// The hook key.
+    pub key: String,
+    /// Its consecutive faults.
+    pub faults: u8,
+    /// Whether its breaker is open.
+    pub tripped: bool,
+}
+
+/// What a hook run came to.
+#[derive(Debug)]
+pub enum HookRun {
+    /// No script handles it, or scripts are off.
+    Absent,
+    /// Its breaker is open; it was not called.
+    Skipped,
+    /// It faulted; nothing was applied.
+    Faulted,
+    /// Its effects were applied.
+    Applied {
+        /// The lines for the actor, in order.
+        msgs: Vec<String>,
+        /// The refusal, when the hook refused the command.
+        refused: Option<String>,
+    },
+}
+
+/// The world a hook call is about.
+pub struct HookCall {
+    pub hook: HookId,
+    pub room: RoomId,
+    pub from: Option<RoomId>,
+    pub text: Option<String>,
+    pub target: Option<EntityId>,
+    pub item: Option<ItemId>,
+}
+
+impl HookCall {
+    const fn new(hook: HookId, room: RoomId) -> Self {
+        Self {
+            hook,
+            room,
+            from: None,
+            text: None,
+            target: None,
+            item: None,
+        }
+    }
+}
+
+fn capped(message: &str) -> String {
+    message.chars().take(FAULT_MESSAGE_MAX).collect()
+}
+
+impl World {
+    // ------------------------------------------------------------ scripts
+
+    /// Installs the world's scripts, or none.
+    ///
+    /// When the version differs from the one last recorded, or on any
+    /// reload, every hook breaker resets and a marker event (perceived by
+    /// no entity) records the new version from this sequence number on.
+    pub fn set_hooks(&mut self, hooks: Option<Arc<dyn WorldHooks>>, now_ms: u64, why: HooksChange) {
+        let version = hooks
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |h| h.version());
+        let previous = self.state.scripts_version.clone();
+        self.hooks = hooks;
+        if why == HooksChange::Start && previous.as_deref() == Some(version.as_str()) {
+            return;
+        }
+        let max = self.hooks.as_ref().map_or(0, |h| h.limits().max_faults);
+        let faults = std::mem::take(&mut self.state.hook_faults);
+        for (key, n) in faults {
+            let (next, _) = hook_step(n, HookOutcome::Reloaded, max);
+            if next > 0 {
+                self.state.hook_faults.insert(key, next);
+            }
+        }
+        self.state.scripts_version = Some(version.clone());
+        let spec = Emit {
+            only: Some(Vec::new()),
+            ..Emit::new(EventKind::System, None, format!("scripts {version} loaded"))
+                .tags(["scripts".to_owned()])
+                .data(json!({ "version": version, "previous": previous, "why": why.name() }))
+        };
+        self.emit_bare(now_ms, spec);
+        self.audit.push(Audit::ScriptsLoaded {
+            version,
+            previous,
+            why: why.name().to_owned(),
+            at_ms: now_ms,
+        });
+    }
+
+    /// The installed scripts, if any.
+    #[must_use]
+    pub fn hooks(&self) -> Option<&Arc<dyn WorldHooks>> {
+        self.hooks.as_ref()
+    }
+
+    /// Whether `verb` is a custom verb of the world's scripts.
+    #[must_use]
+    pub fn is_custom_verb(&self, verb: &str) -> bool {
+        self.hooks.as_ref().is_some_and(|h| h.is_verb(verb))
+    }
+
+    /// The custom verbs `actor` can use where it stands, by name.
+    #[must_use]
+    pub fn verbs_here(&self, actor: &EntityId) -> Vec<String> {
+        let (Some(h), Some(e)) = (&self.hooks, self.state.entities.get(actor)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = h
+            .verbs()
+            .into_iter()
+            .filter(|v| v.works_in(&e.room))
+            .map(|v| v.name)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The help text for `actor`: the built-in verbs, and the custom
+    /// verbs usable where it stands.
+    #[must_use]
+    pub fn help_text(&self, actor: &EntityId) -> String {
+        let mut help = crate::parser::HELP.to_owned();
+        let here = self.verbs_here(actor);
+        if let Some(h) = &self.hooks
+            && !here.is_empty()
+        {
+            let usages: Vec<String> = here
+                .iter()
+                .filter_map(|v| h.verb(v))
+                .map(|v| v.usage)
+                .collect();
+            help.push_str("\nhere: ");
+            help.push_str(&usages.join(" | "));
+        }
+        help
+    }
+
+    /// The breakers that are not at rest: every hook with a fault.
+    #[must_use]
+    pub fn hook_status(&self) -> Vec<HookStatus> {
+        let max = self.hooks.as_ref().map_or(0, |h| h.limits().max_faults);
+        self.state
+            .hook_faults
+            .iter()
+            .map(|(key, n)| HookStatus {
+                key: key.clone(),
+                faults: *n,
+                tripped: !hook_allowed(*n, max),
+            })
+            .collect()
+    }
+
+    // ------------------------------------------------------------ views
+
+    /// An entity as a hook sees it, with its marks. `kind` only: never a
+    /// tier, a mind or whether a human plays it.
+    #[must_use]
+    pub fn actor_facts(&self, id: &EntityId) -> Option<ActorFacts> {
+        let e = self.state.entities.get(id)?;
+        let visible = |i: &ItemId| {
+            self.state
+                .items
+                .get(i)
+                .filter(|it| self.pack.items.get(&it.proto).is_some_and(|d| !d.hidden))
+                .map(|it| it.proto.clone())
+        };
+        Some(ActorFacts {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            kind: kind_word(e.kind).to_owned(),
+            room: e.room.clone(),
+            hp: e.pools.hp,
+            hp_max: e.pools.hp_max,
+            condition: condition(e).to_owned(),
+            attrs: BTreeMap::from([
+                ("st".to_owned(), e.attrs.st),
+                ("dx".to_owned(), e.attrs.dx),
+                ("iq".to_owned(), e.attrs.iq),
+                ("ht".to_owned(), e.attrs.ht),
+            ]),
+            skills: self
+                .pack
+                .skills
+                .keys()
+                .filter_map(|s| Some((s.to_string(), self.skill_level(e, s)?)))
+                .collect(),
+            inventory: e.inventory.iter().filter_map(visible).collect(),
+            equipped: e.equipped.values().filter_map(visible).collect(),
+            currency: e.currency,
+            marks: Some(e.marks.clone()),
+        })
+    }
+
+    fn target_facts(e: &Entity) -> TargetFacts {
+        TargetFacts {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            kind: kind_word(e.kind).to_owned(),
+            condition: condition(e).to_owned(),
+        }
+    }
+
+    fn room_facts(&self, room: &RoomId, actor: Option<&EntityId>) -> RoomFacts {
+        let def = self.pack.rooms.get(room);
+        let exits = def.map_or_else(Vec::new, |d| {
+            d.exits
+                .iter()
+                .map(|(dir, to)| ExitFacts {
+                    dir: dir.short().to_owned(),
+                    to: to.clone(),
+                    locked: self.exit_is_locked(room, *dir),
+                    lockable: d.locks.contains_key(dir),
+                })
+                .collect()
+        });
+        let present = self
+            .present_in(room)
+            .filter(|e| Some(&e.id) != actor && !e.hidden)
+            .take(VIEW_LIST_CAP)
+            .map(Self::target_facts)
+            .collect();
+        let items = self.state.rooms.get(room).map_or_else(Vec::new, |r| {
+            r.items
+                .iter()
+                .filter_map(|i| self.state.items.get(i))
+                .filter(|it| self.pack.items.get(&it.proto).is_some_and(|d| !d.hidden))
+                .take(VIEW_LIST_CAP)
+                .map(|it| it.proto.clone())
+                .collect()
+        });
+        RoomFacts {
+            id: room.clone(),
+            title: def.map_or_else(String::new, |d| d.title.clone()),
+            dark: def.is_some_and(|d| d.dark),
+            lit: self.lit(room),
+            safe: def.is_some_and(|d| d.safe),
+            exits,
+            present,
+            items,
+        }
+    }
+
+    fn cast_facts(&self) -> BTreeMap<EntityId, CastFacts> {
+        self.pack
+            .cast
+            .keys()
+            .filter_map(|id| self.state.entities.get(id))
+            .filter(|e| e.kind != EntityKind::Player)
+            .map(|e| {
+                let present = e.present() && !e.hidden;
+                (
+                    e.id.clone(),
+                    CastFacts {
+                        name: e.name.clone(),
+                        room: present.then(|| e.room.clone()),
+                        alive: e.dead_until_ms.is_none(),
+                        present,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn item_facts(&self, item: ItemId) -> Option<ItemFacts> {
+        let it = self.state.items.get(&item)?;
+        Some(ItemFacts {
+            id: item,
+            proto: it.proto.clone(),
+            name: self.item_name(item),
+        })
+    }
+
+    fn hook_input(&self, actor: ActorFacts, call: &HookCall, now_ms: u64) -> HookInput {
+        HookInput {
+            hook: call.hook.key(),
+            now_ms,
+            room: self.room_facts(&call.room, Some(&actor.id)),
+            actor,
+            from: call.from.clone(),
+            text: Some(call.text.clone().unwrap_or_default()),
+            target: call
+                .target
+                .as_ref()
+                .and_then(|t| self.state.entities.get(t))
+                .map(Self::target_facts),
+            item: call.item.and_then(|i| self.item_facts(i)),
+            flags: self.state.flags.clone(),
+            cast: self.cast_facts(),
+        }
+    }
+
+    /// The input a dry run gives `hook` in `room`: a fresh player from the
+    /// template stands there, and the hook's item is a stand-in.
+    #[must_use]
+    pub fn probe_input(&self, room: &RoomId, hook: &HookId, now_ms: u64) -> HookInput {
+        let t = &self.pack.player_template;
+        let probe = Entity {
+            id: EntityId::from("pc_probe"),
+            name: "probe".to_owned(),
+            aliases: Vec::new(),
+            kind: EntityKind::Player,
+            short: String::new(),
+            description: String::new(),
+            room: room.clone(),
+            home: room.clone(),
+            attrs: t.attrs,
+            pools: mud_rules::Pools::full(&t.attrs),
+            skills: t.skills.clone(),
+            traits: Vec::new(),
+            currency: t.currency,
+            shop: None,
+            inventory: Vec::new(),
+            equipped: BTreeMap::new(),
+            dr: 0,
+            hostile: false,
+            guard: false,
+            respawn_minutes: None,
+            online: true,
+            human: false,
+            tier: crate::pack::Tier::None,
+            defending: false,
+            unconscious: false,
+            dead_until_ms: None,
+            hidden: false,
+            last_attacked_by: None,
+            haggle_with: None,
+            marks: BTreeMap::new(),
+        };
+        let actor = ActorFacts {
+            id: probe.id.clone(),
+            name: probe.name.clone(),
+            kind: "player".to_owned(),
+            room: room.clone(),
+            hp: probe.pools.hp,
+            hp_max: probe.pools.hp_max,
+            condition: "unhurt".to_owned(),
+            attrs: BTreeMap::from([
+                ("st".to_owned(), t.attrs.st),
+                ("dx".to_owned(), t.attrs.dx),
+                ("iq".to_owned(), t.attrs.iq),
+                ("ht".to_owned(), t.attrs.ht),
+            ]),
+            skills: self
+                .pack
+                .skills
+                .keys()
+                .filter_map(|s| Some((s.to_string(), self.skill_level(&probe, s)?)))
+                .collect(),
+            inventory: t.inventory.clone(),
+            equipped: t.equip.clone(),
+            currency: t.currency,
+            marks: Some(BTreeMap::new()),
+        };
+        let mut call = HookCall::new(hook.clone(), room.clone());
+        let mut input = self.hook_input(actor, &call, now_ms);
+        if let HookId::Take(p) | HookId::Use(p) = hook {
+            call.item = None;
+            input.item = Some(ItemFacts {
+                id: ItemId(0),
+                proto: p.clone(),
+                name: self
+                    .pack
+                    .items
+                    .get(p)
+                    .map_or_else(String::new, |d| d.name.clone()),
+            });
+        }
+        input
+    }
+
+    // ------------------------------------------------------------ admission
+
+    /// Checks each effect against the world, before any is applied.
+    ///
+    /// # Errors
+    /// The first effect that cannot apply, and why.
+    pub fn check_effects(
+        &self,
+        room: &RoomId,
+        actor: &EntityId,
+        effects: &[ScriptEffect],
+    ) -> Result<(), String> {
+        let def = self.pack.rooms.get(room);
+        for fx in effects {
+            match fx {
+                ScriptEffect::Msg(t) | ScriptEffect::Narrate(t) | ScriptEffect::Refuse(t) => {
+                    check_text(t)?;
+                }
+                ScriptEffect::Unlock(d) | ScriptEffect::Lock(d) => {
+                    if !def.is_some_and(|r| r.locks.contains_key(d)) {
+                        let which = if matches!(fx, ScriptEffect::Unlock(_)) {
+                            "unlock"
+                        } else {
+                            "lock"
+                        };
+                        return Err(format!(
+                            "{which}({:?}): no lock on that exit here",
+                            d.short()
+                        ));
+                    }
+                }
+                ScriptEffect::SetFlag(n, v) | ScriptEffect::Mark(n, v) => {
+                    check_name(n)?;
+                    if let FlagValue::Text(t) = v
+                        && t.chars().count() > FLAG_TEXT_MAX
+                    {
+                        return Err(format!(
+                            "the value of {n} is over {FLAG_TEXT_MAX} characters"
+                        ));
+                    }
+                }
+                ScriptEffect::ClearFlag(n) | ScriptEffect::Unmark(n) => check_name(n)?,
+                ScriptEffect::Heal(_) | ScriptEffect::Hurt(_) => {
+                    if matches!(fx, ScriptEffect::Hurt(_)) && def.is_some_and(|r| r.safe) {
+                        return Err("hurt() is not allowed in a safe room".to_owned());
+                    }
+                    if !self.state.entities.get(actor).is_some_and(Entity::present) {
+                        return Err("the actor is not here".to_owned());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ running
+
+    /// Runs one hook for `actor`. Deterministic and panic-safe: a hook that
+    /// faults or panics applies nothing and consumes no dice.
+    pub(crate) fn run_hook(&mut self, ctx: &mut Ctx, actor: &EntityId, call: &HookCall) -> HookRun {
+        let Some(hooks) = self.hooks.clone() else {
+            return HookRun::Absent;
+        };
+        if !hooks.has(&call.hook) {
+            return HookRun::Absent;
+        }
+        let key = call.hook.key();
+        let limits = hooks.limits();
+        let faults = self.state.hook_faults.get(&key).copied().unwrap_or(0);
+        if !hook_allowed(faults, limits.max_faults) {
+            return HookRun::Skipped;
+        }
+        let Some(facts) = self.actor_facts(actor) else {
+            return HookRun::Absent;
+        };
+        let input = self.hook_input(facts, call, ctx.now);
+        let dice = self.dice.clone();
+        let reply =
+            std::panic::catch_unwind(AssertUnwindSafe(|| hooks.call(&call.hook, &input, dice)))
+                .unwrap_or_else(|_| HookReply {
+                    outcome: Err("the hook panicked".to_owned()),
+                    log: Vec::new(),
+                });
+        for line in reply.log {
+            self.audit.push(Audit::ScriptLog {
+                hook: key.clone(),
+                entity: actor.clone(),
+                line,
+                at_ms: ctx.now,
+            });
+        }
+        let checked = reply.outcome.and_then(|(fx, dice)| {
+            let t = tally(&fx);
+            if !tally_admissible(t, limits.max_effects, call.hook.is_command()) {
+                return Err(tally_reason(t, limits.max_effects, call.hook.is_command()));
+            }
+            self.check_effects(&call.room, actor, &fx)?;
+            Ok((fx, dice))
+        });
+        match checked {
+            Ok((fx, dice)) => {
+                self.dice = dice;
+                let (next, _) = hook_step(faults, HookOutcome::Ran, limits.max_faults);
+                self.store_faults(&key, next);
+                self.audit.push(Audit::ScriptEffects {
+                    hook: key.clone(),
+                    entity: actor.clone(),
+                    effects: fx.iter().map(ScriptEffect::describe).collect(),
+                    at_ms: ctx.now,
+                });
+                self.apply_effects(ctx, actor, call, &key, fx)
+            }
+            Err(message) => {
+                let (next, allowed) = hook_step(faults, HookOutcome::Faulted, limits.max_faults);
+                self.store_faults(&key, next);
+                self.audit.push(Audit::ScriptFault {
+                    hook: key,
+                    entity: actor.clone(),
+                    message: capped(&message),
+                    faults: next,
+                    tripped: !allowed,
+                    at_ms: ctx.now,
+                });
+                HookRun::Faulted
+            }
+        }
+    }
+
+    fn store_faults(&mut self, key: &str, n: u8) {
+        if n == 0 {
+            self.state.hook_faults.remove(key);
+        } else {
+            self.state.hook_faults.insert(key.to_owned(), n);
+        }
+    }
+
+    fn script_log(&mut self, ctx: &Ctx, key: &str, actor: &EntityId, line: String) {
+        self.audit.push(Audit::ScriptLog {
+            hook: key.to_owned(),
+            entity: actor.clone(),
+            line,
+            at_ms: ctx.now,
+        });
+    }
+
+    fn apply_effects(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        call: &HookCall,
+        key: &str,
+        effects: Vec<ScriptEffect>,
+    ) -> HookRun {
+        let mut msgs = Vec::new();
+        let mut refused = None;
+        let mut died = false;
+        for fx in effects {
+            if died && !matches!(fx, ScriptEffect::Msg(_)) {
+                let line = format!("skipped {}: the actor died", fx.describe());
+                self.script_log(ctx, key, actor, line);
+                continue;
+            }
+            match fx {
+                ScriptEffect::Msg(t) => msgs.push(t.trim().to_owned()),
+                ScriptEffect::Refuse(t) => refused = Some(t.trim().to_owned()),
+                ScriptEffect::Narrate(t) => {
+                    let spec = Emit {
+                        except: Some(actor.clone()),
+                        ..Emit::new(EventKind::System, Some(call.room.clone()), t.trim())
+                            .tags(["script".to_owned(), key.to_owned()])
+                    };
+                    self.emit(ctx, spec);
+                }
+                ScriptEffect::Unlock(d) => self.set_exit_lock(ctx, &call.room, d, false),
+                ScriptEffect::Lock(d) => self.set_exit_lock(ctx, &call.room, d, true),
+                ScriptEffect::SetFlag(n, v) => {
+                    if self.state.flags.len() >= FLAG_CAP && !self.state.flags.contains_key(&n) {
+                        self.script_log(
+                            ctx,
+                            key,
+                            actor,
+                            format!("flags full ({FLAG_CAP}); {n} skipped"),
+                        );
+                    } else {
+                        self.state.flags.insert(n, v);
+                    }
+                }
+                ScriptEffect::ClearFlag(n) => {
+                    self.state.flags.remove(&n);
+                }
+                ScriptEffect::Mark(n, v) => {
+                    if let Some(e) = self.state.entities.get_mut(actor) {
+                        if e.marks.len() >= MARK_CAP && !e.marks.contains_key(&n) {
+                            self.script_log(
+                                ctx,
+                                key,
+                                actor,
+                                format!("marks full ({MARK_CAP}); {n} skipped"),
+                            );
+                        } else {
+                            e.marks.insert(n, v);
+                        }
+                    }
+                }
+                ScriptEffect::Unmark(n) => {
+                    if let Some(e) = self.state.entities.get_mut(actor) {
+                        e.marks.remove(&n);
+                    }
+                }
+                ScriptEffect::Heal(dice) => self.heal_actor(ctx, actor, dice),
+                ScriptEffect::Hurt(dice) => died = self.hurt_actor(ctx, actor, dice),
+            }
+        }
+        HookRun::Applied { msgs, refused }
+    }
+
+    /// Locks or unlocks an exit and its far side.
+    fn set_exit_lock(&mut self, ctx: &mut Ctx, room: &RoomId, dir: Direction, locked: bool) {
+        let far = self
+            .pack
+            .rooms
+            .get(room)
+            .and_then(|d| d.exits.get(&dir))
+            .cloned();
+        let mut sides = vec![(room.clone(), dir)];
+        if let Some(to) = far {
+            sides.push((to, dir.opposite()));
+        }
+        for (r, d) in sides {
+            if let Some(rs) = self.state.rooms.get_mut(&r) {
+                if locked {
+                    rs.unlocked.remove(&d);
+                } else {
+                    rs.unlocked.insert(d);
+                }
+            }
+        }
+        ctx.changes.push(if locked {
+            StateChange::Locked {
+                room: room.clone(),
+                dir,
+            }
+        } else {
+            StateChange::Unlocked {
+                room: room.clone(),
+                dir,
+            }
+        });
+    }
+
+    fn heal_actor(&mut self, ctx: &mut Ctx, actor: &EntityId, dice: mud_rules::DamageDice) {
+        let roll = dice.roll(&mut self.dice, DamageType::Crushing).max(0);
+        let Some(e) = self.state.entities.get_mut(actor) else {
+            return;
+        };
+        let amount = roll.min((e.pools.hp_max - e.pools.hp).max(0));
+        e.pools.hp += amount;
+        if e.unconscious && e.pools.hp > 0 {
+            e.unconscious = false;
+        }
+        ctx.changes.push(StateChange::Hp {
+            entity: actor.clone(),
+            delta: amount,
+            hp: e.pools.hp,
+        });
+    }
+
+    /// Hurts the actor. Returns whether it died of it.
+    fn hurt_actor(&mut self, ctx: &mut Ctx, actor: &EntityId, dice: mud_rules::DamageDice) -> bool {
+        let roll = dice.roll(&mut self.dice, DamageType::Crushing);
+        let Some(e) = self.state.entities.get(actor).cloned() else {
+            return false;
+        };
+        let n = injury(roll, self.armor_dr(&e), DamageType::Crushing);
+        if n <= 0 {
+            return false;
+        }
+        let before = ctx.changes.len();
+        self.wound(ctx, actor, n, actor);
+        ctx.changes[before..].iter().any(|c| {
+            matches!(c, StateChange::Status { entity, status, value: true } if entity == actor && status == "dead")
+                || matches!(c, StateChange::Moved { entity, .. } if entity == actor)
+        })
+    }
+
+    // ------------------------------------------------------------ hook points
+
+    /// A custom verb: the hook decides the command.
+    pub(crate) fn custom_verb(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        name: &str,
+        args: &str,
+    ) -> Done {
+        let info = self
+            .hooks
+            .as_ref()
+            .and_then(|h| h.verb(name))
+            .ok_or_else(|| {
+                Fail::new(
+                    ErrorCode::UnknownVerb,
+                    format!("unknown verb {name:?}; type `help`"),
+                )
+            })?;
+        let room = self.me(actor)?.room.clone();
+        if !info.works_in(&room) {
+            return Err(Fail::new(
+                ErrorCode::NotHere,
+                format!("you cannot {name} here"),
+            ));
+        }
+        let mut call = HookCall::new(HookId::Verb(name.to_owned()), room);
+        call.text = Some(args.to_owned());
+        let word = args.trim().to_ascii_lowercase();
+        if !word.is_empty() {
+            call.target = self.find_here(actor, &word);
+        }
+        self.command_hook(ctx, actor, &call)
+    }
+
+    /// `use` of an item that has no engine use, when a script handles it.
+    /// `None` when no script does.
+    pub(crate) fn use_hook(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        item: ItemId,
+        on: Option<&str>,
+    ) -> Option<Done> {
+        let proto = self.item_proto(item)?;
+        let hook = HookId::Use(proto);
+        if !self.hooks.as_ref().is_some_and(|h| h.has(&hook)) {
+            return None;
+        }
+        let room = self.me(actor).ok()?.room.clone();
+        let mut call = HookCall::new(hook, room);
+        call.item = Some(item);
+        if let Some(w) = on {
+            match self.find_here(actor, w) {
+                Some(t) => call.target = Some(t),
+                None => {
+                    return Some(Err(Fail::new(
+                        ErrorCode::NoSuchTarget,
+                        format!("you see no {w:?} here"),
+                    )));
+                }
+            }
+        }
+        Some(self.command_hook(ctx, actor, &call))
+    }
+
+    fn command_hook(&mut self, ctx: &mut Ctx, actor: &EntityId, call: &HookCall) -> Done {
+        let key = call.hook.key();
+        match self.run_hook(ctx, actor, call) {
+            HookRun::Applied {
+                refused: Some(text),
+                ..
+            } => Err(Fail::new(ErrorCode::Refused, text)),
+            HookRun::Applied { msgs, .. } => {
+                let narrative = if msgs.is_empty() {
+                    "Nothing happens.".to_owned()
+                } else {
+                    msgs.join("\n")
+                };
+                Ok((narrative, json!({ "script": key })))
+            }
+            HookRun::Absent | HookRun::Skipped | HookRun::Faulted => {
+                Err(Fail::new(ErrorCode::ScriptFailed, "Nothing happens."))
+            }
+        }
+    }
+
+    /// The event hook of a command that succeeded, if any: entering a
+    /// room, speaking, or taking an item. Returns the lines for the actor.
+    /// Its faults never fail the command.
+    pub(crate) fn event_hook(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        cmd: &Command,
+        resolution: &Value,
+    ) -> Vec<String> {
+        if self.hooks.is_none() {
+            return Vec::new();
+        }
+        let Some(me) = self.state.entities.get(actor).filter(|e| e.can_act()) else {
+            return Vec::new();
+        };
+        let here = me.room.clone();
+        let call = match cmd {
+            Command::Move { .. } | Command::Flee { .. } => {
+                // The walk itself; a death after it moves the actor again.
+                let walked = ctx.changes.iter().find_map(|c| match c {
+                    StateChange::Moved { entity, from, to } if entity == actor => {
+                        Some((from.clone(), to.clone()))
+                    }
+                    _ => None,
+                });
+                // A hidden mover sets off nothing, as it emits no arrival.
+                let Some((from, to)) = walked.filter(|(_, to)| *to == here && !me.hidden) else {
+                    return Vec::new();
+                };
+                let mut call = HookCall::new(HookId::Enter(to.clone()), to);
+                call.from = Some(from);
+                call
+            }
+            Command::Say { text } => {
+                let mut call = HookCall::new(HookId::Speech(here.clone()), here);
+                call.text = Some(text.clone());
+                call
+            }
+            Command::Take { .. } => {
+                let Some(item) = resolution["item"].as_u64().map(ItemId) else {
+                    return Vec::new();
+                };
+                let Some(proto) = self.item_proto(item) else {
+                    return Vec::new();
+                };
+                let mut call = HookCall::new(HookId::Take(proto), here);
+                call.item = Some(item);
+                call
+            }
+            _ => return Vec::new(),
+        };
+        match self.run_hook(ctx, actor, &call) {
+            HookRun::Applied { msgs, .. } => msgs,
+            HookRun::Absent | HookRun::Skipped | HookRun::Faulted => Vec::new(),
+        }
+    }
+}
+
+const fn condition(e: &Entity) -> &'static str {
+    if e.unconscious {
+        "unconscious"
+    } else {
+        wound_word(e.pools.wound_state())
+    }
+}
+
+fn check_text(t: &str) -> Result<(), String> {
+    let t = t.trim();
+    if t.is_empty() {
+        return Err("text is empty".to_owned());
+    }
+    if t.chars().count() > EFFECT_TEXT_MAX {
+        return Err(format!("text is over {EFFECT_TEXT_MAX} characters"));
+    }
+    if t.chars().any(forbidden_in_text) {
+        return Err("text has a control or direction character".to_owned());
+    }
+    Ok(())
+}
+
+fn check_name(n: &str) -> Result<(), String> {
+    if valid_flag_name(n) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{n:?} is not a flag name (lowercase words of a-z, 0-9 and _, joined by . : or -)"
+        ))
+    }
+}

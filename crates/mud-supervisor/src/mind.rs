@@ -428,7 +428,7 @@ pub fn tool_specs() -> Vec<(&'static str, String, Value)> {
         ),
         (
             "mud_command",
-            "Run one MUD command exactly as a player types it, e.g. `say hi`, `move n`, `buy lantern`, `attack rat`, `board post <msg>`, `attempt lockpicking on grate`, `tell <who> <msg>`. The server resolves it with the dice; you cannot narrate outcomes. Returns ok, narrative, error_code and state_changes.".to_owned(),
+            "Run one MUD command exactly as a player types it, e.g. `say hi`, `move n`, `buy lantern`, `attack rat`, `board post <msg>`, `attempt lockpicking on grate`, `tell <who> <msg>`. The server resolves it with the dice; you cannot narrate outcomes. Returns ok, narrative, error_code and state_changes. Some places have verbs of their own; mud_look lists them under `verbs`.".to_owned(),
             json!({
                 "type": "object",
                 "properties": { "cmd": { "type": "string", "description": "One command line." } },

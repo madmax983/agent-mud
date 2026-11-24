@@ -3,19 +3,25 @@
 //! It plays the done criteria on a manual clock with the scripted minds:
 //! Torin posts the ore bounty on macro-tick 1, kestrel logs in and reads
 //! the board, and kestrel tries to recruit a human who walks into the
-//! Rusty Flagon. `mud smoke` runs it and prints the transcript; a test
-//! runs it in CI.
+//! Rusty Flagon. Then the world's scripts answer: Hale greets the human
+//! on his Rhai mind, `listen` in the Dark Alley is a custom verb, and
+//! saying Vich's name twitches the fence's curtain. `mud smoke` runs it and
+//! prints the transcript; a test runs it in CI.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
+use mud_script::ScriptHost;
 use mud_supervisor::gate::Gate;
 use mud_supervisor::mind::Mind;
 use mud_supervisor::runtime::{ObserverEvent, Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::{FallbackMind, ScriptedMind};
+use mud_world::hooks::WorldHooks;
 use mud_world::pack::Tier;
-use mud_world::{EntityId, Event, Game, ManualClock, RoomId, Seq, World, WorldPack};
+use mud_world::{
+    Clock as _, EntityId, Event, Game, HooksChange, ManualClock, RoomId, Seq, World, WorldPack,
+};
 use tokio::sync::broadcast;
 
 /// What the smoke run saw.
@@ -51,6 +57,31 @@ impl Rig {
         }
         Ok(())
     }
+
+    /// The scripts: back to the square (Hale, on Rhai, greets players),
+    /// down to the alley, `listen`, and the fence's name.
+    async fn scripts_answer(&mut self, game: &Game, human: &EntityId) -> anyhow::Result<()> {
+        for line in ["w", "s"] {
+            let r = game.execute(human, line);
+            ensure!(r.ok, "the human could not walk {line}: {}", r.narrative);
+            self.run_for(5_000).await?;
+        }
+        let r = game.execute(human, "listen");
+        ensure!(
+            r.ok && r.resolution["script"] == "verbs.listen",
+            "`listen` in the Dark Alley did not run its script: {r:?}"
+        );
+        let r = game.execute(human, "say vich?");
+        ensure!(r.ok, "the human could not speak: {}", r.narrative);
+        // The human is alone in the alley: the curtain must reach them,
+        // not only the event stream (a narration skips its actor).
+        ensure!(
+            r.narrative.contains("the curtain twitches"),
+            "saying the fence's name in the alley did not show the human the curtain: {}",
+            r.narrative
+        );
+        self.run_for(2_000).await
+    }
 }
 
 /// Runs the smoke scenario.
@@ -58,11 +89,63 @@ impl Rig {
 /// # Errors
 /// A done criterion fails; the message names it.
 pub async fn run() -> anyhow::Result<Transcript> {
+    let (game, sup, clock) = setup()?;
+    let mut obs = sup.subscribe();
+    let mut all = game.subscribe();
+    let rx = game.subscribe();
+    let mut rig = Rig { sup, clock, rx };
+    play(&game, &mut rig).await?;
+    let mut out = Transcript::default();
+    while let Ok(ev) = all.try_recv() {
+        let room = ev.room.as_ref().map_or("-", RoomId::as_str).to_owned();
+        let text = ev.untrusted_text.clone().map_or_else(
+            || ev.narrative.clone(),
+            |t| format!("{} \"{t}\"", ev.narrative),
+        );
+        if ev.kind != mud_world::EventKind::SelfControlNudge {
+            out.lines.push(format!("#{:<4} [{room}] {text}", ev.seq.0));
+        }
+    }
+    while let Ok(e) = obs.try_recv() {
+        if let ObserverEvent::WakeStarted {
+            entity,
+            priority,
+            reason,
+            ..
+        } = &*e
+        {
+            out.wakes.push(format!("{entity} ({priority:?}): {reason}"));
+        }
+    }
+    // Only Hale's Rhai mind says "evening, <name>" (his TOML rule says
+    // "move along"), and it greets kestrel, an agent PC, as any player.
+    ensure!(
+        out.lines
+            .iter()
+            .any(|l| l.contains("Hale says") && l.contains("\"evening, kestrel.")),
+        "Hale did not greet a player on his Rhai mind: {:?} {:?}",
+        out.lines,
+        out.wakes
+    );
+    Ok(out)
+}
+
+/// The world with the bundled scripts, and a supervisor whose agents all
+/// run the scripted mind (Rhai minds included), on a manual clock at 20:00.
+fn setup() -> anyhow::Result<(Arc<Game>, Arc<Supervisor>, Arc<ManualClock>)> {
     let pack = Arc::new(WorldPack::crypt_v01()?);
     let clock = Arc::new(ManualClock::new(20 * 3_600_000));
-    let game = Game::new(World::new(Arc::clone(&pack), 7), None, clock.clone());
+    let host = Arc::new(ScriptHost::bundled_crypt_v01(&pack)?);
+    let mut world = World::new(Arc::clone(&pack), 7);
+    world.set_hooks(
+        Some(Arc::clone(&host) as Arc<dyn WorldHooks>),
+        clock.now_ms(),
+        HooksChange::Start,
+    );
+    let game = Game::new(world, None, clock.clone());
     let typing = Gate::new(Arc::clone(&game), 7, 0.0);
-    let scripted: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
+    let scripted: Arc<dyn Mind> =
+        Arc::new(ScriptedMind::from_cast(&pack.cast).with_scripts(host, Arc::clone(&game), 7));
     let minds: HashMap<EntityId, Arc<dyn Mind>> = pack
         .cast
         .iter()
@@ -80,11 +163,11 @@ pub async fn run() -> anyhow::Result<Transcript> {
         Arc::new(FallbackMind::from_cast(&pack.cast)),
         cfg,
     );
-    let mut obs = sup.subscribe();
-    let mut all = game.subscribe();
-    let rx = game.subscribe();
-    let mut rig = Rig { sup, clock, rx };
+    Ok((game, sup, clock))
+}
 
+/// Plays the v0.1 done criteria, then the scripts' turn.
+async fn play(game: &Game, rig: &mut Rig) -> anyhow::Result<()> {
     rig.sup.fire_macro_tick(&EntityId::from("torin"));
     rig.run_for(1_000).await?;
     let board = game.read(|w| {
@@ -132,29 +215,7 @@ pub async fn run() -> anyhow::Result<Transcript> {
         "kestrel did not try to recruit the human in the Rusty Flagon"
     );
 
-    let mut out = Transcript::default();
-    while let Ok(ev) = all.try_recv() {
-        let room = ev.room.as_ref().map_or("-", RoomId::as_str).to_owned();
-        let text = ev.untrusted_text.clone().map_or_else(
-            || ev.narrative.clone(),
-            |t| format!("{} \"{t}\"", ev.narrative),
-        );
-        if ev.kind != mud_world::EventKind::SelfControlNudge {
-            out.lines.push(format!("#{:<4} [{room}] {text}", ev.seq.0));
-        }
-    }
-    while let Ok(e) = obs.try_recv() {
-        if let ObserverEvent::WakeStarted {
-            entity,
-            priority,
-            reason,
-            ..
-        } = &*e
-        {
-            out.wakes.push(format!("{entity} ({priority:?}): {reason}"));
-        }
-    }
-    Ok(out)
+    rig.scripts_answer(game, &human).await
 }
 
 #[cfg(test)]
@@ -165,5 +226,10 @@ mod tests {
         assert!(t.wakes.iter().any(|w| w.starts_with("torin")));
         assert!(t.wakes.iter().any(|w| w.starts_with("pc_kestrel")));
         assert!(t.lines.iter().any(|l| l.contains("BOUNTY")));
+        assert!(t.lines.iter().any(|l| l.contains("curtain")));
+        assert!(
+            t.lines.iter().any(|l| l.contains("scripts rhai-")),
+            "the version marker is in the log"
+        );
     }
 }

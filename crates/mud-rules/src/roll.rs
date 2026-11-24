@@ -68,12 +68,13 @@ pub struct SuccessRoll {
     pub outcome: Outcome,
 }
 
-/// The effective skill that [`classify`] sees is clamped to
-/// `-EFFECTIVE_LIMIT..=EFFECTIVE_LIMIT`, the range its Verus proof assumes.
-/// The clamp never changes an outcome: `formal/verus` proves that every
+/// The bound of the effective skill that [`classify`] sees.
+///
+/// It is clamped to `-EFFECTIVE_LIMIT..=EFFECTIVE_LIMIT`, the range its
+/// Verus proof assumes. The clamp never changes an outcome: `formal/verus` proves that every
 /// total classifies the same against `effective` and against the clamped
 /// value. It only keeps `total - effective` from overflowing.
-const EFFECTIVE_LIMIT: i32 = 100;
+pub const EFFECTIVE_LIMIT: i32 = 100;
 
 /// Rolls 3d6 against `effective`.
 pub fn success_roll(rng: &mut dyn DiceRng, effective: i32) -> SuccessRoll {

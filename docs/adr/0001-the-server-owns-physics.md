@@ -49,6 +49,10 @@ flowchart LR
   conservation, money conservation and increasing sequence numbers after
   every step.
 - New settings are new packs; the engine does not change.
+- World scripts (ADR 0010) keep this rule: a hook returns effects that the
+  engine admits (a Verus-proved kernel), validates and applies with its own
+  helpers inside the running command, and a mind script returns lines that
+  go through the parser like anyone's. No script holds the world.
 - A saved world resumes under the pack it is opened with
   (`WorldState::reconcile`): a room the pack added appears, a room it
   dropped goes and its occupants move to the start room, a cast entry the

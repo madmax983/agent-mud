@@ -10,7 +10,7 @@ use crate::ids::{EntityId, RoomId};
 use crate::pack::{Direction, EntityKind};
 use crate::state::Entity;
 
-const fn wound_word(w: WoundState) -> &'static str {
+pub const fn wound_word(w: WoundState) -> &'static str {
     match w {
         WoundState::Healthy => "unhurt",
         WoundState::Staggered => "badly hurt",
@@ -20,7 +20,7 @@ const fn wound_word(w: WoundState) -> &'static str {
     }
 }
 
-const fn kind_word(k: EntityKind) -> &'static str {
+pub const fn kind_word(k: EntityKind) -> &'static str {
     match k {
         EntityKind::Player => "player",
         EntityKind::Npc => "npc",
@@ -97,6 +97,7 @@ impl World {
             "items": items,
             "board": def.board,
             "safe": def.safe,
+            "verbs": self.verbs_here(viewer),
         })
     }
 
@@ -134,6 +135,15 @@ impl World {
             .collect();
         if !items.is_empty() {
             let _ = writeln!(out, "You see: {}.", items.join(", "));
+        }
+        let verbs: Vec<&str> = v["verbs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !verbs.is_empty() {
+            let _ = writeln!(out, "You could also: {}.", verbs.join(", "));
         }
         (out.trim_end().to_owned(), v)
     }

@@ -26,11 +26,13 @@ use autumn_web::app::AppBuilder;
 use autumn_web::config::{AutumnConfig, ConfigError, ConfigLoader, LogConfig, TelemetryConfig};
 use autumn_web::telemetry::{TelemetryGuard, TelemetryInitError, TelemetryProvider};
 use mud_mcp::{CommandGate, TokenRegistry};
+use mud_script::{ScriptError, ScriptHost, ScriptSources};
 use mud_supervisor::gate::Gate;
 use mud_supervisor::littleguy::LittleguyMind;
 use mud_supervisor::runtime::{Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::FallbackMind;
-use mud_world::{CommandResult, EntityId, Game, SystemClock, WorldPack};
+use mud_world::hooks::WorldHooks;
+use mud_world::{Audit, CommandResult, EntityId, Game, HooksChange, SystemClock, WorldPack};
 
 use crate::config::MudConfig;
 use crate::limits::ConnLimiter;
@@ -126,15 +128,40 @@ fn random_hex(bytes: usize) -> anyhow::Result<String> {
         }))
 }
 
+/// Loads, checks and dry-runs the pack's scripts.
+///
+/// # Errors
+/// Any problem: a server never starts with a broken script.
+pub fn load_scripts(cfg: &MudConfig, pack: &Arc<WorldPack>) -> anyhow::Result<ScriptHost> {
+    let host = match &cfg.world.pack {
+        Some(dir) => ScriptHost::load(dir, pack)?,
+        None => ScriptHost::bundled_crypt_v01(pack)?,
+    };
+    let problems = host.dry_run(pack);
+    if !problems.is_empty() {
+        return Err(ScriptError::Invalid(problems).into());
+    }
+    for w in &host.current().warnings {
+        tracing::warn!("{w}");
+    }
+    Ok(host)
+}
+
 /// Loads the world and builds the supervisor and its minds.
 ///
 /// # Errors
-/// The pack or the store fails to open, or a mind cannot be built.
+/// The pack, its scripts or the store fail to open, or a mind cannot be
+/// built.
 pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     let pack = Arc::new(match &cfg.world.pack {
         Some(dir) => WorldPack::load(dir)?,
         None => WorldPack::crypt_v01()?,
     });
+    let scripts = if cfg.scripts.enabled {
+        Some(Arc::new(load_scripts(cfg, &pack)?))
+    } else {
+        None
+    };
     let game = Game::open(
         Arc::clone(&pack),
         cfg.world.db.as_deref(),
@@ -142,13 +169,25 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         Arc::new(SystemClock),
     )
     .context("opening the world")?;
+    let hooks = scripts.clone().map(|h| h as Arc<dyn WorldHooks>);
+    game.write(|w, now| w.set_hooks(hooks, now, HooksChange::Start));
+    if let Some(h) = &scripts {
+        tracing::info!(scripts = %h.summary(), "world scripts loaded");
+    }
     let typing = Gate::new(
         Arc::clone(&game),
         cfg.world.seed,
         cfg.supervisor.typing_scale,
     );
     let tokens = Arc::new(TokenRegistry::new());
-    let minds = minds::build(cfg, &pack, &tokens)?;
+    let minds = minds::build(
+        cfg,
+        &pack,
+        &tokens,
+        scripts
+            .as_ref()
+            .map(|host| minds::MindScripts { host, game: &game }),
+    )?;
     let s = &cfg.supervisor;
     let sup_cfg = SupervisorConfig {
         seed: cfg.world.seed,
@@ -180,12 +219,137 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             ),
             shutdown: tokio_util::sync::CancellationToken::new(),
             littleguy: minds.littleguy.clone(),
+            scripts,
         }),
         admin_token_generated,
         tokens,
         littleguy: minds.littleguy,
         step: Duration::from_millis(s.step_ms.max(10)),
     })
+}
+
+/// A reload that took.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReloadOk {
+    /// The new version.
+    pub version: String,
+    /// The version before.
+    pub previous: String,
+    /// How many files it has.
+    pub files: usize,
+}
+
+/// A reload that did not take; the old scripts keep running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadError {
+    /// `[scripts] enabled = false`.
+    Disabled,
+    /// The new scripts have problems.
+    Invalid {
+        /// The version still running.
+        version: String,
+        /// Every problem.
+        problems: Vec<String>,
+    },
+}
+
+/// Reloads the scripts from the pack folder.
+///
+/// It compiles, validates and
+/// dry-runs them off the async workers, then swaps them in between two
+/// commands. Every successful reload reopens every hook and mind breaker
+/// and records a marker event, even with unchanged files. The bundled
+/// pack has nothing to read again: its reload re-arms the scripts running
+/// now, which only reopens the breakers and records the marker.
+///
+/// A refused reload is logged and published to the observer's feed.
+///
+/// # Errors
+/// Scripts are off, or the new ones have problems.
+pub async fn reload_scripts(mud: &Mud) -> Result<ReloadOk, ReloadError> {
+    let Some(host) = &mud.scripts else {
+        return Err(ReloadError::Disabled);
+    };
+    let _one_at_a_time = host.reload_lock().lock().await;
+    let previous = host.version();
+    let hooks = Arc::clone(host) as Arc<dyn WorldHooks>;
+    if !host.reloadable() {
+        let files = host.current().files;
+        mud.game.write(|w, now| {
+            host.rearm();
+            w.set_hooks(Some(hooks), now, HooksChange::Reload);
+        });
+        tracing::info!(version = %previous, "bundled scripts re-armed; breakers reset");
+        return Ok(ReloadOk {
+            version: previous.clone(),
+            previous,
+            files,
+        });
+    }
+    let pack = mud.game.read(|w| Arc::clone(w.pack()));
+    let compiling = Arc::clone(host);
+    let compiled = tokio::task::spawn_blocking(move || compiling.compile_from_source(&pack))
+        .await
+        .map_err(|e| vec![format!("the reload task failed: {e}")])
+        .and_then(|r| r.map_err(|e| e.problems()));
+    let compiled = match compiled {
+        Ok(c) => c,
+        Err(problems) => {
+            tracing::warn!(version = %previous, ?problems, "scripts reload refused");
+            mud.game.publish_audit(Audit::ScriptsReloadRefused {
+                version: previous.clone(),
+                problems: problems.clone(),
+                at_ms: mud.game.now_ms(),
+            });
+            return Err(ReloadError::Invalid {
+                version: previous,
+                problems,
+            });
+        }
+    };
+    let ok = ReloadOk {
+        version: compiled.version.clone(),
+        previous,
+        files: compiled.files,
+    };
+    mud.game.write(|w, now| {
+        host.install(compiled);
+        w.set_hooks(Some(hooks), now, HooksChange::Reload);
+    });
+    tracing::info!(version = %ok.version, previous = %ok.previous, "scripts reloaded");
+    Ok(ok)
+}
+
+/// `mud check`: checks a pack and its scripts, and dry-runs every script.
+/// Returns the lines to print.
+///
+/// # Errors
+/// The pack does not load, or a script has a problem; the message lists
+/// every problem.
+pub fn check_pack(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let p = Arc::new(WorldPack::load(dir)?);
+    let mut out = vec![format!(
+        "{}: {} rooms, {} items, {} skills, {} cast, {} shops — ok",
+        p.world.name,
+        p.rooms.len(),
+        p.items.len(),
+        p.skills.len(),
+        p.cast.len(),
+        p.economy.shops.len()
+    )];
+    let sources = ScriptSources::read_dir(dir)?;
+    let compiled = mud_script::load::compile(&sources, &p)?;
+    let problems = compiled.dry_run(&p);
+    if !problems.is_empty() {
+        return Err(ScriptError::Invalid(problems).into());
+    }
+    if sources.manifest.is_some() {
+        out.push(format!("scripts {} — ok", compiled.summary()));
+    } else {
+        out.push("scripts: none (no scripts.toml)".to_owned());
+    }
+    out.extend(compiled.warnings.iter().map(|w| format!("warning: {w}")));
+    Ok(out)
 }
 
 /// The per-entity budgets, keyed by entity id. A key the cast does not

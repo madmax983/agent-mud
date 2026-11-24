@@ -108,9 +108,10 @@ flowchart LR
 | `mud-rules` | The GURPS-like core: 3d6 success rolls with criticals, damage dice and the ST table, injury after DR, wound states, defenses, self-control rolls. No I/O. |
 | `mud-world` | World packs, the verb parser, the deterministic engine, events with `untrusted_text`, the SQLite store, and `Game` (shared, persistent, broadcasting). |
 | `mud-mcp` | The MCP server (rmcp, streamable HTTP): six tools (look, sheet, events, command, wake_me, cancel_wake), one entity per bearer token. |
-| `mud-supervisor` | The attention router, anti-chatter, budgets, Turing friction, the typing gate, and the minds: scripted, fallback, littleguy, harvest, plugin-agent. |
+| `mud-script` | Sandboxed Rhai world scripts ([docs/scripting.md](docs/scripting.md), ADR 0010): room, item and verb hooks that return effects the engine admits and applies, and mind scripts that return command lines. The only crate with rhai. |
+| `mud-supervisor` | The attention router, anti-chatter, budgets, Turing friction, the typing gate, and the minds: scripted (TOML rules and Rhai mind scripts), fallback, littleguy, harvest, plugin-agent. |
 | `mud-server` | The `mud` binary: autumn-web terminal and observer, telnet, `/mcp`, config, smoke. |
-| `worlds/crypt-v01` | The starter pack: 11 rooms, 8 cast, 3 shops, the trait library. |
+| `worlds/crypt-v01` | The starter pack: 11 rooms, 8 cast, 3 shops, the trait library, and its scripts (`pray`, `listen`, the ossuary, the charm, Hale's mind). |
 | `formal/verus` | Verus proofs of the kernels. |
 
 ## The invariants, and where they hold
@@ -121,7 +122,8 @@ flowchart LR
 | Information is local | each event names its recipients when emitted; `mud_events` returns only those |
 | Zero tokens in empty rooms | event-driven wakes; macro-ticks only with no player present; anti-chatter (proved) |
 | Untrusted speech is data | `untrusted_text` never enters narratives or cues; policy codes such as `POLICY_TRADE_REQUIRED` |
-| Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops and cast are pack data |
+| Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops, cast and scripts are pack data |
+| Scripts are data in, data out | hooks return effects that a proved admission kernel and `check_effects` gate; no script holds the world; player text reaches scripts only as `Untrusted` (ADR 0010) |
 
 ## Development
 
@@ -129,6 +131,8 @@ flowchart LR
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings   # pedantic + nursery
 cargo test --workspace
+cargo test --release -p mud-script --test cost          # script cost bounds
+cargo run -p mud-server --bin mud -- check worlds/crypt-v01
 cargo llvm-cov --workspace --fail-under-lines 85
 VERUS=/path/to/verus; "$VERUS" formal/verus/src/lib.rs --crate-type=lib
 LG_BIN=/path/to/lg cargo test -p mud-server --test littleguy_e2e
