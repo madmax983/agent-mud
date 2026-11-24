@@ -36,6 +36,18 @@ fn the_config_points_littleguy_at_the_mud() {
         !text.contains("secret-token"),
         "the token never goes in a file"
     );
+    assert_eq!(v["max_steps"].as_integer(), Some(64));
+}
+
+#[test]
+fn zero_max_steps_leaves_a_wake_unbounded() {
+    // littleguy bounds an op only when `max_steps` is set (ADR 0034 there).
+    let cfg = LittleguyConfig {
+        max_steps: 0,
+        ..LittleguyConfig::default()
+    };
+    let v: toml::Table = toml::from_str(&render_config(&cfg, &persona())).unwrap();
+    assert!(!v.contains_key("max_steps"));
 }
 
 fn fake_daemon(path: &Path, answer: &'static str) -> tokio::task::JoinHandle<String> {

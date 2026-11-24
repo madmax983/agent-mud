@@ -220,8 +220,8 @@ pub struct LittleguySection {
     pub model_names: BTreeMap<String, String>,
     /// `--base-url`.
     pub base_url: Option<String>,
-    /// Tool rounds one wake may use. A wake that needs more ends with no
-    /// answer (and is still charged).
+    /// Tool rounds one wake may use; `0` is no bound. A wake that needs
+    /// more ends with no answer (and is still charged).
     pub max_steps: u32,
 }
 

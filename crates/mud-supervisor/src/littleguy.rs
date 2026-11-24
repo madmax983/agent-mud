@@ -55,8 +55,10 @@ pub struct LittleguyConfig {
     pub model_name: Option<String>,
     /// `--base-url`, for an OpenAI-compatible server.
     pub base_url: Option<String>,
-    /// Tool rounds per wake. A wake walks, looks, reads and speaks, each a
-    /// round, so this must leave room for a short errand.
+    /// Tool rounds per wake; `0` sets no bound, so a wake runs until the
+    /// model answers (the daily budget still caps spend). A wake walks,
+    /// looks, reads and speaks, each a round, and one that runs out ends
+    /// with no answer, so leave room for a whole errand.
     pub max_steps: u32,
     /// Minutes between reflection heartbeats; 0 turns them off.
     pub heartbeat_minutes: u32,
@@ -73,7 +75,7 @@ impl Default for LittleguyConfig {
             provider: "offline".into(),
             model_name: None,
             base_url: None,
-            max_steps: 24,
+            max_steps: 64,
             heartbeat_minutes: 240,
             start_timeout_secs: 30,
         }
@@ -103,7 +105,9 @@ pub fn render_config(cfg: &LittleguyConfig, p: &Persona) -> String {
         system_prompt(&p.name, &p.persona, &p.goal).into(),
     );
     root.insert("window".into(), 30.into());
-    root.insert("max_steps".into(), i64::from(cfg.max_steps).into());
+    if cfg.max_steps > 0 {
+        root.insert("max_steps".into(), i64::from(cfg.max_steps).into());
+    }
     let mut tools = toml::Table::new();
     for (k, v) in [
         ("web_fetch", false),

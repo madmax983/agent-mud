@@ -34,7 +34,8 @@ process lifecycle; littleguy owns the mind.
   ("I used every tool round…"), waits for an approval, outlives its wake,
   or a heartbeat between wakes, is charged too. A reply's own `usage` is
   used only when the daemon has no database to read. `[littleguy]
-  max_steps` (24) bounds the tool rounds of one wake.
+  max_steps` (64; `0` for no bound) bounds the tool rounds of one wake.
+  Prompt caching makes a long wake cheap; the daily budget is the guard.
 - littleguy's own heartbeat is kept for quiet reflection and memory
   consolidation only.
 - **Shutdown.** Each daemon holds an MCP session open (an SSE response),

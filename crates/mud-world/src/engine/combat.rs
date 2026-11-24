@@ -331,7 +331,7 @@ impl World {
             let spec = Emit::new(
                 EventKind::Leave,
                 Some(me.room.clone()),
-                format!("{} leaves {}.", me.name, dir.name()),
+                format!("{} {}.", me.name, dir.leaving()),
             )
             .actor(actor, if fleeing { "flee" } else { "move" })
             .data(json!({ "dir": dir.short() }));
@@ -350,7 +350,7 @@ impl World {
             let spec = Emit::new(
                 EventKind::Enter,
                 Some(to),
-                format!("{} arrives from the {}.", me.name, from_dir.name()),
+                format!("{} {}.", me.name, from_dir.arriving_from()),
             )
             .actor(actor, if fleeing { "flee" } else { "move" })
             .data(json!({ "from": from_dir.short() }));

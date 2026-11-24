@@ -896,3 +896,32 @@ fn a_saved_player_with_a_reserved_name_can_still_log_in() {
     assert_eq!(w.login("me", 1), Ok(me));
     assert_eq!(w.login("self", 1), Err(LoginError::Reserved));
 }
+
+#[test]
+fn climbing_reads_as_climbing() {
+    // Regression: "kestrel arrives from the up." and "kestrel leaves down."
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    give_item(&mut w, &ada, "grate_key");
+    ok(&mut w, &ada, "s");
+    w.drain_fresh();
+    ok(&mut w, &ada, "d");
+    let text = |w: &mut World| -> Vec<String> {
+        w.drain_fresh()
+            .into_iter()
+            .filter(|e| matches!(e.kind, EventKind::Enter | EventKind::Leave))
+            .map(|e| e.narrative)
+            .collect()
+    };
+    assert_eq!(
+        text(&mut w),
+        ["ada climbs down.", "ada arrives from above."]
+    );
+    ok(&mut w, &ada, "u");
+    assert_eq!(text(&mut w), ["ada climbs up.", "ada arrives from below."]);
+    ok(&mut w, &ada, "n");
+    assert_eq!(
+        text(&mut w),
+        ["ada leaves north.", "ada arrives from the south."]
+    );
+}

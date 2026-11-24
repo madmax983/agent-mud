@@ -120,6 +120,42 @@ impl Direction {
         }
     }
 
+    /// How a departure this way reads after a name: `leaves north`,
+    /// `climbs up`.
+    #[must_use]
+    pub const fn leaving(self) -> &'static str {
+        match self {
+            Self::N => "leaves north",
+            Self::S => "leaves south",
+            Self::E => "leaves east",
+            Self::W => "leaves west",
+            Self::Ne => "leaves northeast",
+            Self::Nw => "leaves northwest",
+            Self::Se => "leaves southeast",
+            Self::Sw => "leaves southwest",
+            Self::U => "climbs up",
+            Self::D => "climbs down",
+        }
+    }
+
+    /// How an arrival from this side reads after a name: `arrives from
+    /// the south`, `arrives from above`.
+    #[must_use]
+    pub const fn arriving_from(self) -> &'static str {
+        match self {
+            Self::N => "arrives from the north",
+            Self::S => "arrives from the south",
+            Self::E => "arrives from the east",
+            Self::W => "arrives from the west",
+            Self::Ne => "arrives from the northeast",
+            Self::Nw => "arrives from the northwest",
+            Self::Se => "arrives from the southeast",
+            Self::Sw => "arrives from the southwest",
+            Self::U => "arrives from above",
+            Self::D => "arrives from below",
+        }
+    }
+
     /// The direction back.
     #[must_use]
     pub const fn opposite(self) -> Self {
