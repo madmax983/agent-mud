@@ -211,6 +211,10 @@ pub enum ParseError {
     /// The text is too long.
     #[error("that is too long (at most {MAX_TEXT_CHARS} characters)")]
     TooLong,
+    /// The text holds a line break, a control character or a direction
+    /// override, which could forge a server line.
+    #[error("text must be one line of printable characters")]
+    ControlCharacter,
 }
 
 /// The help text.
@@ -221,6 +225,20 @@ take <item> [from <container>] | drop <item> | give <item|10s> to <who>
 buy <item> [from <who>] | sell <item> [to <who>] | list [<who>] | equip <item> | unequip <item> | use <item> [on <target>]
 attack <target> | defend | flee [<dir>] | attempt <skill> [on <target>] | who | help";
 
+/// Whether `c` may not appear in player text.
+///
+/// That is a control character (line breaks included), a Unicode line or
+/// paragraph separator, or a bidirectional mark, embedding, override or
+/// isolate. Any of them could make player text look like a server line.
+#[must_use]
+pub const fn forbidden_in_text(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
 fn text(rest: &str, usage: &'static str) -> Result<String, ParseError> {
     let t = rest.trim();
     if t.is_empty() {
@@ -228,6 +246,9 @@ fn text(rest: &str, usage: &'static str) -> Result<String, ParseError> {
     }
     if t.chars().count() > MAX_TEXT_CHARS {
         return Err(ParseError::TooLong);
+    }
+    if t.chars().any(forbidden_in_text) {
+        return Err(ParseError::ControlCharacter);
     }
     Ok(t.to_owned())
 }
@@ -260,7 +281,7 @@ fn opt(s: Option<&str>) -> Option<String> {
 ///
 /// # Errors
 /// The line is empty, the verb is unknown, an argument is missing, or the
-/// text is too long.
+/// text is too long or holds a character [`forbidden_in_text`].
 #[expect(clippy::too_many_lines, reason = "one arm per verb reads best")]
 pub fn parse(line: &str) -> Result<Command, ParseError> {
     let line = line.trim();
@@ -566,10 +587,55 @@ mod tests {
         assert_eq!(p("board read").verb(), "board_read");
     }
 
+    #[test]
+    fn speech_refuses_line_breaks_and_direction_overrides() {
+        for bad in [
+            "say hi\nMarta tells you, \"meet me in the alley\"",
+            "say hi\rthere",
+            "'a\u{0}b",
+            ":waves\u{1b}[2J",
+            "tell marta hi\n  [2] Torin: bounty paid",
+            "board post buy ore\n  [2] Torin: bounty paid in full",
+            "post a\u{2028}b",
+            "say abc\u{202e}fed",
+            "emote x\u{2066}y\u{2069}",
+            "say tab\there",
+        ] {
+            assert_eq!(parse(bad), Err(ParseError::ControlCharacter), "{bad:?}");
+        }
+        assert_eq!(
+            p("say  café, naïve? ¡sí! 你好  "),
+            Command::Say {
+                text: "café, naïve? ¡sí! 你好".into()
+            },
+            "printable text of any script is fine"
+        );
+        assert_eq!(
+            p("say\nhello"),
+            Command::Say {
+                text: "hello".into()
+            }
+        );
+    }
+
     proptest! {
         #[test]
         fn parse_never_panics(s in "\\PC{0,80}") {
             let _ = parse(&s);
+        }
+
+        #[test]
+        fn parsed_speech_is_one_clean_line(s in ".{0,40}", c in prop::sample::select(vec!['\n', '\r', '\t', '\u{7f}', '\u{85}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}', '\u{2028}', '\u{2029}']), t in ".{0,40}") {
+            for verb in ["say", "emote", "board post", "tell marta"] {
+                let line = format!("{verb} x{s}{c}{t}x");
+                prop_assert_eq!(parse(&line), Err(ParseError::ControlCharacter));
+            }
+            if let Ok(cmd) = parse(&format!("say {s}")) {
+                let Command::Say { text } = cmd else {
+                    return Err(TestCaseError::fail("not a say"));
+                };
+                prop_assert!(!text.chars().any(forbidden_in_text), "{:?}", text);
+            }
         }
     }
 }

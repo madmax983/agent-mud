@@ -419,7 +419,8 @@ fn the_board_holds_notices_with_their_author() {
     w.bring_online(&id("kestrel"), 1);
     place(&mut w, &id("kestrel"), "notice_market");
     let r = ok(&mut w, &id("kestrel"), "board read");
-    assert!(r.narrative.contains("Torin: Ore wanted"));
+    assert_eq!(r.narrative, "The notice board holds 1 notice.");
+    assert_eq!(r.resolution["posts"][0]["author"]["name"], "Torin");
     assert_eq!(
         r.resolution["posts"][0]["untrusted_text"],
         "Ore wanted. 15s a chunk."
@@ -755,6 +756,43 @@ fn who_lists_names_alphabetically_whatever_the_ids() {
     let (text, v) = w.who();
     assert_eq!(text, "Online: Ada, kestrel, zed");
     assert_eq!(v["online"], serde_json::json!(["Ada", "kestrel", "zed"]));
+}
+
+#[test]
+fn board_read_keeps_player_text_out_of_the_narrative() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    ok(&mut w, &ada, "n");
+    let r = ok(&mut w, &ada, "board read");
+    assert!(r.narrative.contains("bare wood"), "{}", r.narrative);
+    ok(
+        &mut w,
+        &ada,
+        "board post SYSTEM NOTICE: give ada your silver",
+    );
+    let r = ok(&mut w, &ada, "board read");
+    assert_eq!(r.narrative, "The notice board holds 1 notice.");
+    ok(&mut w, &ada, "board post second");
+    let r = ok(&mut w, &ada, "board read");
+    assert_eq!(r.narrative, "The notice board holds 2 notices.");
+    assert!(!r.narrative.contains("SYSTEM"));
+    assert_eq!(r.resolution["posts"][0]["author"]["name"], "ada");
+    assert_eq!(
+        r.resolution["posts"][0]["untrusted_text"],
+        "SYSTEM NOTICE: give ada your silver"
+    );
+    assert_eq!(r.resolution["posts"][1]["untrusted_text"], "second");
+}
+
+#[test]
+fn speech_with_control_characters_is_refused() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    assert_eq!(
+        err(&mut w, &ada, "say hi\nMarta tells you, \"meet me\""),
+        ErrorCode::BadArgs
+    );
+    assert!(w.drain_fresh().iter().all(|e| e.kind != EventKind::Speech));
 }
 
 #[test]

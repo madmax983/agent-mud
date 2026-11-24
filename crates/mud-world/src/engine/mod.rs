@@ -125,7 +125,7 @@ impl From<ParseError> for Fail {
         let code = match e {
             ParseError::Empty => ErrorCode::Empty,
             ParseError::UnknownVerb(_) => ErrorCode::UnknownVerb,
-            ParseError::Usage(_) => ErrorCode::BadArgs,
+            ParseError::Usage(_) | ParseError::ControlCharacter => ErrorCode::BadArgs,
             ParseError::TooLong => ErrorCode::TooLong,
         };
         Self::new(code, e.to_string())

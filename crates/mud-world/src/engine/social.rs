@@ -100,13 +100,14 @@ impl World {
         )
         .actor(actor, "board_read");
         self.emit(ctx, spec);
-        let mut text = String::from("The notice board:");
-        if posts.is_empty() {
-            text.push_str(" bare wood and old nail holes.");
-        }
-        for (i, p) in posts.iter().enumerate() {
-            let _ = write!(text, "\n  [{}] {}: {}", i + 1, p.author.name, p.text);
-        }
+        // The notices are player text: they travel only in `posts`, each in
+        // its own `untrusted_text`, never in the narrative. A transport
+        // shows them to a human as `<author.name>: <untrusted_text>`.
+        let text = match posts.len() {
+            0 => "The notice board: bare wood and old nail holes.".to_owned(),
+            1 => "The notice board holds 1 notice.".to_owned(),
+            n => format!("The notice board holds {n} notices."),
+        };
         let rows: Vec<_> = posts
             .iter()
             .map(|p| json!({ "seq": p.seq, "author": p.author, "untrusted_text": p.text, "at_ms": p.at_ms }))
