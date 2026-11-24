@@ -320,6 +320,28 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_leaves_no_ghost_humans() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("world.db");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let game = Game::open(pack(), Some(&db), 7, clock.clone()).unwrap();
+        let ada = game.login("ada").unwrap();
+        let square = crate::ids::RoomId::from("town_square");
+        assert!(game.read(|w| w.human_present(&square)));
+        // A crash: the game goes away without the session logging ada out.
+        drop(game);
+
+        let again = Game::open(pack(), Some(&db), 7, clock).unwrap();
+        assert!(!again.read(|w| w.entity(&ada).unwrap().online));
+        assert!(!again.read(|w| w.human_present(&square)));
+        let who = again.read(|w| w.who().0);
+        assert!(!who.contains("ada"), "{who}");
+        // She comes back when she logs in again.
+        assert_eq!(again.login("ada").unwrap(), ada);
+        assert!(again.read(|w| w.human_present(&square)));
+    }
+
+    #[test]
     fn a_database_of_another_pack_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("w.db");

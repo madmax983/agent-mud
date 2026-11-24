@@ -32,6 +32,10 @@ const TARGET_SLOT: &str = concat!("{", "target", "}");
 /// The cue placeholder for what set the roll off.
 const TRIGGER_SLOT: &str = concat!("{", "trigger", "}");
 
+/// The words a command uses for the speaker; no player may take one as a
+/// name.
+const SELF_WORDS: &[&str] = &["me", "self", "myself"];
+
 /// How long a trait waits between two self-control rolls, in ms.
 pub const NUDGE_COOLDOWN_MS: u64 = 120_000;
 
@@ -294,6 +298,9 @@ pub enum LoginError {
     /// Another entity has that name.
     #[error("that name is taken")]
     Taken,
+    /// The name is a word that means the speaker, such as `me`.
+    #[error("that word is reserved; choose another name")]
+    Reserved,
 }
 
 /// What one emit needs.
@@ -387,8 +394,17 @@ impl World {
     }
 
     /// A world resumed from a stored state and its recent events.
+    ///
+    /// Every human starts offline: no session is connected yet, and a
+    /// state saved before a crash may still say otherwise. A human comes
+    /// back when their session logs in. Agent PCs and NPCs are left to
+    /// the supervisor and the pack.
     #[must_use]
-    pub fn from_state(pack: Arc<WorldPack>, state: WorldState, recent: Vec<Event>) -> Self {
+    pub fn from_state(pack: Arc<WorldPack>, mut state: WorldState, recent: Vec<Event>) -> Self {
+        for e in state.entities.values_mut().filter(|e| e.human) {
+            e.online = false;
+            e.hidden = false;
+        }
         let dice = Dice::Seeded(SeededDice::new(state.dice_state));
         Self {
             pack,
@@ -598,7 +614,7 @@ impl World {
     /// Finds a visible entity in `room` by a word. `me` and `self` find the
     /// viewer.
     pub(crate) fn find_here(&self, viewer: &EntityId, word: &str) -> Option<EntityId> {
-        if matches!(word, "me" | "self" | "myself") {
+        if SELF_WORDS.contains(&word) {
             return Some(viewer.clone());
         }
         let room = &self.state.entities.get(viewer)?.room;
@@ -862,6 +878,11 @@ impl World {
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !valid {
             return Err(LoginError::Invalid);
+        }
+        // `find_here` reads these as the viewer, so nobody could target
+        // a player with one of them as a name.
+        if SELF_WORDS.iter().any(|w| name.eq_ignore_ascii_case(w)) {
+            return Err(LoginError::Reserved);
         }
         let id = EntityId::new(format!("pc_{}", name.to_ascii_lowercase()));
         let taken =

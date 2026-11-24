@@ -396,13 +396,19 @@ impl World {
     }
 
     pub(crate) fn who(&self) -> (String, Value) {
-        let names: Vec<String> = self
+        let mut names: Vec<String> = self
             .state
             .entities
             .values()
             .filter(|e| e.kind == EntityKind::Player && e.online)
             .map(|e| e.name.clone())
             .collect();
+        // By name, never by id: the id order would set agent PCs apart.
+        names.sort_by(|a, b| {
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a.cmp(b))
+        });
         let text = if names.is_empty() {
             "Nobody is online.".to_owned()
         } else {

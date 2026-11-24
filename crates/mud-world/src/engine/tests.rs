@@ -736,3 +736,44 @@ fn selling_and_buying_back_never_makes_money() {
         r.narrative
     );
 }
+
+#[test]
+fn the_self_words_are_not_player_names() {
+    let mut w = world();
+    for name in ["me", "Self", "MYSELF"] {
+        assert_eq!(w.login(name, 1), Err(LoginError::Reserved), "{name}");
+    }
+    assert!(w.login("meg", 1).is_ok());
+}
+
+#[test]
+fn who_lists_names_alphabetically_whatever_the_ids() {
+    let mut w = world();
+    let _ = w.login("zed", 1).unwrap();
+    let _ = w.login("Ada", 1).unwrap();
+    w.bring_online(&id("kestrel"), 1);
+    let (text, v) = w.who();
+    assert_eq!(text, "Online: Ada, kestrel, zed");
+    assert_eq!(v["online"], serde_json::json!(["Ada", "kestrel", "zed"]));
+}
+
+#[test]
+fn a_resumed_world_takes_every_human_offline() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    w.bring_online(&id("kestrel"), 1);
+    let square = RoomId::from("town_square");
+    assert!(w.human_present(&square));
+    let snapshot = w.snapshot();
+    let resumed = World::from_state(Arc::clone(&w.pack), snapshot, Vec::new());
+    assert!(!resumed.entity(&ada).unwrap().online, "no ghost humans");
+    assert!(!resumed.human_present(&square));
+    assert!(
+        resumed.entity(&id("marta")).unwrap().online,
+        "npcs stay in the world"
+    );
+    assert!(
+        resumed.entity(&id("kestrel")).unwrap().online,
+        "agent PCs are the supervisor's to manage"
+    );
+}
