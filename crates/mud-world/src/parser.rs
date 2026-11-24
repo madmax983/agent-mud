@@ -236,6 +236,13 @@ pub enum ParseError {
     ControlCharacter,
 }
 
+/// The words a player's connection keeps for itself.
+///
+/// The server reads them before the engine, so the engine never sees them,
+/// and no world script may declare a verb with one of these names.
+/// `password` above all must never reach a script or the command log.
+pub const SESSION_WORDS: &[&str] = &["password", "logout", "quit"];
+
 /// Every built-in verb word and alias. A world script may not declare a
 /// verb with one of these names.
 pub const BUILTIN_WORDS: &[&str] = &[

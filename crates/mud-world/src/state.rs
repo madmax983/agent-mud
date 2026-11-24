@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use mud_rules::{Attributes, Pools};
 use serde::{Deserialize, Serialize};
 
+use crate::engine::LoginError;
 use crate::event::ActorRef;
 use crate::hooks::{FLAG_CAP, FlagValue, MARK_CAP};
 use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, ShopId, SkillId};
 use crate::pack::{
-    CastDef, Direction, EntityKind, RoomDef, RoomItem, Slot, Tier, TraitRef, WorldPack,
+    CastDef, Direction, EntityKind, RoomDef, RoomItem, SELF_WORDS, Slot, Tier, TraitRef, WorldPack,
 };
 
 /// One entity.
@@ -257,7 +258,78 @@ pub enum Holder {
     },
 }
 
+/// Who holds a login name. Server-internal: never part of a view, an
+/// event or an MCP result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameOwner {
+    /// Nobody: a new character would get this id.
+    Free(EntityId),
+    /// A human character.
+    Human(EntityId),
+    /// A player character no human plays, or another player the name
+    /// matches.
+    OtherPlayer,
+    /// An NPC or a mob.
+    NonPlayer,
+}
+
+/// The prefix of every player character's id. A new name may not start
+/// with it: `pc_ada` would otherwise be a character that `ada` locks out.
+pub const PLAYER_ID_PREFIX: &str = "pc_";
+
 impl WorldState {
+    /// Who holds the login name `name`.
+    ///
+    /// # Errors
+    /// [`LoginError::Invalid`] for a name that is not 2 to 16 letters,
+    /// digits or underscores; [`LoginError::Reserved`] for a word that
+    /// means the speaker, or a new name starting with `pc_`.
+    pub fn name_owner(&self, name: &str) -> Result<NameOwner, LoginError> {
+        let name = name.trim();
+        let valid = (2..=16).contains(&name.chars().count())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(LoginError::Invalid);
+        }
+        let lower = name.to_ascii_lowercase();
+        let id = EntityId::new(format!("{PLAYER_ID_PREFIX}{lower}"));
+        // A save from before a name was reserved may still hold such a
+        // player; it may come back, but nobody new may take the name.
+        let saved_human = self.entities.get(&id).is_some_and(|e| e.human);
+        if !saved_human
+            && (SELF_WORDS.iter().any(|w| lower == *w) || lower.starts_with(PLAYER_ID_PREFIX))
+        {
+            return Err(LoginError::Reserved);
+        }
+        let other = self
+            .entities
+            .values()
+            .find(|e| e.id != id && (e.matches(name) || e.id.as_str() == lower));
+        if let Some(e) = other {
+            return Ok(if e.kind == EntityKind::Player {
+                NameOwner::OtherPlayer
+            } else {
+                NameOwner::NonPlayer
+            });
+        }
+        Ok(match self.entities.get(&id) {
+            Some(e) if e.human => NameOwner::Human(id),
+            Some(e) if e.kind == EntityKind::Player => NameOwner::OtherPlayer,
+            Some(_) => NameOwner::NonPlayer,
+            None => NameOwner::Free(id),
+        })
+    }
+
+    /// Every human character's id.
+    #[must_use]
+    pub fn human_ids(&self) -> Vec<EntityId> {
+        self.entities
+            .values()
+            .filter(|e| e.human)
+            .map(|e| e.id.clone())
+            .collect()
+    }
+
     /// A fresh state from a pack.
     #[must_use]
     pub fn from_pack(pack: &WorldPack, seed: u64) -> Self {

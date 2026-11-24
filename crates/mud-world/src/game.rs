@@ -18,6 +18,7 @@ use crate::engine::{Audit, CommandResult, LoginError, World};
 use crate::event::Event;
 use crate::ids::{EntityId, Seq};
 use crate::pack::WorldPack;
+use crate::state::NameOwner;
 use crate::store::{ScriptMemory, Store, StoreError};
 
 /// How many events the store reloads into memory at start.
@@ -321,6 +322,21 @@ impl Game {
     /// Runs one line for `actor`.
     pub fn execute(&self, actor: &EntityId, line: &str) -> CommandResult {
         self.write(|w, now| w.execute(actor, line, now))
+    }
+
+    /// Who holds the login name `name`. Server-internal: the login
+    /// dialogue reads it; no view, event or MCP result carries it.
+    ///
+    /// # Errors
+    /// The name is invalid or reserved.
+    pub fn name_owner(&self, name: &str) -> Result<NameOwner, LoginError> {
+        self.read(|w| w.name_owner(name))
+    }
+
+    /// Every human character's id.
+    #[must_use]
+    pub fn human_ids(&self) -> Vec<EntityId> {
+        self.read(|w| w.state().human_ids())
     }
 
     /// Logs a human in.

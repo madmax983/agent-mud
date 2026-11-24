@@ -1,5 +1,5 @@
 //! The shared logic of the Verus mirror guards (`verus_mirror` in
-//! `mud-rules` and in `mud-supervisor`).
+//! `mud-rules`, `mud-supervisor`, `mud-server` and `mud-accounts`).
 //!
 //! Each Verus proof in `formal/verus` mirrors Rust source text. A file marks
 //! each mirrored region with `// mirror-begin <name>` and
@@ -159,7 +159,7 @@ pub fn mirrors(source: &str, proof: &str) -> TestResult {
 }
 
 /// Each Verus module and the Rust file it mirrors.
-pub const PAIRS: [(&str, &str); 9] = [
+pub const PAIRS: [(&str, &str); 11] = [
     ("classify", "crates/mud-rules/src/roll.rs"),
     ("injury", "crates/mud-rules/src/damage.rs"),
     ("wounds", "crates/mud-rules/src/stats.rs"),
@@ -169,6 +169,8 @@ pub const PAIRS: [(&str, &str); 9] = [
     ("typing", "crates/mud-supervisor/src/turing.rs"),
     ("connections", "crates/mud-server/src/limits.rs"),
     ("hooks", "crates/mud-world/src/hooks.rs"),
+    ("login_route", "crates/mud-accounts/src/route.rs"),
+    ("throttle", "crates/mud-accounts/src/throttle.rs"),
 ];
 
 /// The Verus file of a module named in [`PAIRS`].

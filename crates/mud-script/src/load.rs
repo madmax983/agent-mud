@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use mud_world::hooks::{HookId, VerbInfo};
 use mud_world::pack::{EntityKind, Tier};
-use mud_world::parser::{BUILTIN_WORDS, ParseError, parse};
+use mud_world::parser::{BUILTIN_WORDS, ParseError, SESSION_WORDS, parse};
 use mud_world::{EntityId, WorldPack};
 use rhai::AST;
 use serde_json::Value;
@@ -340,6 +340,12 @@ pub fn compile(sources: &ScriptSources, pack: &WorldPack) -> Result<Compiled, Sc
         {
             problems.push(format!(
                 "scripts.toml verbs[{i}] {name:?} shadows a built-in verb"
+            ));
+            continue;
+        }
+        if SESSION_WORDS.contains(&name.as_str()) {
+            problems.push(format!(
+                "scripts.toml verbs[{i}] {name:?} is a session word the server keeps (password, logout, quit)"
             ));
             continue;
         }

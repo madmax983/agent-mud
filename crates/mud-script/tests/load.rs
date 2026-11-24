@@ -195,6 +195,33 @@ fn a_verb_cannot_shadow_a_built_in() {
     }
 }
 
+/// `password`, `logout` and `quit` belong to the player's connection: the
+/// server reads them before the engine, so a script verb with one of these
+/// names would never run, and `password` must never reach a script.
+#[test]
+fn a_verb_cannot_take_a_session_word() {
+    for v in mud_world::SESSION_WORDS {
+        let p = problems(
+            &format!("[[verbs]]\nname = \"{v}\"\nusage = \"x\"\nfile = \"a.rhai\"\n"),
+            &[("a.rhai", "fn x(ctx) { [] }")],
+        );
+        let want = format!(
+            "scripts.toml verbs[0] \"{v}\" is a session word the server keeps (password, logout, quit)"
+        );
+        assert!(p.contains(&want), "{v}: {p:?}");
+    }
+}
+
+/// The script engine never holds an account handle: mud-script does not
+/// depend on mud-accounts, so no script can reach a password, a hash or a
+/// token (ADR 0009).
+#[test]
+fn the_script_crate_cannot_reach_accounts() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(!manifest.contains("mud-accounts"), "{manifest}");
+    assert!(!manifest.contains("bcrypt"), "{manifest}");
+}
+
 #[test]
 fn on_use_cannot_shadow_an_engine_use() {
     for (item, why) in [
