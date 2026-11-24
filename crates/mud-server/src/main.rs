@@ -31,7 +31,8 @@ enum Command {
     },
     /// Run the headless v0.1 smoke scenario and print its transcript.
     Smoke,
-    /// Check a world pack and print a summary.
+    /// Check a world pack and its scripts (with a dry run), and print a
+    /// summary. Exits 1 and lists every problem if any.
     Check {
         /// The pack folder.
         #[arg(default_value = "worlds/crypt-v01")]
@@ -67,20 +68,15 @@ async fn main() -> anyhow::Result<()> {
             for w in &t.wakes {
                 println!("  {w}");
             }
-            println!("\nsmoke: PASS (bounty posted, board read, human recruited)");
+            println!(
+                "\nsmoke: PASS (bounty posted, board read, human recruited, the alley answered)"
+            );
             Ok(())
         }
         Command::Check { pack } => {
-            let p = mud_world::WorldPack::load(&pack)?;
-            println!(
-                "{}: {} rooms, {} items, {} skills, {} cast, {} shops — ok",
-                p.world.name,
-                p.rooms.len(),
-                p.items.len(),
-                p.skills.len(),
-                p.cast.len(),
-                p.economy.shops.len()
-            );
+            for line in mud_server::check_pack(&pack)? {
+                println!("{line}");
+            }
             Ok(())
         }
     }

@@ -2240,6 +2240,7 @@ dependencies = [
  "getrandom 0.4.3",
  "maud",
  "mud-mcp",
+ "mud-script",
  "mud-supervisor",
  "mud-world",
  "proptest",

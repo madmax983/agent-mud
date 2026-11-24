@@ -56,6 +56,8 @@ pub struct Mud {
     pub shutdown: tokio_util::sync::CancellationToken,
     /// The littleguy minds, for the observer's links to their pages.
     pub littleguy: Vec<Arc<mud_supervisor::littleguy::LittleguyMind>>,
+    /// The world's scripts, unless `[scripts] enabled = false`.
+    pub scripts: Option<Arc<mud_script::ScriptHost>>,
 }
 
 impl Mud {
@@ -97,6 +99,9 @@ pub fn routes() -> Vec<autumn_web::Route> {
         observer_entities,
         observer_feed,
         observer_littleguy,
+        observer_scripts,
+        scripts_reload,
+        scripts_memory_reset,
         macro_tick,
         healthz,
         terminal_js,
@@ -357,6 +362,8 @@ async fn observer(State(state): State<AppState>, Query(q): Query<Admin>) -> Resp
             h1 { "Observer — private" }
             p.muted { "Agent goals, wake triggers, self-control rolls and token burn. Never show this to players." }
             div hx-get=(format!("/observer/entities?token={token}")) hx-trigger="load, every 2s" {}
+            h1 { "Scripts" }
+            div hx-get=(format!("/observer/scripts?token={token}")) hx-trigger="load, every 5s" {}
             h1 { "Live feed" }
             div #feed .feed {}
         },
@@ -455,6 +462,110 @@ async fn observer_littleguy(
             .into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
+}
+
+/// The Scripts panel: the version, each hook's breaker, the mind scripts
+/// with their memory, Reload and Reset memory. Everything is rendered by
+/// maud, which escapes it.
+#[get("/observer/scripts")]
+async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    let token = url_escape(&app.admin_token);
+    let Some(host) = &app.scripts else {
+        return html! { p.muted { "Scripts are off ([scripts] enabled = false)." } }
+            .into_response();
+    };
+    let status = app.game.read(mud_world::World::hook_status);
+    let compiled = host.current();
+    html! {
+        p { "Version " strong { (compiled.version) } " · " (compiled.summary())
+            @if host.reloadable() {
+                " "
+                form style="display:inline" hx-post=(format!("/observer/scripts/reload?token={token}")) hx-swap="none" {
+                    button type="submit" { "Reload" }
+                }
+            } @else { span.muted { " (bundled: reload needs [world] pack)" } }
+        }
+        table {
+            tr { th { "hook" } th { "faults" } th { "state" } }
+            @for key in host.hook_keys() {
+                @let s = status.iter().find(|s| s.key == key);
+                tr {
+                    td { (key) }
+                    td { (s.map_or(0, |s| s.faults)) }
+                    td {
+                        @if s.is_some_and(|s| s.tripped) { span.hard { "TRIPPED" } } @else { "OK" }
+                    }
+                }
+            }
+            @for id in host.minds() {
+                tr {
+                    td { "minds." (id) ".on_wake" }
+                    td { span.muted { "see feed" } }
+                    td {
+                        form hx-post=(format!("/observer/scripts/memory/{}/reset?token={token}", url_escape(id.as_str()))) hx-swap="none" {
+                            button type="submit" { "Reset memory" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .into_response()
+}
+
+/// Reloads the scripts from the pack folder. 200 with the new version, 422
+/// with every problem (the old scripts keep running), 409 when there is
+/// nothing to reload.
+#[post("/observer/scripts/reload")]
+async fn scripts_reload(State(state): State<AppState>, Query(q): Query<Admin>) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    match crate::reload_scripts(&app).await {
+        Ok(ok) => Json(json!({
+            "ok": true,
+            "version": ok.version,
+            "previous": ok.previous,
+            "files": ok.files,
+        }))
+        .into_response(),
+        Err(crate::ReloadError::Invalid { version, problems }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "version": version, "problems": problems })),
+        )
+            .into_response(),
+        Err(crate::ReloadError::Bundled) => (
+            StatusCode::CONFLICT,
+            "the bundled pack cannot be reloaded; set [world] pack to a folder",
+        )
+            .into_response(),
+        Err(crate::ReloadError::Disabled) => (
+            StatusCode::CONFLICT,
+            "scripts are disabled ([scripts] enabled = false)",
+        )
+            .into_response(),
+    }
+}
+
+/// Clears one mind's script memory.
+#[post("/observer/scripts/memory/{id}/reset")]
+async fn scripts_memory_reset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<Admin>,
+) -> Response {
+    let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
+        return forbidden();
+    };
+    let entity = EntityId::new(id);
+    if !app.scripts.as_ref().is_some_and(|h| h.has_mind(&entity)) {
+        return (StatusCode::NOT_FOUND, "no mind script for that entity").into_response();
+    }
+    app.game.reset_script_memory(&entity);
+    Json(json!({ "ok": true, "entity": entity })).into_response()
 }
 
 #[post("/observer/macro-tick/{id}")]
