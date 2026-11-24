@@ -10,6 +10,8 @@
 pub mod budget;
 pub mod chatter;
 pub mod gate;
+pub mod harvest;
+pub mod littleguy;
 pub mod mind;
 pub mod router;
 pub mod runtime;

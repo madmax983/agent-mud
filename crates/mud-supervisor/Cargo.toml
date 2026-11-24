@@ -9,11 +9,14 @@ repository.workspace = true
 
 [dependencies]
 mud-world.workspace = true
+autumn-harvest-agent = { version = "0.11.0", features = ["sqlite", "openai", "anthropic"] }
+autumn-harvest-sqlite = "0.11.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
