@@ -15,17 +15,23 @@ struct Rig {
 }
 
 fn rig(cfg: SupervisorConfig) -> Rig {
+    rig_with(cfg, HashMap::new())
+}
+
+/// A rig on scripted minds, except for the minds in `own`.
+fn rig_with(cfg: SupervisorConfig, own: HashMap<EntityId, Arc<dyn Mind>>) -> Rig {
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
     let clock = Arc::new(ManualClock::new(20 * 3_600_000));
     let game = Game::new(World::new(Arc::clone(&pack), 5), None, clock.clone());
     let typing = Gate::new(Arc::clone(&game), 5, 0.0);
     let scripted: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
-    let minds: HashMap<EntityId, Arc<dyn Mind>> = pack
+    let mut minds: HashMap<EntityId, Arc<dyn Mind>> = pack
         .cast
         .iter()
         .filter(|(_, c)| matches!(c.mind.tier, Tier::Ambient | Tier::Persistent | Tier::Turing))
         .map(|(id, _)| (id.clone(), Arc::clone(&scripted)))
         .collect();
+    minds.extend(own);
     let fallback = Arc::new(FallbackMind::from_cast(&pack.cast));
     let sup = Supervisor::new(Arc::clone(&game), typing, minds, fallback, cfg);
     Rig { sup, game, clock }
@@ -351,4 +357,92 @@ fn snapshot_and_step_never_deadlock() {
         };
         assert!(["snapshot", "step"].contains(&who));
     }
+}
+
+/// Spends `now` and never answers; its model reports `later` after the
+/// wake has been given up.
+#[derive(Debug)]
+struct Stalls {
+    now: Usage,
+    later: Usage,
+}
+
+impl Mind for Stalls {
+    fn kind(&self) -> &'static str {
+        "stalls"
+    }
+
+    fn wake(
+        &self,
+        _ctx: WakeContext,
+        tools: MudTools,
+    ) -> crate::mind::BoxFuture<'_, Result<MindReply, crate::mind::MindError>> {
+        Box::pin(async move {
+            let meter = crate::mind::UsageMeter::new(&tools);
+            meter.recorder().add(self.now);
+            let (sink, who, later) = (
+                Arc::clone(tools.usage_sink()),
+                tools.entity().clone(),
+                self.later,
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sink.add(&who, later);
+            });
+            std::future::pending::<()>().await;
+            Ok(MindReply {
+                usage: meter.settle(),
+                ..MindReply::default()
+            })
+        })
+    }
+}
+
+fn spent(r: &Rig, who: &str) -> u64 {
+    r.sup.snapshot()["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == who)
+        .unwrap()["budget"]["tokens"]
+        .as_u64()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_timed_out_wake_is_still_charged() {
+    // Regression: a timed-out or failed wake recorded zero spend, so a slow
+    // model kept the entity at Normal however much it spent.
+    let torin = EntityId::from("torin");
+    let tokens = |n| Usage {
+        calls: 1,
+        input_tokens: n,
+        output_tokens: 0,
+        cost_usd_micros: 0,
+    };
+    let mind: Arc<dyn Mind> = Arc::new(Stalls {
+        now: tokens(700),
+        later: tokens(50),
+    });
+    let cfg = SupervisorConfig {
+        wake_timeout_ms: 30,
+        ..quiet()
+    };
+    let r = rig_with(cfg, HashMap::from([(torin.clone(), mind)]));
+    let mut obs = r.sup.subscribe();
+    r.sup.fire_macro_tick(&torin);
+    for h in r.sup.step() {
+        h.await.unwrap();
+    }
+    assert_eq!(spent(&r, "torin"), 700, "the spend before the timeout");
+    let finished = std::iter::from_fn(|| obs.try_recv().ok()).find_map(|e| match &*e {
+        ObserverEvent::WakeFinished {
+            entity, ok, usage, ..
+        } if entity == &torin => Some((*ok, *usage)),
+        _ => None,
+    });
+    assert_eq!(finished, Some((false, tokens(700))));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(r.sup.step());
+    assert_eq!(spent(&r, "torin"), 750, "and what came in after it");
 }

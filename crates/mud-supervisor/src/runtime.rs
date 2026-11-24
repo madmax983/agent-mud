@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::budget::{Budget, BudgetLevel};
 use crate::gate::Gate;
-use crate::mind::{Mind, MindReply, MudTools, Usage, WakeContext};
+use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
 use crate::router::{EntityRuntime, Priority, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::FallbackMind;
 use crate::turing::{Afk, in_session, mix, pick};
@@ -144,6 +144,8 @@ pub struct Supervisor {
     router: Mutex<Router>,
     state: Mutex<HashMap<EntityId, EntityState>>,
     observer: broadcast::Sender<Arc<ObserverEvent>>,
+    /// Spend minds could not put in a reply (failed or timed-out wakes).
+    usage: Arc<UsageSink>,
     last_world_tick: AtomicU64,
 }
 
@@ -191,6 +193,7 @@ impl Supervisor {
             state: Mutex::new(state),
             observer,
             last_world_tick: AtomicU64::new(now),
+            usage: Arc::default(),
         })
     }
 
@@ -372,6 +375,7 @@ impl Supervisor {
             self.last_world_tick.store(now, Ordering::Relaxed);
             self.game.tick();
         }
+        self.charge_late_spend(now);
         self.turing_sessions(now);
         self.macro_ticks(now);
         let wakes = lock(&self.router).due(now);
@@ -417,6 +421,21 @@ impl Supervisor {
         })
     }
 
+    /// Charges spend that came in after its wake ended (a model that kept
+    /// going after a timeout).
+    fn charge_late_spend(&self, now: u64) {
+        let late = self.usage.take_all();
+        if late.is_empty() {
+            return;
+        }
+        let mut st = lock(&self.state);
+        for (id, u) in late {
+            if let Some(s) = st.get_mut(&id) {
+                s.budget.spend(now, u.tokens(), u.cost_usd_micros, u.calls);
+            }
+        }
+    }
+
     /// Runs one wake to the end and records it.
     pub async fn run_wake(self: Arc<Self>, wake: Wake) {
         let start = self.game.now_ms();
@@ -454,7 +473,8 @@ impl Supervisor {
             Arc::clone(&self.game),
             Arc::clone(&self.gate),
             wake.entity.clone(),
-        );
+        )
+        .with_usage_sink(Arc::clone(&self.usage));
         let res = tokio::time::timeout(
             Duration::from_millis(self.cfg.wake_timeout_ms),
             mind.wake(ctx, tools),
@@ -478,15 +498,14 @@ impl Supervisor {
             ),
         };
         let end = self.game.now_ms();
+        // The reply's spend, plus what the mind could not put in a reply: a
+        // failed wake, or one dropped by the timeout above.
+        let usage = reply.usage.plus(self.usage.take(&wake.entity));
         let budget = {
             let mut st = lock(&self.state);
             st.get_mut(&wake.entity).map_or(BudgetLevel::Normal, |s| {
-                s.budget.spend(
-                    end,
-                    reply.usage.tokens(),
-                    reply.usage.cost_usd_micros,
-                    reply.usage.calls,
-                );
+                s.budget
+                    .spend(end, usage.tokens(), usage.cost_usd_micros, usage.calls);
                 s.last_wake = Some((wake.priority, wake.reason.clone(), start));
                 s.wakes += 1;
                 s.budget.level(end)
@@ -497,7 +516,7 @@ impl Supervisor {
             entity: wake.entity,
             ok,
             note: reply.text,
-            usage: reply.usage,
+            usage,
             budget,
             took_ms: end.saturating_sub(start),
         });

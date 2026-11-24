@@ -83,6 +83,77 @@ async fn waiting_for_an_approval_is_an_error() {
     assert!(chat(&dir.path().join("none.sock"), "w", "x").await.is_err());
 }
 
+#[tokio::test]
+async fn a_reply_after_the_wake_was_given_up_is_still_charged() {
+    // Regression: the daemon kept spending after a wake timed out, but its
+    // reply (and the usage in it) went to a dropped socket.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut req = String::new();
+        reader.read_line(&mut req).await.unwrap();
+        go_rx.await.unwrap();
+        let mut stream = reader.into_inner();
+        // The peer may be gone; the write must not panic the daemon.
+        let _ = stream
+            .write_all(b"{\"kind\":\"reply\",\"text\":\"late\",\"usage\":{\"calls\":3,\"input_tokens\":5000,\"output_tokens\":200,\"cost_usd_micros\":40}}\n")
+            .await;
+    });
+    let torin = EntityId::from("torin");
+    let sink = Arc::new(UsageSink::default());
+    let cut = tokio::time::timeout(
+        Duration::from_millis(100),
+        chat_charged(
+            sock.clone(),
+            "wake-torin-9".into(),
+            "hello".into(),
+            torin.clone(),
+            Arc::clone(&sink),
+        ),
+    )
+    .await;
+    assert!(cut.is_err(), "the wake timed out");
+    go_tx.send(()).unwrap();
+    server.await.unwrap();
+    let mut late = Usage::default();
+    for _ in 0..100 {
+        late = sink.take(&torin);
+        if !late.is_zero() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(late.tokens(), 5_200);
+    assert_eq!(late.calls, 3);
+}
+
+#[tokio::test]
+async fn a_reply_in_time_is_not_charged_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let _server = fake_daemon(
+        &sock,
+        r#"{"kind":"reply","text":"ok","usage":{"calls":1,"input_tokens":10,"output_tokens":2,"cost_usd_micros":0}}"#,
+    );
+    let torin = EntityId::from("torin");
+    let sink = Arc::new(UsageSink::default());
+    let r = chat_charged(
+        sock,
+        "w".into(),
+        "x".into(),
+        torin.clone(),
+        Arc::clone(&sink),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.usage.tokens(), 12);
+    assert!(sink.take(&torin).is_zero());
+}
+
 /// Runs a real `lg serve` when `LG_BIN` names one (the CI job that builds
 /// littleguy sets it). It checks that littleguy accepts the generated
 /// config, opens its socket, and answers a wake.

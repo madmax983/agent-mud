@@ -148,3 +148,106 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
             .any(|e| e["kind"] == "board_post")
     );
 }
+
+/// Looks once, then answers; holds call `hold_at` until released.
+#[derive(Debug)]
+struct Slow {
+    calls: std::sync::atomic::AtomicUsize,
+    hold_at: usize,
+    release: tokio::sync::Notify,
+}
+
+impl AgentModel for Slow {
+    fn chat<'a>(
+        &'a self,
+        _request: &'a ChatRequest,
+    ) -> HBoxFuture<'a, Result<ChatResponse, AgentError>> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if n == self.hold_at {
+                self.release.notified().await;
+            }
+            Ok(if n == 0 {
+                call("c0", "mud_look", json!({}))
+            } else {
+                ChatResponse {
+                    content: vec![ContentPart::Text(format!("done {n}"))],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::new(50, 5),
+                }
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_wake_is_charged_when_its_job_ends() {
+    // Regression: the worker measured spend per job and sent it to a reply
+    // nobody waited for, so a timed-out wake was never charged.
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let model = Arc::new(Slow {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        hold_at: 1,
+        release: tokio::sync::Notify::new(),
+    });
+    let torin = EntityId::from("torin");
+    let mind = HarvestMind::new(
+        Arc::clone(&model) as Arc<dyn AgentModel>,
+        None,
+        HashMap::from([(
+            torin.clone(),
+            HarvestPersona {
+                name: "Torin".into(),
+                persona: "A smith.".into(),
+                goal: "Ore.".into(),
+            },
+        )]),
+    );
+    let ctx = |id: &str| WakeContext {
+        entity: torin.clone(),
+        name: "Torin".into(),
+        priority: Priority::RoomBatch,
+        reason: "test".into(),
+        events: vec![],
+        event_views: vec![],
+        look: Value::Null,
+        macro_tick: false,
+        macro_ticks: 0,
+        login: false,
+        wake_id: id.into(),
+    };
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
+    let cut = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        mind.wake(ctx("w1"), tools.clone()),
+    )
+    .await;
+    assert!(cut.is_err(), "the first wake times out");
+    assert!(tools.usage_sink().take(&torin).is_zero(), "nothing yet");
+    model.release.notify_one();
+    let mut late = Usage::default();
+    for _ in 0..100 {
+        late = tools.usage_sink().take(&torin);
+        if !late.is_zero() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        late.tokens() > 0,
+        "the abandoned job's spend reached the sink"
+    );
+    let r = mind.wake(ctx("w2"), tools.clone()).await.unwrap();
+    assert!(r.usage.tokens() > 0);
+    assert!(
+        r.usage.tokens() < late.tokens(),
+        "the next wake pays only its own call: {r:?} vs {late:?}"
+    );
+    assert!(tools.usage_sink().take(&torin).is_zero(), "charged once");
+}

@@ -18,15 +18,20 @@ use std::time::Duration;
 use mud_world::EntityId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+
+use tokio::sync::{Mutex, oneshot};
 
 use crate::mind::{
-    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, WakeContext, system_prompt,
+    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, UsageSink, WakeContext, system_prompt,
     wake_message,
 };
+
+/// How long a daemon's reply is still read after its wake was given up.
+const LATE_REPLY_GRACE: Duration = Duration::from_secs(3_600);
 
 /// The variable that carries the MCP bearer token into `lg serve`.
 pub const TOKEN_ENV: &str = "MUD_MCP_TOKEN";
@@ -242,6 +247,35 @@ pub async fn chat(socket: &Path, message_id: &str, text: &str) -> Result<MindRep
     }
 }
 
+/// [`chat`] on a task of its own. `lg serve` finishes an op after its
+/// wake is given up (a timeout), so the reply is read whatever happens to
+/// the wake; if nobody waits for it any more, its usage goes to `sink`.
+///
+/// Spend the daemon never reports (a `waiting` or `busy` answer, a daemon
+/// that dies mid-op, a reply later than [`LATE_REPLY_GRACE`]) stays
+/// uncharged: only littleguy's own cost ledger has it.
+pub(crate) async fn chat_charged(
+    socket: PathBuf,
+    message_id: String,
+    text: String,
+    entity: EntityId,
+    sink: Arc<UsageSink>,
+) -> Result<MindReply, MindError> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let Ok(out) =
+            tokio::time::timeout(LATE_REPLY_GRACE, chat(&socket, &message_id, &text)).await
+        else {
+            return;
+        };
+        if let Err(Ok(r)) = tx.send(out) {
+            sink.add(&entity, r.usage);
+        }
+    });
+    rx.await
+        .map_err(|_| MindError::Unavailable("the daemon did not answer in time".into()))?
+}
+
 #[derive(Debug)]
 struct Daemon {
     child: Child,
@@ -382,11 +416,18 @@ impl Mind for LittleguyMind {
     fn wake(
         &self,
         ctx: WakeContext,
-        _tools: MudTools,
+        tools: MudTools,
     ) -> BoxFuture<'_, Result<MindReply, MindError>> {
         Box::pin(async move {
             let socket = self.ensure(&ctx.entity).await?;
-            chat(&socket, &ctx.wake_id, &wake_message(&ctx)).await
+            chat_charged(
+                socket,
+                ctx.wake_id.clone(),
+                wake_message(&ctx),
+                ctx.entity.clone(),
+                Arc::clone(tools.usage_sink()),
+            )
+            .await
         })
     }
 }
