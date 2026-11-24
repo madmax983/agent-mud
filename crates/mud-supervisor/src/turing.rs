@@ -71,13 +71,15 @@ pub struct Salience {
     pub combat_or_loot: bool,
     /// A goal keyword appeared.
     pub goal_keyword: bool,
+    /// Someone arrived in the room. People notice arrivals.
+    pub arrival: bool,
 }
 
 /// Whether a hidden PC notices an event: always when named, in a fight,
 /// near loot, or on a goal keyword; otherwise with `wake_chance`.
 #[must_use]
 pub fn notices(spec: &TuringSpec, s: Salience, hash: u64) -> bool {
-    if s.named || s.combat_or_loot || s.goal_keyword {
+    if s.named || s.combat_or_loot || s.goal_keyword || s.arrival {
         return true;
     }
     let chance = spec.wake_chance.clamp(0.0, 1.0);

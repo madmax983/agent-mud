@@ -5,3 +5,4 @@
 *.db-shm
 *.lock
 !Cargo.lock
+/.claude/worktrees/

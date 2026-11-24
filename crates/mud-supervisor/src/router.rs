@@ -307,6 +307,7 @@ impl Router {
                     combat_or_loot: matches!(ev.kind, EventKind::Combat | EventKind::Death)
                         || ev.tags.iter().any(|t| t == "loot" || t == "combat"),
                     goal_keyword: has_keyword(&spec, &haystack),
+                    arrival: ev.kind == EventKind::Enter,
                 };
                 let h = mix(
                     self.cfg.seed,
@@ -424,6 +425,26 @@ impl Router {
             seq,
             due_ms: p.due_ms,
         }
+    }
+
+    /// Queues a wake for a reason outside the event stream, such as a
+    /// session start or an interrupted line.
+    pub fn force(&mut self, entity: &EntityId, priority: Priority, reason: &str, now: u64) {
+        let p = self
+            .pending
+            .entry(entity.clone())
+            .or_insert_with(|| Pending {
+                priority,
+                seqs: Vec::new(),
+                first_ms: now,
+                due_ms: now,
+                reason: reason.to_owned(),
+            });
+        if priority >= p.priority {
+            p.priority = priority;
+            p.reason = reason.to_owned();
+        }
+        p.due_ms = p.due_ms.min(now);
     }
 
     /// Takes the wakes that are due, skipping entities with one in flight.
