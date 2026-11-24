@@ -6,9 +6,12 @@
 
 use vstd::prelude::*;
 
+pub mod budget;
+pub mod chatter;
 pub mod classify;
 pub mod injury;
 pub mod schedule;
+pub mod typing;
 pub mod wounds;
 
 verus! {

@@ -114,6 +114,10 @@ pub const fn typing_delay_ms(chars: u32, wpm: u32, reaction_ms: u32, jitter_perm
 }
 // mirror-end typing_delay_ms
 
+/// The longest line [`typing_delay_ms`] is proved for (`formal/verus`):
+/// longer counts are clamped. The parser already rejects lines this long.
+pub const MAX_TYPED_CHARS: usize = 100_000;
+
 /// The hold before a typed (speech) command, from a hash.
 #[must_use]
 pub fn speech_delay_ms(spec: &TuringSpec, chars: usize, hash: u64) -> u64 {
@@ -126,7 +130,7 @@ pub fn speech_delay_ms(spec: &TuringSpec, chars: usize, hash: u64) -> u64 {
     )]
     let wpm = spec.wpm.max(1.0).round() as u32;
     typing_delay_ms(
-        u32::try_from(chars).unwrap_or(u32::MAX),
+        u32::try_from(chars.min(MAX_TYPED_CHARS)).unwrap_or(0),
         wpm,
         reaction,
         jitter,
@@ -315,6 +319,14 @@ mod tests {
         fn typing_delay_grows_with_length(chars in 0u32..2_000, wpm in 1u32..200, r in 0u32..3_000, j in 850u32..=1_150) {
             prop_assert!(typing_delay_ms(chars + 1, wpm, r, j) >= typing_delay_ms(chars, wpm, r, j));
             prop_assert!(typing_delay_ms(chars, wpm, r, j) >= u64::from(r));
+        }
+
+        #[test]
+        fn a_huge_line_types_as_the_longest_proved_one(hash in any::<u64>()) {
+            let s = spec();
+            let longest = speech_delay_ms(&s, MAX_TYPED_CHARS, hash);
+            prop_assert_eq!(speech_delay_ms(&s, usize::MAX, hash), longest);
+            prop_assert!(longest > speech_delay_ms(&s, MAX_TYPED_CHARS - 1_000, hash));
         }
     }
 }
