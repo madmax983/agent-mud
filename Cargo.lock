@@ -2137,6 +2137,7 @@ dependencies = [
  "mud-world",
  "reqwest 0.13.5",
  "rmcp",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",

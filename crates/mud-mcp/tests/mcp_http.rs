@@ -55,6 +55,9 @@ mod http {
         game: Arc<Game>,
         make_gate: impl FnOnce(Arc<Game>) -> Arc<dyn CommandGate>,
     ) -> Server {
+        // Workspace feature unification can leave reqwest with no TLS
+        // crypto provider; install one before any client is built.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let tokens = Arc::new(TokenRegistry::new());
         let app: axum::Router = router(
             Arc::clone(&game),
