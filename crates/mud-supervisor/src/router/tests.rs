@@ -273,7 +273,7 @@ fn a_turing_pc_misses_some_chatter_but_not_its_goals() {
     let mut w = world();
     let mut r = Router::new(RouterConfig::default());
     let rt = HashMap::new();
-    w.bring_online(&id("kestrel"), 0);
+    w.bring_online(&id("pc_kestrel"), 0);
     let ada = w.login("ada", 0).unwrap();
     w.drain_fresh();
     run(&mut w, &mut r, &rt, &ada, "e", 0);
@@ -288,7 +288,7 @@ fn a_turing_pc_misses_some_chatter_but_not_its_goals() {
             &format!("say weather is grim {i}"),
             100 + i,
         );
-        if dropped_for(&n, "kestrel").is_some() {
+        if dropped_for(&n, "pc_kestrel").is_some() {
             dropped += 1;
         } else {
             heard += 1;
@@ -309,7 +309,7 @@ fn a_turing_pc_misses_some_chatter_but_not_its_goals() {
             1_000 + i,
         );
         assert!(
-            queued_for(&n, "kestrel").is_some(),
+            queued_for(&n, "pc_kestrel").is_some(),
             "goal keywords always land"
         );
         r.pending.clear();
@@ -322,22 +322,22 @@ fn afk_holds_routine_wakes_but_not_urgent_ones() {
     let mut r = Router::new(RouterConfig::default());
     let mut rt = HashMap::new();
     rt.insert(
-        id("kestrel"),
+        id("pc_kestrel"),
         EntityRuntime {
             budget: None,
             afk_until_ms: Some(120_000),
         },
     );
-    w.bring_online(&id("kestrel"), 0);
+    w.bring_online(&id("pc_kestrel"), 0);
     let ada = w.login("ada", 0).unwrap();
     w.drain_fresh();
     run(&mut w, &mut r, &rt, &ada, "e", 0);
     r.pending.clear();
     let n = run(&mut w, &mut r, &rt, &ada, "say cellar run anyone", 1_000);
-    assert_eq!(queued_for(&n, "kestrel").unwrap().1, 120_000);
+    assert_eq!(queued_for(&n, "pc_kestrel").unwrap().1, 120_000);
     r.pending.clear();
     let n = run(&mut w, &mut r, &rt, &ada, "tell kestrel you there?", 1_000);
-    assert!(queued_for(&n, "kestrel").unwrap().1 <= 1_500);
+    assert!(queued_for(&n, "pc_kestrel").unwrap().1 <= 1_500);
 }
 
 #[test]

@@ -100,7 +100,7 @@ pub async fn run() -> anyhow::Result<Transcript> {
     );
 
     rig.run_for(2_000).await?;
-    let kestrel = EntityId::from("kestrel");
+    let kestrel = EntityId::from("pc_kestrel");
     let read = game.events(&kestrel, Seq(0), 500)["events"]
         .as_array()
         .is_some_and(|evs| {
@@ -121,7 +121,7 @@ pub async fn run() -> anyhow::Result<Transcript> {
         .as_array()
         .is_some_and(|evs| {
             evs.iter().any(|e| {
-                e["actor"]["id"] == "kestrel"
+                e["actor"]["id"] == "pc_kestrel"
                     && e["untrusted_text"]
                         .as_str()
                         .is_some_and(|t| t.contains("wanderer") && t.contains("50/50"))
@@ -163,7 +163,7 @@ mod tests {
     async fn the_v01_done_criteria_hold() {
         let t = super::run().await.unwrap();
         assert!(t.wakes.iter().any(|w| w.starts_with("torin")));
-        assert!(t.wakes.iter().any(|w| w.starts_with("kestrel")));
+        assert!(t.wakes.iter().any(|w| w.starts_with("pc_kestrel")));
         assert!(t.lines.iter().any(|l| l.contains("BOUNTY")));
     }
 }

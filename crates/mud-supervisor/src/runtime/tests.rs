@@ -90,7 +90,7 @@ async fn the_v01_smoke_path() {
     assert_eq!(board[0].author.name, "Torin");
     // Kestrel's session starts: it reads the board and heads to the Flagon.
     r.run_for(2_000, 250, &mut rx).await;
-    let k = EntityId::from("kestrel");
+    let k = EntityId::from("pc_kestrel");
     assert!(r.game.read(|w| w.entity(&k).unwrap().online));
     let k_saw = r.game.events(&k, Seq(0), 500);
     assert!(
@@ -127,7 +127,7 @@ async fn the_v01_smoke_path() {
             woke.insert(entity.to_string());
         }
     }
-    for who in ["torin", "kestrel", "marta"] {
+    for who in ["torin", "pc_kestrel", "marta"] {
         assert!(woke.contains(who), "{who} never woke: {woke:?}");
     }
     let snap = r.sup.snapshot();
@@ -213,7 +213,7 @@ async fn a_distracted_spell_starts_only_when_the_pc_is_idle() {
     // Regression: spells started whenever the PC stood in a safe room, even
     // mid-wake or with a reply to a human queued.
     let r = rig(quiet());
-    let k = EntityId::from("kestrel");
+    let k = EntityId::from("pc_kestrel");
     let afk = |r: &Rig| lock(&r.sup.state)[&k].afk_until;
     lock(&r.sup.state).get_mut(&k).unwrap().afk.next_at_ms = 1;
     let now = r.game.now_ms();
@@ -298,7 +298,7 @@ async fn sessions_end_outside_the_window() {
     let r = rig(quiet());
     let mut rx = r.game.subscribe();
     r.run_for(500, 250, &mut rx).await;
-    let k = EntityId::from("kestrel");
+    let k = EntityId::from("pc_kestrel");
     assert!(r.game.read(|w| w.entity(&k).unwrap().online));
     // Kestrel's window in crypt-v01 is all day; a narrow one logs it out.
     let mut spec = r

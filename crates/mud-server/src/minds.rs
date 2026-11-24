@@ -188,7 +188,7 @@ mod tests {
         let m = build(&MudConfig::default(), &pack, &tokens).unwrap();
         let mut ids: Vec<&str> = m.by_entity.keys().map(EntityId::as_str).collect();
         ids.sort_unstable();
-        assert_eq!(ids, ["guard_01", "kestrel", "marta", "torin", "vich"]);
+        assert_eq!(ids, ["guard_01", "marta", "pc_kestrel", "torin", "vich"]);
         assert!(m.by_entity.values().all(|m| m.kind() == "scripted"));
         assert!(tokens.is_empty());
     }
@@ -202,7 +202,10 @@ mod tests {
         let m = build(&cfg, &pack, &tokens).unwrap();
         assert_eq!(tokens.len(), 3, "marta, torin, vich");
         assert_eq!(m.by_entity[&EntityId::from("torin")].kind(), "littleguy");
-        assert_eq!(m.by_entity[&EntityId::from("kestrel")].kind(), "scripted");
+        assert_eq!(
+            m.by_entity[&EntityId::from("pc_kestrel")].kind(),
+            "scripted"
+        );
         assert_eq!(m.littleguy.len(), 1);
     }
 

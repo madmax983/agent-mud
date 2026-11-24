@@ -275,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn kestrel_recruits_a_human_who_walks_in() {
         let (game, typing, pack) = setup();
-        let k = EntityId::from("kestrel");
+        let k = EntityId::from("pc_kestrel");
         game.bring_online(&k);
         let mind = ScriptedMind::from_cast(&pack.cast);
         let ada = game.login("ada").unwrap();
@@ -287,7 +287,7 @@ mod tests {
         }
         let r = mind
             .wake(
-                ctx("kestrel", Priority::RoomBatch, evs),
+                ctx("pc_kestrel", Priority::RoomBatch, evs),
                 MudTools::new(Arc::clone(&game), typing, k.clone()),
             )
             .await

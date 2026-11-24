@@ -160,6 +160,37 @@ async fn two_players_share_a_room_over_websockets() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_terminal_message_closes_the_socket() {
+    let (addr, built) = boot().await;
+    let mut ws = ws(addr).await;
+    send(&mut ws, json!({ "login": "ada" })).await;
+    until(&mut ws, "Town Square").await;
+    let huge = "x".repeat(mud_server::MAX_WS_MESSAGE_BYTES * 4);
+    let _ = ws
+        .send(Message::Text(
+            json!({ "cmd": format!("say {huge}") }).to_string().into(),
+        ))
+        .await;
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_) | Ok(Message::Close(_))) => return true,
+                Some(Ok(Message::Text(t))) if t.contains("You say") => return false,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(closed, "an oversized message must not be executed");
+    let said = built
+        .mud
+        .game
+        .events(&mud_world::EntityId::from("pc_ada"), mud_world::Seq(0), 50);
+    assert!(!said.to_string().contains("xxxxxxxx"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_observer_needs_the_token_and_shows_private_goals() {
     let (addr, built) = boot().await;
     let token = built.mud.admin_token.clone();

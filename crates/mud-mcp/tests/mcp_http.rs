@@ -430,7 +430,7 @@ mod http {
             })
         })
         .await;
-        let kestrel = EntityId::from("kestrel");
+        let kestrel = EntityId::from("pc_kestrel");
         server.game.bring_online(&kestrel);
         let client = server.client(&server.issue(&kestrel)).await;
 

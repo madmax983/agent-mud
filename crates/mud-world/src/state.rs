@@ -567,7 +567,7 @@ mod tests {
         let torin = &s.entities[&EntityId::from("torin")];
         assert_eq!(torin.inventory.len(), 6);
         assert!(torin.inventory.iter().all(|i| s.items[i].stock));
-        let kestrel = &s.entities[&EntityId::from("kestrel")];
+        let kestrel = &s.entities[&EntityId::from("pc_kestrel")];
         assert!(!kestrel.online, "a turing PC starts logged out");
         assert_eq!(kestrel.kind, EntityKind::Player);
         assert_eq!(kestrel.equipped.len(), 1);

@@ -4,9 +4,12 @@ Status: accepted
 
 ## Decision
 
-A Turing PC (`tier = "turing"`, kestrel in crypt-v01) is an ordinary
+A Turing PC (`tier = "turing"`, `pc_kestrel` in crypt-v01) is an ordinary
 `player` to every view: `look`, `who` and `mud_events` never expose a
-tier, a controller or a human flag. The supervisor adds friction:
+tier, a controller or a human flag. Its id has the same shape as a human
+login's (`pc_<name>`); the pack check refuses a player entry with any
+other id, and `who` sorts by name so its order reveals nothing. The
+supervisor adds friction:
 
 - **Sessions.** `active_windows_utc` shift each UTC day by a deterministic
   offset of up to `daily_offset_minutes`. Outside a window the PC logs

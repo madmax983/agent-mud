@@ -193,7 +193,7 @@ on = "enter"
 who = "human"
 do = ["say move along. and stay out of the alley after dark."]
 
-[cast.kestrel]
+[cast.pc_kestrel]
 name = "kestrel"
 short = "kestrel is here, fiddling with a strap."
 description = "A wiry adventurer in a patched cloak, shortsword on the hip, eyes that keep going to the door."
@@ -208,12 +208,12 @@ equip = ["shortsword"]
 persona = "You are kestrel, a player in a text MUD. You type like a person: lowercase, short fragments, MUD idioms (omw, sec, ty, wait what, lol). Never more than one sentence. Never sound like an assistant."
 goal = "Scrape 40s for a lantern and a leather jerkin. Recruit a human for the Ossuary. Never split loot less than 50/50."
 fallback = "kestrel is idle."
-[cast.kestrel.mind]
+[cast.pc_kestrel.mind]
 tier = "turing"
 runtime = "littleguy"
 model = "flash"
 macro_tick_hours = [2.0, 6.0]
-[cast.kestrel.mind.turing]
+[cast.pc_kestrel.mind.turing]
 active_windows_utc = ["00:00-23:59"]
 daily_offset_minutes = 20
 wake_chance = 0.35
@@ -222,17 +222,17 @@ wpm = 55.0
 afk_every_minutes = [20, 60]
 afk_minutes = [2, 6]
 
-[[cast.kestrel.script]]
+[[cast.pc_kestrel.script]]
 on = "login"
 do = ["move w", "move n", "board read", "move s", "move e"]
 
-[[cast.kestrel.script]]
+[[cast.pc_kestrel.script]]
 on = "enter"
 who = "human"
 room = "rusty_flagon_taproom"
 do = ["say yo {actor} you going down the cellar? need a 2nd blade for the ossuary, split 50/50"]
 
-[[cast.kestrel.script]]
+[[cast.pc_kestrel.script]]
 on = "speech"
 keywords = ["split", "40", "60"]
 do = ["say 50/50 or nothing"]

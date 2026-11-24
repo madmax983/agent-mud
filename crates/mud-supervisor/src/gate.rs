@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_turing_pc_types_and_others_do_not() {
         let g = game();
-        let k = EntityId::from("kestrel");
+        let k = EntityId::from("pc_kestrel");
         g.bring_online(&k);
         let gate = Gate::new(Arc::clone(&g), 9, 1.0);
         let say = gate.hold_ms(&k, "say anyone up for the cellar?", 1);
@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn combat_interrupts_a_held_line() {
         let g = game();
-        let k = EntityId::from("kestrel");
+        let k = EntityId::from("pc_kestrel");
         g.bring_online(&k);
         let gate = Gate::new(Arc::clone(&g), 9, 1.0);
         let g2 = Arc::clone(&gate);
@@ -219,7 +219,7 @@ mod tests {
         // Regression: the first line to finish removed the entity's entry,
         // so a second line still being typed could not be interrupted.
         let g = game();
-        let k = EntityId::from("kestrel");
+        let k = EntityId::from("pc_kestrel");
         g.bring_online(&k);
         let gate = Gate::new(Arc::clone(&g), 9, 1.0);
         let (g1, k1) = (Arc::clone(&gate), k.clone());
@@ -244,7 +244,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_interrupt_drops_every_held_line() {
         let g = game();
-        let k = EntityId::from("kestrel");
+        let k = EntityId::from("pc_kestrel");
         g.bring_online(&k);
         let gate = Gate::new(Arc::clone(&g), 9, 1.0);
         let lines = [
@@ -268,7 +268,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_line_leaves_no_held_entry() {
         let g = game();
-        let k = EntityId::from("kestrel");
+        let k = EntityId::from("pc_kestrel");
         g.bring_online(&k);
         let gate = Gate::new(Arc::clone(&g), 9, 1.0);
         let cut = tokio::time::timeout(

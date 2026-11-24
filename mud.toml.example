@@ -47,4 +47,4 @@ macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
 first_macro_tick_secs = [30, 120]
 step_ms = 250
 [supervisor.budgets]
-kestrel = 600000
+pc_kestrel = 600000

@@ -81,7 +81,7 @@ fn look_shows_the_room_and_hides_who_is_an_agent() {
         .filter_map(|e| e["name"].as_str())
         .collect();
     assert_eq!(names, vec!["Marta"], "kestrel starts logged out");
-    w.bring_online(&id("kestrel"), 2);
+    w.bring_online(&id("pc_kestrel"), 2);
     let v = w.look_view(&ada);
     let k = v["entities"]
         .as_array()
@@ -89,6 +89,10 @@ fn look_shows_the_room_and_hides_who_is_an_agent() {
         .iter()
         .find(|e| e["name"] == "kestrel")
         .unwrap();
+    assert_eq!(
+        k["id"], "pc_kestrel",
+        "the agent PC's id is shaped like a human's"
+    );
     assert_eq!(k["kind"], "player", "a Turing PC looks like any player");
     let text = v.to_string();
     for leak in ["turing", "tier", "human", "littleguy"] {
@@ -416,9 +420,9 @@ fn the_board_holds_notices_with_their_author() {
     ok(&mut w, &torin, "e");
     ok(&mut w, &torin, "n");
     ok(&mut w, &torin, "board post Ore wanted. 15s a chunk.");
-    w.bring_online(&id("kestrel"), 1);
-    place(&mut w, &id("kestrel"), "notice_market");
-    let r = ok(&mut w, &id("kestrel"), "board read");
+    w.bring_online(&id("pc_kestrel"), 1);
+    place(&mut w, &id("pc_kestrel"), "notice_market");
+    let r = ok(&mut w, &id("pc_kestrel"), "board read");
     assert_eq!(r.narrative, "The notice board holds 1 notice.");
     assert_eq!(r.resolution["posts"][0]["author"]["name"], "Torin");
     assert_eq!(
@@ -515,7 +519,7 @@ fn unconscious_entities_cannot_act_and_regen_wakes_them() {
 #[test]
 fn offline_entities_cannot_act_and_logout_is_seen() {
     let mut w = world();
-    let k = id("kestrel");
+    let k = id("pc_kestrel");
     assert_eq!(err(&mut w, &k, "look"), ErrorCode::Offline);
     w.bring_online(&k, 1);
     ok(&mut w, &k, "look");
@@ -549,7 +553,7 @@ fn parse_errors_come_back_coded() {
 fn who_lists_players_only() {
     let mut w = world();
     let _ = w.login("ada", 1).unwrap();
-    w.bring_online(&id("kestrel"), 1);
+    w.bring_online(&id("pc_kestrel"), 1);
     let (text, _) = w.who();
     assert!(text.contains("ada") && text.contains("kestrel") && !text.contains("Marta"));
 }
@@ -752,7 +756,7 @@ fn who_lists_names_alphabetically_whatever_the_ids() {
     let mut w = world();
     let _ = w.login("zed", 1).unwrap();
     let _ = w.login("Ada", 1).unwrap();
-    w.bring_online(&id("kestrel"), 1);
+    w.bring_online(&id("pc_kestrel"), 1);
     let (text, v) = w.who();
     assert_eq!(text, "Online: Ada, kestrel, zed");
     assert_eq!(v["online"], serde_json::json!(["Ada", "kestrel", "zed"]));
@@ -799,7 +803,7 @@ fn speech_with_control_characters_is_refused() {
 fn a_resumed_world_takes_every_human_offline() {
     let mut w = world();
     let ada = w.login("ada", 1).unwrap();
-    w.bring_online(&id("kestrel"), 1);
+    w.bring_online(&id("pc_kestrel"), 1);
     let square = RoomId::from("town_square");
     assert!(w.human_present(&square));
     let snapshot = w.snapshot();
@@ -811,7 +815,7 @@ fn a_resumed_world_takes_every_human_offline() {
         "npcs stay in the world"
     );
     assert!(
-        resumed.entity(&id("kestrel")).unwrap().online,
+        resumed.entity(&id("pc_kestrel")).unwrap().online,
         "agent PCs are the supervisor's to manage"
     );
 }

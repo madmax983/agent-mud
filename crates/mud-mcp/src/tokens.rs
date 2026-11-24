@@ -144,9 +144,9 @@ mod tests {
     fn issued_tokens_resolve_to_their_entity() {
         let reg = TokenRegistry::new();
         let a = reg.issue(EntityId::from("ada")).unwrap();
-        let k = reg.issue(EntityId::from("kestrel")).unwrap();
+        let k = reg.issue(EntityId::from("pc_kestrel")).unwrap();
         assert_eq!(reg.resolve(&a), Some(EntityId::from("ada")));
-        assert_eq!(reg.resolve(&k), Some(EntityId::from("kestrel")));
+        assert_eq!(reg.resolve(&k), Some(EntityId::from("pc_kestrel")));
         assert_eq!(reg.resolve("nope"), None);
         assert_eq!(reg.resolve(""), None);
         assert_eq!(reg.len(), 2);
@@ -168,13 +168,13 @@ mod tests {
         let reg = TokenRegistry::new();
         let a = reg.issue(EntityId::from("ada")).unwrap();
         let a2 = reg.issue(EntityId::from("ada")).unwrap();
-        let k = reg.issue(EntityId::from("kestrel")).unwrap();
+        let k = reg.issue(EntityId::from("pc_kestrel")).unwrap();
         assert!(reg.revoke(&a));
         assert!(!reg.revoke(&a), "already gone");
         assert_eq!(reg.resolve(&a), None);
         assert_eq!(reg.revoke_entity(&EntityId::from("ada")), 1);
         assert_eq!(reg.resolve(&a2), None);
-        assert_eq!(reg.resolve(&k), Some(EntityId::from("kestrel")));
+        assert_eq!(reg.resolve(&k), Some(EntityId::from("pc_kestrel")));
         assert!(!reg.is_empty());
         assert!(reg.revoke(&k));
         assert!(reg.is_empty());
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(reg.advance_cursor(&a, &ada, |c| (Seq(3), c)), Some(Seq(5)));
         assert_eq!(reg.advance_cursor(&a, &ada, |c| (c, c)), Some(Seq(5)));
         assert_eq!(reg.advance_cursor(&b, &ada, |c| (c, c)), Some(Seq(0)));
-        let other = EntityId::from("kestrel");
+        let other = EntityId::from("pc_kestrel");
         assert_eq!(reg.advance_cursor(&a, &other, |c| (c, c)), None);
         assert_eq!(reg.advance_cursor("nope", &ada, |c| (c, c)), None);
     }

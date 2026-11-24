@@ -34,6 +34,12 @@ use crate::config::MudConfig;
 use crate::session::Presence;
 use crate::web::Mud;
 
+/// The largest WebSocket message a terminal may send, in bytes.
+pub const MAX_WS_MESSAGE_BYTES: usize = 4_096;
+
+/// The most open terminal (or telnet) connections at once.
+pub const MAX_CONNECTIONS: usize = 512;
+
 /// The MCP command gate: every `mud_command` from an agent passes the
 /// Turing typing gate, as in-process minds do.
 #[derive(Debug, Clone)]
@@ -169,6 +175,9 @@ pub fn settings(cfg: &MudConfig) -> anyhow::Result<AutumnConfig> {
     c.aeo.enabled = false;
     c.security.csrf.enabled = false;
     c.security.signing_secret.secret = Some(random_hex(32)?);
+    // A terminal line is one command; nothing legitimate is near 4 KiB.
+    c.realtime.max_message_bytes = Some(MAX_WS_MESSAGE_BYTES);
+    c.realtime.max_connections = Some(MAX_CONNECTIONS);
     Ok(c)
 }
 
@@ -232,7 +241,8 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding telnet on {addr}"))?;
         tracing::info!(%addr, "telnet is up");
-        tasks.push(tokio::spawn(telnet::serve(
+        tasks.push(tokio::spawn(telnet::serve_limited(
+            MAX_CONNECTIONS,
             listener,
             Arc::clone(&built.mud.game),
             Arc::clone(&built.mud.presence),

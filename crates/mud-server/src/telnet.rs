@@ -188,14 +188,33 @@ async fn handle(
 
 /// Serves telnet clients on `listener` until the task is aborted.
 pub async fn serve(listener: TcpListener, game: Arc<Game>, presence: Arc<Presence>) {
+    serve_limited(crate::MAX_CONNECTIONS, listener, game, presence).await;
+}
+
+/// Serves telnet clients with at most `max` open at once. A client over
+/// the limit is told so and dropped.
+pub async fn serve_limited(
+    max: usize,
+    listener: TcpListener,
+    game: Arc<Game>,
+    presence: Arc<Presence>,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(max));
     loop {
         match listener.accept().await {
-            Ok((stream, peer)) => {
+            Ok((mut stream, peer)) => {
+                let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                    let _ = stream
+                        .write_all(b"The server is full. Try again later.\r\n")
+                        .await;
+                    continue;
+                };
                 let (g, p) = (Arc::clone(&game), Arc::clone(&presence));
                 tokio::spawn(async move {
                     if let Err(e) = handle(stream, g, p).await {
                         tracing::debug!(%peer, error = %e, "telnet session ended");
                     }
+                    drop(permit);
                 });
             }
             Err(e) => tracing::warn!(error = %e, "telnet accept failed"),
@@ -209,6 +228,31 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_full_server_turns_new_clients_away() {
+        let game = Game::new(
+            World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1),
+            None,
+            Arc::new(ManualClock::new(1)),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_limited(
+            1,
+            listener,
+            game,
+            Arc::new(Presence::default()),
+        ));
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut greeting = [0u8; 16];
+        first.read_exact(&mut greeting).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut out = String::new();
+        second.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("The server is full"), "{out}");
+        task.abort();
+    }
 
     /// Sends `input` to a fresh server and returns everything it wrote
     /// back before closing.

@@ -1038,6 +1038,17 @@ impl WorldPack {
             {
                 problems.push(format!("cast {id} keeps unknown shop {shop:?}"));
             }
+            // A player-kind entity must carry a human-shaped id (`pc_<name>`,
+            // as `World::login` makes), or its id alone would reveal that
+            // an agent plays it.
+            if c.kind == EntityKind::Player
+                && id.as_str() != format!("pc_{}", c.name.to_ascii_lowercase())
+            {
+                problems.push(format!(
+                    "cast {id} is a player; its id must be pc_{}",
+                    c.name.to_ascii_lowercase()
+                ));
+            }
             if c.mind.tier == Tier::Turing && c.mind.turing.is_none() {
                 problems.push(format!(
                     "cast {id} is a turing PC with no [mind.turing] table"
@@ -1144,6 +1155,33 @@ traits = [{ name = "nope", control = 12 }]
         for needle in ["nowhere", "exit north", "ghost", "juggling", "nope"] {
             assert!(text.contains(needle), "{needle} missing from {text}");
         }
+    }
+
+    #[test]
+    fn a_player_cast_entry_needs_a_human_shaped_id() {
+        let world = "[world]\nname = \"x\"\ntitle = \"x\"\nstart_room = \"a\"\nrespawn_room = \"a\"\n[[rooms]]\nid = \"a\"\ntitle = \"A\"\ndescription = \"a\"\n";
+        let economy = "[currency]\nname = \"gold\"\nshort = \"g\"\n";
+        let bad = "[cast.kes]\nname = \"kes\"\nkind = \"player\"\nroom = \"a\"\n";
+        let err = WorldPack::from_sources(PackSources {
+            world,
+            skills: "",
+            items: "",
+            economy,
+            cast: bad,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("its id must be pc_kes"), "{err}");
+        let good = "[cast.pc_kes]\nname = \"kes\"\nkind = \"player\"\nroom = \"a\"\n";
+        assert!(
+            WorldPack::from_sources(PackSources {
+                world,
+                skills: "",
+                items: "",
+                economy,
+                cast: good
+            })
+            .is_ok()
+        );
     }
 
     #[test]
