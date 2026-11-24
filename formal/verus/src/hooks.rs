@@ -139,9 +139,9 @@ pub enum EffectClass {
 pub struct Tally {
     /// Effects seen (saturating).
     pub effects: u8,
-    /// refuse() effects seen (saturating).
+    /// `refuse()` effects seen (saturating).
     pub refuses: u8,
-    /// heal() and hurt() effects seen (saturating).
+    /// `heal()` and `hurt()` effects seen (saturating).
     pub bodies: u8,
 }
 // mirror-end effect_tally

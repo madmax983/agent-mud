@@ -132,6 +132,14 @@ pub enum Command {
     Who,
     /// List the verbs.
     Help,
+    /// A verb the world's scripts declare, such as `pray`.
+    Custom {
+        /// The verb, lowercase.
+        name: String,
+        /// Whatever followed it, trimmed. Player text: it follows the
+        /// speech rules and may be empty.
+        args: String,
+    },
 }
 
 impl Command {
@@ -165,6 +173,17 @@ impl Command {
             Self::Attempt { .. } => "attempt",
             Self::Who => "who",
             Self::Help => "help",
+            Self::Custom { .. } => "custom",
+        }
+    }
+
+    /// The verb as the player typed it: the custom verb's own name, or
+    /// [`Command::verb`]. Results and refusals name it.
+    #[must_use]
+    pub fn display_verb(&self) -> &str {
+        match self {
+            Self::Custom { name, .. } => name,
+            other => other.verb(),
         }
     }
 
@@ -216,6 +235,70 @@ pub enum ParseError {
     #[error("text must be one line of printable characters")]
     ControlCharacter,
 }
+
+/// Every built-in verb word and alias. A world script may not declare a
+/// verb with one of these names.
+pub const BUILTIN_WORDS: &[&str] = &[
+    "look",
+    "l",
+    "exits",
+    "examine",
+    "exa",
+    "x",
+    "move",
+    "go",
+    "walk",
+    "inventory",
+    "inv",
+    "i",
+    "sheet",
+    "score",
+    "stats",
+    "say",
+    "emote",
+    "me",
+    "tell",
+    "whisper",
+    "t",
+    "board",
+    "read",
+    "post",
+    "take",
+    "get",
+    "pick",
+    "drop",
+    "give",
+    "buy",
+    "sell",
+    "list",
+    "wares",
+    "equip",
+    "wield",
+    "wear",
+    "hold",
+    "unequip",
+    "remove",
+    "unwield",
+    "use",
+    "drink",
+    "eat",
+    "open",
+    "attack",
+    "kill",
+    "k",
+    "hit",
+    "defend",
+    "parry",
+    "dodge",
+    "flee",
+    "run",
+    "attempt",
+    "try",
+    "who",
+    "help",
+    "?",
+    "commands",
+];
 
 /// The help text.
 pub const HELP: &str = "\
@@ -434,10 +517,124 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
     })
 }
 
+/// The arguments of a custom verb: trimmed, at most [`MAX_TEXT_CHARS`]
+/// characters, none [`forbidden_in_text`]. They may be empty.
+///
+/// # Errors
+/// They are too long or hold a forbidden character.
+pub fn custom_args(rest: &str) -> Result<String, ParseError> {
+    let t = rest.trim();
+    if t.chars().count() > MAX_TEXT_CHARS {
+        return Err(ParseError::TooLong);
+    }
+    if t.chars().any(forbidden_in_text) {
+        return Err(ParseError::ControlCharacter);
+    }
+    Ok(t.to_owned())
+}
+
+/// Parses one line, reading the verbs for which `custom` holds as
+/// [`Command::Custom`]. Built-in verbs always win.
+///
+/// `parse_with(line, &|_| false)` is exactly [`parse`].
+///
+/// # Errors
+/// As [`parse`]; a custom verb's arguments follow [`custom_args`].
+pub fn parse_with(line: &str, custom: &dyn Fn(&str) -> bool) -> Result<Command, ParseError> {
+    match parse(line) {
+        Err(ParseError::UnknownVerb(verb)) if custom(&verb) => {
+            let t = line.trim();
+            let rest = t.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+            Ok(Command::Custom {
+                name: verb,
+                args: custom_args(rest)?,
+            })
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn pray(v: &str) -> bool {
+        matches!(v, "pray" | "listen")
+    }
+
+    #[test]
+    fn parse_with_prefers_builtins_and_reads_custom_verbs() {
+        assert_eq!(
+            parse_with("Pray", &pray),
+            Ok(Command::Custom {
+                name: "pray".into(),
+                args: String::new()
+            })
+        );
+        assert_eq!(
+            parse_with("listen  at the Grate ", &pray),
+            Ok(Command::Custom {
+                name: "listen".into(),
+                args: "at the Grate".into()
+            })
+        );
+        assert_eq!(parse_with("look", &|_| true), Ok(Command::Look));
+        assert_eq!(
+            parse_with("n", &|_| true),
+            Ok(Command::Move { dir: Direction::N })
+        );
+        assert!(
+            matches!(parse_with("dance", &pray), Err(ParseError::UnknownVerb(v)) if v == "dance")
+        );
+        let c = parse_with("pray", &pray).unwrap();
+        assert_eq!(c.verb(), "custom");
+        assert_eq!(c.display_verb(), "pray");
+        assert!(!c.is_read_only() && !c.is_speech());
+        assert_eq!(p("look").display_verb(), "look");
+    }
+
+    #[test]
+    fn custom_args_follow_the_speech_rules() {
+        assert_eq!(
+            parse_with(&format!("pray {}", "a".repeat(501)), &pray),
+            Err(ParseError::TooLong)
+        );
+        assert_eq!(
+            parse_with("pray a\u{202e}b", &pray),
+            Err(ParseError::ControlCharacter)
+        );
+        assert_eq!(
+            parse_with("pray café", &pray),
+            Ok(Command::Custom {
+                name: "pray".into(),
+                args: "café".into()
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_words_cover_every_verb_and_alias() {
+        for w in BUILTIN_WORDS {
+            let line = match *w {
+                "read" => "read board".to_owned(),
+                other => format!("{other} n"),
+            };
+            assert!(
+                !matches!(parse(&line), Err(ParseError::UnknownVerb(_))),
+                "{w} is a built-in verb"
+            );
+        }
+        for line in HELP.lines() {
+            for part in line.split('|') {
+                let word = part.split_whitespace().next().unwrap_or("");
+                // `give <item|10s>` splits inside its placeholder.
+                if word.chars().all(|c| c.is_ascii_lowercase()) {
+                    assert!(BUILTIN_WORDS.contains(&word), "{word} is missing");
+                }
+            }
+        }
+    }
 
     fn p(s: &str) -> Command {
         parse(s).unwrap()
@@ -622,6 +819,11 @@ mod tests {
         #[test]
         fn parse_never_panics(s in "\\PC{0,80}") {
             let _ = parse(&s);
+        }
+
+        #[test]
+        fn parse_with_no_verbs_equals_parse(s in "\\PC{0,80}") {
+            prop_assert_eq!(parse_with(&s, &|_| false), parse(&s));
         }
 
         #[test]

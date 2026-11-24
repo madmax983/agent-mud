@@ -627,6 +627,10 @@ impl World {
         if def.slot.is_some() {
             return self.equip(ctx, actor, word);
         }
+        // A world script may give an item with no engine use one.
+        if let Some(done) = self.use_hook(ctx, actor, item, on) {
+            return done;
+        }
         Err(Fail::new(
             ErrorCode::CannotUse,
             format!("you cannot think of a use for the {}", def.name),

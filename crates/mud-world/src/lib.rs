@@ -17,9 +17,11 @@ pub mod schedule;
 pub mod state;
 pub mod store;
 
-pub use engine::{Audit, CommandResult, ErrorCode, LoginError, StateChange, World};
+pub use engine::{
+    Audit, CommandResult, ErrorCode, HookStatus, HooksChange, LoginError, StateChange, World,
+};
 pub use event::{ActorRef, Event, EventKind};
 pub use game::{Clock, Game, ManualClock, SystemClock};
 pub use ids::{EntityId, ItemId, ProtoId, RoomId, Seq, ShopId, SkillId};
 pub use pack::WorldPack;
-pub use parser::{Command, parse};
+pub use parser::{Command, parse, parse_with};

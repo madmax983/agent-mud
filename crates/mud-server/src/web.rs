@@ -148,10 +148,11 @@ function fmt(k,m){
     return `typing  ${m.entity}  line dropped: combat broke out`;
   }
   if(k==='roll')return `roll    ${m.entity}  ${m.trait_name}(${m.roll.target_number}) rolled ${m.roll.total} → ${m.nudged?'FAILED, nudged':'resisted'}`;
+  if(k==='script')return `script  ${m.text}`;
   if(k==='session')return m.kind==='afk'?`afk     ${m.entity}  until ${new Date(m.until_ms).toLocaleTimeString()}`:`session ${m.entity}  ${m.online?'logged in':'logged out'}`;
   return `world   [${m.room||'-'}] ${m.who}${m.human?' (human)':''}: ${m.text}`;
 }
-['route','wake','roll','world','session'].forEach(k=>es.addEventListener(k,e=>row(k==='roll'?'soft':(k==='world'?'muted':''),fmt(k,JSON.parse(e.data)))));
+['route','wake','roll','world','session','script'].forEach(k=>es.addEventListener(k,e=>row(k==='roll'?'soft':(k==='world'?'muted':''),fmt(k,JSON.parse(e.data)))));
 ";
 
 /// The page scripts are files, not inline: the app's CSP allows
@@ -493,6 +494,7 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
         match &*r.ok()? {
             a @ Audit::SelfControl { .. } => Some(sse("roll", &serde_json::to_value(a).ok()?)),
             Audit::Command { .. } => None,
+            a => Some(sse("script", &json!({ "text": script_line(a)? }))),
         }
     });
     let world = BroadcastStream::new(app.game.subscribe()).filter_map(|r| async move {
@@ -504,6 +506,47 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
     futures::stream::select(sup, futures::stream::select(audit, world))
         .map(Ok::<_, Infallible>)
         .take_until(app.shutdown.clone().cancelled_owned())
+}
+
+/// One script entry as the observer's feed line. Script logs and fault
+/// messages are server or pack text; the observer still renders them with
+/// `textContent`.
+#[must_use]
+pub fn script_line(a: &mud_world::Audit) -> Option<String> {
+    use mud_world::Audit;
+    Some(match a {
+        Audit::ScriptFault {
+            hook,
+            entity,
+            message,
+            faults,
+            tripped,
+            ..
+        } => format!(
+            "{hook} FAULT {faults}{} ({entity}) · {message}",
+            if *tripped { " TRIPPED" } else { "" }
+        ),
+        Audit::ScriptLog {
+            hook, entity, line, ..
+        } => format!("{hook} log ({entity}) · {line}"),
+        Audit::ScriptEffects {
+            hook,
+            entity,
+            effects,
+            ..
+        } => format!("{hook} ran ({entity}) · {}", effects.join(", ")),
+        Audit::ScriptsLoaded {
+            version,
+            previous,
+            why,
+            ..
+        } => format!(
+            "scripts loaded {version} ({why}; was {})",
+            previous.as_deref().unwrap_or("nothing")
+        ),
+        Audit::MindMemoryReset { entity, .. } => format!("memory reset for {entity}"),
+        Audit::SelfControl { .. } | Audit::Command { .. } => return None,
+    })
 }
 
 /// One world event as the observer's feed line, or `None` for an event

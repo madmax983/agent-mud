@@ -68,9 +68,10 @@ pub struct SuccessRoll {
     pub outcome: Outcome,
 }
 
-/// The effective skill that [`classify`] sees is clamped to
-/// `-EFFECTIVE_LIMIT..=EFFECTIVE_LIMIT`, the range its Verus proof assumes.
-/// The clamp never changes an outcome: `formal/verus` proves that every
+/// The bound of the effective skill that [`classify`] sees.
+///
+/// It is clamped to `-EFFECTIVE_LIMIT..=EFFECTIVE_LIMIT`, the range its
+/// Verus proof assumes. The clamp never changes an outcome: `formal/verus` proves that every
 /// total classifies the same against `effective` and against the clamped
 /// value. It only keeps `total - effective` from overflowing.
 pub const EFFECTIVE_LIMIT: i32 = 100;

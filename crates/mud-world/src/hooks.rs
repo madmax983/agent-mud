@@ -505,9 +505,9 @@ pub enum EffectClass {
 pub struct Tally {
     /// Effects seen (saturating).
     pub effects: u8,
-    /// refuse() effects seen (saturating).
+    /// `refuse()` effects seen (saturating).
     pub refuses: u8,
-    /// heal() and hurt() effects seen (saturating).
+    /// `heal()` and `hurt()` effects seen (saturating).
     pub bodies: u8,
 }
 // mirror-end effect_tally
@@ -621,7 +621,7 @@ mod tests {
             .copied()
             .fold(Tally::default(), tally_step);
         assert_eq!(tally_reason(t, 8, true), "refuse() must be the only effect");
-        let t = [Refuse].iter().copied().fold(Tally::default(), tally_step);
+        let t = tally_step(Tally::default(), Refuse);
         assert_eq!(
             tally_reason(t, 8, false),
             "refuse() is only for verb and on_use scripts"
