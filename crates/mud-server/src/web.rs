@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::config::Timeouts;
 use crate::session::{Line, LineKind, Presence, Session};
 
 /// What every route reads: the world, the supervisor, and the admin token.
@@ -40,6 +41,8 @@ pub struct Mud {
     pub presence: Arc<Presence>,
     /// The observer's token.
     pub admin_token: String,
+    /// How long a terminal may wait for a name, and stay silent after.
+    pub timeouts: Timeouts,
 }
 
 impl Mud {
@@ -217,9 +220,17 @@ async fn terminal(state: AppState) -> impl WsHandler {
     let app = mud(&state);
     move |mut socket: WebSocket| async move {
         let Some(app) = app else { return };
-        // Log in first.
+        // Log in first, in time.
         let session = loop {
-            let Some(Ok(Message::Text(t))) = socket.recv().await else {
+            let Some(incoming) = Timeouts::within(app.timeouts.login, socket.recv()).await else {
+                let l = Line {
+                    kind: LineKind::Error,
+                    text: "Too slow. Farewell.".to_owned(),
+                };
+                let _ = socket.send(encode(&l)).await;
+                return;
+            };
+            let Some(Ok(Message::Text(t))) = incoming else {
                 return;
             };
             let name = serde_json::from_str::<ClientMsg>(&t)
@@ -247,7 +258,15 @@ async fn terminal(state: AppState) -> impl WsHandler {
         let mut events = app.game.subscribe();
         loop {
             tokio::select! {
-                incoming = socket.recv() => {
+                incoming = Timeouts::within(app.timeouts.idle, socket.recv()) => {
+                    let Some(incoming) = incoming else {
+                        let l = Line {
+                            kind: LineKind::Error,
+                            text: "Idle too long. Farewell.".to_owned(),
+                        };
+                        let _ = socket.send(encode(&l)).await;
+                        break;
+                    };
                     let line = match incoming {
                         Some(Ok(Message::Text(t))) => serde_json::from_str::<ClientMsg>(&t).ok().and_then(|m| m.cmd).unwrap_or_default(),
                         Some(Ok(Message::Close(_)) | Err(_)) | None => break,

@@ -49,3 +49,9 @@ flowchart LR
   conservation, money conservation and increasing sequence numbers after
   every step.
 - New settings are new packs; the engine does not change.
+- A saved world resumes under the pack it is opened with
+  (`WorldState::reconcile`): a room the pack added appears, a room it
+  dropped goes and its occupants move to the start room, a cast entry the
+  save lacks is spawned, and a non-human entity the cast no longer names
+  retires, its gear left on the floor. Renaming a cast id therefore makes
+  a new character; humans are never retired.

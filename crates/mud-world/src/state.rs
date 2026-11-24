@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::ActorRef;
 use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, ShopId, SkillId};
-use crate::pack::{CastDef, Direction, EntityKind, RoomItem, Slot, Tier, TraitRef, WorldPack};
+use crate::pack::{
+    CastDef, Direction, EntityKind, RoomDef, RoomItem, Slot, Tier, TraitRef, WorldPack,
+};
 
 /// One entity.
 #[expect(
@@ -259,26 +261,125 @@ impl WorldState {
             last_regen_ms: 0,
         };
         for (rid, def) in &pack.rooms {
-            for placed in &def.items {
-                let id = s.new_item(placed.proto(), pack);
-                if let RoomItem::WithContents { contents, .. } = placed {
-                    for c in contents {
-                        let inner = s.new_item(c, pack);
-                        if let Some(it) = s.items.get_mut(&id) {
-                            it.contents.push(inner);
-                        }
-                    }
-                }
-                if let Some(room) = s.rooms.get_mut(rid) {
-                    room.items.push(id);
-                }
-            }
+            s.place_room_items(rid, def, pack);
         }
         for (id, def) in &pack.cast {
             let e = s.entity_from_cast(id, def, pack);
             s.entities.insert(id.clone(), e);
         }
         s
+    }
+
+    /// Puts a room's starting items on its floor.
+    fn place_room_items(&mut self, rid: &RoomId, def: &RoomDef, pack: &WorldPack) {
+        for placed in &def.items {
+            let id = self.new_item(placed.proto(), pack);
+            if let RoomItem::WithContents { contents, .. } = placed {
+                for c in contents {
+                    let inner = self.new_item(c, pack);
+                    if let Some(it) = self.items.get_mut(&id) {
+                        it.contents.push(inner);
+                    }
+                }
+            }
+            if let Some(room) = self.rooms.get_mut(rid) {
+                room.items.push(id);
+            }
+        }
+    }
+
+    /// Brings a saved state in line with the pack it resumes under, so a
+    /// pack edit never strands the world.
+    ///
+    /// - A room the pack added appears with its starting items; a room it
+    ///   dropped goes, with what lay on its floor, and whoever stood or
+    ///   lived there moves to the start room.
+    /// - A non-human entity the cast no longer names (a renamed or removed
+    ///   cast id) retires: it has no mind behind it, so it would be a ghost.
+    ///   Its gear falls to the floor as plain goods, and every reference to
+    ///   it is cleared.
+    /// - A cast entry the save lacks is spawned fresh.
+    ///
+    /// Humans are never retired. Renaming a cast id therefore makes a new
+    /// character, not a moved one.
+    pub fn reconcile(&mut self, pack: &WorldPack) {
+        let start = pack.world.start_room.clone();
+        for (rid, def) in &pack.rooms {
+            if !self.rooms.contains_key(rid) {
+                self.rooms.insert(rid.clone(), RoomState::default());
+                self.place_room_items(rid, def, pack);
+            }
+        }
+        let dropped: Vec<RoomId> = self
+            .rooms
+            .keys()
+            .filter(|r| !pack.rooms.contains_key(*r))
+            .cloned()
+            .collect();
+        for rid in &dropped {
+            if let Some(room) = self.rooms.remove(rid) {
+                for item in room.items {
+                    self.forget_item(item);
+                }
+            }
+        }
+        for e in self.entities.values_mut() {
+            if !pack.rooms.contains_key(&e.room) {
+                e.room.clone_from(&start);
+            }
+            if !pack.rooms.contains_key(&e.home) {
+                e.home.clone_from(&start);
+            }
+        }
+        let stale: Vec<EntityId> = self
+            .entities
+            .values()
+            .filter(|e| !e.human && !pack.cast.contains_key(&e.id))
+            .map(|e| e.id.clone())
+            .collect();
+        for id in &stale {
+            let Some(e) = self.entities.remove(id) else {
+                continue;
+            };
+            for item in &e.inventory {
+                if let Some(it) = self.items.get_mut(item) {
+                    it.stock = false;
+                    it.paid = None;
+                }
+            }
+            if let Some(room) = self.rooms.get_mut(&e.room) {
+                room.items.extend(e.inventory);
+            }
+        }
+        if !stale.is_empty() {
+            for e in self.entities.values_mut() {
+                if e.last_attacked_by
+                    .as_ref()
+                    .is_some_and(|(a, _)| stale.contains(a))
+                {
+                    e.last_attacked_by = None;
+                }
+                if e.haggle_with.as_ref().is_some_and(|k| stale.contains(k)) {
+                    e.haggle_with = None;
+                }
+            }
+            self.nudge_rolled_ms.retain(|(e, _), _| !stale.contains(e));
+        }
+        for (id, def) in &pack.cast {
+            if !self.entities.contains_key(id) {
+                let e = self.entity_from_cast(id, def, pack);
+                self.entities.insert(id.clone(), e);
+            }
+        }
+    }
+
+    /// Removes an item and everything inside it from the world.
+    fn forget_item(&mut self, item: ItemId) {
+        if let Some(it) = self.items.remove(&item) {
+            for inner in it.contents {
+                self.forget_item(inner);
+            }
+        }
     }
 
     /// Makes a new item instance, held by nobody yet.

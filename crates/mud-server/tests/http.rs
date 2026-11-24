@@ -19,9 +19,18 @@ async fn boot() -> (SocketAddr, Arc<Built>) {
 
 /// Boots the server, with `admin_token` as the observer token if given.
 async fn boot_with(admin_token: Option<&str>) -> (SocketAddr, Arc<Built>) {
+    boot_cfg(admin_token, |_| {}).await
+}
+
+/// Boots the server with `tweak` applied to the default config.
+async fn boot_cfg(
+    admin_token: Option<&str>,
+    tweak: impl FnOnce(&mut MudConfig),
+) -> (SocketAddr, Arc<Built>) {
     let mut cfg = MudConfig::default();
     cfg.world.db = None;
     cfg.supervisor.typing_scale = 0.0;
+    tweak(&mut cfg);
     let mut built = build(&cfg).unwrap();
     if let Some(t) = admin_token {
         built.mud = Arc::new(web::Mud {
@@ -157,6 +166,55 @@ async fn two_players_share_a_room_over_websockets() {
     assert_eq!(until(&mut bo, "unknown verb").await["kind"], "error");
     drop(bo);
     until(&mut ada, "bo fades from view").await;
+}
+
+/// Waits up to 3 s for the server to close `ws`.
+async fn closed(ws: &mut Ws) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the server never closed the socket"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_that_gives_no_name_is_closed() {
+    let (addr, _) = boot_cfg(None, |c| {
+        c.server.login_timeout_ms = 100;
+        c.server.idle_timeout_ms = 0;
+    })
+    .await;
+    let mut ws = ws(addr).await;
+    assert_eq!(until(&mut ws, "Too slow").await["kind"], "error");
+    closed(&mut ws).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_terminal_is_closed_after_login() {
+    let (addr, built) = boot_cfg(None, |c| {
+        c.server.login_timeout_ms = 0;
+        c.server.idle_timeout_ms = 200;
+    })
+    .await;
+    let mut ws = ws(addr).await;
+    send(&mut ws, json!({ "login": "ada" })).await;
+    until(&mut ws, "Town Square").await;
+    until(&mut ws, "Idle too long").await;
+    closed(&mut ws).await;
+    let ada = mud_world::EntityId::new("pc_ada");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while built
+        .mud
+        .game
+        .read(|w| w.entity(&ada).is_some_and(|e| e.online))
+    {
+        assert!(tokio::time::Instant::now() < deadline, "ada never left");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

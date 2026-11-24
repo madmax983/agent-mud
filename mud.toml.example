@@ -10,6 +10,8 @@ bind = "127.0.0.1:3000"          # terminal at /, observer at /observer, MCP at 
 telnet = "127.0.0.1:4000"        # optional plain-text clients
 # public_url = "http://127.0.0.1:3000"   # what agents use to reach /mcp
 admin_token_env = "MUD_ADMIN_TOKEN"     # unset: a token is made at start and logged
+login_timeout_ms = 60000         # a client that gives no name in time is closed (0: never)
+idle_timeout_ms = 3600000        # a player silent this long is closed (0: never)
 
 [world]
 # pack = "worlds/crypt-v01"      # unset: the pack compiled into the binary

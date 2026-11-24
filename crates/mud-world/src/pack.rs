@@ -17,6 +17,10 @@ use thiserror::Error;
 
 use crate::ids::{EntityId, ProtoId, RoomId, ShopId, SkillId};
 
+/// The words a command uses for the speaker. No player, and no cast
+/// entry, may answer to one.
+pub(crate) const SELF_WORDS: &[&str] = &["me", "self", "myself"];
+
 /// Why a pack did not load.
 #[derive(Debug, Error)]
 pub enum PackError {
@@ -1038,6 +1042,17 @@ impl WorldPack {
             {
                 problems.push(format!("cast {id} keeps unknown shop {shop:?}"));
             }
+            // `find_here` reads these words as the viewer, so an entity
+            // answering to one could never be targeted by it.
+            let words = c
+                .name
+                .split_whitespace()
+                .chain(c.aliases.iter().map(String::as_str));
+            for w in words {
+                if SELF_WORDS.iter().any(|s| w.eq_ignore_ascii_case(s)) {
+                    problems.push(format!("cast {id} answers to the reserved word {w:?}"));
+                }
+            }
             // A player-kind entity must carry a human-shaped id (`pc_<name>`,
             // as `World::login` makes), or its id alone would reveal that
             // an agent plays it.
@@ -1155,6 +1170,30 @@ traits = [{ name = "nope", control = 12 }]
         for needle in ["nowhere", "exit north", "ghost", "juggling", "nope"] {
             assert!(text.contains(needle), "{needle} missing from {text}");
         }
+    }
+
+    #[test]
+    fn a_cast_entry_may_not_answer_to_a_self_word() {
+        let world = "[world]\nname = \"x\"\ntitle = \"x\"\nstart_room = \"a\"\nrespawn_room = \"a\"\n[[rooms]]\nid = \"a\"\ntitle = \"A\"\ndescription = \"a\"\n";
+        let economy = "[currency]\nname = \"gold\"\nshort = \"g\"\n";
+        let cast = "[cast.old]\nname = \"Old Self\"\nkind = \"npc\"\nroom = \"a\"\n[cast.bob]\nname = \"bob\"\naliases = [\"ME\"]\nkind = \"npc\"\nroom = \"a\"\n";
+        let err = WorldPack::from_sources(PackSources {
+            world,
+            skills: "",
+            items: "",
+            economy,
+            cast,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cast old answers to the reserved word \"Self\""),
+            "{err}"
+        );
+        assert!(
+            err.contains("cast bob answers to the reserved word \"ME\""),
+            "{err}"
+        );
     }
 
     #[test]

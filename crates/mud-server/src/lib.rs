@@ -13,6 +13,7 @@ pub mod smoke;
 pub mod telnet;
 pub mod web;
 
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::Path;
@@ -130,11 +131,7 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     let sup_cfg = SupervisorConfig {
         seed: cfg.world.seed,
         daily_token_budget: (s.daily_token_budget > 0).then_some(s.daily_token_budget),
-        budgets: s
-            .budgets
-            .iter()
-            .map(|(k, v)| (EntityId::new(k.clone()), *v))
-            .collect(),
+        budgets: budgets(&pack, &s.budgets)?,
         macro_tick_scale: s.macro_tick_scale,
         first_macro_tick_secs: s.first_macro_tick_secs,
         ..SupervisorConfig::default()
@@ -154,12 +151,37 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             sup,
             presence: Arc::new(Presence::default()),
             admin_token,
+            timeouts: cfg.server.timeouts(),
         }),
         admin_token_generated,
         tokens,
         littleguy: minds.littleguy,
         step: Duration::from_millis(s.step_ms.max(10)),
     })
+}
+
+/// The per-entity budgets, keyed by entity id. A key the cast does not
+/// name (a typo, or an id a pack edit renamed) fails loudly: ignoring it
+/// would silently drop that agent to the default budget.
+fn budgets(
+    pack: &WorldPack,
+    given: &BTreeMap<String, u64>,
+) -> anyhow::Result<HashMap<EntityId, u64>> {
+    let unknown: Vec<&str> = given
+        .keys()
+        .filter(|k| !pack.cast.contains_key(&EntityId::new((*k).clone())))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "[supervisor.budgets] names entities the cast does not have: {}",
+            unknown.join(", ")
+        );
+    }
+    Ok(given
+        .iter()
+        .map(|(k, v)| (EntityId::new(k.clone()), *v))
+        .collect())
 }
 
 /// The autumn-web settings: the bind, no CSRF (no route trusts a cookie;
@@ -243,6 +265,7 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
         tracing::info!(%addr, "telnet is up");
         tasks.push(tokio::spawn(telnet::serve_limited(
             MAX_CONNECTIONS,
+            cfg.server.timeouts(),
             listener,
             Arc::clone(&built.mud.game),
             Arc::clone(&built.mud.presence),
@@ -283,6 +306,20 @@ mod tests {
             assert!(generated);
             assert_eq!(t.len(), 32);
         }
+    }
+
+    #[test]
+    fn a_budget_for_an_entity_the_cast_lacks_is_refused() {
+        let pack = WorldPack::crypt_v01().unwrap();
+        let stale = BTreeMap::from([("kestrel".to_owned(), 600_000), ("torin".to_owned(), 1)]);
+        let err = budgets(&pack, &stale).unwrap_err().to_string();
+        assert!(err.contains("kestrel"), "{err}");
+        assert!(!err.contains("torin"), "{err}");
+        let good = BTreeMap::from([("pc_kestrel".to_owned(), 600_000)]);
+        assert_eq!(
+            budgets(&pack, &good).unwrap(),
+            HashMap::from([(EntityId::new("pc_kestrel"), 600_000)])
+        );
     }
 
     #[test]

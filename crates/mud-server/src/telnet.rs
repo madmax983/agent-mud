@@ -5,12 +5,29 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::config::Timeouts;
 use crate::session::{Line, Presence, Session};
 use mud_world::Game;
 
-/// The longest line a telnet client may send, in bytes. The rest of a
-/// longer line is read and discarded.
+/// The longest line a telnet client may send, in characters. A longer
+/// line is read to its end, discarded and refused.
 const MAX_LINE: usize = 1_024;
+
+/// The bytes kept of one line: room for [`MAX_LINE`] characters of four
+/// UTF-8 bytes each.
+const MAX_LINE_BYTES: usize = MAX_LINE * 4;
+
+/// What the server says to a line over [`MAX_LINE`].
+const TOO_LONG: &str = "That line is too long; nothing was done.";
+
+/// One line from the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Input {
+    /// A line within the limit.
+    Line(String),
+    /// A line over [`MAX_LINE`] characters.
+    TooLong,
+}
 
 /// Telnet "interpret as command".
 const IAC: u8 = 0xFF;
@@ -56,15 +73,17 @@ impl Telnet {
     }
 }
 
-/// Reads lines from a telnet client: strips telnet commands, keeps at
-/// most [`MAX_LINE`] bytes of each line, and decodes what is left as
-/// UTF-8, replacing invalid bytes. Cancel-safe: a partial line survives a
-/// dropped `next_line` future.
+/// Reads lines from a telnet client: strips telnet commands, decodes
+/// each line as UTF-8 (replacing invalid bytes), and refuses a line over
+/// [`MAX_LINE`] characters without holding more than [`MAX_LINE_BYTES`]
+/// of it. Cancel-safe: a partial line survives a dropped `next_line`
+/// future.
 struct LineReader<R> {
     inner: BufReader<R>,
     telnet: Telnet,
     line: Vec<u8>,
     pending: bool,
+    overflow: bool,
 }
 
 impl<R: AsyncRead + Unpin> LineReader<R> {
@@ -74,20 +93,27 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
             telnet: Telnet::Data,
             line: Vec::new(),
             pending: false,
+            overflow: false,
         }
     }
 
-    fn take_line(&mut self) -> String {
+    fn take_line(&mut self) -> Input {
         self.pending = false;
+        let overflow = std::mem::take(&mut self.overflow);
         let mut line = std::mem::take(&mut self.line);
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        String::from_utf8_lossy(&line).into_owned()
+        let text = String::from_utf8_lossy(&line).into_owned();
+        if overflow || text.chars().count() > MAX_LINE {
+            Input::TooLong
+        } else {
+            Input::Line(text)
+        }
     }
 
     /// The next line, or `None` at the end of the stream.
-    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+    async fn next_line(&mut self) -> std::io::Result<Option<Input>> {
         loop {
             let buf = self.inner.fill_buf().await?;
             if buf.is_empty() {
@@ -104,8 +130,10 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
                     }
                     Some(c) => {
                         self.pending = true;
-                        if self.line.len() < MAX_LINE {
+                        if self.line.len() < MAX_LINE_BYTES {
                             self.line.push(c);
+                        } else {
+                            self.overflow = true;
                         }
                     }
                     None => {}
@@ -140,14 +168,25 @@ async fn handle(
     stream: TcpStream,
     game: Arc<Game>,
     presence: Arc<Presence>,
+    timeouts: Timeouts,
 ) -> std::io::Result<()> {
     let (r, mut w) = stream.into_split();
     let mut lines = LineReader::new(r);
     w.write_all(b"Welcome to Harrow's Rest. What is your name?\r\n")
         .await?;
     let session = loop {
-        let Some(name) = lines.next_line().await? else {
+        let Some(next) = Timeouts::within(timeouts.login, lines.next_line()).await else {
+            w.write_all(b"Too slow. Farewell.\r\n").await?;
             return Ok(());
+        };
+        let name = match next? {
+            None => return Ok(()),
+            Some(Input::TooLong) => {
+                w.write_all(format!("{TOO_LONG} What is your name?\r\n").as_bytes())
+                    .await?;
+                continue;
+            }
+            Some(Input::Line(name)) => name,
         };
         match Session::login(Arc::clone(&game), Arc::clone(&presence), name.trim()) {
             Ok((s, greet)) => {
@@ -163,8 +202,19 @@ async fn handle(
     let mut events = game.subscribe();
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                let Some(line) = line? else { break };
+            line = Timeouts::within(timeouts.idle, lines.next_line()) => {
+                let Some(line) = line else {
+                    w.write_all(b"Idle too long. Farewell.\r\n").await?;
+                    break;
+                };
+                let line = match line? {
+                    None => break,
+                    Some(Input::TooLong) => {
+                        w.write_all(format!("{TOO_LONG}\r\n").as_bytes()).await?;
+                        continue;
+                    }
+                    Some(Input::Line(line)) => line,
+                };
                 if line.trim().eq_ignore_ascii_case("quit") {
                     w.write_all(b"Farewell.\r\n").await?;
                     break;
@@ -186,15 +236,25 @@ async fn handle(
     Ok(())
 }
 
-/// Serves telnet clients on `listener` until the task is aborted.
+/// Serves telnet clients on `listener` until the task is aborted, with
+/// the default limits.
 pub async fn serve(listener: TcpListener, game: Arc<Game>, presence: Arc<Presence>) {
-    serve_limited(crate::MAX_CONNECTIONS, listener, game, presence).await;
+    serve_limited(
+        crate::MAX_CONNECTIONS,
+        Timeouts::default(),
+        listener,
+        game,
+        presence,
+    )
+    .await;
 }
 
 /// Serves telnet clients with at most `max` open at once. A client over
-/// the limit is told so and dropped.
+/// the limit is told so and dropped; a client that stays silent past
+/// `timeouts` is closed, freeing its slot.
 pub async fn serve_limited(
     max: usize,
+    timeouts: Timeouts,
     listener: TcpListener,
     game: Arc<Game>,
     presence: Arc<Presence>,
@@ -211,7 +271,7 @@ pub async fn serve_limited(
                 };
                 let (g, p) = (Arc::clone(&game), Arc::clone(&presence));
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, g, p).await {
+                    if let Err(e) = handle(stream, g, p, timeouts).await {
                         tracing::debug!(%peer, error = %e, "telnet session ended");
                     }
                     drop(permit);
@@ -240,6 +300,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(serve_limited(
             1,
+            Timeouts::default(),
             listener,
             game,
             Arc::new(Presence::default()),
@@ -304,14 +365,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_endless_line_is_cut_and_the_session_goes_on() {
+    async fn an_endless_line_is_refused_and_the_session_goes_on() {
         // More than the whole old 16 MiB stream budget, in one line.
         let mut input = b"ada\r\nsay ".to_vec();
         input.resize(input.len() + (17 << 20), b'a');
         input.extend_from_slice(b"\r\nsay still here\r\nquit\r\n");
         let out = exchange(&input).await;
-        // The cut line still runs, once, as one (too long) command.
-        assert_eq!(out.matches("too long").count(), 1, "{out}");
+        // The long line is refused once and never runs, cut or whole.
+        assert_eq!(out.matches(TOO_LONG).count(), 1, "{out}");
+        assert!(!out.contains("You say, \"aaa"), "{out}");
         assert!(out.contains("You say, \"still here\""), "{out}");
         assert!(out.contains("Farewell."), "{out}");
     }
@@ -321,16 +383,89 @@ mod tests {
         let mut input = vec![b'h', 0xFF, 0xFF, b'i', b'\r', b'\n'];
         input.extend_from_slice(&[0xFF, 0xFA, 0x18, b'\n', 0xFF, 0xFF, 0xFF, 0xF0]);
         input.extend_from_slice(&[0xFF, 0xF1, b'x']);
-        input.resize(input.len() + 3 * MAX_LINE, b'y');
+        input.resize(input.len() + 3 * MAX_LINE_BYTES, b'y');
         input.extend_from_slice(b"\nlast");
         let mut r = LineReader::new(&input[..]);
-        assert_eq!(r.next_line().await.unwrap().unwrap(), "h\u{FFFD}i");
-        let long = r.next_line().await.unwrap().unwrap();
-        assert_eq!(long.len(), MAX_LINE);
-        assert!(long.starts_with("xyy"));
-        assert_eq!(r.next_line().await.unwrap().unwrap(), "last");
+        let line = |s: &str| Some(Input::Line(s.to_owned()));
+        assert_eq!(r.next_line().await.unwrap(), line("h\u{FFFD}i"));
+        assert_eq!(r.next_line().await.unwrap(), Some(Input::TooLong));
+        assert_eq!(r.next_line().await.unwrap(), line("last"));
         assert!(r.next_line().await.unwrap().is_none());
         let mut r = LineReader::new(&[0xFF, 0xFB, 0x01][..]);
         assert!(r.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_line_limit_counts_characters_not_bytes() {
+        // 1,024 three-byte characters: 3 KiB, but within the limit.
+        let wide = "\u{4E2D}".repeat(MAX_LINE);
+        let input = format!("{wide}\n{wide}\u{4E2D}\nok\n");
+        let mut r = LineReader::new(input.as_bytes());
+        assert_eq!(r.next_line().await.unwrap(), Some(Input::Line(wide)));
+        assert_eq!(r.next_line().await.unwrap(), Some(Input::TooLong));
+        assert_eq!(r.next_line().await.unwrap(), Some(Input::Line("ok".into())));
+    }
+
+    #[tokio::test]
+    async fn a_wide_say_under_the_parser_limit_arrives_whole() {
+        let text = "\u{4E2D}".repeat(400);
+        let out = exchange(format!("ada\r\nsay {text}\r\nquit\r\n").as_bytes()).await;
+        assert!(out.contains(&format!("You say, \"{text}\"")), "{out}");
+    }
+
+    /// A one-slot server with short timeouts.
+    async fn tight(timeouts: Timeouts) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let game = Game::new(
+            World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1),
+            None,
+            Arc::new(ManualClock::new(1)),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_limited(
+            1,
+            timeouts,
+            listener,
+            game,
+            Arc::new(Presence::default()),
+        ));
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_is_closed_and_its_slot_freed() {
+        let ms = Some(std::time::Duration::from_millis(100));
+        let (addr, task) = tight(Timeouts {
+            login: ms,
+            idle: None,
+        })
+        .await;
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let mut out = String::new();
+        silent.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("Too slow"), "{out}");
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        next.write_all(b"ada\r\nquit\r\n").await.unwrap();
+        let mut out = String::new();
+        next.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("Town Square"), "{out}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_idle_player_is_closed() {
+        let ms = Some(std::time::Duration::from_millis(100));
+        let (addr, task) = tight(Timeouts {
+            login: None,
+            idle: ms,
+        })
+        .await;
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"ada\r\n").await.unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("Town Square"), "{out}");
+        assert!(out.contains("Idle too long"), "{out}");
+        task.abort();
     }
 }

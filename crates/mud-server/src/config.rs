@@ -41,6 +41,12 @@ pub struct ServerConfig {
     /// The variable that holds the observer token. Unset: one is made at
     /// start and logged.
     pub admin_token_env: String,
+    /// How long a terminal or telnet client may take to give a name, in
+    /// ms. `0`: no limit.
+    pub login_timeout_ms: u64,
+    /// How long a logged-in player may send nothing before the connection
+    /// closes, in ms. `0`: no limit.
+    pub idle_timeout_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -50,11 +56,22 @@ impl Default for ServerConfig {
             telnet: None,
             public_url: None,
             admin_token_env: "MUD_ADMIN_TOKEN".into(),
+            login_timeout_ms: 60_000,
+            idle_timeout_ms: 3_600_000,
         }
     }
 }
 
 impl ServerConfig {
+    /// The connection timeouts.
+    #[must_use]
+    pub const fn timeouts(&self) -> Timeouts {
+        Timeouts {
+            login: ms(self.login_timeout_ms),
+            idle: ms(self.idle_timeout_ms),
+        }
+    }
+
     /// The MCP endpoint agents should use.
     #[must_use]
     pub fn mcp_url(&self) -> String {
@@ -63,6 +80,44 @@ impl ServerConfig {
             .clone()
             .unwrap_or_else(|| format!("http://{}", self.bind));
         format!("{}{}", base.trim_end_matches('/'), mud_mcp::MCP_PATH)
+    }
+}
+
+/// How long a connection may wait. Each connection slot is scarce (see
+/// [`crate::MAX_CONNECTIONS`]), so a silent client must not hold one
+/// forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// For the name, before login. `None`: no limit.
+    pub login: Option<std::time::Duration>,
+    /// Between two lines, after login. `None`: no limit.
+    pub idle: Option<std::time::Duration>,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        ServerConfig::default().timeouts()
+    }
+}
+
+impl Timeouts {
+    /// Runs `fut`, or gives `None` once `limit` passes first.
+    pub async fn within<T>(
+        limit: Option<std::time::Duration>,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        match limit {
+            Some(d) => tokio::time::timeout(d, fut).await.ok(),
+            None => Some(fut.await),
+        }
+    }
+}
+
+const fn ms(n: u64) -> Option<std::time::Duration> {
+    if n == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(n))
     }
 }
 

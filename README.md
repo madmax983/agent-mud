@@ -23,6 +23,9 @@ scripts. Then:
 - open the observer link printed in the log (`/observer?token=…`) to watch
   wake decisions, self-control rolls and token burn;
 - or `telnet 127.0.0.1 4000` after setting `[server] telnet` in `mud.toml`.
+  Both close a client that gives no name within `login_timeout_ms` (60 s)
+  or stays silent for `idle_timeout_ms` (1 h), and both cap open
+  connections at 512.
 
 The v0.1 done criteria run headless:
 

@@ -819,3 +819,80 @@ fn a_resumed_world_takes_every_human_offline() {
         "agent PCs are the supervisor's to manage"
     );
 }
+
+/// A save made before a cast id changed: the old entity is still there
+/// under its old id, online, holding an item.
+fn save_with_renamed(w: &World, from: &str, to: &str) -> WorldState {
+    let mut s = w.snapshot();
+    let mut e = s.entities.remove(&id(from)).unwrap();
+    e.id = id(to);
+    e.online = true;
+    s.entities.insert(id(to), e);
+    s
+}
+
+#[test]
+fn a_resumed_world_spawns_cast_the_save_lacks_and_retires_stale_agents() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    let lamp = give_item(&mut w, &id("pc_kestrel"), "torch");
+    let room = w.entity(&id("pc_kestrel")).unwrap().room.clone();
+    let mut save = save_with_renamed(&w, "pc_kestrel", "kestrel");
+    save.entities.get_mut(&ada).unwrap().last_attacked_by = Some((id("kestrel"), 1));
+    let resumed = World::from_state(Arc::clone(&w.pack), save, Vec::new());
+    let fresh = resumed
+        .entity(&id("pc_kestrel"))
+        .expect("the cast entry is back");
+    assert!(!fresh.online, "a turing PC comes back logged out");
+    assert!(resumed.entity(&id("kestrel")).is_none(), "no orphan agent");
+    assert!(
+        resumed.state.rooms[&room].items.contains(&lamp),
+        "the orphan's gear lands on the floor"
+    );
+    assert!(
+        resumed.state.check().is_empty(),
+        "{:?}",
+        resumed.state.check()
+    );
+    assert_eq!(
+        resumed.entity(&ada).unwrap().last_attacked_by,
+        None,
+        "no reference to a retired entity survives"
+    );
+    let (_, v) = resumed.who();
+    assert_eq!(v["online"], serde_json::json!([]));
+}
+
+#[test]
+fn a_resumed_world_moves_entities_out_of_rooms_the_pack_dropped() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    let mut save = w.snapshot();
+    let gone = RoomId::from("demolished_wing");
+    save.rooms
+        .insert(gone.clone(), crate::state::RoomState::default());
+    let e = save.entities.get_mut(&ada).unwrap();
+    e.room = gone.clone();
+    e.home = gone.clone();
+    let resumed = World::from_state(Arc::clone(&w.pack), save, Vec::new());
+    let start = &w.pack.world.start_room;
+    assert_eq!(&resumed.entity(&ada).unwrap().room, start);
+    assert_eq!(&resumed.entity(&ada).unwrap().home, start);
+    assert!(!resumed.state.rooms.contains_key(&gone));
+    assert!(
+        resumed.state.check().is_empty(),
+        "{:?}",
+        resumed.state.check()
+    );
+}
+
+#[test]
+fn a_saved_player_with_a_reserved_name_can_still_log_in() {
+    let mut w = world();
+    let me = id("pc_me");
+    let start = w.pack.world.start_room.clone();
+    let pack = Arc::clone(&w.pack);
+    w.state.new_player(&me, "me", start, &pack);
+    assert_eq!(w.login("me", 1), Ok(me));
+    assert_eq!(w.login("self", 1), Err(LoginError::Reserved));
+}

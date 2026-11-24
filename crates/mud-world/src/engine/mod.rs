@@ -32,9 +32,7 @@ const TARGET_SLOT: &str = concat!("{", "target", "}");
 /// The cue placeholder for what set the roll off.
 const TRIGGER_SLOT: &str = concat!("{", "trigger", "}");
 
-/// The words a command uses for the speaker; no player may take one as a
-/// name.
-const SELF_WORDS: &[&str] = &["me", "self", "myself"];
+use crate::pack::SELF_WORDS;
 
 /// How long a trait waits between two self-control rolls, in ms.
 pub const NUDGE_COOLDOWN_MS: u64 = 120_000;
@@ -398,9 +396,11 @@ impl World {
     /// Every human starts offline: no session is connected yet, and a
     /// state saved before a crash may still say otherwise. A human comes
     /// back when their session logs in. Agent PCs and NPCs are left to
-    /// the supervisor and the pack.
+    /// the supervisor and the pack. The state is first reconciled with the
+    /// pack (see [`WorldState::reconcile`]).
     #[must_use]
     pub fn from_state(pack: Arc<WorldPack>, mut state: WorldState, recent: Vec<Event>) -> Self {
+        state.reconcile(&pack);
         for e in state.entities.values_mut().filter(|e| e.human) {
             e.online = false;
             e.hidden = false;
@@ -881,10 +881,13 @@ impl World {
         }
         // `find_here` reads these as the viewer, so nobody could target
         // a player with one of them as a name.
-        if SELF_WORDS.iter().any(|w| name.eq_ignore_ascii_case(w)) {
+        let id = EntityId::new(format!("pc_{}", name.to_ascii_lowercase()));
+        // A save from before the name was reserved may still hold such a
+        // player; it may come back, but nobody new may take the name.
+        let saved_human = self.state.entities.get(&id).is_some_and(|e| e.human);
+        if !saved_human && SELF_WORDS.iter().any(|w| name.eq_ignore_ascii_case(w)) {
             return Err(LoginError::Reserved);
         }
-        let id = EntityId::new(format!("pc_{}", name.to_ascii_lowercase()));
         let taken =
             self.state.entities.values().any(|e| {
                 e.id != id && (e.matches(name) || e.id.as_str() == name.to_ascii_lowercase())
