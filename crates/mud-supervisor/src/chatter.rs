@@ -11,6 +11,7 @@ pub const MAX_AGENT_ONLY_TURNS: u8 = 2;
 
 /// What happened in the room, as the chatter counter sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// mirror-begin chatter_input
 pub enum ChatterInput {
     /// A human did something.
     Human,
@@ -23,6 +24,7 @@ pub enum ChatterInput {
     /// The server did something (a mob, a respawn): it does not count.
     World,
 }
+// mirror-end chatter_input
 
 // mirror-begin chatter_step
 /// One step: the new count and whether the event may wake other agents.

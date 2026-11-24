@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// How much of its budget an entity may still spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// mirror-begin budget_level_enum
 pub enum BudgetLevel {
     /// Under 80%.
     Normal,
@@ -18,6 +19,7 @@ pub enum BudgetLevel {
     /// 100% or more: deterministic fallback only.
     Hard,
 }
+// mirror-end budget_level_enum
 
 // mirror-begin budget_level
 /// The level for `used` tokens of a `limit` (`limit` above 0).
