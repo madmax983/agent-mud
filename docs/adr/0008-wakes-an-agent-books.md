@@ -33,9 +33,18 @@ far too late for "back in 25 minutes".
   `mud_wake_me` to come back to something, and that no other reminder tool
   can act in the world.
 - **The observer shows each agent's bookings** (notes escaped by maud).
-- Bookings live in memory, like budgets and macro-tick schedules: a
-  restart drops them, and the agent is told nothing. Persisting them is
-  future work, with the rest of the supervisor's state.
+- **Bookings persist (ADR 0011).** The `sup_booking` table and its
+  `BookingInsert` / `BookingDelete` ops exist since store v1; from phase 2
+  the supervisor writes through them. `mud_wake_me` answers ok only after
+  its row is written with `synchronous = FULL` (`Game::act`); a failing
+  store answers `{"ok":false,"error_code":"store"}` and keeps nothing.
+  Booking ids are `max(next_booking_id, max id) + 1` after a restart, so
+  they never repeat. A booking is removed only with the first effectful
+  command of the wake that carried it (or at that wake's close), in the
+  same transaction: a crash before that leaves the booking, and it fires
+  again as a new wake with a fresh id. A booking overdue past
+  `booking_max_late_ms` at boot is dropped with an event. Until phase 2
+  ships, bookings still live in memory and a restart drops them.
 
 ```mermaid
 sequenceDiagram

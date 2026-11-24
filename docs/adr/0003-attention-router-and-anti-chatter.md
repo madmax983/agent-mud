@@ -57,6 +57,20 @@ stateDiagram-v2
   Hard --> Normal: UTC midnight
 ```
 
+## Amended by ADR 0011: after a restart (phase 4, not built yet)
+
+- **No storm at boot.** Addressed events (a tell, an attack, a mention by
+  name) newer than `[supervisor] replay_max_age_ms` (120 s) that a
+  recipient has not been woken for (`seq > seen_seq`) are replayed as
+  Immediate wakes only; ambient and room-batch wakes are never replayed,
+  and older events are skipped (their recipients' `seen_seq` is raised).
+- **The chatter fold.** The per-room anti-chatter counters are rebuilt by
+  folding the reloaded event tail through the proved `chatter_step`. A
+  macro-tick reset is not an event, so the fold can only overcount: more
+  holding, the safe direction.
+- Deterministic errands (a macro-tick, booking or login plan) are not
+  replays: they resume at their cursor after any outage (ADR 0011).
+
 ## Consequences
 
 - An empty world costs nothing but macro-ticks.

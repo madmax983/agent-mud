@@ -123,9 +123,16 @@ items: `take`, `drop`, `give`, `buy`, `sell`, `equip`, `use`. Action and
 combat: `attack`, `defend`, `flee`, `attempt <skill> [on <target>]`.
 
 MCP tools: `mud_look`, `mud_sheet`, `mud_events(since_seq)` (with
-quarantined `untrusted_text` and private nudges) and `mud_command(cmd)`
-(a deterministic resolution object or a structured `error_code` such as
-`POLICY_TRADE_REQUIRED`).
+quarantined `untrusted_text` and private nudges, and `truncated: true`
+when `since_seq` is older than the in-memory log of the last 10000
+events) and `mud_command(cmd)` (a deterministic resolution object or a
+structured `error_code` such as `POLICY_TRADE_REQUIRED`).
+
+Persistence (ADR 0011): `world.db` carries a schema version, an epoch and a
+boot number; supervisor state (bookings, macro counters, plans, spend)
+lives in its side tables and commits with the world command that consumed
+it; old events are archived to `archive/events-YYYY-MM.jsonl` before they
+are trimmed.
 
 ## 7. Starter world: `worlds/crypt-v01/`
 
