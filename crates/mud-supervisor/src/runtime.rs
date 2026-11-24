@@ -298,12 +298,15 @@ impl Supervisor {
                 });
             }
             if want {
+                // A spell starts only while idle: in town, with no wake in
+                // flight or waiting and no line being typed.
+                let idle = lock(&self.router).is_idle(&id) && !self.gate.is_holding(&id);
                 let mut st = lock(&self.state);
                 if let Some(s) = st.get_mut(&id) {
                     let was = s.afk_until;
-                    let away = s
-                        .afk
-                        .update(&spec, self.cfg.seed, id.as_str(), now, in_town);
+                    let away =
+                        s.afk
+                            .update(&spec, self.cfg.seed, id.as_str(), now, in_town && idle);
                     s.afk_until = if away { s.afk.until_ms } else { None };
                     if let (Some(until), None) = (s.afk_until, was) {
                         drop(st);

@@ -191,6 +191,12 @@ impl Router {
             .collect()
     }
 
+    /// Whether `entity` has no wake in flight and none waiting.
+    #[must_use]
+    pub fn is_idle(&self, entity: &EntityId) -> bool {
+        !self.busy.contains(entity) && !self.pending.contains_key(entity)
+    }
+
     fn jitter(&self, range: [u64; 2], entity: &EntityId, seq: Seq, salt: &[u8]) -> u64 {
         pick(
             mix(

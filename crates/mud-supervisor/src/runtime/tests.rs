@@ -203,6 +203,27 @@ async fn a_macro_tick_merged_into_a_pending_wake_still_runs() {
 }
 
 #[tokio::test]
+async fn a_distracted_spell_starts_only_when_the_pc_is_idle() {
+    // Regression: spells started whenever the PC stood in a safe room, even
+    // mid-wake or with a reply to a human queued.
+    let r = rig(quiet());
+    let k = EntityId::from("kestrel");
+    let afk = |r: &Rig| lock(&r.sup.state)[&k].afk_until;
+    lock(&r.sup.state).get_mut(&k).unwrap().afk.next_at_ms = 1;
+    let now = r.game.now_ms();
+    r.sup.turing_sessions(now);
+    assert!(r.game.read(|w| w.entity(&k).unwrap().online));
+    assert_eq!(afk(&r), None, "not with the login wake pending");
+    let wakes = lock(&r.sup.router).due(now);
+    assert!(wakes.iter().any(|w| w.entity == k));
+    r.sup.turing_sessions(now);
+    assert_eq!(afk(&r), None, "not mid-wake");
+    lock(&r.sup.router).finish(&k, now);
+    r.sup.turing_sessions(now);
+    assert!(afk(&r).is_some(), "idle in a safe room: away");
+}
+
+#[tokio::test]
 async fn two_macro_ticks_merged_while_busy_count_once() {
     let r = rig(quiet());
     let torin = EntityId::from("torin");
