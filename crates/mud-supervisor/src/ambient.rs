@@ -7,19 +7,58 @@
 //! that can talk back.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use autumn_plugin_agent::{
-    Agent, AgentError, ChatMessage, ChatRole, FnTool, LlmClient, ToolEffect,
+    Agent, AgentError, ChatMessage, ChatRequest, ChatResponse, ChatRole, FnTool, LlmClient,
+    ToolEffect,
 };
 use mud_world::EntityId;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::mind::{
-    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, WakeContext, system_prompt, tool_specs,
-    wake_message,
+    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, UsageMeter, UsageRecorder, WakeContext,
+    system_prompt, tool_specs, wake_message,
 };
+
+/// A client that records each call's spend as it comes in, so a wake that
+/// fails or is dropped by the timeout is still charged for its calls.
+#[derive(Debug)]
+struct Metered {
+    inner: Arc<dyn LlmClient>,
+    spent: UsageRecorder,
+}
+
+impl LlmClient for Metered {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, AgentError>> + Send + 'a>> {
+        Box::pin(async move {
+            let r = self.inner.chat(request).await?;
+            self.spent.add(Usage {
+                calls: 1,
+                input_tokens: u64::from(r.usage.input_tokens),
+                output_tokens: u64::from(r.usage.output_tokens),
+                cost_usd_micros: 0,
+            });
+            Ok(r)
+        })
+    }
+
+    fn list_models(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, AgentError>> + Send + '_>> {
+        self.inner.list_models()
+    }
+
+    fn provider_name(&self) -> &'static str {
+        self.inner.provider_name()
+    }
+}
 
 /// The most messages an ambient NPC remembers.
 pub const HISTORY_CAP: usize = 24;
@@ -72,8 +111,17 @@ impl AmbientMind {
         }
     }
 
-    fn agent(&self, card: &(String, String, String), tools: &MudTools) -> Agent {
-        let mut agent = Agent::new(Arc::clone(&self.client))
+    fn agent(
+        &self,
+        card: &(String, String, String),
+        tools: &MudTools,
+        spent: UsageRecorder,
+    ) -> Agent {
+        let client: Arc<dyn LlmClient> = Arc::new(Metered {
+            inner: Arc::clone(&self.client),
+            spent,
+        });
+        let mut agent = Agent::new(client)
             .system_prompt(system_prompt(&card.0, &card.1, &card.2))
             .max_steps(MAX_STEPS);
         for (name, description, schema) in tool_specs() {
@@ -118,11 +166,16 @@ impl Mind for AmbientMind {
                 .get(&ctx.entity)
                 .cloned()
                 .unwrap_or_default();
+            // Dropped unsettled (an error, a timeout), the meter charges the
+            // calls made so far through the supervisor's sink.
+            let meter = UsageMeter::new(&tools);
             let turn = self
-                .agent(card, &tools)
+                .agent(card, &tools, meter.recorder())
                 .run_turn(history, &wake_message(&ctx))
                 .await
                 .map_err(|e| MindError::Failed(e.to_string()))?;
+            // The reply reports the spend from here on.
+            let _ = meter.settle();
             let usage = turn.outcome.usage();
             let text = turn.outcome.text().map(str::to_owned);
             self.history
@@ -238,6 +291,7 @@ mod tests {
             events: vec![],
             event_views: vec![],
             look: game.look(&guard),
+            macro_tick: false,
             macro_ticks: 0,
             login: false,
             wake_id: "w1".into(),
@@ -260,6 +314,85 @@ mod tests {
             !mind.history.lock().await[&guard].is_empty(),
             "it remembers the exchange"
         );
+    }
+
+    /// Looks once, then never answers again.
+    #[derive(Debug, Default)]
+    struct Hangs(std::sync::atomic::AtomicBool);
+
+    impl LlmClient for Hangs {
+        fn chat<'a>(
+            &'a self,
+            _r: &'a ChatRequest,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ChatResponse, AgentError>> + Send + 'a>>
+        {
+            let first = !self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if !first {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ChatResponse {
+                    content: vec![ContentPart::ToolCall {
+                        id: "c1".into(),
+                        name: "mud_look".into(),
+                        arguments: json!({}),
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::new(200, 30),
+                })
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, AgentError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "hangs"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_wake_still_reports_what_it_spent() {
+        // Regression: the spend of a wake dropped by the timeout was lost.
+        let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+        let game = Game::new(
+            World::new(Arc::clone(&pack), 1),
+            None,
+            Arc::new(ManualClock::new(1_000)),
+        );
+        let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+        let guard = EntityId::from("guard_01");
+        let mind = AmbientMind::new(
+            Arc::new(Hangs::default()),
+            HashMap::from([(guard.clone(), ("Hale".into(), "W.".into(), "P.".into()))]),
+        );
+        let ctx = WakeContext {
+            entity: guard.clone(),
+            name: "Hale".into(),
+            priority: Priority::RoomBatch,
+            reason: "test".into(),
+            events: vec![],
+            event_views: vec![],
+            look: Value::Null,
+            macro_tick: false,
+            macro_ticks: 0,
+            login: false,
+            wake_id: "w1".into(),
+        };
+        let tools = MudTools::new(Arc::clone(&game), typing, guard.clone());
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            mind.wake(ctx, tools.clone()),
+        )
+        .await;
+        assert!(cut.is_err(), "the wake timed out");
+        let owed = tools.usage_sink().take(&guard);
+        assert_eq!(owed.tokens(), 230, "{owed:?}");
+        assert_eq!(owed.calls, 1);
     }
 
     #[test]

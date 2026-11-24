@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::budget::{Budget, BudgetLevel};
 use crate::gate::Gate;
-use crate::mind::{Mind, MindReply, MudTools, Usage, WakeContext};
+use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
 use crate::router::{EntityRuntime, Priority, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::FallbackMind;
 use crate::turing::{Afk, in_session, mix, pick};
@@ -128,6 +128,12 @@ struct EntityState {
 }
 
 /// The supervisor.
+///
+/// Lock order: the world (`Game::read`, `Game::write` and every other
+/// `Game` call) comes first. The supervisor's own `router` and `state`
+/// locks may be taken inside a world closure, one at a time, but are never
+/// held while calling into `Game`, never nested in each other, and the
+/// gate's lock is a leaf. Breaking this order deadlocks the whole world.
 #[derive(Debug)]
 pub struct Supervisor {
     game: Arc<Game>,
@@ -138,6 +144,8 @@ pub struct Supervisor {
     router: Mutex<Router>,
     state: Mutex<HashMap<EntityId, EntityState>>,
     observer: broadcast::Sender<Arc<ObserverEvent>>,
+    /// Spend minds could not put in a reply (failed or timed-out wakes).
+    usage: Arc<UsageSink>,
     last_world_tick: AtomicU64,
 }
 
@@ -185,6 +193,7 @@ impl Supervisor {
             state: Mutex::new(state),
             observer,
             last_world_tick: AtomicU64::new(now),
+            usage: Arc::default(),
         })
     }
 
@@ -249,14 +258,11 @@ impl Supervisor {
     /// Fires a macro-tick for `entity` now (the admin page and tests).
     pub fn fire_macro_tick(&self, entity: &EntityId) -> RouteNote {
         let now = self.game.now_ms();
+        // The tick is counted when its wake is delivered (`run_wake`), not
+        // here: two ticks can merge into one wake.
         let note = self
             .game
             .read(|w| lock(&self.router).macro_tick(entity, w, now));
-        if matches!(note, RouteNote::Queued { .. })
-            && let Some(s) = lock(&self.state).get_mut(entity)
-        {
-            s.macro_ticks += 1;
-        }
         self.publish(ObserverEvent::Route(note.clone()));
         note
     }
@@ -295,12 +301,15 @@ impl Supervisor {
                 });
             }
             if want {
+                // A spell starts only while idle: in town, with no wake in
+                // flight or waiting and no line being typed.
+                let idle = lock(&self.router).is_idle(&id) && !self.gate.is_holding(&id);
                 let mut st = lock(&self.state);
                 if let Some(s) = st.get_mut(&id) {
                     let was = s.afk_until;
-                    let away = s
-                        .afk
-                        .update(&spec, self.cfg.seed, id.as_str(), now, in_town);
+                    let away =
+                        s.afk
+                            .update(&spec, self.cfg.seed, id.as_str(), now, in_town && idle);
                     s.afk_until = if away { s.afk.until_ms } else { None };
                     if let (Some(until), None) = (s.afk_until, was) {
                         drop(st);
@@ -366,6 +375,7 @@ impl Supervisor {
             self.last_world_tick.store(now, Ordering::Relaxed);
             self.game.tick();
         }
+        self.charge_late_spend(now);
         self.turing_sessions(now);
         self.macro_ticks(now);
         let wakes = lock(&self.router).due(now);
@@ -398,6 +408,7 @@ impl Supervisor {
                 event_views: events.iter().map(|ev| ev.view_for(&wake.entity)).collect(),
                 events,
                 look: w.look_view(&wake.entity),
+                macro_tick: wake.macro_tick,
                 macro_ticks,
                 login: wake.reason == "login",
                 wake_id: format!(
@@ -408,6 +419,21 @@ impl Supervisor {
                 ),
             }
         })
+    }
+
+    /// Charges spend that came in after its wake ended (a model that kept
+    /// going after a timeout).
+    fn charge_late_spend(&self, now: u64) {
+        let late = self.usage.take_all();
+        if late.is_empty() {
+            return;
+        }
+        let mut st = lock(&self.state);
+        for (id, u) in late {
+            if let Some(s) = st.get_mut(&id) {
+                s.budget.spend(now, u.tokens(), u.cost_usd_micros, u.calls);
+            }
+        }
     }
 
     /// Runs one wake to the end and records it.
@@ -437,12 +463,18 @@ impl Supervisor {
             mind: mind.kind().to_owned(),
             at_ms: start,
         });
+        if wake.macro_tick
+            && let Some(s) = lock(&self.state).get_mut(&wake.entity)
+        {
+            s.macro_ticks += 1;
+        }
         let ctx = self.context(&wake);
         let tools = MudTools::new(
             Arc::clone(&self.game),
             Arc::clone(&self.gate),
             wake.entity.clone(),
-        );
+        )
+        .with_usage_sink(Arc::clone(&self.usage));
         let res = tokio::time::timeout(
             Duration::from_millis(self.cfg.wake_timeout_ms),
             mind.wake(ctx, tools),
@@ -466,15 +498,14 @@ impl Supervisor {
             ),
         };
         let end = self.game.now_ms();
+        // The reply's spend, plus what the mind could not put in a reply: a
+        // failed wake, or one dropped by the timeout above.
+        let usage = reply.usage.plus(self.usage.take(&wake.entity));
         let budget = {
             let mut st = lock(&self.state);
             st.get_mut(&wake.entity).map_or(BudgetLevel::Normal, |s| {
-                s.budget.spend(
-                    end,
-                    reply.usage.tokens(),
-                    reply.usage.cost_usd_micros,
-                    reply.usage.calls,
-                );
+                s.budget
+                    .spend(end, usage.tokens(), usage.cost_usd_micros, usage.calls);
                 s.last_wake = Some((wake.priority, wake.reason.clone(), start));
                 s.wakes += 1;
                 s.budget.level(end)
@@ -485,7 +516,7 @@ impl Supervisor {
             entity: wake.entity,
             ok,
             note: reply.text,
-            usage: reply.usage,
+            usage,
             budget,
             took_ms: end.saturating_sub(start),
         });
@@ -525,49 +556,68 @@ impl Supervisor {
     #[must_use]
     pub fn snapshot(&self) -> Value {
         let now = self.game.now_ms();
-        let mut st = lock(&self.state);
         let pending: HashMap<EntityId, (Priority, u64)> = lock(&self.router)
             .pending()
             .into_iter()
             .map(|(e, p, d)| (e, (p, d)))
             .collect();
-        let entities: Vec<Value> = self.game.read(|w| {
-            let mut ids: Vec<&EntityId> = self.minds.keys().collect();
-            ids.sort();
+        // The world first, with no supervisor lock held (see the lock order).
+        let mut ids: Vec<&EntityId> = self.minds.keys().collect();
+        ids.sort();
+        let seen: Vec<(&EntityId, Value)> = self.game.read(|w| {
             ids.into_iter()
                 .filter_map(|id| {
                     let e = w.entity(id)?;
                     let cast = w.pack().cast.get(id)?;
-                    let s = st.get_mut(id)?;
-                    let level = s.budget.level(now);
-                    Some(json!({
-                        "id": id,
-                        "name": e.name,
-                        "tier": e.tier,
-                        "mind": self.minds.get(id).map(|m| m.kind()),
-                        "online": e.online,
-                        "room": e.room,
-                        "hp": e.pools.hp,
-                        "currency": e.currency,
-                        "goal": cast.goal,
-                        "budget": {
-                            "level": level,
-                            "tokens": s.budget.tokens,
-                            "limit": s.budget.limit,
-                            "cost_usd_micros": s.budget.cost_usd_micros,
-                            "calls": s.budget.calls,
-                        },
-                        "wakes": s.wakes,
-                        "last_wake": s.last_wake.as_ref().map(|(p, r, at)| json!({ "priority": p, "reason": r, "at_ms": at })),
-                        "pending": pending.get(id).map(|(p, d)| json!({ "priority": p, "due_ms": d })),
-                        "macro_ticks": s.macro_ticks,
-                        "next_macro_ms": s.next_macro_ms,
-                        "afk_until_ms": s.afk_until,
-                        "typing": self.gate.is_holding(id),
-                    }))
+                    Some((
+                        id,
+                        json!({
+                            "id": id,
+                            "name": e.name,
+                            "tier": e.tier,
+                            "mind": self.minds.get(id).map(|m| m.kind()),
+                            "online": e.online,
+                            "room": e.room,
+                            "hp": e.pools.hp,
+                            "currency": e.currency,
+                            "goal": cast.goal,
+                        }),
+                    ))
                 })
                 .collect()
         });
+        let typing: HashMap<&EntityId, bool> = seen
+            .iter()
+            .map(|(id, _)| (*id, self.gate.is_holding(id)))
+            .collect();
+        let mut st = lock(&self.state);
+        let entities: Vec<Value> = seen
+            .into_iter()
+            .filter_map(|(id, mut v)| {
+                let s = st.get_mut(id)?;
+                let level = s.budget.level(now);
+                let extra = json!({
+                    "budget": {
+                        "level": level,
+                        "tokens": s.budget.tokens,
+                        "limit": s.budget.limit,
+                        "cost_usd_micros": s.budget.cost_usd_micros,
+                        "calls": s.budget.calls,
+                    },
+                    "wakes": s.wakes,
+                    "last_wake": s.last_wake.as_ref().map(|(p, r, at)| json!({ "priority": p, "reason": r, "at_ms": at })),
+                    "pending": pending.get(id).map(|(p, d)| json!({ "priority": p, "due_ms": d })),
+                    "macro_ticks": s.macro_ticks,
+                    "next_macro_ms": s.next_macro_ms,
+                    "afk_until_ms": s.afk_until,
+                    "typing": typing.get(id).copied().unwrap_or(false),
+                });
+                if let (Some(obj), Value::Object(more)) = (v.as_object_mut(), extra) {
+                    obj.extend(more);
+                }
+                Some(v)
+            })
+            .collect();
         let tokens: u64 = st.values().map(|s| s.budget.tokens).sum();
         let cost: u64 = st.values().map(|s| s.budget.cost_usd_micros).sum();
         drop(st);

@@ -27,7 +27,31 @@ pub struct Gate {
     counter: AtomicU64,
     /// Typing holds can be shortened for tests and demos (1.0 is real time).
     scale: f64,
-    held: Mutex<HashMap<EntityId, Arc<Notify>>>,
+    /// The lines being typed, per entity, by the nonce of their run. One
+    /// entity can type several at once (parallel MCP calls).
+    held: Mutex<Held>,
+}
+
+type Held = HashMap<EntityId, HashMap<u64, Arc<Notify>>>;
+
+/// Removes one run's held entry when the run ends, however it ends: done,
+/// interrupted, or dropped mid-hold by a timeout or a cancelled request.
+struct HeldGuard<'a> {
+    held: &'a Mutex<Held>,
+    entity: &'a EntityId,
+    nonce: u64,
+}
+
+impl Drop for HeldGuard<'_> {
+    fn drop(&mut self) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(lines) = held.get_mut(self.entity) {
+            lines.remove(&self.nonce);
+            if lines.is_empty() {
+                held.remove(self.entity);
+            }
+        }
+    }
 }
 
 impl Gate {
@@ -86,20 +110,22 @@ impl Gate {
         self.held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(entity)
+            .get(entity)
+            .is_some_and(|lines| !lines.is_empty())
     }
 
-    /// Drops the held line of `entity`, if any. Returns whether one was held.
+    /// Drops every held line of `entity`. Returns whether one was held.
     pub fn interrupt(&self, entity: &EntityId) -> bool {
-        let n = self
+        let lines = self
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(entity);
-        n.is_some_and(|n| {
+            .remove(entity)
+            .unwrap_or_default();
+        for n in lines.values() {
             n.notify_one();
-            true
-        })
+        }
+        !lines.is_empty()
     }
 
     /// Runs one line for `entity`, after its hold.
@@ -111,15 +137,19 @@ impl Gate {
             self.held
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(entity.clone(), Arc::clone(&notify));
+                .entry(entity.clone())
+                .or_default()
+                .insert(nonce, Arc::clone(&notify));
+            let guard = HeldGuard {
+                held: &self.held,
+                entity,
+                nonce,
+            };
             let interrupted = tokio::select! {
                 () = tokio::time::sleep(Duration::from_millis(hold)) => false,
                 () = notify.notified() => true,
             };
-            self.held
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(entity);
+            drop(guard);
             if interrupted {
                 let verb = parse(line).ok().map(|c| c.verb());
                 return refusal(
@@ -182,5 +212,72 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.error_code, Some(ErrorCode::Interrupted));
         assert!(!gate.interrupt(&k), "nothing left to interrupt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_line_leaves_another_held_line_interruptible() {
+        // Regression: the first line to finish removed the entity's entry,
+        // so a second line still being typed could not be interrupted.
+        let g = game();
+        let k = EntityId::from("kestrel");
+        g.bring_online(&k);
+        let gate = Gate::new(Arc::clone(&g), 9, 1.0);
+        let (g1, k1) = (Arc::clone(&gate), k.clone());
+        let say = tokio::spawn(async move {
+            g1.run(&k1, "say this is a long sentence to type, really long")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (g2, k2) = (Arc::clone(&gate), k.clone());
+        let mv = tokio::spawn(async move { g2.run(&k2, "look").await });
+        assert!(mv.await.unwrap().ok);
+        let (g3, k3) = (Arc::clone(&gate), k.clone());
+        let mv = tokio::spawn(async move { g3.run(&k3, "move w").await });
+        assert!(mv.await.unwrap().ok, "the move commits first");
+        assert!(gate.is_holding(&k), "the say is still being typed");
+        assert!(gate.interrupt(&k));
+        let r = say.await.unwrap();
+        assert_eq!(r.error_code, Some(ErrorCode::Interrupted));
+        assert!(!gate.is_holding(&k));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_drops_every_held_line() {
+        let g = game();
+        let k = EntityId::from("kestrel");
+        g.bring_online(&k);
+        let gate = Gate::new(Arc::clone(&g), 9, 1.0);
+        let lines = [
+            "say first long line to type",
+            "say second long line to type",
+        ];
+        let tasks: Vec<_> = lines
+            .iter()
+            .map(|l| {
+                let (g, k, l) = (Arc::clone(&gate), k.clone(), (*l).to_owned());
+                tokio::spawn(async move { g.run(&k, &l).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(gate.interrupt(&k));
+        for t in tasks {
+            assert_eq!(t.await.unwrap().error_code, Some(ErrorCode::Interrupted));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_line_leaves_no_held_entry() {
+        let g = game();
+        let k = EntityId::from("kestrel");
+        g.bring_online(&k);
+        let gate = Gate::new(Arc::clone(&g), 9, 1.0);
+        let cut = tokio::time::timeout(
+            Duration::from_millis(200),
+            gate.run(&k, "say a line that never gets finished"),
+        )
+        .await;
+        assert!(cut.is_err(), "the wake timed out mid-hold");
+        assert!(!gate.is_holding(&k), "no phantom typing");
+        assert!(!gate.interrupt(&k), "nothing to interrupt");
     }
 }

@@ -86,6 +86,16 @@ fn harvest_tools(tools: &MudTools) -> Vec<Arc<dyn autumn_harvest_agent::Tool>> {
         .collect()
 }
 
+/// The tokens the agent has used in all, if its state can be read.
+/// The query starts now, so the future holds no borrow of the runtime.
+fn tokens_used(
+    rt: &SqliteRuntime,
+    id: &AgentId,
+) -> impl std::future::Future<Output = Option<u64>> + Send + 'static {
+    let query = Box::pin(sqlite::state(rt, id));
+    async move { query.await.ok().flatten().map(|s| s.tokens_used) }
+}
+
 impl HarvestMind {
     /// A mind over `model`. With no `data_dir`, each agent lives in memory.
     #[must_use]
@@ -148,13 +158,13 @@ impl HarvestMind {
         }
         let (mut rt, id) = self.open(entity, tools)?;
         let (tx, mut rx) = mpsc::channel::<Job>(16);
+        let (sink, who) = (Arc::clone(tools.usage_sink()), entity.clone());
         tokio::spawn(async move {
+            // Spend is measured from the last job that was charged, not
+            // from the start of this one, so a job whose wake was abandoned
+            // (or failed) is still paid for.
+            let mut last_seen = tokens_used(&rt, &id).await.unwrap_or(0);
             while let Some((text, wake_id, reply)) = rx.recv().await {
-                let before = sqlite::state(&rt, &id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map_or(0, |s| s.tokens_used);
                 let op = AgentOp::message_with_id(text, wake_id.clone());
                 let out = match sqlite::send(&mut rt, &id, &op, Some(&wake_id)) {
                     Err(e) => Err(MindError::Failed(e.to_string())),
@@ -163,20 +173,31 @@ impl HarvestMind {
                         Ok(_) => match sqlite::state(&rt, &id).await {
                             Ok(Some(s)) => Ok(MindReply {
                                 text: s.last_answer.clone(),
-                                usage: Usage {
-                                    calls: 0,
-                                    input_tokens: s.tokens_used.saturating_sub(before),
-                                    output_tokens: 0,
-                                    cost_usd_micros: 0,
-                                },
-                                commands: 0,
+                                ..MindReply::default()
                             }),
                             Ok(None) => Ok(MindReply::default()),
                             Err(e) => Err(MindError::Failed(e.to_string())),
                         },
                     },
                 };
-                let _ = reply.send(out);
+                let mut spent = Usage::default();
+                if let Some(now) = tokens_used(&rt, &id).await {
+                    spent.input_tokens = now.saturating_sub(last_seen);
+                    last_seen = now;
+                }
+                match out {
+                    Ok(mut r) => {
+                        r.usage = spent;
+                        // Nobody waits (the wake timed out): charge it anyway.
+                        if let Err(Ok(r)) = reply.send(Ok(r)) {
+                            sink.add(&who, r.usage);
+                        }
+                    }
+                    Err(e) => {
+                        sink.add(&who, spent);
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
         });
         workers.insert(entity.clone(), tx.clone());

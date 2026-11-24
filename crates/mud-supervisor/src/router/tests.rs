@@ -142,6 +142,47 @@ fn agents_alone_get_two_turns_then_silence() {
 }
 
 #[test]
+fn agent_tells_count_as_agent_only_turns() {
+    // Regression: a tell has no room, so agent-to-agent tells skipped the
+    // anti-chatter counter and could ping-pong forever.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let (vich, marta) = (id("vich"), id("marta"));
+    let n = run(&mut w, &mut r, &rt, &vich, "tell marta psst", 100);
+    assert!(queued_for(&n, "marta").is_some(), "{n:?}");
+    let n = run(&mut w, &mut r, &rt, &marta, "tell vich what", 200);
+    assert!(queued_for(&n, "vich").is_some(), "{n:?}");
+    let n = run(&mut w, &mut r, &rt, &vich, "tell marta psst again", 300);
+    assert_eq!(
+        dropped_for(&n, "marta").as_deref(),
+        Some("anti-chatter: agent-only turns exhausted"),
+        "{n:?}"
+    );
+    let n = run(&mut w, &mut r, &rt, &marta, "tell vich still here", 400);
+    assert!(dropped_for(&n, "vich").is_some(), "{n:?}");
+    // A human next to either party keeps tells flowing.
+    let ada = w.login("ada", 500).unwrap();
+    w.drain_fresh();
+    run(&mut w, &mut r, &rt, &ada, "e", 600);
+    r.pending.clear();
+    for i in 0..5 {
+        let n = run(
+            &mut w,
+            &mut r,
+            &rt,
+            &vich,
+            &format!("tell marta hi {i}"),
+            700 + i,
+        );
+        assert!(queued_for(&n, "marta").is_some(), "{n:?}");
+    }
+    // A human's tell is never held back.
+    let n = run(&mut w, &mut r, &rt, &ada, "tell vich hey", 800);
+    assert!(queued_for(&n, "vich").is_some(), "{n:?}");
+}
+
+#[test]
 fn budgets_shed_wakes() {
     let mut w = world();
     let mut r = Router::new(RouterConfig::default());
@@ -211,6 +252,20 @@ fn macro_ticks_wait_for_an_empty_room() {
     w.execute(&ada, "w", 8);
     let note = r.macro_tick(&id("torin"), &w, 9);
     assert!(matches!(note, RouteNote::Dropped { .. }));
+}
+
+#[test]
+fn a_macro_tick_keeps_its_identity_inside_a_merged_wake() {
+    let w = world();
+    let mut r = Router::new(RouterConfig::default());
+    r.force(&id("torin"), Priority::RoomBatch, "leave by ada", 0);
+    r.macro_tick(&id("torin"), &w, 5);
+    let wakes = r.due(5);
+    assert_eq!(wakes[0].priority, Priority::RoomBatch);
+    assert!(wakes[0].macro_tick, "{wakes:?}");
+    r.finish(&id("torin"), 6);
+    r.force(&id("torin"), Priority::Immediate, "login", 10);
+    assert!(!r.due(10)[0].macro_tick, "an ordinary wake is not a tick");
 }
 
 #[test]
@@ -302,6 +357,45 @@ fn busy_entities_wait_and_cooldowns_apply() {
     assert!(due >= 63_000, "cooldown after the last wake: {due}");
     r.forget(&id("marta"));
     assert!(r.pending().iter().all(|(e, _, _)| e != &id("marta")));
+}
+
+#[test]
+fn a_wake_queued_while_busy_waits_out_the_cooldown() {
+    // Regression: the floor was computed when the event came in, from the
+    // wake before, so a wake queued mid-wake fired right after finish().
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    assert!(r.due(5_000).iter().any(|w| w.entity == id("marta")));
+    run(&mut w, &mut r, &rt, &ada, "say again", 5_000);
+    r.finish(&id("marta"), 60_000);
+    assert!(
+        r.due(60_001).iter().all(|w| w.entity != id("marta")),
+        "the cooldown starts when the wake ends"
+    );
+    let due = r
+        .pending()
+        .into_iter()
+        .find(|(e, _, _)| e == &id("marta"))
+        .unwrap()
+        .2;
+    assert!((63_000..=68_000).contains(&due), "{due}");
+    assert!(r.due(due).iter().any(|w| w.entity == id("marta")));
+}
+
+#[test]
+fn an_urgent_wake_queued_while_busy_still_goes_at_once() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    assert!(r.due(5_000).iter().any(|w| w.entity == id("marta")));
+    run(&mut w, &mut r, &rt, &ada, "say marta, an ale", 5_000);
+    r.finish(&id("marta"), 60_000);
+    assert!(r.due(60_000).iter().any(|w| w.entity == id("marta")));
 }
 
 #[test]

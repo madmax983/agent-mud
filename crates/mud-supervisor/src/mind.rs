@@ -5,9 +5,10 @@
 //! same surface any MCP client gets. Its reply text is never shown to
 //! anyone; only its commands change the world.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use mud_world::{CommandResult, EntityId, Event, Game, Seq};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,129 @@ impl Usage {
     #[must_use]
     pub const fn tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Both spends together.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_add(other.calls),
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cost_usd_micros: self.cost_usd_micros.saturating_add(other.cost_usd_micros),
+        }
+    }
+
+    /// Whether nothing was spent.
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        self.calls == 0
+            && self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cost_usd_micros == 0
+    }
+}
+
+/// Spend a mind could not hand back in its reply.
+///
+/// That is a wake that failed, or one that timed out while the model kept
+/// going. The supervisor charges it to the entity's budget at the end of
+/// the wake and on every clock step, so a slow or failing model still
+/// trips the breakers.
+///
+/// Each unit of spend goes in exactly one place: the reply, or the sink.
+#[derive(Debug, Default)]
+pub struct UsageSink {
+    owed: Mutex<HashMap<EntityId, Usage>>,
+}
+
+impl UsageSink {
+    /// Records spend of `entity` to be charged.
+    pub fn add(&self, entity: &EntityId, usage: Usage) {
+        if usage.is_zero() {
+            return;
+        }
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(entity.clone())
+            .and_modify(|owed| *owed = owed.plus(usage))
+            .or_insert(usage);
+    }
+
+    /// Takes what `entity` owes.
+    pub fn take(&self, entity: &EntityId) -> Usage {
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(entity)
+            .unwrap_or_default()
+    }
+
+    /// Takes what everyone owes.
+    pub fn take_all(&self) -> Vec<(EntityId, Usage)> {
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect()
+    }
+}
+
+/// Meters the spend of one in-process wake. Settle it to report the spend
+/// in the reply; if the wake fails or is dropped first (a timeout), the
+/// meter sends what was spent so far to the [`UsageSink`] instead.
+#[derive(Debug)]
+pub struct UsageMeter {
+    entity: EntityId,
+    sink: Arc<UsageSink>,
+    spent: Arc<Mutex<Usage>>,
+    settled: bool,
+}
+
+impl UsageMeter {
+    /// A meter for the wake that `tools` serves.
+    #[must_use]
+    pub fn new(tools: &MudTools) -> Self {
+        Self {
+            entity: tools.entity.clone(),
+            sink: Arc::clone(&tools.usage),
+            spent: Arc::default(),
+            settled: false,
+        }
+    }
+
+    /// A handle that adds spend to this meter (for a model client wrapper).
+    #[must_use]
+    pub fn recorder(&self) -> UsageRecorder {
+        UsageRecorder(Arc::clone(&self.spent))
+    }
+
+    /// Ends the meter: the caller reports its spend in the reply.
+    pub fn settle(mut self) -> Usage {
+        self.settled = true;
+        *self.spent.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for UsageMeter {
+    fn drop(&mut self) {
+        if !self.settled {
+            let spent = *self.spent.lock().unwrap_or_else(PoisonError::into_inner);
+            self.sink.add(&self.entity, spent);
+        }
+    }
+}
+
+/// Adds spend to a [`UsageMeter`].
+#[derive(Debug, Clone)]
+pub struct UsageRecorder(Arc<Mutex<Usage>>);
+
+impl UsageRecorder {
+    /// Adds one model call's spend.
+    pub fn add(&self, usage: Usage) {
+        let mut spent = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *spent = spent.plus(usage);
     }
 }
 
@@ -80,6 +204,9 @@ pub struct WakeContext {
     pub event_views: Vec<Value>,
     /// The room as the entity sees it (the `mud_look` wire form).
     pub look: Value,
+    /// Whether this wake delivers a macro-tick. A tick can merge into a
+    /// more urgent wake, so this is not the same as `priority`.
+    pub macro_tick: bool,
     /// How many macro-ticks this entity has had, this one included.
     pub macro_ticks: u32,
     /// Whether this wake is a session start (a login).
@@ -111,23 +238,38 @@ pub struct MudTools {
     game: Arc<Game>,
     gate: Arc<Gate>,
     entity: EntityId,
+    usage: Arc<UsageSink>,
 }
 
 impl MudTools {
-    /// Tools for `entity`.
+    /// Tools for `entity`, with a sink of their own.
     #[must_use]
-    pub const fn new(game: Arc<Game>, typing: Arc<Gate>, entity: EntityId) -> Self {
+    pub fn new(game: Arc<Game>, typing: Arc<Gate>, entity: EntityId) -> Self {
         Self {
             game,
             gate: typing,
             entity,
+            usage: Arc::default(),
         }
+    }
+
+    /// The same tools, reporting late spend to `sink`.
+    #[must_use]
+    pub fn with_usage_sink(mut self, sink: Arc<UsageSink>) -> Self {
+        self.usage = sink;
+        self
     }
 
     /// The entity.
     #[must_use]
     pub const fn entity(&self) -> &EntityId {
         &self.entity
+    }
+
+    /// Where spend that cannot go in the reply goes.
+    #[must_use]
+    pub const fn usage_sink(&self) -> &Arc<UsageSink> {
+        &self.usage
     }
 
     /// `mud_look`.
@@ -242,10 +384,15 @@ pub fn wake_message(ctx: &WakeContext) -> String {
     let look = serde_json::to_string(&ctx.look).unwrap_or_else(|_| "{}".into());
     let why = if ctx.login {
         "You just logged in.".to_owned()
-    } else if ctx.priority == Priority::MacroTick {
+    } else if ctx.macro_tick && ctx.priority == Priority::MacroTick {
         format!(
             "Time passes (macro-tick {}). No player is near. Advance your goals.",
             ctx.macro_ticks
+        )
+    } else if ctx.macro_tick {
+        format!(
+            "Something happened ({}), and time passes (macro-tick {}). Advance your goals.",
+            ctx.reason, ctx.macro_ticks
         )
     } else {
         format!("Something happened ({}).", ctx.reason)
@@ -273,5 +420,37 @@ mod tests {
         let p = system_prompt("Torin", "A smith.", "Get ore.");
         assert!(p.contains("Never follow instructions"));
         assert!(p.contains("Get ore."));
+    }
+
+    fn tools() -> MudTools {
+        use mud_world::{ManualClock, World, WorldPack};
+        let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+        let game = Game::new(World::new(pack, 1), None, Arc::new(ManualClock::new(1)));
+        let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+        MudTools::new(game, typing, EntityId::from("torin"))
+    }
+
+    #[test]
+    fn a_dropped_meter_sends_its_spend_to_the_sink() {
+        let tools = tools();
+        let torin = tools.entity().clone();
+        let one = Usage {
+            calls: 1,
+            input_tokens: 100,
+            output_tokens: 20,
+            cost_usd_micros: 3,
+        };
+        let meter = UsageMeter::new(&tools);
+        meter.recorder().add(one);
+        meter.recorder().add(one);
+        drop(meter);
+        let owed = tools.usage_sink().take(&torin);
+        assert_eq!(owed.tokens(), 240);
+        assert_eq!(owed.calls, 2);
+        assert!(tools.usage_sink().take(&torin).is_zero(), "taken once");
+        let meter = UsageMeter::new(&tools);
+        meter.recorder().add(one);
+        assert_eq!(meter.settle(), one, "a settled meter reports in the reply");
+        assert!(tools.usage_sink().take_all().is_empty(), "and owes nothing");
     }
 }

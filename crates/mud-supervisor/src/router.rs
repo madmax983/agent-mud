@@ -89,6 +89,10 @@ pub struct Wake {
     pub seqs: Vec<Seq>,
     /// Why, for the observer.
     pub reason: String,
+    /// Whether a macro-tick is part of it, whatever its priority (a tick
+    /// can merge into a more urgent wake).
+    #[serde(default)]
+    pub macro_tick: bool,
 }
 
 /// A routing decision, for the observer.
@@ -124,6 +128,11 @@ struct Pending {
     first_ms: u64,
     due_ms: u64,
     reason: String,
+    macro_tick: bool,
+    /// The longest cooldown its non-urgent events asked for, in ms.
+    cooldown_ms: u64,
+    /// The latest distracted spell its non-urgent events saw.
+    afk_until_ms: Option<u64>,
 }
 
 /// The router.
@@ -180,6 +189,12 @@ impl Router {
             .iter()
             .map(|(e, p)| (e.clone(), p.priority, p.due_ms))
             .collect()
+    }
+
+    /// Whether `entity` has no wake in flight and none waiting.
+    #[must_use]
+    pub fn is_idle(&self, entity: &EntityId) -> bool {
+        !self.busy.contains(entity) && !self.pending.contains_key(entity)
     }
 
     fn jitter(&self, range: [u64; 2], entity: &EntityId, seq: Seq, salt: &[u8]) -> u64 {
@@ -251,6 +266,32 @@ impl Router {
                 .entry(room.clone())
                 .or_default()
                 .step(input, self.cfg.max_agent_only_turns)
+        } else if ev.room.is_none()
+            && actor_is_agent
+            && let Some(a) = actor
+        {
+            // A roomless agent event (a tell) still counts, in the room of
+            // the actor and of each party it reaches: agent-only unless a
+            // human is with one of them.
+            let rooms: BTreeSet<&RoomId> = std::iter::once(&a.room)
+                .chain(
+                    ev.recipients
+                        .iter()
+                        .filter(|r| !ev.is_by(r))
+                        .filter_map(|r| world.entity(r))
+                        .map(|t| &t.room),
+                )
+                .collect();
+            let input = if rooms.iter().any(|room| world.human_present(room)) {
+                ChatterInput::AgentWithHuman
+            } else {
+                ChatterInput::AgentAlone
+            };
+            let max = self.cfg.max_agent_only_turns;
+            rooms.into_iter().fold(true, |allow, room| {
+                let ok = self.rooms.entry(room.clone()).or_default().step(input, max);
+                allow && ok
+            })
         } else {
             true
         };
@@ -328,6 +369,7 @@ impl Router {
                 Priority::MacroTick => now,
             };
             let mut floor = 0;
+            let mut cooldown_ms = 0;
             if priority < Priority::Immediate {
                 let range = world
                     .pack()
@@ -339,6 +381,7 @@ impl Router {
                 if state.budget == Some(BudgetLevel::Soft) {
                     cooldown *= 2;
                 }
+                cooldown_ms = cooldown;
                 if let Some(end) = self.last_wake_end.get(r) {
                     floor = end + cooldown;
                 }
@@ -357,8 +400,15 @@ impl Router {
                     ev.kind.name(),
                     ev.actor.as_ref().map_or("world", |a| a.name.as_str())
                 ),
+                macro_tick: false,
+                cooldown_ms: 0,
+                afk_until_ms: None,
             });
             p.seqs.push(ev.seq);
+            if priority < Priority::Immediate {
+                p.cooldown_ms = p.cooldown_ms.max(cooldown_ms);
+                p.afk_until_ms = p.afk_until_ms.max(state.afk_until_ms);
+            }
             if priority > p.priority {
                 p.priority = priority;
                 p.due_ms = p.due_ms.min(due);
@@ -417,7 +467,12 @@ impl Router {
                 first_ms: now,
                 due_ms: now,
                 reason: "macro-tick".into(),
+                macro_tick: true,
+                cooldown_ms: 0,
+                afk_until_ms: None,
             });
+        // The tick keeps its identity even inside a more urgent wake.
+        p.macro_tick = true;
         p.due_ms = p.due_ms.min(now);
         RouteNote::Queued {
             entity: entity.clone(),
@@ -439,6 +494,9 @@ impl Router {
                 first_ms: now,
                 due_ms: now,
                 reason: reason.to_owned(),
+                macro_tick: false,
+                cooldown_ms: 0,
+                afk_until_ms: None,
             });
         if priority >= p.priority {
             p.priority = priority;
@@ -464,6 +522,7 @@ impl Router {
                     priority: p.priority,
                     seqs: p.seqs,
                     reason: p.reason,
+                    macro_tick: p.macro_tick,
                 });
             }
         }
@@ -471,10 +530,17 @@ impl Router {
         out
     }
 
-    /// Marks a wake finished; its cooldown starts now.
+    /// Marks a wake finished; its cooldown starts now. A non-urgent wake
+    /// queued meanwhile waits out that cooldown (and any distracted spell).
     pub fn finish(&mut self, entity: &EntityId, now: u64) {
         self.busy.remove(entity);
         self.last_wake_end.insert(entity.clone(), now);
+        if let Some(p) = self.pending.get_mut(entity)
+            && p.priority < Priority::Immediate
+        {
+            let floor = (now + p.cooldown_ms).max(p.afk_until_ms.unwrap_or(0));
+            p.due_ms = p.due_ms.max(floor);
+        }
     }
 
     /// Forgets every waiting wake of an entity (it logged out).
