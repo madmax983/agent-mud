@@ -2259,6 +2259,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "maud",
+ "mud-accounts",
  "mud-mcp",
  "mud-script",
  "mud-supervisor",
@@ -2276,6 +2277,7 @@ dependencies = [
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

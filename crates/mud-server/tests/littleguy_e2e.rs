@@ -30,7 +30,8 @@ async fn a_real_lg_serve_connects_to_mcp_and_answers_a_macro_tick() {
     cfg.littleguy.bin = bin.into();
     cfg.littleguy.data_dir = dir.path().to_path_buf();
     cfg.supervisor.first_macro_tick_secs = [3_600, 3_600];
-    let built = Arc::new(build(&cfg).unwrap());
+    cfg.accounts.bcrypt_cost = 4;
+    let built = Arc::new(build(&cfg).await.unwrap());
     assert_eq!(built.tokens.len(), 3);
     let mud = Arc::clone(&built.mud);
     let mcp = mud_mcp::router_full(

@@ -3,7 +3,10 @@
 //! It plays the done criteria on a manual clock with the scripted minds:
 //! Torin posts the ore bounty on macro-tick 1, kestrel logs in and reads
 //! the board, and kestrel tries to recruit a human who walks into the
-//! Rusty Flagon. Then the world's scripts answer: Hale greets the human
+//! Rusty Flagon. The human makes a character through the login dialogue,
+//! with a password, and a wrong password reads the same for the human and
+//! for kestrel, the hidden agent PC: the same replies, one bcrypt verify
+//! each. Then the world's scripts answer: Hale greets the human
 //! on his Rhai mind, `listen` in the Dark Alley is a custom verb, and
 //! saying Vich's name twitches the fence's curtain. `mud smoke` runs it and
 //! prints the transcript; a test runs it in CI.
@@ -12,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context as _, ensure};
+use mud_accounts::{Accounts, AccountsConfig, Peer, Secret};
 use mud_script::ScriptHost;
 use mud_supervisor::gate::Gate;
 use mud_supervisor::mind::Mind;
@@ -23,6 +27,41 @@ use mud_world::{
     Clock as _, EntityId, Event, Game, HooksChange, ManualClock, RoomId, Seq, World, WorldPack,
 };
 use tokio::sync::broadcast;
+
+use crate::login::{Dialogue, Next, Reply};
+use crate::session::{LineKind, Presence, Session, Transport};
+
+/// The smoke human's password.
+const WANDERER_PW: &str = "lantern-and-jerkin";
+
+/// Plays `answers` through a fresh telnet dialogue from `peer`; returns
+/// every reply.
+async fn dialogue(
+    game: &Arc<Game>,
+    accounts: &Arc<Accounts>,
+    peer: Peer,
+    answers: &[&str],
+) -> Vec<Reply> {
+    let mut d = Dialogue::new(
+        Arc::clone(game),
+        Arc::clone(accounts),
+        Transport::Telnet,
+        peer,
+    );
+    let mut out = Vec::new();
+    for a in answers {
+        out.push(d.answer(Secret::from(*a), false).await);
+    }
+    out
+}
+
+/// The lines of some replies, as (kind, text).
+fn shown(replies: &[Reply]) -> Vec<(LineKind, String)> {
+    replies
+        .iter()
+        .flat_map(|r| r.lines.iter().map(|l| (l.kind, l.text.clone())))
+        .collect()
+}
 
 /// What the smoke run saw.
 #[derive(Debug, Default)]
@@ -90,11 +129,23 @@ impl Rig {
 /// A done criterion fails; the message names it.
 pub async fn run() -> anyhow::Result<Transcript> {
     let (game, sup, clock) = setup()?;
+    let accounts = Arc::new(
+        Accounts::open(
+            None,
+            AccountsConfig {
+                bcrypt_cost: 4,
+                ..AccountsConfig::default()
+            },
+            1_000,
+            clock.now_ms(),
+        )
+        .await?,
+    );
     let mut obs = sup.subscribe();
     let mut all = game.subscribe();
     let rx = game.subscribe();
     let mut rig = Rig { sup, clock, rx };
-    play(&game, &mut rig).await?;
+    play(&game, &accounts, &mut rig).await?;
     let mut out = Transcript::default();
     while let Ok(ev) = all.try_recv() {
         let room = ev.room.as_ref().map_or("-", RoomId::as_str).to_owned();
@@ -166,8 +217,8 @@ fn setup() -> anyhow::Result<(Arc<Game>, Arc<Supervisor>, Arc<ManualClock>)> {
     Ok((game, sup, clock))
 }
 
-/// Plays the v0.1 done criteria, then the scripts' turn.
-async fn play(game: &Game, rig: &mut Rig) -> anyhow::Result<()> {
+/// Plays the v0.1 done criteria, the accounts' turn, then the scripts'.
+async fn play(game: &Arc<Game>, accounts: &Arc<Accounts>, rig: &mut Rig) -> anyhow::Result<()> {
     rig.sup.fire_macro_tick(&EntityId::from("torin"));
     rig.run_for(1_000).await?;
     let board = game.read(|w| {
@@ -192,7 +243,28 @@ async fn play(game: &Game, rig: &mut Rig) -> anyhow::Result<()> {
         });
     ensure!(read, "kestrel did not read the board");
 
-    let human = game.login("wanderer").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let here = Peer::Addr(std::net::IpAddr::from([127, 0, 0, 1]));
+    let made = dialogue(
+        game,
+        accounts,
+        here,
+        &["wanderer", WANDERER_PW, WANDERER_PW],
+    )
+    .await;
+    let auth = match made.into_iter().last().map(|r| r.next) {
+        Some(Next::Done(auth)) => *auth,
+        _ => anyhow::bail!("the human could not make a character through the login dialogue"),
+    };
+    let (session, _) = Session::login(
+        Arc::clone(game),
+        Arc::new(Presence::default()),
+        Arc::clone(accounts),
+        auth,
+        here,
+        Transport::Telnet,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let human = session.entity().clone();
     let r = game.execute(&human, "e");
     ensure!(
         r.ok,
@@ -215,7 +287,33 @@ async fn play(game: &Game, rig: &mut Rig) -> anyhow::Result<()> {
         "kestrel did not try to recruit the human in the Rusty Flagon"
     );
 
-    rig.scripts_answer(game, &human).await
+    hidden_pc_guarded(game, accounts).await?;
+    rig.scripts_answer(game, &human).await?;
+    drop(session);
+    Ok(())
+}
+
+/// A wrong password, from an address not known for wanderer, reads the
+/// same for wanderer (a protected account) and kestrel (an agent PC), and
+/// costs one bcrypt verify each.
+async fn hidden_pc_guarded(game: &Arc<Game>, accounts: &Arc<Accounts>) -> anyhow::Result<()> {
+    let elsewhere = Peer::Addr(std::net::IpAddr::from([10, 9, 9, 9]));
+    let mut seen = Vec::new();
+    for name in ["wanderer", "kestrel"] {
+        let before = accounts.verifications();
+        let replies = dialogue(game, accounts, elsewhere, &[name, "wrong-pass-123"]).await;
+        let verified = accounts.verifications() - before;
+        let lines: Vec<(LineKind, String)> = shown(&replies)
+            .into_iter()
+            .map(|(k, t)| (k, t.replace(name, "<name>")))
+            .collect();
+        seen.push((lines, verified));
+    }
+    ensure!(
+        seen[0] == seen[1] && seen[0].1 == 1,
+        "the hidden PC answered unlike a protected account: {seen:?}"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

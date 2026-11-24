@@ -89,6 +89,37 @@ pub fn client_addr(resolved: Option<IpAddr>, peer: Option<SocketAddr>) -> Option
     resolved.or_else(|| peer.map(|p| p.ip()))
 }
 
+/// What the login throttles key a web client by.
+///
+/// 1. A request that came through a proxy (`X-Forwarded-For`, `Forwarded`
+///    or `X-Real-IP`) while no proxy is trusted: [`Peer::Shared`], with
+///    one warning, because the TCP peer is the proxy and every player
+///    would share its address.
+/// 2. The address the trusted-proxy layer resolved, bucketed.
+/// 3. The TCP peer, bucketed.
+/// 4. Otherwise [`Peer::Shared`].
+///
+/// [`Peer::Shared`]: mud_accounts::Peer::Shared
+#[must_use]
+pub fn account_peer(
+    resolved: Option<IpAddr>,
+    peer: Option<SocketAddr>,
+    forwarded: bool,
+    trusted: bool,
+) -> mud_accounts::Peer {
+    use mud_accounts::Peer;
+    if forwarded && !trusted {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "a web client came through a proxy, but [server] trusted_proxies is empty; address-based login limits are off for such clients"
+            );
+        });
+        return Peer::Shared;
+    }
+    bucket(resolved.or_else(|| peer.map(|p| p.ip()))).map_or(Peer::Shared, Peer::Addr)
+}
+
 #[derive(Debug, Default)]
 struct Counts {
     total: u32,
@@ -259,6 +290,33 @@ mod tests {
         assert_eq!(client_addr(Some(real), Some(peer)), Some(real));
         assert_eq!(client_addr(None, Some(peer)), Some(peer.ip()));
         assert_eq!(client_addr(None, None), None);
+    }
+
+    #[test]
+    fn account_peer_cases() {
+        use mud_accounts::Peer;
+        let real: IpAddr = "203.0.113.7".parse().unwrap();
+        let proxy: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        assert_eq!(
+            account_peer(Some(real), Some(proxy), true, true),
+            Peer::Addr(real)
+        );
+        assert_eq!(account_peer(None, Some(proxy), true, false), Peer::Shared);
+        assert_eq!(
+            account_peer(Some(proxy.ip()), Some(proxy), true, false),
+            Peer::Shared,
+            "untrusted: whatever was resolved is the proxy"
+        );
+        assert_eq!(
+            account_peer(None, Some(proxy), false, false),
+            Peer::Addr(proxy.ip())
+        );
+        let v6: SocketAddr = "[2001:db8:1:2:3:4:5:6]:1".parse().unwrap();
+        assert_eq!(
+            account_peer(None, Some(v6), false, false),
+            Peer::Addr("2001:db8:1:2::".parse().unwrap())
+        );
+        assert_eq!(account_peer(None, None, false, false), Peer::Shared);
     }
 
     #[test]

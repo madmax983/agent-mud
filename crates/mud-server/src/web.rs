@@ -1,8 +1,10 @@
 //! The autumn-web app: the terminal, the observer dashboard, and `/mcp`.
 //!
 //! - `/` is a browser terminal. It speaks JSON over the `/ws` WebSocket:
-//!   the client sends `{"login": name}` once, then `{"cmd": line}`; the
-//!   server sends `{"kind", "text"}` lines.
+//!   the client sends `{"resume": token}` or `{"line": text, "remember":
+//!   bool}`; the server sends [`ServerMsg`]s (`{"kind", ...}`). The login
+//!   dialogue ([`crate::login`]) runs first; a resume token is an explicit
+//!   message, never a cookie.
 //! - `/observer` is the private dashboard: every agent's goal, last wake,
 //!   budget and spend, and a live feed of routing decisions, wakes,
 //!   self-control rolls and world events. It needs the admin token.
@@ -18,13 +20,14 @@ use autumn_web::htmx::HTMX_JS_PATH;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::Extension;
 use autumn_web::reexports::axum::extract::ConnectInfo;
-use autumn_web::reexports::axum::http::StatusCode;
+use autumn_web::reexports::axum::http::{HeaderMap, StatusCode, header};
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::security::ResolvedClientIdentity;
 use autumn_web::sse::{Event as SseEvent, Sse};
-use autumn_web::ws::{Message, WebSocket, WsHandler};
+use autumn_web::ws::{CloseFrame, Message, WebSocket, WsHandler};
 use futures::{Stream, StreamExt};
 use maud::{DOCTYPE, Markup, PreEscaped};
+use mud_accounts::{Accounts, Secret};
 use mud_supervisor::runtime::Supervisor;
 use mud_world::{EntityId, Game};
 use serde::Deserialize;
@@ -32,8 +35,9 @@ use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config::Timeouts;
-use crate::limits::{ConnLimiter, client_addr};
-use crate::session::{Line, LineKind, Presence, Session};
+use crate::limits::{ConnLimiter, account_peer, client_addr};
+use crate::login::{Dialogue, Next};
+use crate::session::{CloseKind, Control, Line, LineKind, Presence, Session, Transport};
 
 /// What every route reads: the world, the supervisor, and the admin token.
 #[derive(Debug, Clone)]
@@ -58,6 +62,13 @@ pub struct Mud {
     pub littleguy: Vec<Arc<mud_supervisor::littleguy::LittleguyMind>>,
     /// The world's scripts, unless `[scripts] enabled = false`.
     pub scripts: Option<Arc<mud_script::ScriptHost>>,
+    /// Player accounts. Only the transports hold it; the script engine
+    /// never does.
+    pub accounts: Arc<Accounts>,
+    /// `[server] public_url`, for the terminal's Origin check.
+    pub public_url: Option<String>,
+    /// Whether `[server] trusted_proxies` is set.
+    pub trusted_proxies: bool,
 }
 
 impl Mud {
@@ -125,18 +136,41 @@ table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px
 ";
 
 const TERMINAL_JS: &str = r"
-const out=document.getElementById('out'),form=document.getElementById('f'),input=document.getElementById('i');
-let ws=null,named=false;
+const out=document.getElementById('out'),form=document.getElementById('f'),input=document.getElementById('i'),keep=document.getElementById('keep'),keepBox=document.getElementById('keepbox');
+let ws=null,authed=false,secret=false,tries=0;
+function get(s,k){try{return s.getItem(k)||'';}catch(e){return '';}}
+function put(s,k,v){try{s.setItem(k,v);}catch(e){}}
+function drop(s,k){try{s.removeItem(k);}catch(e){}}
+if(keep){keep.checked=get(localStorage,'mud.keep')==='1';keep.addEventListener('change',()=>put(localStorage,'mud.keep',keep.checked?'1':'0'));}
+function showKeep(on){if(keepBox)keepBox.style.display=on?'':'none';}
+showKeep(false);
 function add(kind,text){const d=document.createElement('div');d.className=kind;d.textContent=text;out.appendChild(d);out.scrollTop=out.scrollHeight;}
+function onMsg(m){
+  if(m.kind==='prompt'){add('system',m.text);secret=!!m.secret;input.type=secret?'password':'text';input.autocomplete=m.secret||(authed?'off':'username');showKeep(secret&&!authed);input.focus();return;}
+  if(m.kind==='authed'){authed=true;tries=0;showKeep(false);input.type='text';input.autocomplete='off';return;}
+  if(m.kind==='remember'){if(m.persist)put(localStorage,'mud.device',m.token);else put(sessionStorage,'mud.tab',m.token);return;}
+  if(m.kind==='forget'){drop(localStorage,'mud.device');drop(sessionStorage,'mud.tab');return;}
+  add(m.kind,m.text);
+}
 function connect(){
   const proto=location.protocol==='https:'?'wss':'ws';
   ws=new WebSocket(proto+'://'+location.host+'/ws');
-  ws.onmessage=e=>{const m=JSON.parse(e.data);add(m.kind,m.text);if(m.kind!=='error')named=true;};
-  ws.onclose=()=>{add('system','[disconnected — reload to reconnect]');};
-  ws.onopen=()=>add('system','What is your name?');
+  ws.onopen=()=>ws.send(JSON.stringify({resume:get(localStorage,'mud.device')||get(sessionStorage,'mud.tab')||''}));
+  ws.onmessage=e=>onMsg(JSON.parse(e.data));
+  ws.onclose=e=>{
+    secret=false;input.type='text';
+    if(e.code===1000){add('system','[disconnected \u2014 reload to play again]');return;}
+    if(e.code===1008){add('system','[disconnected]');return;}
+    if(tries>=10){add('system','[disconnected \u2014 reload to play again]');return;}
+    add('system','[connection lost \u2014 reconnecting\u2026]');
+    const wait=[1,2,4,8,16][tries]||30;tries++;authed=false;
+    setTimeout(connect,wait*1000);
+  };
 }
 form.addEventListener('submit',e=>{e.preventDefault();const v=input.value;input.value='';if(!ws||ws.readyState!==1)return;
-  if(!named){ws.send(JSON.stringify({login:v}));}else{add('muted','> '+v);ws.send(JSON.stringify({cmd:v}));}});
+  if(!secret)add('muted','> '+v);
+  ws.send(JSON.stringify({line:v,remember:!!(keep&&keep.checked)}));
+  secret=false;input.type='text';});
 connect();
 ";
 
@@ -200,7 +234,8 @@ fn page(title: &str, body: &Markup, script: &str) -> Markup {
 }
 
 #[get("/")]
-async fn index() -> Markup {
+async fn index(State(state): State<AppState>) -> Markup {
+    let remember = mud(&state).is_some_and(|m| m.accounts.config().remember_days > 0);
     page(
         "Harrow's Rest",
         &html! {
@@ -210,29 +245,187 @@ async fn index() -> Markup {
                 input #i autofocus placeholder="type a command — help for the list";
                 button type="submit" { "Send" }
             }
-            p.muted { "Same commands as everyone else in the world. Some of the people you meet may not be people." }
+            @if remember {
+                p #keepbox { label { input #keep type="checkbox"; " stay signed in on this browser" } }
+            }
+            p.muted { "Same commands as everyone else in the world. Some of the people you meet may not be people. Type logout to make this browser forget you." }
         },
         "/static/mud/terminal.js",
     )
 }
 
-#[derive(Deserialize)]
+/// What a terminal sends. It has no `Debug`: it may hold a password or a
+/// token.
+#[derive(Deserialize, Default)]
 struct ClientMsg {
-    login: Option<String>,
-    cmd: Option<String>,
+    /// A typed line: a name, a password, or a command. `login` and `cmd`
+    /// are the v0.1 names.
+    #[serde(default, alias = "login", alias = "cmd")]
+    line: Option<String>,
+    /// "Stay signed in" was ticked.
+    #[serde(default)]
+    remember: bool,
+    /// A resume token, on the first message only.
+    #[serde(default)]
+    resume: Option<String>,
 }
 
-fn encode(line: &Line) -> Message {
-    Message::Text(serde_json::to_string(line).unwrap_or_default().into())
+/// What the server sends a terminal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServerMsg<'a> {
+    /// The answer to the player's own command.
+    Narrative {
+        /// The text.
+        text: &'a str,
+    },
+    /// Something that happened around them.
+    Event {
+        /// The text.
+        text: &'a str,
+    },
+    /// A refusal.
+    Error {
+        /// The text.
+        text: &'a str,
+    },
+    /// A server notice.
+    System {
+        /// The text.
+        text: &'a str,
+    },
+    /// A question; `secret` marks one whose answer must not echo.
+    Prompt {
+        /// The text.
+        text: &'a str,
+        /// `current-password` or `new-password`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secret: Option<&'static str>,
+    },
+    /// The login is done.
+    Authed {
+        /// The character's name.
+        name: &'a str,
+    },
+    /// Keep this resume token.
+    Remember {
+        /// `series:token`.
+        token: &'a str,
+        /// `localStorage` ("stay signed in") or `sessionStorage` (a tab).
+        persist: bool,
+    },
+    /// Forget any resume token.
+    Forget,
+}
+
+impl<'a> ServerMsg<'a> {
+    /// The message of a line.
+    #[must_use]
+    pub const fn from_line(l: &'a Line) -> Self {
+        let text = l.text.as_str();
+        match l.kind {
+            LineKind::Narrative => Self::Narrative { text },
+            LineKind::Event => Self::Event { text },
+            LineKind::Error => Self::Error { text },
+            LineKind::System => Self::System { text },
+            LineKind::Prompt => Self::Prompt { text, secret: None },
+            LineKind::Secret(s) => Self::Prompt {
+                text,
+                secret: Some(s.as_str()),
+            },
+        }
+    }
+
+    /// The message of a control.
+    #[must_use]
+    pub fn from_control(c: &'a Control) -> Self {
+        match c {
+            Control::Authed { name } => Self::Authed { name },
+            Control::Remember(t) => Self::Remember {
+                token: t.value.expose(),
+                persist: t.persist,
+            },
+            Control::Forget => Self::Forget,
+        }
+    }
+}
+
+fn encode(m: &ServerMsg<'_>) -> Message {
+    Message::Text(serde_json::to_string(m).unwrap_or_default().into())
+}
+
+fn error_msg(text: &str) -> Message {
+    encode(&ServerMsg::Error { text })
 }
 
 async fn send_lines(socket: &mut WebSocket, lines: &[Line]) -> bool {
     for l in lines {
-        if socket.send(encode(l)).await.is_err() {
+        if socket.send(encode(&ServerMsg::from_line(l))).await.is_err() {
             return false;
         }
     }
     true
+}
+
+async fn send_all(socket: &mut WebSocket, lines: &[Line], controls: &[Control]) -> bool {
+    if !send_lines(socket, lines).await {
+        return false;
+    }
+    for c in controls {
+        if socket
+            .send(encode(&ServerMsg::from_control(c)))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn close(socket: &mut WebSocket, kind: CloseKind) {
+    let code = match kind {
+        CloseKind::Normal => 1000,
+        CloseKind::Policy => 1008,
+    };
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: "".into(),
+        })))
+        .await;
+}
+
+/// Whether a terminal connection may come from `origin`: no `Origin`
+/// header (a non-browser client), or this server's own page, by its
+/// `Host` or its `public_url`.
+#[must_use]
+pub fn origin_allowed(origin: Option<&str>, host: Option<&str>, public_url: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    if let Some(h) = host
+        && (origin == format!("http://{h}") || origin == format!("https://{h}"))
+    {
+        return true;
+    }
+    public_url.is_some_and(|u| {
+        let u = u.trim_end_matches('/');
+        let base = u
+            .find("://")
+            .and_then(|i| u[i + 3..].find('/').map(|j| &u[..i + 3 + j]))
+            .unwrap_or(u);
+        origin == base
+    })
+}
+
+/// The first message: a resume token, a name, or nothing yet.
+async fn first_reply(d: &mut Dialogue, m: ClientMsg) -> crate::login::Reply {
+    match (m.resume.filter(|r| !r.is_empty()), m.line) {
+        (Some(token), _) => d.resume(Secret::new(token)).await,
+        (None, Some(line)) => d.answer(Secret::new(line), m.remember).await,
+        (None, None) => d.greeting(),
+    }
 }
 
 #[ws("/ws")]
@@ -240,11 +433,30 @@ async fn terminal(
     state: AppState,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     resolved: Option<Extension<ResolvedClientIdentity>>,
+    headers: HeaderMap,
 ) -> impl WsHandler {
     let app = mud(&state);
-    let addr = client_addr(
-        resolved.and_then(|Extension(r)| r.addr),
-        peer.map(|Extension(ConnectInfo(p))| p),
+    let resolved = resolved.and_then(|Extension(r)| r.addr);
+    let peer = peer.map(|Extension(ConnectInfo(p))| p);
+    let addr = client_addr(resolved, peer);
+    let text = |h| {
+        headers
+            .get(h)
+            .and_then(|v: &header::HeaderValue| v.to_str().ok())
+    };
+    let origin_ok = origin_allowed(
+        text(header::ORIGIN),
+        text(header::HOST),
+        app.as_ref().and_then(|a| a.public_url.as_deref()),
+    );
+    let forwarded = ["x-forwarded-for", "forwarded", "x-real-ip"]
+        .iter()
+        .any(|h| headers.contains_key(*h));
+    let who = account_peer(
+        resolved,
+        peer,
+        forwarded,
+        app.as_ref().is_some_and(|a| a.trusted_proxies),
     );
     // Taken at upgrade time; the socket closure owns it until it ends.
     let slot = app.as_ref().map(|a| a.limiter.try_acquire(addr));
@@ -253,88 +465,151 @@ async fn terminal(
         let _slot = match slot {
             Some(Ok(s)) => s,
             Some(Err(refusal)) => {
-                let l = Line {
-                    kind: LineKind::Error,
-                    text: refusal.to_string(),
-                };
-                let _ = socket.send(encode(&l)).await;
+                let _ = socket.send(error_msg(&refusal.to_string())).await;
+                close(&mut socket, CloseKind::Policy).await;
                 return;
             }
             None => return,
         };
-        // Log in first, in time.
-        let session = loop {
-            let Some(incoming) = Timeouts::within(app.timeouts.login, socket.recv()).await else {
-                let l = Line {
-                    kind: LineKind::Error,
-                    text: "Too slow. Farewell.".to_owned(),
-                };
-                let _ = socket.send(encode(&l)).await;
+        if !origin_ok {
+            let _ = socket
+                .send(error_msg(
+                    "This terminal only accepts connections from its own page.",
+                ))
+                .await;
+            close(&mut socket, CloseKind::Policy).await;
+            return;
+        }
+        let Some(auth) = login(&app, &mut socket, who).await else {
+            return;
+        };
+        let (session, greet) = match Session::login(
+            Arc::clone(&app.game),
+            Arc::clone(&app.presence),
+            Arc::clone(&app.accounts),
+            auth,
+            who,
+            Transport::Web,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = socket.send(error_msg(&format!("{e}. Farewell."))).await;
+                close(&mut socket, CloseKind::Policy).await;
                 return;
-            };
-            let Some(Ok(Message::Text(t))) = incoming else {
-                return;
-            };
-            let name = serde_json::from_str::<ClientMsg>(&t)
-                .ok()
-                .and_then(|m| m.login)
-                .unwrap_or_default();
-            match Session::login(Arc::clone(&app.game), Arc::clone(&app.presence), &name) {
-                Ok((s, greet)) => {
-                    if !send_lines(&mut socket, &greet).await {
-                        return;
-                    }
-                    break s;
-                }
-                Err(e) => {
-                    let l = Line {
-                        kind: LineKind::Error,
-                        text: format!("{e}. What is your name?"),
-                    };
-                    if socket.send(encode(&l)).await.is_err() {
-                        return;
-                    }
-                }
             }
         };
-        let mut events = app.game.subscribe();
-        loop {
-            tokio::select! {
-                incoming = Timeouts::within(app.timeouts.idle, socket.recv()) => {
-                    let Some(incoming) = incoming else {
-                        let l = Line {
-                            kind: LineKind::Error,
-                            text: "Idle too long. Farewell.".to_owned(),
-                        };
-                        let _ = socket.send(encode(&l)).await;
-                        break;
-                    };
-                    let line = match incoming {
-                        Some(Ok(Message::Text(t))) => serde_json::from_str::<ClientMsg>(&t).ok().and_then(|m| m.cmd).unwrap_or_default(),
-                        Some(Ok(Message::Close(_)) | Err(_)) | None => break,
-                        Some(Ok(_)) => continue,
-                    };
-                    if !send_lines(&mut socket, &session.command(&line)).await {
-                        break;
-                    }
+        if send_lines(&mut socket, &greet).await {
+            play(&app, &mut socket, session).await;
+        }
+    }
+}
+
+/// The login dialogue over a socket, within the total login deadline.
+async fn login(
+    app: &Mud,
+    socket: &mut WebSocket,
+    who: mud_accounts::Peer,
+) -> Option<mud_accounts::Authenticated> {
+    let deadline = app.timeouts.login_deadline();
+    let mut d = Dialogue::new(
+        Arc::clone(&app.game),
+        Arc::clone(&app.accounts),
+        Transport::Web,
+        who,
+    );
+    let mut first = true;
+    loop {
+        let incoming = Timeouts::until(deadline, socket.recv()).await;
+        let Some(incoming) = incoming else {
+            let _ = socket.send(error_msg("Too slow. Farewell.")).await;
+            close(socket, CloseKind::Normal).await;
+            return None;
+        };
+        let m = match incoming {
+            Some(Ok(Message::Text(t))) => serde_json::from_str::<ClientMsg>(&t).unwrap_or_default(),
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
+            Some(Ok(_)) => continue,
+        };
+        let reply = if std::mem::take(&mut first) {
+            Timeouts::until(deadline, first_reply(&mut d, m)).await
+        } else if let Some(line) = m.line {
+            Timeouts::until(deadline, d.answer(Secret::new(line), m.remember)).await
+        } else {
+            continue;
+        };
+        let Some(reply) = reply else {
+            let _ = socket.send(error_msg("Too slow. Farewell.")).await;
+            close(socket, CloseKind::Normal).await;
+            return None;
+        };
+        if !send_all(socket, &reply.lines, &reply.controls).await {
+            return None;
+        }
+        match reply.next {
+            Next::Ask => {}
+            Next::Close(kind) => {
+                close(socket, kind).await;
+                return None;
+            }
+            Next::Done(auth) => return Some(*auth),
+        }
+    }
+}
+
+/// A logged-in terminal: lines in, events out, and a revalidation tick.
+async fn play(app: &Mud, socket: &mut WebSocket, mut session: Session) {
+    let mut events = app.game.subscribe();
+    let every =
+        std::time::Duration::from_secs(u64::from(app.accounts.config().revalidate_secs.max(1)));
+    let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    loop {
+        tokio::select! {
+            incoming = Timeouts::within(app.timeouts.idle, socket.recv()) => {
+                let Some(incoming) = incoming else {
+                    let _ = socket.send(error_msg("Idle too long. Farewell.")).await;
+                    close(socket, CloseKind::Normal).await;
+                    break;
+                };
+                let line = match incoming {
+                    Some(Ok(Message::Text(t))) => serde_json::from_str::<ClientMsg>(&t).ok().and_then(|m| m.line).unwrap_or_default(),
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(_)) => continue,
+                };
+                let out = session.input(Secret::new(line)).await;
+                if !send_all(socket, &out.lines, &out.controls).await {
+                    break;
                 }
-                ev = events.recv() => {
-                    match ev {
-                        Ok(ev) => {
-                            if let Some(l) = session.render(&ev)
-                                && socket.send(encode(&l)).await.is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
+                if let Some(kind) = out.close {
+                    close(socket, kind).await;
+                    break;
                 }
             }
+            ev = events.recv() => {
+                match ev {
+                    Ok(ev) => {
+                        if let Some(l) = session.render(&ev)
+                            && socket.send(encode(&ServerMsg::from_line(&l))).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = recheck.tick() => match session.revalidate().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let msg = ServerMsg::System { text: "Your account changed elsewhere. Farewell." };
+                    let _ = socket.send(encode(&msg)).await;
+                    close(socket, CloseKind::Policy).await;
+                    break;
+                }
+                Err(e) => tracing::warn!(target: "mud::auth", error = %e, "a session could not be revalidated"),
+            },
         }
-        drop(session);
     }
+    drop(session);
 }
 
 #[derive(Deserialize)]
@@ -391,7 +666,9 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
     let cost = snap["cost_usd_micros_today"].as_u64().unwrap_or(0);
     #[expect(clippy::cast_precision_loss, reason = "display only")]
     let dollars = cost as f64 / 1_000_000.0;
+    let logins = app.accounts.stats();
     html! {
+        p { "Logins: " (logins.ok) " ok · " (logins.failed) " failed · " (logins.held) " held · " (logins.created) " new · " (logins.resumed) " resumed" }
         p { "Tokens today: " strong { (tokens) } " · cost: $" (format!("{dollars:.4}")) }
         table {
             tr { th { "entity" } th { "tier / mind" } th { "where" } th { "budget" } th { "last wake" } th { "goal" } th { "macro" } th { "state" } }
@@ -744,6 +1021,116 @@ mod tests {
             observer_text(&event(EventKind::SelfControlNudge, None)),
             None
         );
+    }
+
+    #[test]
+    fn server_messages_serialize_as_documented() {
+        use crate::session::Secretness;
+        let line = |kind, text: &str| Line::new(kind, text);
+        let cases = [
+            (
+                line(LineKind::Narrative, "a"),
+                r#"{"kind":"narrative","text":"a"}"#,
+            ),
+            (line(LineKind::Event, "b"), r#"{"kind":"event","text":"b"}"#),
+            (line(LineKind::Error, "c"), r#"{"kind":"error","text":"c"}"#),
+            (
+                line(LineKind::System, "d"),
+                r#"{"kind":"system","text":"d"}"#,
+            ),
+            (
+                line(LineKind::Prompt, "What is your name?"),
+                r#"{"kind":"prompt","text":"What is your name?"}"#,
+            ),
+            (
+                line(LineKind::Secret(Secretness::Current), "Password:"),
+                r#"{"kind":"prompt","text":"Password:","secret":"current-password"}"#,
+            ),
+            (
+                line(LineKind::Secret(Secretness::New), "Type it again:"),
+                r#"{"kind":"prompt","text":"Type it again:","secret":"new-password"}"#,
+            ),
+        ];
+        for (l, want) in cases {
+            assert_eq!(
+                serde_json::to_string(&ServerMsg::from_line(&l)).unwrap(),
+                want
+            );
+        }
+        let authed = Control::Authed { name: "ada".into() };
+        assert_eq!(
+            serde_json::to_string(&ServerMsg::from_control(&authed)).unwrap(),
+            r#"{"kind":"authed","name":"ada"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMsg::from_control(&Control::Forget)).unwrap(),
+            r#"{"kind":"forget"}"#
+        );
+        let r = ServerMsg::Remember {
+            token: "s:t",
+            persist: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"kind":"remember","token":"s:t","persist":true}"#
+        );
+    }
+
+    #[test]
+    fn client_messages_read_every_spelling() {
+        let m: ClientMsg = serde_json::from_str(r#"{"login":"ada"}"#).unwrap();
+        assert_eq!(m.line.as_deref(), Some("ada"));
+        let m: ClientMsg = serde_json::from_str(r#"{"cmd":"look","remember":true}"#).unwrap();
+        assert_eq!((m.line.as_deref(), m.remember), (Some("look"), true));
+        let m: ClientMsg = serde_json::from_str(r#"{"resume":null}"#).unwrap();
+        assert!(m.resume.is_none() && m.line.is_none());
+    }
+
+    #[test]
+    fn the_terminal_script_never_uses_inner_html() {
+        for js in [TERMINAL_JS, OBSERVER_JS] {
+            assert!(!js.contains("innerHTML"));
+            assert!(!js.contains("outerHTML"));
+            assert!(!js.contains("insertAdjacentHTML"));
+        }
+        assert!(TERMINAL_JS.contains("textContent"));
+        assert!(!TERMINAL_JS.contains("cookie"), "no route trusts a cookie");
+    }
+
+    #[test]
+    fn origin_allowed_cases() {
+        assert!(origin_allowed(None, Some("mud.example"), None), "absent");
+        assert!(origin_allowed(
+            Some("http://127.0.0.1:3000"),
+            Some("127.0.0.1:3000"),
+            None
+        ));
+        assert!(origin_allowed(
+            Some("https://mud.example"),
+            Some("mud.example"),
+            None
+        ));
+        assert!(origin_allowed(
+            Some("https://play.example:8443"),
+            Some("10.0.0.5:3000"),
+            Some("https://play.example:8443/mud/")
+        ));
+        assert!(origin_allowed(
+            Some("https://play.example"),
+            None,
+            Some("https://play.example")
+        ));
+        assert!(!origin_allowed(
+            Some("https://evil.example"),
+            Some("mud.example"),
+            None
+        ));
+        assert!(!origin_allowed(
+            Some("https://evil.example"),
+            Some("mud.example"),
+            Some("https://play.example")
+        ));
+        assert!(!origin_allowed(Some("null"), None, None));
     }
 
     #[test]
