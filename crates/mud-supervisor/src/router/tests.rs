@@ -142,6 +142,47 @@ fn agents_alone_get_two_turns_then_silence() {
 }
 
 #[test]
+fn agent_tells_count_as_agent_only_turns() {
+    // Regression: a tell has no room, so agent-to-agent tells skipped the
+    // anti-chatter counter and could ping-pong forever.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let (vich, marta) = (id("vich"), id("marta"));
+    let n = run(&mut w, &mut r, &rt, &vich, "tell marta psst", 100);
+    assert!(queued_for(&n, "marta").is_some(), "{n:?}");
+    let n = run(&mut w, &mut r, &rt, &marta, "tell vich what", 200);
+    assert!(queued_for(&n, "vich").is_some(), "{n:?}");
+    let n = run(&mut w, &mut r, &rt, &vich, "tell marta psst again", 300);
+    assert_eq!(
+        dropped_for(&n, "marta").as_deref(),
+        Some("anti-chatter: agent-only turns exhausted"),
+        "{n:?}"
+    );
+    let n = run(&mut w, &mut r, &rt, &marta, "tell vich still here", 400);
+    assert!(dropped_for(&n, "vich").is_some(), "{n:?}");
+    // A human next to either party keeps tells flowing.
+    let ada = w.login("ada", 500).unwrap();
+    w.drain_fresh();
+    run(&mut w, &mut r, &rt, &ada, "e", 600);
+    r.pending.clear();
+    for i in 0..5 {
+        let n = run(
+            &mut w,
+            &mut r,
+            &rt,
+            &vich,
+            &format!("tell marta hi {i}"),
+            700 + i,
+        );
+        assert!(queued_for(&n, "marta").is_some(), "{n:?}");
+    }
+    // A human's tell is never held back.
+    let n = run(&mut w, &mut r, &rt, &ada, "tell vich hey", 800);
+    assert!(queued_for(&n, "vich").is_some(), "{n:?}");
+}
+
+#[test]
 fn budgets_shed_wakes() {
     let mut w = world();
     let mut r = Router::new(RouterConfig::default());

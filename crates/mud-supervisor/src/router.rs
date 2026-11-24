@@ -251,6 +251,32 @@ impl Router {
                 .entry(room.clone())
                 .or_default()
                 .step(input, self.cfg.max_agent_only_turns)
+        } else if ev.room.is_none()
+            && actor_is_agent
+            && let Some(a) = actor
+        {
+            // A roomless agent event (a tell) still counts, in the room of
+            // the actor and of each party it reaches: agent-only unless a
+            // human is with one of them.
+            let rooms: BTreeSet<&RoomId> = std::iter::once(&a.room)
+                .chain(
+                    ev.recipients
+                        .iter()
+                        .filter(|r| !ev.is_by(r))
+                        .filter_map(|r| world.entity(r))
+                        .map(|t| &t.room),
+                )
+                .collect();
+            let input = if rooms.iter().any(|room| world.human_present(room)) {
+                ChatterInput::AgentWithHuman
+            } else {
+                ChatterInput::AgentAlone
+            };
+            let max = self.cfg.max_agent_only_turns;
+            rooms.into_iter().fold(true, |allow, room| {
+                let ok = self.rooms.entry(room.clone()).or_default().step(input, max);
+                allow && ok
+            })
         } else {
             true
         };
