@@ -141,6 +141,85 @@ fn agents_alone_get_two_turns_then_silence() {
     assert_eq!(queued_for(&n, "marta").unwrap().0, Priority::Ambient);
 }
 
+/// Vich walked to the taproom, with the room's counter fresh.
+fn vich_in_the_taproom(
+    w: &mut World,
+    r: &mut Router,
+    rt: &HashMap<EntityId, EntityRuntime>,
+) -> RoomId {
+    for d in ["w", "n", "e"] {
+        run(w, r, rt, &id("vich"), d, 0);
+    }
+    let room = RoomId::from("rusty_flagon_taproom");
+    r.rooms.insert(room.clone(), RoomChatter::default());
+    r.pending.clear();
+    room
+}
+
+#[test]
+fn npcs_treat_an_agent_pc_as_they_treat_a_human() {
+    // Regression: kestrel (an agent-played PC) counted as an agent, so Hale
+    // and Marta fell silent after two exchanges with it — a tell a human
+    // would never see.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let room = vich_in_the_taproom(&mut w, &mut r, &rt);
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 50);
+    w.drain_fresh();
+    for (i, line) in [
+        "say evening",
+        "say vich, got a key?",
+        "say well?",
+        "say hello?",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let t = 1_000 * (u64::try_from(i).unwrap() + 1);
+        let n = run(&mut w, &mut r, &rt, &kestrel, line, t);
+        assert!(
+            dropped_for(&n, "vich").is_none(),
+            "{line}: a player's speech is never chatter-capped: {n:?}"
+        );
+        assert_eq!(r.agent_only_turns(&room), 0, "a player resets the room");
+        r.pending.clear();
+        // And the NPCs answering it, with a player present, are not capped.
+        let n = run(&mut w, &mut r, &rt, &id("marta"), "say mm", t + 100);
+        assert!(dropped_for(&n, "vich").is_none(), "{n:?}");
+        let n = run(&mut w, &mut r, &rt, &id("vich"), "say aye", t + 200);
+        assert!(dropped_for(&n, "marta").is_none(), "{n:?}");
+        r.pending.clear();
+    }
+}
+
+#[test]
+fn an_agent_pcs_chatter_batches_like_a_humans() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    vich_in_the_taproom(&mut w, &mut r, &rt);
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 50);
+    w.drain_fresh();
+    let n = run(&mut w, &mut r, &rt, &kestrel, "say quiet in here", 1_000);
+    assert_eq!(queued_for(&n, "vich").unwrap().0, Priority::RoomBatch);
+}
+
+#[test]
+fn macro_ticks_wait_while_an_agent_pc_is_in_the_room() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 1);
+    let note = r.macro_tick(&id("marta"), &w, 5);
+    assert!(
+        matches!(note, RouteNote::Dropped { ref why, .. } if why.contains("player")),
+        "{note:?}"
+    );
+}
+
 #[test]
 fn agent_tells_count_as_agent_only_turns() {
     // Regression: a tell has no room, so agent-to-agent tells skipped the

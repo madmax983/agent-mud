@@ -665,9 +665,12 @@ pub enum Who {
     /// Anyone.
     #[default]
     Any,
-    /// Only a human-controlled entity.
+    /// Only a player character, whoever plays it (a human or an agent
+    /// PC): scripts react to players alike, so they reveal no tier.
+    /// `player` is accepted as a synonym.
+    #[serde(alias = "player")]
     Human,
-    /// Only an agent or mob.
+    /// Only a non-player: an NPC or a mob.
     Agent,
 }
 

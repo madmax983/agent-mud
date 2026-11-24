@@ -115,7 +115,7 @@ flowchart LR
 |---|---|
 | The server owns physics | every change is `World::execute` of one parsed line; property test over random play keeps items and money conserved |
 | Information is local | each event names its recipients when emitted; `mud_events` returns only those |
-| Zero tokens in empty rooms | event-driven wakes; macro-ticks only with no human present; anti-chatter (proved) |
+| Zero tokens in empty rooms | event-driven wakes; macro-ticks only with no player present; anti-chatter (proved) |
 | Untrusted speech is data | `untrusted_text` never enters narratives or cues; policy codes such as `POLICY_TRADE_REQUIRED` |
 | Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops and cast are pack data |
 

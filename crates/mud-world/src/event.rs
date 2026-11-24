@@ -105,10 +105,16 @@ pub struct Event {
     pub data: Value,
     /// Who perceives it.
     pub recipients: Vec<EntityId>,
-    /// Whether a human caused it. The attention router reads it; no
-    /// entity view ever shows it.
+    /// Whether a human caused it. The observer reads it; no entity view
+    /// ever shows it.
     #[serde(default)]
     pub human_actor: bool,
+    /// Whether a player character caused it, whoever plays it: a human or
+    /// an agent-played PC. The attention router and scripts react to
+    /// players, never to `human_actor`, so an agent PC is treated exactly
+    /// as a human one. No entity view shows it.
+    #[serde(default)]
+    pub player_actor: bool,
 }
 
 impl Event {
@@ -216,6 +222,7 @@ mod tests {
             data: Value::Null,
             recipients: vec![EntityId::from("pc_kestrel"), EntityId::from("marta")],
             human_actor: false,
+            player_actor: true,
         }
     }
 
@@ -229,6 +236,7 @@ mod tests {
         assert_eq!(v["untrusted_text"], "anyone split a cellar run?");
         assert!(v.get("recipients").is_none());
         assert!(v.get("human_actor").is_none());
+        assert!(v.get("player_actor").is_none());
         let mine = e.view_for(&EntityId::from("pc_kestrel"));
         assert_eq!(mine["actor"]["is_self"], true);
     }

@@ -40,8 +40,8 @@ fn rule_matches_event(rule: &ScriptRule, ev: &Event, me: &EntityId, my_room: Opt
     }
     let who_ok = match rule.who {
         Who::Any => true,
-        Who::Human => ev.human_actor,
-        Who::Agent => !ev.human_actor,
+        Who::Human => ev.player_actor,
+        Who::Agent => !ev.player_actor,
     };
     let room_ok = rule
         .room
@@ -216,6 +216,34 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn a_human_rule_answers_any_player_alike() {
+        let rule: ScriptRule =
+            toml::from_str("on = \"enter\"\nwho = \"human\"\ndo = [\"say hi\"]").unwrap();
+        let alias: ScriptRule =
+            toml::from_str("on = \"enter\"\nwho = \"player\"\ndo = [\"say hi\"]").unwrap();
+        assert_eq!(rule.who, alias.who, "`player` is a synonym");
+        let mut ev: Event = serde_json::from_value(serde_json::json!({
+            "seq": 1, "at_ms": 0, "room": "rusty_flagon_taproom", "kind": "enter",
+            "tags": [], "actor": { "id": "pc_kestrel", "name": "kestrel" },
+            "narrative": "kestrel arrives.", "data": null, "recipients": [],
+            "human_actor": false, "player_actor": true
+        }))
+        .unwrap();
+        let me = EntityId::from("marta");
+        assert!(
+            rule_matches_event(&rule, &ev, &me, Some("rusty_flagon_taproom")),
+            "an agent-played PC sets off a human rule, as a human does"
+        );
+        ev.player_actor = false;
+        assert!(!rule_matches_event(
+            &rule,
+            &ev,
+            &me,
+            Some("rusty_flagon_taproom")
+        ));
+    }
     use crate::gate::Gate;
 
     fn setup() -> (Arc<Game>, Arc<Gate>, Arc<WorldPack>) {
