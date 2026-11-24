@@ -219,6 +219,10 @@ async fn a_tripped_mind_runs_toml_until_the_version_changes() {
         "a tripped mind is not called"
     );
     assert!(notes[3].starts_with("rhai tripped (3/3)"), "{notes:?}");
+    // The host holds the mind breakers, so the observer can show them.
+    let hale = EntityId::from("guard_01");
+    assert_eq!(h.mind_faults(&hale), 3);
+    assert_eq!(h.mind_breakers().get(&hale), Some(&3));
     let fixed = mud_script::load::compile(&sources("[\"say back\"]", 1), &pack()).unwrap();
     h.install(fixed);
     let r = m
@@ -226,6 +230,31 @@ async fn a_tripped_mind_runs_toml_until_the_version_changes() {
         .await
         .unwrap();
     assert!(r.text.unwrap().starts_with("rhai: 1 lines"));
+    assert_eq!(h.mind_faults(&hale), 0, "a new version reopens it");
+}
+
+#[test]
+fn a_fault_from_before_a_reload_does_not_count_against_the_new_scripts() {
+    let h = host("ctx.nope");
+    let hale = EntityId::from("guard_01");
+    let since = h.reloads();
+    assert_eq!(
+        h.step_mind(&hale, since, HookOutcome::Faulted),
+        Some((1, true))
+    );
+    // A wake started before the reload finishes after it: its fault is
+    // dropped, and a success clears the count.
+    h.rearm();
+    assert_eq!(h.mind_faults(&hale), 0);
+    assert_eq!(h.step_mind(&hale, since, HookOutcome::Faulted), None);
+    assert_eq!(h.mind_faults(&hale), 0);
+    let since = h.reloads();
+    assert_eq!(
+        h.step_mind(&hale, since, HookOutcome::Faulted),
+        Some((1, true))
+    );
+    assert_eq!(h.step_mind(&hale, since, HookOutcome::Ran), Some((0, true)));
+    assert!(h.mind_breakers().is_empty());
 }
 
 #[tokio::test]

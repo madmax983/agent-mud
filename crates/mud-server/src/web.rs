@@ -479,14 +479,17 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
     };
     let status = app.game.read(mud_world::World::hook_status);
     let compiled = host.current();
+    let max = compiled.limits.max_consecutive_faults;
     html! {
         p { "Version " strong { (compiled.version) } " · " (compiled.summary())
-            @if host.reloadable() {
-                " "
-                form style="display:inline" hx-post=(format!("/observer/scripts/reload?token={token}")) hx-swap="none" {
-                    button type="submit" { "Reload" }
-                }
-            } @else { span.muted { " (bundled: reload needs [world] pack)" } }
+            " "
+            form style="display:inline" hx-post=(format!("/observer/scripts/reload?token={token}")) hx-swap="none" {
+                button type="submit" { "Reload" }
+            }
+            @if !host.reloadable() {
+                span.muted { " (bundled: Reload re-arms these scripts and reopens their breakers)" }
+            }
+            span.muted { " A refused reload shows its problems in the feed." }
         }
         table {
             tr { th { "hook" } th { "faults" } th { "state" } }
@@ -494,18 +497,20 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
                 @let s = status.iter().find(|s| s.key == key);
                 tr {
                     td { (key) }
-                    td { (s.map_or(0, |s| s.faults)) }
+                    td { (s.map_or(0, |s| s.faults)) "/" (max) }
                     td {
                         @if s.is_some_and(|s| s.tripped) { span.hard { "TRIPPED" } } @else { "OK" }
                     }
                 }
             }
             @for id in host.minds() {
+                @let faults = host.mind_faults(&id);
                 tr {
                     td { "minds." (id) ".on_wake" }
-                    td { span.muted { "see feed" } }
+                    td { (faults) "/" (max) }
                     td {
-                        form hx-post=(format!("/observer/scripts/memory/{}/reset?token={token}", url_escape(id.as_str()))) hx-swap="none" {
+                        @if mud_world::hooks::hook_allowed(faults, max) { "OK " } @else { span.hard { "TRIPPED" } " (runs its TOML plan) " }
+                        form style="display:inline" hx-post=(format!("/observer/scripts/memory/{}/reset?token={token}", url_escape(id.as_str()))) hx-swap="none" {
                             button type="submit" { "Reset memory" }
                         }
                     }
@@ -516,9 +521,9 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
     .into_response()
 }
 
-/// Reloads the scripts from the pack folder. 200 with the new version, 422
-/// with every problem (the old scripts keep running), 409 when there is
-/// nothing to reload.
+/// Reloads the scripts from the pack folder, or re-arms the bundled ones.
+/// 200 with the new version, 422 with every problem (the old scripts keep
+/// running, and the feed shows the problems), 409 when scripts are off.
 #[post("/observer/scripts/reload")]
 async fn scripts_reload(State(state): State<AppState>, Query(q): Query<Admin>) -> Response {
     let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
@@ -535,11 +540,6 @@ async fn scripts_reload(State(state): State<AppState>, Query(q): Query<Admin>) -
         Err(crate::ReloadError::Invalid { version, problems }) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "ok": false, "version": version, "problems": problems })),
-        )
-            .into_response(),
-        Err(crate::ReloadError::Bundled) => (
-            StatusCode::CONFLICT,
-            "the bundled pack cannot be reloaded; set [world] pack to a folder",
         )
             .into_response(),
         Err(crate::ReloadError::Disabled) => (
@@ -654,6 +654,14 @@ pub fn script_line(a: &mud_world::Audit) -> Option<String> {
         } => format!(
             "scripts loaded {version} ({why}; was {})",
             previous.as_deref().unwrap_or("nothing")
+        ),
+        Audit::ScriptsReloadRefused {
+            version, problems, ..
+        } => format!(
+            "scripts reload refused (still {version}): {} problem{} · {}",
+            problems.len(),
+            if problems.len() == 1 { "" } else { "s" },
+            problems.join(" · ")
         ),
         Audit::MindMemoryReset { entity, .. } => format!("memory reset for {entity}"),
         Audit::SelfControl { .. } | Audit::Command { .. } => return None,

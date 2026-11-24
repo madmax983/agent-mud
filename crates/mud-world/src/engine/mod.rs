@@ -327,6 +327,15 @@ pub enum Audit {
         /// When.
         at_ms: u64,
     },
+    /// An operator's reload was refused; the old scripts keep running.
+    ScriptsReloadRefused {
+        /// The version still running.
+        version: String,
+        /// Every problem found.
+        problems: Vec<String>,
+        /// When.
+        at_ms: u64,
+    },
     /// An operator cleared a mind's script memory.
     MindMemoryReset {
         /// Whose.

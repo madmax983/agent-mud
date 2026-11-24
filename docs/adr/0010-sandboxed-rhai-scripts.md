@@ -132,7 +132,10 @@ kestrel exactly as a human (tested).
 `max`, stays tripped until the scripts change or are reloaded, and the
 saturating tally admits exactly the lists the plain rule admits
 (`max <= 16`). Hook breakers persist in `WorldState.hook_faults`; mind
-breakers live in the supervisor and reset on any new version or reload.
+breakers live in memory in the `ScriptHost`, where the Scripts panel shows
+them (faults/max, TRIPPED), and reset on any new version, reload or
+re-arm. A fault from a wake that started before a reload counts for
+nothing.
 
 ### Reload, versions, records
 
@@ -143,8 +146,19 @@ which version ran from which seq. The store does not keep script sources;
 an operator who keeps the pack in git matches the hash to a commit.
 `POST /observer/scripts/reload` compiles, validates and dry-runs off the
 async workers and swaps between two commands; every successful reload
-reopens every hook breaker. A reload that would change which entities run
-on Rhai is refused: that needs a restart.
+reopens every hook and mind breaker. A reload that would change which
+entities run on Rhai is refused: that needs a restart. A refused reload
+answers 422 with its problems, logs a warning and publishes a
+`ScriptsReloadRefused` row to the observer's feed (the panel's button
+shows no response body). The bundled pack has no folder to read again:
+its reload **re-arms** the scripts running now (breakers reset, marker
+recorded), since its hook faults survive a restart with the same version
+and nothing else could reopen them.
+
+Mind memory saves are conditional: a wake reads the memory with the
+mind's reset count, and its save is dropped if an operator's Reset
+memory came in between, so a reset is never undone by a wake that was
+already running.
 
 ### Runtime opt-in, and TOML as the net
 

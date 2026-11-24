@@ -32,7 +32,7 @@ use mud_supervisor::littleguy::LittleguyMind;
 use mud_supervisor::runtime::{Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::FallbackMind;
 use mud_world::hooks::WorldHooks;
-use mud_world::{CommandResult, EntityId, Game, HooksChange, SystemClock, WorldPack};
+use mud_world::{Audit, CommandResult, EntityId, Game, HooksChange, SystemClock, WorldPack};
 
 use crate::config::MudConfig;
 use crate::limits::ConnLimiter;
@@ -244,8 +244,6 @@ pub struct ReloadOk {
 pub enum ReloadError {
     /// `[scripts] enabled = false`.
     Disabled,
-    /// The pack is the bundled one.
-    Bundled,
     /// The new scripts have problems.
     Invalid {
         /// The version still running.
@@ -259,44 +257,61 @@ pub enum ReloadError {
 ///
 /// It compiles, validates and
 /// dry-runs them off the async workers, then swaps them in between two
-/// commands. Every successful reload reopens every hook breaker and
-/// records a marker event, even with unchanged files.
+/// commands. Every successful reload reopens every hook and mind breaker
+/// and records a marker event, even with unchanged files. The bundled
+/// pack has nothing to read again: its reload re-arms the scripts running
+/// now, which only reopens the breakers and records the marker.
+///
+/// A refused reload is logged and published to the observer's feed.
 ///
 /// # Errors
-/// Scripts are off, bundled, or the new ones have problems.
+/// Scripts are off, or the new ones have problems.
 pub async fn reload_scripts(mud: &Mud) -> Result<ReloadOk, ReloadError> {
     let Some(host) = &mud.scripts else {
         return Err(ReloadError::Disabled);
     };
-    if !host.reloadable() {
-        return Err(ReloadError::Bundled);
-    }
     let _one_at_a_time = host.reload_lock().lock().await;
+    let previous = host.version();
+    let hooks = Arc::clone(host) as Arc<dyn WorldHooks>;
+    if !host.reloadable() {
+        let files = host.current().files;
+        mud.game.write(|w, now| {
+            host.rearm();
+            w.set_hooks(Some(hooks), now, HooksChange::Reload);
+        });
+        tracing::info!(version = %previous, "bundled scripts re-armed; breakers reset");
+        return Ok(ReloadOk {
+            version: previous.clone(),
+            previous,
+            files,
+        });
+    }
     let pack = mud.game.read(|w| Arc::clone(w.pack()));
     let compiling = Arc::clone(host);
     let compiled = tokio::task::spawn_blocking(move || compiling.compile_from_source(&pack))
         .await
-        .map_err(|e| ReloadError::Invalid {
-            version: host.version(),
-            problems: vec![format!("the reload task failed: {e}")],
-        })?;
+        .map_err(|e| vec![format!("the reload task failed: {e}")])
+        .and_then(|r| r.map_err(|e| e.problems()));
     let compiled = match compiled {
         Ok(c) => c,
-        Err(ScriptError::Bundled) => return Err(ReloadError::Bundled),
-        Err(e) => {
+        Err(problems) => {
+            tracing::warn!(version = %previous, ?problems, "scripts reload refused");
+            mud.game.publish_audit(Audit::ScriptsReloadRefused {
+                version: previous.clone(),
+                problems: problems.clone(),
+                at_ms: mud.game.now_ms(),
+            });
             return Err(ReloadError::Invalid {
-                version: host.version(),
-                problems: e.problems(),
+                version: previous,
+                problems,
             });
         }
     };
-    let previous = host.version();
     let ok = ReloadOk {
         version: compiled.version.clone(),
         previous,
         files: compiled.files,
     };
-    let hooks = Arc::clone(host) as Arc<dyn WorldHooks>;
     mud.game.write(|w, now| {
         host.install(compiled);
         w.set_hooks(Some(hooks), now, HooksChange::Reload);

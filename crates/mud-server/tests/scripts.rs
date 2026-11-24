@@ -10,7 +10,8 @@ use std::time::Duration;
 use autumn_web::test::TestApp;
 use mud_server::config::{MudConfig, Runtime};
 use mud_server::{Built, build, check_pack, settings, web};
-use mud_world::EntityId;
+use mud_world::hooks::{HookId, HookInput, HookLimits, HookReply, VerbInfo, WorldDice, WorldHooks};
+use mud_world::{EntityId, ErrorCode, HooksChange, World};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -77,7 +78,7 @@ async fn post(addr: SocketAddr, path: &str) -> (u16, String) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reloading_scripts_needs_the_admin_token_and_a_folder() {
+async fn reloading_scripts_needs_the_admin_token_and_scripts() {
     let (addr, built) = boot(|_| {}).await;
     assert_eq!(post(addr, "/observer/scripts/reload").await.0, 401);
     assert_eq!(
@@ -85,12 +86,14 @@ async fn reloading_scripts_needs_the_admin_token_and_a_folder() {
         401
     );
     let token = built.mud.admin_token.clone();
+    // The bundled pack has nothing to read again; its reload re-arms the
+    // same scripts: breakers reset, and a marker records it.
+    let version = built.mud.scripts.as_ref().unwrap().version();
     let (status, body) = post(addr, &format!("/observer/scripts/reload?token={token}")).await;
-    assert_eq!(status, 409);
-    assert_eq!(
-        body,
-        "the bundled pack cannot be reloaded; set [world] pack to a folder"
-    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["version"], version);
+    assert_eq!(v["previous"], version);
     let (addr, built) = boot(|c| c.scripts.enabled = false).await;
     let token = built.mud.admin_token.clone();
     let (status, body) = post(addr, &format!("/observer/scripts/reload?token={token}")).await;
@@ -111,6 +114,78 @@ async fn reloading_scripts_needs_the_admin_token_and_a_folder() {
     assert_eq!(r.error_code, Some(mud_world::ErrorCode::UnknownVerb));
 }
 
+/// The bundled scripts, except that every call faults.
+#[derive(Debug)]
+struct Faulting(Arc<mud_script::ScriptHost>);
+
+impl WorldHooks for Faulting {
+    fn version(&self) -> String {
+        self.0.version()
+    }
+    fn has(&self, hook: &HookId) -> bool {
+        self.0.has(hook)
+    }
+    fn verb(&self, name: &str) -> Option<VerbInfo> {
+        self.0.verb(name)
+    }
+    fn verbs(&self) -> Vec<VerbInfo> {
+        self.0.verbs()
+    }
+    fn limits(&self) -> HookLimits {
+        self.0.limits()
+    }
+    fn call(&self, _: &HookId, _: &HookInput, _: WorldDice) -> HookReply {
+        HookReply {
+            outcome: Err("an input the script did not expect".into()),
+            log: Vec::new(),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tripped_bundled_hook_survives_a_restart_and_reopens_on_reload() {
+    let (addr, built) = boot(|_| {}).await;
+    let token = built.mud.admin_token.clone();
+    let host = Arc::clone(built.mud.scripts.as_ref().unwrap());
+    let game = &built.mud.game;
+    let ada = game.login("ada").unwrap();
+    assert!(game.execute(&ada, "s").ok);
+    game.write(|w, now| {
+        w.set_hooks(
+            Some(Arc::new(Faulting(Arc::clone(&host))) as Arc<dyn WorldHooks>),
+            now,
+            HooksChange::Start,
+        );
+    });
+    for _ in 0..3 {
+        let r = game.execute(&ada, "listen");
+        assert_eq!(r.error_code, Some(ErrorCode::ScriptFailed));
+    }
+    // A restart installs the same version, so the saved faults stand.
+    game.write(|w, now| {
+        w.set_hooks(
+            Some(Arc::clone(&host) as Arc<dyn WorldHooks>),
+            now,
+            HooksChange::Start,
+        );
+    });
+    assert!(
+        game.read(World::hook_status)
+            .iter()
+            .any(|s| s.key == "verbs.listen" && s.tripped)
+    );
+    let r = game.execute(&ada, "listen");
+    assert_eq!(r.error_code, Some(ErrorCode::ScriptFailed), "{r:?}");
+    // The operator's Reload reopens it, bundled pack or not.
+    let reloads = host.reloads();
+    let (status, body) = post(addr, &format!("/observer/scripts/reload?token={token}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(host.reloads(), reloads + 1, "mind breakers follow it too");
+    assert!(game.read(World::hook_status).iter().all(|s| !s.tripped));
+    let r = game.execute(&ada, "listen");
+    assert!(r.ok, "{r:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bad_reload_keeps_the_old_scripts_and_a_good_one_changes_the_version() {
     let dir = pack_copy();
@@ -125,6 +200,7 @@ async fn a_bad_reload_keeps_the_old_scripts_and_a_good_one_changes_the_version()
         good.replace("fn on_listen(ctx)", "fn on_listen(ctx, x)"),
     )
     .unwrap();
+    let mut audit = built.mud.game.subscribe_audit();
     let (status, body) = post(addr, &format!("/observer/scripts/reload?token={token}")).await;
     assert_eq!(status, 422, "{body}");
     let v: Value = serde_json::from_str(&body).unwrap();
@@ -134,6 +210,16 @@ async fn a_bad_reload_keeps_the_old_scripts_and_a_good_one_changes_the_version()
         v["problems"][0].as_str().unwrap().contains("on_listen"),
         "{v}"
     );
+    // The observer's feed says so too: the Reload button shows no body.
+    let refused = audit.try_recv().unwrap();
+    let line = web::script_line(&refused).unwrap();
+    assert!(
+        line.starts_with(&format!(
+            "scripts reload refused (still {old}): 1 problem · "
+        )),
+        "{line}"
+    );
+    assert!(line.contains("on_listen"), "{line}");
     assert_eq!(built.mud.scripts.as_ref().unwrap().version(), old);
     // Fixed, with one more word: it takes.
     std::fs::write(&alley, good.replace("Nothing else.", "Nothing more.")).unwrap();
@@ -226,10 +312,31 @@ async fn the_scripts_panel_shows_hooks_and_minds_escaped() {
     assert!(html.contains("verbs.pray"), "{html}");
     assert!(html.contains("minds.guard_01.on_wake"));
     assert!(html.contains("Reset memory"));
-    assert!(
-        html.contains("bundled"),
-        "no reload button for the bundled pack"
-    );
+    assert!(html.contains("Reload"), "the bundled pack re-arms: {html}");
+    assert!(html.contains("0/3"), "each mind shows its faults: {html}");
+    assert!(!html.contains("see feed"));
+    let host = built.mud.scripts.as_ref().unwrap();
+    let hale = EntityId::from("guard_01");
+    for _ in 0..3 {
+        host.step_mind(
+            &hale,
+            host.reloads(),
+            mud_world::hooks::HookOutcome::Faulted,
+        );
+    }
+    let html = http()
+        .get(format!("http://{addr}/observer/scripts?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let row = html
+        .split("<tr>")
+        .find(|r| r.contains("minds.guard_01.on_wake"))
+        .unwrap();
+    assert!(row.contains("3/3") && row.contains("TRIPPED"), "{row}");
     let page = http()
         .get(format!("http://{addr}/observer?token={token}"))
         .send()
@@ -297,27 +404,51 @@ fn serve_refuses_a_broken_script() {
 
 #[test]
 fn runtime_rhai_changes_no_view() {
+    // Hale is the only ambient NPC. On littleguy (which needs no key to
+    // build), the `runtime = "rhai"` override is the only reason he runs
+    // his Rhai mind in `on`; in `off` he runs on littleguy.
     let mut on = MudConfig::default();
     on.world.db = None;
+    on.minds.ambient = Runtime::Littleguy;
     let mut off = on.clone();
     off.scripts.allow_runtime_override = false;
-    off.minds.ambient = Runtime::Scripted;
     let (with_rhai, without) = (build(&on).unwrap(), build(&off).unwrap());
-    for id in ["pc_kestrel", "guard_01"] {
-        let e = EntityId::from(id);
+    let hale = EntityId::from("guard_01");
+    assert!(!with_rhai.littleguy.iter().any(|m| m.serves(&hale)));
+    assert!(without.littleguy.iter().any(|m| m.serves(&hale)));
+    for b in [&with_rhai, &without] {
+        let ada = b.mud.game.login("ada").unwrap();
+        assert!(b.mud.game.execute(&hale, "say evening").ok);
+        assert_eq!(ada.as_str(), "pc_ada");
+    }
+    let ada = EntityId::from("pc_ada");
+    for id in [&ada, &EntityId::from("pc_kestrel"), &hale] {
         assert_eq!(
-            with_rhai.mud.game.look(&e),
-            without.mud.game.look(&e),
+            with_rhai.mud.game.look(id),
+            without.mud.game.look(id),
             "{id}"
         );
         assert_eq!(
-            with_rhai.mud.game.sheet(&e),
-            without.mud.game.sheet(&e),
+            with_rhai.mud.game.sheet(id),
+            without.mud.game.sheet(id),
             "{id}"
         );
-        let look = with_rhai.mud.game.look(&e).to_string();
-        for bad in ["runtime", "rhai", "tier", "mind"] {
+        assert_eq!(
+            with_rhai.mud.game.events(id, mud_world::Seq(0), 50),
+            without.mud.game.events(id, mud_world::Seq(0), 50),
+            "{id}"
+        );
+        let look = with_rhai.mud.game.look(id).to_string();
+        for bad in ["runtime", "rhai", "tier", "mind", "littleguy", "scripted"] {
             assert!(!look.contains(bad), "{bad} in {look}");
         }
     }
+    let who = |b: &Built| b.mud.game.execute(&ada, "who").narrative;
+    assert_eq!(who(&with_rhai), who(&without));
+    let said = with_rhai
+        .mud
+        .game
+        .events(&ada, mud_world::Seq(0), 50)
+        .to_string();
+    assert!(said.contains("evening"), "ada heard Hale: {said}");
 }

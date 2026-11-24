@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mud_script::{EventActor, MindWake, ScriptEvent, ScriptHost};
-use mud_world::hooks::{HookOutcome, hook_allowed, hook_step};
+use mud_world::hooks::{HookOutcome, hook_allowed};
 use mud_world::pack::{CastDef, EntityKind, ScriptRule, ScriptTrigger, Who};
 use mud_world::{Audit, EntityId, Event, EventKind, Game, World};
 
@@ -36,16 +36,14 @@ pub struct ScriptedMind {
     scripts: Option<Scripts>,
 }
 
-/// The Rhai side of a scripted mind.
+/// The Rhai side of a scripted mind. The mind breakers live in the host
+/// (in memory: a restart, a reload and a re-arm reopen them), where the
+/// observer reads them.
 #[derive(Debug)]
 struct Scripts {
     host: Arc<ScriptHost>,
     game: Arc<Game>,
     seed: u64,
-    /// Consecutive faults per mind. In memory: a restart reopens them.
-    breakers: Mutex<HashMap<EntityId, u8>>,
-    /// The version and reload count the breakers belong to.
-    seen: Mutex<(String, u64)>,
 }
 
 /// What the Rhai side decided.
@@ -100,35 +98,17 @@ fn script_event(w: &World, me: &EntityId, ev: &Event) -> ScriptEvent {
 }
 
 impl Scripts {
-    fn breakers(&self) -> std::sync::MutexGuard<'_, HashMap<EntityId, u8>> {
-        self.breakers.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Resets every mind breaker when the scripts changed or were reloaded.
-    fn follow_reloads(&self) {
-        let now = (self.host.version(), self.host.reloads());
-        let changed = {
-            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-            let changed = *seen != now;
-            *seen = now;
-            changed
-        };
-        if changed {
-            self.breakers().clear();
-        }
-    }
-
     async fn decide(&self, ctx: &WakeContext, toml_plan: &[String], tools: &MudTools) -> Decision {
-        self.follow_reloads();
         let e = &ctx.entity;
+        let since = self.host.reloads();
         let compiled = self.host.current();
         let max = compiled.limits.max_consecutive_faults;
-        let faults = self.breakers().get(e).copied().unwrap_or(0);
+        let faults = self.host.mind_faults(e);
         if !hook_allowed(faults, max) {
             return Decision::Toml(format!("rhai tripped ({faults}/{max}); ran the TOML plan"));
         }
         let schema = self.host.mind_memory_schema(e);
-        let memory = self.game.script_memory(e, schema);
+        let (resets, memory) = self.game.script_memory_at(e, schema);
         let (me, here, events) = self.game.read(|w| {
             let me = w.actor_facts(e).map_or(serde_json::Value::Null, |mut f| {
                 f.marks = None;
@@ -180,9 +160,12 @@ impl Scripts {
         }
         match outcome {
             Ok(plan) => {
-                self.breakers().remove(e);
-                if let Some(m) = plan.memory.filter(|m| *m != memory) {
-                    self.game.save_script_memory(e, schema, m);
+                self.host.step_mind(e, since, HookOutcome::Ran);
+                // An operator's reset during the wake wins over this save.
+                if let Some(m) = plan.memory.filter(|m| *m != memory)
+                    && !self.game.save_script_memory_if(e, schema, resets, m)
+                {
+                    tracing::info!(entity = %e, "memory reset during the wake; not saved");
                 }
                 if let Some((minutes, note)) = &plan.wake_me {
                     let booked = tools.wake_me(*minutes, note);
@@ -194,8 +177,14 @@ impl Scripts {
                 Decision::Lines(plan.lines, format!("rhai: {n} lines"))
             }
             Err(message) => {
-                let (next, allowed) = hook_step(faults, HookOutcome::Faulted, max);
-                self.breakers().insert(e.clone(), next);
+                // A fault from before a reload counts for nothing.
+                let (next, allowed) = self
+                    .host
+                    .step_mind(e, since, HookOutcome::Faulted)
+                    .unwrap_or_else(|| {
+                        let now = self.host.mind_faults(e);
+                        (now, hook_allowed(now, max))
+                    });
                 self.game.publish_audit(Audit::ScriptFault {
                     hook,
                     entity: e.clone(),
@@ -268,14 +257,7 @@ impl ScriptedMind {
     /// entities that have one. `seed` seeds their dice with `mix`.
     #[must_use]
     pub fn with_scripts(mut self, host: Arc<ScriptHost>, game: Arc<Game>, seed: u64) -> Self {
-        let version = (host.version(), host.reloads());
-        self.scripts = Some(Scripts {
-            host,
-            game,
-            seed,
-            breakers: Mutex::new(HashMap::new()),
-            seen: Mutex::new(version),
-        });
+        self.scripts = Some(Scripts { host, game, seed });
         self
     }
 

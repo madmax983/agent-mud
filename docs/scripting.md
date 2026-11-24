@@ -186,11 +186,15 @@ curl -X POST "http://127.0.0.1:3000/observer/scripts/reload?token=$MUD_ADMIN_TOK
 ```
 
 200 gives the new version; 422 lists every problem and keeps the old
-scripts running; a reload of the bundled pack, or with scripts off, is
-409. Every reload reopens every breaker. A reload cannot change which
+scripts running (the feed shows a `scripts reload refused` row and the
+server logs a warning); with scripts off it is 409. The bundled pack
+(`[world] pack` unset) has nothing to read again: its reload re-arms the
+same scripts. Every reload reopens every breaker, hook and mind; the
+panel shows each mind's faults and TRIPPED too. A reload cannot change which
 entities run on Rhai (restart for that). Old memory can fault new code:
 bump `memory_schema`, or press **Reset memory** on the panel
-(`POST /observer/scripts/memory/{entity}/reset?token=`).
+(`POST /observer/scripts/memory/{entity}/reset?token=`). A wake already
+running when you reset does not save its memory over the reset.
 
 ## `mud check`
 

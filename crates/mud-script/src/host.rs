@@ -10,10 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use mud_world::hooks::{
-    HookId, HookInput, HookLimits, HookReply, ScriptEffect, VerbInfo, WorldDice, WorldHooks,
+    HookId, HookInput, HookLimits, HookOutcome, HookReply, ScriptEffect, VerbInfo, WorldDice,
+    WorldHooks, hook_step,
 };
 use mud_world::{EntityId, WorldPack};
 use rhai::{AST, Array, Dynamic, Engine, Map};
@@ -269,12 +270,17 @@ enum Source {
 }
 
 /// The scripts of a running world.
+///
+/// It also keeps the mind breakers (consecutive faults per mind script),
+/// in memory: a restart, a reload and a re-arm reopen them. Lock order:
+/// the mind breakers, then the compiled scripts.
 #[derive(Debug)]
 pub struct ScriptHost {
     source: Source,
     compiled: RwLock<Arc<Compiled>>,
     reload: tokio::sync::Mutex<()>,
     reloads: AtomicU64,
+    mind_faults: Mutex<BTreeMap<EntityId, u8>>,
 }
 
 impl ScriptHost {
@@ -284,7 +290,14 @@ impl ScriptHost {
             compiled: RwLock::new(Arc::new(compiled)),
             reload: tokio::sync::Mutex::new(()),
             reloads: AtomicU64::new(0),
+            mind_faults: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn mind_faults_mut(&self) -> std::sync::MutexGuard<'_, BTreeMap<EntityId, u8>> {
+        self.mind_faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Loads and checks the scripts of the pack in `dir`.
@@ -340,12 +353,56 @@ impl ScriptHost {
     }
 
     /// Swaps in a new version. Wakes already running finish on the old.
+    /// Every mind breaker reopens.
     pub fn install(&self, compiled: Compiled) {
+        let mut faults = self.mind_faults_mut();
         *self
             .compiled
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Arc::new(compiled);
         self.reloads.fetch_add(1, Ordering::SeqCst);
+        faults.clear();
+    }
+
+    /// Re-arms the scripts running now, as a reload with nothing new to
+    /// read (the bundled pack): every mind breaker reopens, and the reload
+    /// count moves on.
+    pub fn rearm(&self) {
+        let mut faults = self.mind_faults_mut();
+        self.reloads.fetch_add(1, Ordering::SeqCst);
+        faults.clear();
+    }
+
+    /// `e`'s consecutive mind script faults.
+    #[must_use]
+    pub fn mind_faults(&self, e: &EntityId) -> u8 {
+        self.mind_faults_mut().get(e).copied().unwrap_or(0)
+    }
+
+    /// Every mind with faults, and how many.
+    #[must_use]
+    pub fn mind_breakers(&self) -> BTreeMap<EntityId, u8> {
+        self.mind_faults_mut().clone()
+    }
+
+    /// Steps `e`'s mind breaker by the outcome of a wake that started at
+    /// reload count `since`. A wake that started before a reload or a
+    /// re-arm counts for nothing: it returns `None`. Otherwise it returns
+    /// the faults now and whether the mind may still run its script.
+    pub fn step_mind(&self, e: &EntityId, since: u64, outcome: HookOutcome) -> Option<(u8, bool)> {
+        let mut faults = self.mind_faults_mut();
+        if self.reloads() != since {
+            return None;
+        }
+        let max = self.current().limits.max_consecutive_faults;
+        let (next, allowed) = hook_step(faults.get(e).copied().unwrap_or(0), outcome, max);
+        if next == 0 {
+            faults.remove(e);
+        } else {
+            faults.insert(e.clone(), next);
+        }
+        drop(faults);
+        Some((next, allowed))
     }
 
     /// The mutex a reload holds, so two reloads never interleave.

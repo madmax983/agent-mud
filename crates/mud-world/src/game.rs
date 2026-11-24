@@ -5,6 +5,7 @@
 //! one, and broadcasts its events to every subscriber: web terminals, the
 //! attention router, the observer dashboard.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -93,7 +94,16 @@ pub struct Game {
     audit: broadcast::Sender<Arc<Audit>>,
     clock: Arc<dyn Clock>,
     store_errors: AtomicU64,
-    memory: Mutex<ScriptMemory>,
+    memory: Mutex<MemoryCache>,
+}
+
+/// Mind script memory, cached, with a reset count per mind.
+#[derive(Debug, Default)]
+struct MemoryCache {
+    values: ScriptMemory,
+    /// Bumped by every reset, so a wake that read the memory before a
+    /// reset cannot save over it afterwards.
+    resets: BTreeMap<EntityId, u64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -122,7 +132,10 @@ impl Game {
             audit,
             clock,
             store_errors: AtomicU64::new(0),
-            memory: Mutex::new(memory),
+            memory: Mutex::new(MemoryCache {
+                values: memory,
+                resets: BTreeMap::new(),
+            }),
         })
     }
 
@@ -162,33 +175,73 @@ impl Game {
     /// when what it has was saved under another schema.
     #[must_use]
     pub fn script_memory(&self, entity: &EntityId, schema: u32) -> serde_json::Value {
-        lock(&self.memory)
+        self.script_memory_at(entity, schema).1
+    }
+
+    /// A mind's script memory, as [`Game::script_memory`], with the count
+    /// of its resets so far, for [`Game::save_script_memory_if`].
+    #[must_use]
+    pub fn script_memory_at(&self, entity: &EntityId, schema: u32) -> (u64, serde_json::Value) {
+        let m = lock(&self.memory);
+        let value = m
+            .values
             .get(entity)
             .filter(|(s, _)| *s == schema)
-            .map_or_else(|| serde_json::json!({}), |(_, v)| v.clone())
+            .map_or_else(|| serde_json::json!({}), |(_, v)| v.clone());
+        (m.resets.get(entity).copied().unwrap_or(0), value)
+    }
+
+    fn store_memory(&self, entity: &EntityId, schema: u32, body: &serde_json::Value) {
+        if let Some(store) = &self.store
+            && let Err(e) = lock(store).save_script_memory(entity, schema, body, self.now_ms())
+        {
+            self.store_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(error = %e, "saving script memory failed");
+        }
     }
 
     /// Saves a mind's script memory, in memory and in the store. Mind
     /// memory is not world state: it never touches physics.
     pub fn save_script_memory(&self, entity: &EntityId, schema: u32, body: serde_json::Value) {
-        if let Some(store) = &self.store
-            && let Err(e) = lock(store).save_script_memory(entity, schema, &body, self.now_ms())
-        {
-            self.store_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(error = %e, "saving script memory failed");
+        let mut m = lock(&self.memory);
+        self.store_memory(entity, schema, &body);
+        m.values.insert(entity.clone(), (schema, body));
+    }
+
+    /// Saves a mind's script memory only if it was not reset since it was
+    /// read with `resets` (from [`Game::script_memory_at`]). Returns
+    /// whether it saved.
+    pub fn save_script_memory_if(
+        &self,
+        entity: &EntityId,
+        schema: u32,
+        resets: u64,
+        body: serde_json::Value,
+    ) -> bool {
+        let mut m = lock(&self.memory);
+        if m.resets.get(entity).copied().unwrap_or(0) != resets {
+            return false;
         }
-        lock(&self.memory).insert(entity.clone(), (schema, body));
+        self.store_memory(entity, schema, &body);
+        m.values.insert(entity.clone(), (schema, body));
+        true
     }
 
     /// Forgets a mind's script memory, and records who asked in the audit.
     pub fn reset_script_memory(&self, entity: &EntityId) {
-        if let Some(store) = &self.store
-            && let Err(e) = lock(store).clear_script_memory(entity)
         {
-            self.store_errors.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(error = %e, "clearing script memory failed");
+            // The memory lock covers the store too, so no save interleaves.
+            let mut m = lock(&self.memory);
+            if let Some(store) = &self.store
+                && let Err(e) = lock(store).clear_script_memory(entity)
+            {
+                self.store_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(error = %e, "clearing script memory failed");
+            }
+            m.values.remove(entity);
+            let next = m.resets.get(entity).copied().unwrap_or(0).saturating_add(1);
+            m.resets.insert(entity.clone(), next);
         }
-        lock(&self.memory).remove(entity);
         self.publish_audit(Audit::MindMemoryReset {
             entity: entity.clone(),
             at_ms: self.now_ms(),
@@ -422,6 +475,32 @@ mod tests {
         let third = Game::open(pack(), Some(&db), 7, clock).unwrap();
         assert_eq!(third.script_memory(&hale, 1), serde_json::json!({}));
         assert_eq!(third.store_errors(), 0);
+    }
+
+    #[test]
+    fn a_reset_wins_over_a_wake_that_read_the_memory_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("world.db");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let hale = EntityId::from("guard_01");
+        let game = Game::open(pack(), Some(&db), 7, clock.clone()).unwrap();
+        game.save_script_memory(&hale, 1, serde_json::json!({ "n": 1 }));
+        // A wake reads the memory, and runs its script...
+        let (generation, before) = game.script_memory_at(&hale, 1);
+        assert_eq!(before["n"], 1);
+        // ...while the operator resets it.
+        game.reset_script_memory(&hale);
+        // The wake's save, built from the old memory, does not undo it.
+        assert!(!game.save_script_memory_if(&hale, 1, generation, serde_json::json!({ "n": 2 })));
+        assert_eq!(game.script_memory(&hale, 1), serde_json::json!({}));
+        // A wake that read after the reset saves as usual.
+        let (generation, now) = game.script_memory_at(&hale, 1);
+        assert_eq!(now, serde_json::json!({}));
+        assert!(game.save_script_memory_if(&hale, 1, generation, serde_json::json!({ "n": 9 })));
+        assert_eq!(game.script_memory(&hale, 1)["n"], 9);
+        drop(game);
+        let again = Game::open(pack(), Some(&db), 7, clock).unwrap();
+        assert_eq!(again.script_memory(&hale, 1)["n"], 9, "the store agrees");
     }
 
     #[test]
