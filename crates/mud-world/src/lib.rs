@@ -9,6 +9,7 @@
 pub mod engine;
 pub mod event;
 pub mod game;
+pub mod hooks;
 pub mod ids;
 pub mod pack;
 pub mod parser;
