@@ -76,5 +76,5 @@ jobs:
         env:
           LG_BIN: ${{ github.workspace }}/littleguy/target/release/lg
         run: |
-          cargo test -p mud-supervisor --lib a_real_lg_serve_answers_a_wake
-          cargo test -p mud-server --test littleguy_e2e
+          cargo test -p mud-supervisor --lib littleguy::
+          cargo test -p mud-server --test littleguy_e2e --test shutdown

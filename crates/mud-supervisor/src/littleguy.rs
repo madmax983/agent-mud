@@ -317,6 +317,48 @@ pub(crate) async fn chat_charged(
         .map_err(|_| MindError::Unavailable("the daemon did not answer in time".into()))?
 }
 
+/// The file in an entity's folder that holds its daemon's process id.
+const PID_FILE: &str = "lg.pid";
+
+/// Stops a daemon a previous run of the MUD left behind (it crashed or was
+/// killed before it could stop its children), so two daemons never share
+/// one database. The process is stopped only if its command line names
+/// this entity's `socket`, so a recycled process id is never touched.
+/// Where `/proc` is missing (not Linux) nothing is checked or stopped.
+pub(crate) async fn reap_orphan(dir: &Path, socket: &Path) {
+    let pid_file = dir.join(PID_FILE);
+    let Some(pid) = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let ours = std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmd| {
+        let want = socket.as_os_str().as_encoded_bytes();
+        cmd.split(|b| *b == 0).any(|arg| arg == want)
+    });
+    if ours {
+        tracing::warn!(pid, dir = %dir.display(), "stopping an lg serve left by an earlier run");
+        for signal in ["-TERM", "-KILL"] {
+            let _ = Command::new("kill")
+                .arg(signal)
+                .arg(pid.to_string())
+                .status()
+                .await;
+            for _ in 0..20 {
+                if !Path::new(&format!("/proc/{pid}")).exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(pid_file);
+}
+
 #[derive(Debug)]
 struct Daemon {
     child: Child,
@@ -330,6 +372,8 @@ pub struct LittleguyMind {
     personas: HashMap<EntityId, Persona>,
     daemons: Mutex<HashMap<EntityId, Daemon>>,
     meters: std::sync::Mutex<HashMap<EntityId, Arc<LedgerMeter>>>,
+    /// Set by [`LittleguyMind::shutdown`]: no daemon starts after it.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl LittleguyMind {
@@ -341,6 +385,7 @@ impl LittleguyMind {
             personas,
             daemons: Mutex::new(HashMap::new()),
             meters: std::sync::Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -374,6 +419,11 @@ impl LittleguyMind {
     )]
     pub async fn ensure(&self, entity: &EntityId) -> Result<PathBuf, MindError> {
         let mut daemons = self.daemons.lock().await;
+        // Checked under the lock `shutdown` takes, so a wake racing the
+        // shutdown cannot start a daemon after it has stopped the rest.
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(MindError::Unavailable("the MUD is shutting down".into()));
+        }
         if let Some(d) = daemons.get_mut(entity) {
             if matches!(d.child.try_wait(), Ok(None)) {
                 return Ok(d.socket.clone());
@@ -390,6 +440,7 @@ impl LittleguyMind {
         let config = dir.join("lg.toml");
         std::fs::write(&config, render_config(&self.cfg, persona)).map_err(io)?;
         let socket = dir.join("lg.sock");
+        reap_orphan(&dir, &socket).await;
         let _ = std::fs::remove_file(&socket);
         let mut cmd = Command::new(&self.cfg.bin);
         cmd.arg("serve")
@@ -429,6 +480,9 @@ impl LittleguyMind {
         let mut child = cmd.spawn().map_err(|e| {
             MindError::Unavailable(format!("starting {}: {e}", self.cfg.bin.display()))
         })?;
+        if let Some(pid) = child.id() {
+            std::fs::write(dir.join(PID_FILE), pid.to_string()).map_err(io)?;
+        }
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.cfg.start_timeout_secs);
         while !socket.exists() {
@@ -455,12 +509,24 @@ impl LittleguyMind {
         Ok(socket)
     }
 
-    /// Stops every daemon.
+    /// Stops every daemon and waits for each to exit; no daemon starts
+    /// after this. Idempotent.
     pub async fn shutdown(&self) {
         let mut daemons = self.daemons.lock().await;
-        for (_, mut d) in daemons.drain() {
-            let _ = d.child.kill().await;
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        for (entity, mut d) in daemons.drain() {
+            if let Err(e) = d.child.kill().await {
+                tracing::warn!(%entity, error = %e, "stopping lg serve");
+            }
+            let _ = std::fs::remove_file(self.entity_dir(&entity).join(PID_FILE));
+            let _ = std::fs::remove_file(&d.socket);
         }
+    }
+
+    /// Whether [`LittleguyMind::shutdown`] has run.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
