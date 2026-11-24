@@ -1,0 +1,27 @@
+[package]
+name = "mud-world"
+description = "Room graph, world pack loader, verb parser and the deterministic command engine of the littleguy MUD."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mud-rules.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+# The same SQLite build as autumn-harvest: two libsqlite3-sys copies cannot link.
+rusqlite = { version = "0.42", features = ["bundled"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

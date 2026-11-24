@@ -1,0 +1,33 @@
+[package]
+name = "mud-mcp"
+description = "The MCP server of the littleguy MUD: four tools, each bearer token scoped to one entity."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mud-world.workspace = true
+axum = "0.8"
+futures = "0.3"
+getrandom = "0.4"
+rmcp = { version = "3.9", default-features = false, features = [
+    "server",
+    "transport-streamable-http-server",
+] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rmcp = { version = "3.9", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true

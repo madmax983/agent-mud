@@ -1,0 +1,93 @@
+# crypt-v01: a small town over a flooded crypt. Eleven rooms.
+[world]
+name = "crypt-v01"
+title = "The Crypt Under Harrow's Rest"
+start_room = "town_square"
+respawn_room = "town_square"
+# The skill penalty in a dark room with no light present.
+darkness_penalty = -3
+motd = "Harrow's Rest. Rain on the cobbles, light in the Flagon's windows, and something wrong under the alley grate."
+
+# ------------------------------------------------------------------ town
+[[rooms]]
+id = "notice_market"
+title = "Notice Board and Market"
+description = "Stalls under patched awnings ring a tall oak notice board, its face shingled with nailed-up papers. The square lies south."
+safe = true
+board = true
+exits = { s = "town_square" }
+
+[[rooms]]
+id = "smithy"
+title = "Torin's Smithy"
+description = "Heat rolls off a banked forge. Tongs, half-finished blades and an empty ore bin crowd the walls. The square is back east."
+safe = true
+exits = { e = "town_square" }
+
+[[rooms]]
+id = "town_square"
+title = "Town Square"
+description = "Wet cobbles around a dry fountain. The market lies north, the smithy west, the Rusty Flagon's lit windows east, and a narrow alley slopes away south."
+safe = true
+exits = { n = "notice_market", w = "smithy", e = "rusty_flagon_taproom", s = "dark_alley" }
+
+[[rooms]]
+id = "rusty_flagon_taproom"
+title = "The Rusty Flagon"
+description = "Low beams, a long scarred bar and a fire that smokes more than it burns. Tallow and spilled ale. The square is out west."
+safe = true
+exits = { w = "town_square" }
+
+[[rooms]]
+id = "dark_alley"
+title = "Dark Alley"
+description = "A slot between leaning houses. Runoff gurgles through an iron grate set in the cobbles. A curtained door leads east; the square is north."
+safe = true
+exits = { n = "town_square", e = "fence_backroom", d = "cellar_landing" }
+locks = { d = { lock = "alley_grate", pick = -2, describe = "An iron grate, locked with a heavy padlock." } }
+
+[[rooms]]
+id = "fence_backroom"
+title = "Fence's Backroom"
+description = "A windowless room of crates and a single candle. Everything here belonged to someone else once. The alley is west."
+safe = true
+exits = { w = "dark_alley" }
+
+# ---------------------------------------------------------------- cellar
+[[rooms]]
+id = "cellar_landing"
+title = "Cellar Landing"
+description = "Slick stone steps end at a landing. Passages run west, where it smells of old wine, and east, toward the sound of dripping water. The grate is overhead."
+dark = true
+exits = { u = "dark_alley", w = "wine_vault", e = "flooded_cistern" }
+
+[[rooms]]
+id = "wine_vault"
+title = "Wine Vault"
+description = "Broken casks and a carpet of glass. Something has gnawed through the racks. A low hole leads west; a passage slopes south."
+dark = true
+exits = { e = "cellar_landing", w = "rat_warren", s = "ossuary_crypt" }
+items = ["rat_tail"]
+
+[[rooms]]
+id = "rat_warren"
+title = "Rat Warren"
+description = "A crawlspace packed with shredded cloth and bones. The vault is back east."
+dark = true
+exits = { e = "wine_vault" }
+
+[[rooms]]
+id = "flooded_cistern"
+title = "Flooded Cistern"
+description = "Black water to the knee. Pillars rise into darkness. The landing is west; a channel runs south."
+dark = true
+exits = { w = "cellar_landing", s = "ossuary_crypt" }
+items = [{ proto = "rusted_lockbox", contents = ["silver_ring", "old_coin_pouch", "healing_draught"] }]
+
+[[rooms]]
+id = "ossuary_crypt"
+title = "Ossuary Crypt"
+description = "Skulls stacked to the vault of the ceiling. A cracked sarcophagus, and beside it a cache of dark ore under a rotted tarp. Passages lead northwest and northeast."
+dark = true
+exits = { nw = "wine_vault", ne = "flooded_cistern" }
+items = ["iron_ore", "iron_ore", "iron_ore", "iron_ore", "bone_charm"]

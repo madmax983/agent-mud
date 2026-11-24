@@ -1,0 +1,288 @@
+# The cast of crypt-v01: entities, their minds, and the trait library.
+#
+# `mind.tier` is one of:
+#   none        a human player slot or a plain object
+#   mob         deterministic; the server runs it
+#   ambient     a light NPC on autumn-plugin-agent
+#   persistent  a durable littleguy agent
+#   turing      a hidden agent PC on littleguy
+#
+# `script` rules drive the deterministic mind (tests, the smoke run, and
+# the fallback when a budget is spent or no model is configured). Each rule
+# fires on one trigger and runs its commands through the same parser as a
+# human. `{actor}` is the name of the entity that caused the trigger.
+
+# ------------------------------------------------------- trait library
+# A trait with `control` rolls 3d6 against it when a trigger reaches the
+# entity's room. A failure sends the entity a private nudge with `cue`.
+[traits.greedy]
+kinds = ["item_drop", "give", "trade", "loot"]
+keywords = ["silver", "coin", "pouch", "loot", "gold", "pay", "split"]
+cue = "You failed your Greedy ({target}-) roll at {trigger}. You strongly want a cut, or a way to pocket it."
+
+[traits.cowardly]
+kinds = ["combat", "death"]
+keywords = ["crypt", "skeleton", "warden", "fight", "kill"]
+cue = "You failed your Cowardice ({target}-) roll at {trigger}. You want very badly to be somewhere else."
+
+[traits.gossip]
+kinds = ["enter", "board_post"]
+keywords = ["cellar", "grate", "crypt", "heard", "rumor"]
+cue = "You failed your Gossip ({target}-) roll at {trigger}. You cannot keep from passing on what you know."
+
+[traits.stubborn]
+kinds = ["haggle"]
+keywords = ["cheaper", "discount", "lower", "deal", "less"]
+cue = "You failed your Stubbornness ({target}-) roll at {trigger}. You will not budge on this."
+
+[traits.honest]
+kinds = ["theft"]
+keywords = ["steal", "lie", "cheat", "fence", "stolen"]
+cue = "You failed your Honesty ({target}-) roll at {trigger}. You cannot let a crooked thing pass without saying so."
+
+[traits.duty]
+kinds = ["combat", "guard_intervene"]
+keywords = ["alley", "grate", "trouble", "help", "guard"]
+cue = "You failed your Sense of Duty ({target}-) roll at {trigger}. You must step in."
+
+[traits.curious]
+kinds = ["board_post", "item_drop"]
+keywords = ["cellar", "lantern", "ore", "crypt", "lockbox", "secret", "key"]
+cue = "You failed your Curiosity ({target}-) roll at {trigger}. You need to know more, right now."
+
+[traits.impatient]
+kinds = ["speech"]
+keywords = ["wait", "later", "hold on", "brb", "sec", "tomorrow"]
+cue = "You failed your Impatience ({target}-) roll at {trigger}. You hate waiting. Push to go now."
+
+[traits.pacifist_self_defense]
+# No roll: a server rule. The entity cannot start a fight.
+policy = "no_first_strike"
+
+[traits.blunt]
+
+# ------------------------------------------------------- player slots
+[player_template]
+attrs = { st = 10, dx = 10, iq = 10, ht = 10 }
+skills = { shortsword = 11, brawling = 11, stealth = 10, first_aid = 10 }
+currency = 25
+inventory = ["dagger", "torch", "bandage"]
+equip = ["dagger"]
+
+# ------------------------------------------------------------- the cast
+[cast.marta]
+name = "Marta"
+aliases = ["barkeep", "barkeeper"]
+short = "Marta the barkeep wipes down the bar."
+description = "A broad woman with flour on her sleeves and an eye that misses nothing. She keeps the Flagon's ledger in her head."
+kind = "npc"
+room = "rusty_flagon_taproom"
+attrs = { st = 10, dx = 10, iq = 12, ht = 11 }
+skills = { fast_talk = 13, detect_lies = 12, merchant = 11 }
+traits = [{ name = "gossip", control = 12 }, { name = "pacifist_self_defense" }]
+currency = 40
+shop = "marta"
+persona = "Marta runs the Rusty Flagon. Warm with regulars, sharp with strangers, never gives credit. Talks in short, dry sentences."
+goal = "Track who goes down the cellar grate and who comes back. Sell what you hear for a drink or 2s."
+fallback = "Marta polishes a mug and says nothing."
+[cast.marta.mind]
+tier = "persistent"
+runtime = "littleguy"
+model = "flash"
+macro_tick_hours = [2.0, 6.0]
+
+[[cast.marta.script]]
+on = "enter"
+who = "human"
+do = ["say evening. ale's a silver. news costs two."]
+
+[[cast.marta.script]]
+on = "speech"
+keywords = ["cellar", "grate", "crypt"]
+do = ["say heard rats down there big as dogs. and worse past the vault. two silver buys you the rest."]
+
+[cast.torin]
+name = "Torin"
+aliases = ["smith", "blacksmith"]
+short = "Torin the blacksmith works the bellows."
+description = "A thick-armed dwarf-blooded smith, beard singed short. He looks at the empty ore bin more than at you."
+kind = "npc"
+room = "smithy"
+attrs = { st = 13, dx = 11, iq = 10, ht = 12 }
+skills = { smith = 14, merchant = 12, broadsword = 11 }
+traits = [{ name = "stubborn", control = 12 }, { name = "honest", control = 12 }]
+currency = 120
+shop = "torin"
+equip = []
+persona = "Torin is a blacksmith of few words. Gruff, fair, proud of his work, never haggles down."
+goal = "You are out of ore. Pay 15s per chunk of dwarven iron ore, or trade a sharpened blade for four. Post a bounty on the board."
+fallback = "Torin grunts and keeps hammering."
+[cast.torin.mind]
+tier = "persistent"
+runtime = "littleguy"
+model = "flash"
+macro_tick_hours = [2.0, 6.0]
+
+[[cast.torin.script]]
+on = "macro_tick"
+nth = 1
+do = [
+  "move e",
+  "move n",
+  "board post BOUNTY: dwarven iron ore wanted. 15s a chunk, or a sharpened broadsword for four. Bring it to Torin's smithy. -T",
+  "move s",
+  "move w",
+]
+
+[[cast.torin.script]]
+on = "enter"
+who = "human"
+do = ["emote looks up from the anvil. \"Got ore? No? Then make it quick.\""]
+
+[cast.vich]
+name = "Vich"
+aliases = ["fence"]
+short = "Vich lounges on a crate, counting nothing in particular."
+description = "Thin, quick, and smiling with half his mouth. His sleeves are too long for his arms, which is probably the point."
+kind = "npc"
+room = "fence_backroom"
+attrs = { st = 9, dx = 12, iq = 12, ht = 10 }
+skills = { stealth = 13, lockpicking = 13, streetwise = 13 }
+traits = [{ name = "greedy", control = 12 }, { name = "cowardly", control = 12 }]
+currency = 80
+shop = "vich"
+persona = "Vich is the alley fence. Friendly in a way that costs you later. Never fights. Always has a price."
+goal = "Buy cellar loot at 60% of value. Sell the cellar grate key for 20s, or for a favor."
+fallback = "Vich smiles and says nothing for free."
+[cast.vich.mind]
+tier = "persistent"
+runtime = "littleguy"
+model = "flash"
+macro_tick_hours = [2.0, 6.0]
+
+[[cast.vich.script]]
+on = "enter"
+who = "human"
+do = ["say well now. buying or selling? key to the grate's twenty silver. no questions."]
+
+[cast.guard_01]
+name = "Hale"
+aliases = ["guard", "watchman"]
+short = "Hale of the town watch leans on a spear."
+description = "A watchman in a dented cap and a cloak that has seen too much rain."
+kind = "npc"
+room = "town_square"
+attrs = { st = 12, dx = 11, iq = 9, ht = 11 }
+skills = { spear = 12, intimidate = 11, observation = 10 }
+traits = [{ name = "duty", control = 12 }, { name = "blunt" }]
+currency = 5
+inventory = ["spear", "leather_jerkin"]
+equip = ["spear", "leather_jerkin"]
+guard = true
+persona = "Hale is a town watchman. Blunt, tired, decent. Keeps the peace in the Square and warns loiterers off the alley."
+goal = "Keep the peace in the Square. Warn people away from the Alley grate."
+fallback = "Hale shifts his grip on the spear and watches you."
+[cast.guard_01.mind]
+tier = "ambient"
+runtime = "plugin-agent"
+model = "flash"
+cooldown_secs = [10, 30]
+
+[[cast.guard_01.script]]
+on = "enter"
+who = "human"
+do = ["say move along. and stay out of the alley after dark."]
+
+[cast.pc_kestrel]
+name = "kestrel"
+short = "kestrel is here, fiddling with a strap."
+description = "A wiry adventurer in a patched cloak, shortsword on the hip, eyes that keep going to the door."
+kind = "player"
+room = "rusty_flagon_taproom"
+attrs = { st = 10, dx = 12, iq = 11, ht = 11 }
+skills = { shortsword = 13, lockpicking = 12, stealth = 12, merchant = 10 }
+traits = [{ name = "curious", control = 12 }, { name = "impatient", control = 12 }]
+currency = 12
+inventory = ["shortsword"]
+equip = ["shortsword"]
+persona = "You are kestrel, a player in a text MUD. You type like a person: lowercase, short fragments, MUD idioms (omw, sec, ty, wait what, lol). Never more than one sentence. Never sound like an assistant."
+goal = "Scrape 40s for a lantern and a leather jerkin. Recruit a human for the Ossuary. Never split loot less than 50/50."
+fallback = "kestrel is idle."
+[cast.pc_kestrel.mind]
+tier = "turing"
+runtime = "littleguy"
+model = "flash"
+macro_tick_hours = [2.0, 6.0]
+[cast.pc_kestrel.mind.turing]
+active_windows_utc = ["00:00-23:59"]
+daily_offset_minutes = 20
+wake_chance = 0.35
+goal_keywords = ["cellar", "ore", "lantern", "crypt", "ossuary", "split", "party", "group"]
+wpm = 55.0
+afk_every_minutes = [20, 60]
+afk_minutes = [2, 6]
+
+[[cast.pc_kestrel.script]]
+on = "login"
+do = ["move w", "move n", "board read", "move s", "move e"]
+
+[[cast.pc_kestrel.script]]
+on = "enter"
+who = "human"
+room = "rusty_flagon_taproom"
+do = ["say yo {actor} you going down the cellar? need a 2nd blade for the ossuary, split 50/50"]
+
+[[cast.pc_kestrel.script]]
+on = "speech"
+keywords = ["split", "40", "60"]
+do = ["say 50/50 or nothing"]
+
+# ---------------------------------------------------------------- mobs
+[cast.giant_rat_1]
+name = "giant rat"
+aliases = ["rat"]
+short = "A giant rat, mangy and dog-sized, hisses at you."
+description = "Patchy fur, yellow teeth, and far too much confidence."
+kind = "mob"
+room = "wine_vault"
+attrs = { st = 6, dx = 12, iq = 3, ht = 11 }
+skills = { brawling = 12 }
+inventory = ["rat_teeth"]
+equip = ["rat_teeth"]
+hostile = true
+respawn_minutes = 30
+[cast.giant_rat_1.mind]
+tier = "mob"
+
+[cast.giant_rat_2]
+name = "giant rat"
+aliases = ["rat"]
+short = "A giant rat crouches in the nesting, eyes catching the light."
+description = "Bigger than the other one. Fatter, too."
+kind = "mob"
+room = "rat_warren"
+attrs = { st = 7, dx = 12, iq = 3, ht = 12 }
+skills = { brawling = 12 }
+inventory = ["rat_teeth", "rat_tail"]
+equip = ["rat_teeth"]
+hostile = true
+respawn_minutes = 30
+[cast.giant_rat_2.mind]
+tier = "mob"
+
+[cast.skeletal_warden]
+name = "skeletal warden"
+aliases = ["warden", "skeleton"]
+short = "A skeletal warden stands over the ore cache, grave-blade raised."
+description = "Bones bound with tarnished wire, a crown of rust, and nothing at all in its eye sockets."
+kind = "mob"
+room = "ossuary_crypt"
+attrs = { st = 13, dx = 11, iq = 6, ht = 12 }
+skills = { broadsword = 12 }
+inventory = ["warden_blade"]
+equip = ["warden_blade"]
+dr = 2
+hostile = true
+respawn_minutes = 120
+[cast.skeletal_warden.mind]
+tier = "mob"

@@ -1,0 +1,52 @@
+# mud.toml: copy to mud.toml and edit. Every section is optional; with no
+# file at all `mud serve` runs the bundled world on scripted minds, with no
+# model keys and no network.
+#
+# Keys never go in this file. Each one comes from the environment
+# variable that the file names.
+
+[server]
+bind = "127.0.0.1:3000"          # terminal at /, observer at /observer, MCP at /mcp
+telnet = "127.0.0.1:4000"        # optional plain-text clients
+# public_url = "http://127.0.0.1:3000"   # what agents use to reach /mcp
+admin_token_env = "MUD_ADMIN_TOKEN"     # unset: a token is made at start and logged
+login_timeout_ms = 60000         # a client that gives no name in time is closed (0: never)
+idle_timeout_ms = 3600000        # a player silent this long is closed (0: never)
+
+[world]
+# pack = "worlds/crypt-v01"      # unset: the pack compiled into the binary
+db = "data/world.db"             # the SQLite world store
+seed = 1
+
+# Which runtime thinks for each tier of the cast:
+#   scripted     the cast's script rules; no model
+#   harvest      a durable autumn-harvest agent in process (uses [models])
+#   littleguy    one `lg serve` per entity (uses [littleguy])
+#   plugin-agent an autumn-plugin-agent loop (ambient only; uses [models])
+[minds]
+persistent = "littleguy"
+turing = "littleguy"
+ambient = "plugin-agent"
+
+# Model aliases named by `mind.model` in cast.toml.
+[models.flash]
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-chat"
+key_env = "OPENROUTER_API_KEY"
+
+[littleguy]
+bin = "lg"
+data_dir = "data/agents"
+provider = "openrouter"          # offline | claude | openai | openrouter
+# base_url = "http://127.0.0.1:8080/v1"
+[littleguy.model_names]
+default = "deepseek/deepseek-chat"
+
+[supervisor]
+daily_token_budget = 400000      # per agent per UTC day; 0 is unlimited
+typing_scale = 1.0               # Turing PC typing holds; 0 for demos
+macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
+first_macro_tick_secs = [30, 120]
+step_ms = 250
+[supervisor.budgets]
+pc_kestrel = 600000

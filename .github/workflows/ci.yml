@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test, coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show && rustup component add llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy (pedantic + nursery)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: smoke (v0.1 done criteria)
+        run: cargo run -q -p mud-server --bin mud -- smoke
+      - name: world pack check
+        run: cargo run -q -p mud-server --bin mud -- check worlds/crypt-v01
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: coverage (85% line floor)
+        run: cargo llvm-cov --workspace --fail-under-lines 85 --summary-only
+
+  verus:
+    name: verus proofs
+    runs-on: ubuntu-latest
+    env:
+      VERUS_RELEASE: 0.2026.10.04.426d8b0
+      VERUS_SHA256: 624018662868563a7bec0dd07be5e4dd0c3d61124b4b55105765884bf2d4d1a0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the pinned Verus release
+        run: |
+          curl -fsSL --retry 3 -o verus.zip \
+            "https://github.com/verus-lang/verus/releases/download/release%2F${VERUS_RELEASE}/verus-${VERUS_RELEASE}-x86-linux.zip"
+          echo "${VERUS_SHA256}  verus.zip" | sha256sum --check
+          unzip -q verus.zip
+          rustup toolchain install "$(jq -r '.verus.toolchain' verus-x86-linux/version.json | cut -d' ' -f1)" --profile minimal
+      - name: Verify
+        run: |
+          ./verus-x86-linux/verus formal/verus/src/lib.rs --crate-type=lib | tee verus.out
+          grep -Eq '^verification results:: [1-9][0-9]* verified, 0 errors$' verus.out
+      - name: Mirror tests (Rust and Verus bodies match)
+        run: cargo test -p mud-rules -p mud-supervisor --test verus_mirror
+
+  littleguy:
+    name: real littleguy end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: autumn-foundation/littleguy
+          path: littleguy
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            littleguy -> target
+      - name: Build lg (the features the MUD uses)
+        working-directory: littleguy
+        run: cargo build --release -p littleguy --no-default-features --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction"
+      - name: lg serve accepts the generated config and plays over MCP
+        env:
+          LG_BIN: ${{ github.workspace }}/littleguy/target/release/lg
+        run: |
+          cargo test -p mud-supervisor --lib a_real_lg_serve_answers_a_wake
+          cargo test -p mud-server --test littleguy_e2e

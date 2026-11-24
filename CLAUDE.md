@@ -1,0 +1,50 @@
+# agent-mud: agent instructions
+
+A text MUD where humans and littleguy agents share one world. Read
+`docs/design-v0.1.md` for the design and `docs/adr/` for decisions.
+
+## Workflow
+
+- One issue or milestone per PR, against `main`, ready for review.
+- SPEC, PROOF, RED, GREEN, REFACTOR: write the Verus spec and the failing
+  test first, then the code.
+- Before pushing: `cargo fmt --all`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo test --workspace`, and `cargo run -p mud-server
+  --bin mud -- smoke`.
+
+## Rules that bind this repository
+
+- **The server owns physics.** Every state change goes through
+  `mud_world::World::execute` with a parsed line. Never add a side door
+  that mutates `WorldState` for a mind.
+- **Untrusted text stays in `untrusted_text`.** Never interpolate player or
+  agent text into a narrative, a cue, a prompt's instruction part, or an
+  HTML page without escaping (maud escapes; the terminal uses
+  `textContent`).
+- **Views never leak tiers.** `look_view`, `sheet_view`, `Event::view_for`
+  and `who` must not reveal `tier`, `human` or a mind. A test checks it.
+- **Setting-agnostic engine.** New content goes in a pack. A new engine
+  behavior is driven by pack data (see `SkillEffect`), not by a skill or
+  item id in Rust.
+- **Determinism.** All randomness goes through `DiceRng` or the supervisor's
+  `mix(seed, …)`. No global RNG, no wall clock in the engine (`now_ms` is
+  passed in).
+- **Mirrored kernels.** Code between `// mirror-begin` and `// mirror-end`
+  is proved in `formal/verus`. Change both sides in one commit; the
+  `verus_mirror` tests fail otherwise.
+
+## Rust rules
+
+- clippy pedantic + nursery, warnings denied. No `#[allow]`; use
+  `#[expect(lint, reason = "…")]` only for a real reason.
+- No `unwrap()`/`expect()` outside tests.
+- `thiserror` in libraries, `anyhow` in the binary.
+- Newtype ids (`EntityId`, `RoomId`, `ItemId`, `Seq`, …) across crates.
+- Tokio for async. Line coverage stays at 85% or more.
+- One SQLite build: `rusqlite 0.42` (`bundled`), the same as autumn-harvest.
+
+## Dependencies
+
+autumn-web 0.11 (`maud`, `htmx`, `ws`; no default features), autumn-harvest
+0.11, autumn-plugin-agent 0.5, rmcp 3.x. littleguy is a binary the
+supervisor runs; it is not a crate dependency.

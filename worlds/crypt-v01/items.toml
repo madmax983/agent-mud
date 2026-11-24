@@ -1,0 +1,159 @@
+# Item prototypes. `value` is in the currency of economy.toml.
+# Weapons: `damage` is dice ("1d+1") or strength-based ("sw+1", "thr+2").
+[items.shortsword]
+name = "shortsword"
+aliases = ["sword", "short sword"]
+description = "A short, single-edged blade with a leather-wrapped grip."
+value = 40
+slot = "weapon"
+skill = "shortsword"
+damage = "sw"
+damage_type = "cut"
+
+[items.broadsword]
+name = "sharpened broadsword"
+aliases = ["broadsword", "blade", "sword"]
+description = "A heavy blade, freshly honed on Torin's wheel."
+value = 60
+slot = "weapon"
+skill = "broadsword"
+damage = "sw+1"
+damage_type = "cut"
+
+[items.spear]
+name = "spear"
+description = "An ash-shafted spear with an iron head."
+value = 30
+slot = "weapon"
+skill = "spear"
+damage = "thr+2"
+damage_type = "imp"
+
+[items.dagger]
+name = "dagger"
+aliases = ["knife"]
+description = "A plain iron dagger."
+value = 12
+slot = "weapon"
+skill = "shortsword"
+damage = "thr-1"
+damage_type = "imp"
+
+[items.leather_jerkin]
+name = "leather jerkin"
+aliases = ["jerkin", "leather"]
+description = "Boiled leather, stitched in overlapping plates."
+value = 25
+slot = "torso"
+dr = 1
+
+[items.lantern]
+name = "brass lantern"
+aliases = ["lantern", "lamp"]
+description = "A hooded brass lantern. It throws a steady yellow light."
+value = 15
+slot = "light"
+light = true
+
+[items.torch]
+name = "pitch torch"
+aliases = ["torch"]
+description = "A stick wrapped in pitch-soaked rag."
+value = 2
+slot = "light"
+light = true
+
+[items.ale]
+name = "mug of ale"
+aliases = ["ale", "mug", "drink"]
+description = "Thin, brown, and cold enough."
+value = 1
+heal = "1d-3"
+
+[items.healing_draught]
+name = "healing draught"
+aliases = ["draught", "potion"]
+description = "A stoppered vial of something green and bitter."
+value = 20
+heal = "2d"
+
+[items.bandage]
+name = "linen bandage"
+aliases = ["bandage"]
+description = "A roll of clean linen."
+value = 3
+heal = "1d-1"
+heal_skill = "first_aid"
+
+[items.grate_key]
+name = "iron grate key"
+aliases = ["key", "grate key"]
+description = "A heavy iron key, rust flaking from the bit."
+value = 20
+key = "alley_grate"
+
+[items.iron_ore]
+name = "chunk of dwarven iron ore"
+aliases = ["ore", "iron", "ingot", "iron ore"]
+description = "Dense, dark ore streaked with silver. Dwarven-mined, by the look of it."
+value = 10
+tags = ["ore", "loot"]
+
+[items.rusted_lockbox]
+name = "rusted lockbox"
+aliases = ["lockbox", "box"]
+description = "An iron box gone orange with rust. The lock still looks sound."
+value = 0
+fixed = true
+container = true
+lock = -1
+
+[items.silver_ring]
+name = "tarnished silver ring"
+aliases = ["ring"]
+description = "A thin ring, black with tarnish."
+value = 18
+tags = ["loot"]
+
+[items.old_coin_pouch]
+name = "rotted coin pouch"
+aliases = ["pouch"]
+description = "Leather gone soft with damp. Something clinks inside."
+value = 0
+currency = 14
+tags = ["loot"]
+
+[items.rat_tail]
+name = "rat tail"
+aliases = ["tail"]
+description = "Long, pink, and unpleasant. Someone might pay a bounty."
+value = 1
+tags = ["loot"]
+
+[items.bone_charm]
+name = "bone charm"
+aliases = ["charm"]
+description = "A finger bone threaded on wire. It is cold to the touch."
+value = 30
+tags = ["loot"]
+
+[items.rat_teeth]
+name = "rat teeth"
+description = "Yellow incisors, long as a thumb."
+value = 0
+slot = "weapon"
+skill = "brawling"
+damage = "1d-1"
+damage_type = "cut"
+hidden = true
+
+[items.warden_blade]
+name = "notched grave-blade"
+aliases = ["grave-blade", "blade"]
+description = "A broad, notched blade green with age."
+value = 35
+slot = "weapon"
+skill = "broadsword"
+damage = "sw"
+damage_type = "cut"
+tags = ["loot"]
