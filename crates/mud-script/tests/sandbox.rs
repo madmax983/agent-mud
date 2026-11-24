@@ -596,6 +596,87 @@ fn effects_are_for_hooks_and_returns_are_checked() {
 }
 
 #[test]
+fn reward_builds_one_ledgered_ask_and_checks_its_shape() {
+    use std::collections::BTreeMap;
+
+    use mud_world::{PoolId, ProtoId};
+    let fx = effects(
+        "[reward(\"warden_bounty\", #{ currency: 20, items: #{ healing_draught: 2 } }), reward(\"tab\", 7), reward(\"tab\", #{})]",
+    );
+    assert_eq!(
+        fx,
+        [
+            ScriptEffect::Reward {
+                pool: PoolId::from("warden_bounty"),
+                currency: 20,
+                items: BTreeMap::from([(ProtoId::from("healing_draught"), 2)]),
+            },
+            ScriptEffect::Reward {
+                pool: PoolId::from("tab"),
+                currency: 7,
+                items: BTreeMap::new(),
+            },
+            ScriptEffect::Reward {
+                pool: PoolId::from("tab"),
+                currency: 0,
+                items: BTreeMap::new(),
+            },
+        ]
+    );
+    for (body, why) in [
+        (
+            "[reward(\"p\", #{ coins: 3 })]",
+            "reward(): unknown key \"coins\"; use currency and items",
+        ),
+        (
+            "[reward(\"p\", #{ currency: -1 })]",
+            "reward(): currency is an integer of 0 or more",
+        ),
+        (
+            "[reward(\"p\", -1)]",
+            "reward(): currency is an integer of 0 or more",
+        ),
+        (
+            "[reward(\"p\", #{ currency: \"lots\" })]",
+            "reward(): currency is an integer of 0 or more",
+        ),
+        (
+            "[reward(\"p\", #{ items: [1] })]",
+            "reward(): items is a map of item id to count",
+        ),
+        (
+            "[reward(\"p\", #{ items: #{ ale: 0 } })]",
+            "reward(): items.ale is a count of 1 to 16",
+        ),
+        (
+            "[reward(\"p\", #{ items: #{ ale: 17 } })]",
+            "reward(): items.ale is a count of 1 to 16",
+        ),
+    ] {
+        let e = fault(body);
+        assert!(e.contains(why), "{body}: {e}");
+    }
+    // A hook reads what is left of each pool.
+    assert_eq!(
+        said(
+            "let said = `${ctx.pools.warden_bounty.currency} ${ctx.pools.warden_bounty.per} ${ctx.pools.warden_bounty.items.healing_draught}`;"
+        ),
+        "60 day 3"
+    );
+    // A mind cannot mint.
+    let e = mind_host("[reward(\"warden_bounty\", 5)]")
+        .on_wake(&wake(Vec::new(), Vec::new(), 1))
+        .outcome
+        .unwrap_err();
+    assert!(
+        e.contains(
+            "reward() is for room, item and verb scripts; a mind script returns command lines"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
 fn mind_returns_follow_the_contract() {
     let ok = |body: &str| {
         mind_host(body)

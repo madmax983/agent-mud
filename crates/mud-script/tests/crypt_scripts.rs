@@ -7,7 +7,10 @@ use std::sync::Arc;
 use mud_script::{ScriptHost, ScriptSources};
 use mud_world::hooks::{FlagValue, WorldHooks};
 use mud_world::state::{Holder, WorldState};
-use mud_world::{EntityId, ErrorCode, EventKind, HooksChange, ProtoId, RoomId, World, WorldPack};
+use mud_world::{
+    EntityId, ErrorCode, EventKind, HooksChange, PoolId, ProtoId, RoomId, StateChange, World,
+    WorldPack,
+};
 
 fn pack() -> Arc<WorldPack> {
     Arc::new(WorldPack::crypt_v01().unwrap())
@@ -85,7 +88,7 @@ fn the_shipped_scripts_pass_check_and_dry_run() {
     assert_eq!(host.dry_run(&pack), Vec::<String>::new());
     let summary = host.summary();
     assert!(
-        summary.ends_with("(6 files: 1 mind, 2 rooms, 2 items, 2 verbs)"),
+        summary.ends_with("(7 files: 1 mind, 2 rooms, 2 items, 3 verbs)"),
         "{summary}"
     );
     let bundled = ScriptHost::bundled_crypt_v01(&pack).unwrap();
@@ -100,7 +103,7 @@ fn the_shipped_scripts_pass_check_and_dry_run() {
         [EntityId::from("guard_01")]
     );
     assert_eq!(host.mind_memory_schema(&EntityId::from("guard_01")), 1);
-    assert_eq!(host.hook_keys().len(), 6);
+    assert_eq!(host.hook_keys().len(), 7);
 }
 
 #[test]
@@ -312,4 +315,125 @@ fn the_bone_charm_hums_near_the_warden_and_answers_use_on_it() {
             .narrative
             .contains("cold and quiet")
     );
+}
+
+fn carried(w: &World, who: &EntityId, proto: &str) -> usize {
+    w.entity(who)
+        .unwrap()
+        .inventory
+        .iter()
+        .filter(|i| w.state().items[*i].proto.as_str() == proto)
+        .count()
+}
+
+#[test]
+fn hale_pays_a_ledgered_bounty_for_the_wardens_blade() {
+    // With the warden walking, no bounty; without the blade, none either.
+    let (mut w, ids) = world_with(&[("ada", "town_square")], |s, p| {
+        give(s, p, "pc_ada", "warden_blade");
+    });
+    let r = w.execute(&ids[0], "report", at(2));
+    assert!(r.narrative.contains("walks again"), "{r:?}");
+    let (mut w, ids) = world_with(&[("ada", "town_square")], |s, _| {
+        kill(s, "skeletal_warden");
+    });
+    let r = w.execute(&ids[0], "report", at(2));
+    assert!(r.narrative.contains("Bring me proof"), "{r:?}");
+    assert!(w.execute(&ids[0], "s", at(2)).ok);
+    assert_eq!(
+        w.execute(&ids[0], "report", at(2)).error_code,
+        Some(ErrorCode::NotHere)
+    );
+    assert_eq!(w.state().mints, []);
+
+    // The ossuary is quiet, and four claimants bring a blade on one day.
+    let names = [
+        ("ada", "town_square"),
+        ("bo", "town_square"),
+        ("cy", "town_square"),
+        ("di", "town_square"),
+    ];
+    let (mut w, ids) = world_with(&names, |s, p| {
+        kill(s, "skeletal_warden");
+        for who in ["pc_ada", "pc_bo", "pc_cy", "pc_di"] {
+            give(s, p, who, "warden_blade");
+        }
+    });
+    let money = w.state().total_currency(w.pack());
+    let purse = w.entity(&ids[0]).unwrap().currency;
+    let r = w.execute(&ids[0], "report", at(2));
+    assert!(r.ok, "{r:?}");
+    assert!(
+        r.narrative.contains("The watch pays for that"),
+        "{}",
+        r.narrative
+    );
+    assert!(
+        r.narrative
+            .ends_with("You receive 20s and a healing draught."),
+        "{}",
+        r.narrative
+    );
+    assert_eq!(w.entity(&ids[0]).unwrap().currency, purse + 20);
+    assert_eq!(carried(&w, &ids[0], "healing_draught"), 1);
+    assert_eq!(carried(&w, &ids[0], "warden_blade"), 1, "he keeps no proof");
+    assert!(r.state_changes.iter().any(|c| matches!(
+        c,
+        StateChange::Minted { pool, currency: 20, .. } if *pool == PoolId::from("warden_bounty")
+    )));
+    let mint = w.state().mints[0].clone();
+    assert_eq!(
+        (mint.hook.as_str(), &mint.entity, mint.currency),
+        ("verbs.report", &ids[0], 20)
+    );
+    // The others in the square see silver counted, not the ledger.
+    let seen: Vec<String> = w
+        .drain_fresh()
+        .into_iter()
+        .filter(|e| e.reaches(&ids[1]))
+        .map(|e| e.narrative)
+        .collect();
+    assert_eq!(seen, ["Hale counts silver into ada's hand."]);
+    // Once a day per player.
+    let r = w.execute(&ids[0], "report", at(3));
+    assert!(r.narrative.contains("Once a day"), "{}", r.narrative);
+    assert_eq!(w.state().mints.len(), 1);
+    // The pool pays three a day: the fourth finds the purse empty, and the
+    // hook does not fault for it.
+    assert!(w.execute(&ids[1], "report", at(3)).ok);
+    assert!(w.execute(&ids[2], "report", at(3)).ok);
+    let r = w.execute(&ids[3], "report", at(4));
+    assert!(r.ok && r.narrative.contains("purse is empty"), "{r:?}");
+    assert_eq!(carried(&w, &ids[3], "healing_draught"), 0);
+    assert!(w.state().hook_faults.is_empty());
+    assert_eq!(w.state().mints.len(), 3);
+    assert_eq!(w.state().total_currency(w.pack()), money + 60);
+    assert_eq!(w.state().minted_currency(), 60);
+    assert_eq!(w.state().check_rewards(w.pack()), Vec::<String>::new());
+    // The next game day it pays again.
+    let r = w.execute(&ids[3], "report", at(26));
+    assert!(r.narrative.contains("The watch pays"), "{}", r.narrative);
+    assert_eq!(carried(&w, &ids[3], "healing_draught"), 1);
+    assert_eq!(w.state().mints.len(), 4);
+    assert_eq!(w.state().check(), Vec::<String>::new());
+}
+
+#[test]
+fn nobody_is_paid_while_hale_is_away() {
+    let (mut w, ids) = world_with(&[("ada", "town_square")], |s, p| {
+        kill(s, "skeletal_warden");
+        give(s, p, "pc_ada", "warden_blade");
+        s.entities
+            .get_mut(&EntityId::from("guard_01"))
+            .unwrap()
+            .room = RoomId::from("smithy");
+    });
+    let r = w.execute(&ids[0], "report", at(2));
+    assert_eq!(r.error_code, Some(ErrorCode::Refused));
+    assert!(
+        r.narrative.contains("no one from the watch"),
+        "{}",
+        r.narrative
+    );
+    assert_eq!(w.state().mints, []);
 }

@@ -35,6 +35,11 @@ fn the_hooks_proof_covers_the_shipped_kernel() -> TestResult {
 }
 
 #[test]
+fn the_rewards_proof_covers_the_shipped_kernel() -> TestResult {
+    proof_mirrors("rewards")
+}
+
+#[test]
 fn every_proof_module_is_checked() -> TestResult {
     every_proof_module_is_listed()
 }

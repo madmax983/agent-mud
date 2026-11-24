@@ -13,6 +13,8 @@ use crate::hooks::{
 };
 use crate::state::Holder;
 
+mod rewards;
+
 type Answer = dyn Fn(&HookId, &HookInput, WorldDice) -> HookReply + Send + Sync;
 
 struct FakeHooks {
@@ -1130,8 +1132,11 @@ fn old_snapshots_without_script_fields_load() {
     obj.remove("flags");
     obj.remove("hook_faults");
     obj.remove("scripts_version");
+    obj.remove("pool_spent");
+    obj.remove("mints");
     let back: crate::state::WorldState = serde_json::from_value(v).unwrap();
     assert!(back.flags.is_empty() && back.hook_faults.is_empty() && back.scripts_version.is_none());
+    assert!(back.pool_spent.is_empty() && back.mints.is_empty());
     assert_eq!(back, w.snapshot());
 }
 

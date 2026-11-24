@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod ids;
 pub mod pack;
 pub mod parser;
+pub mod rewards;
 pub mod schedule;
 pub mod state;
 pub mod store;
@@ -22,7 +23,7 @@ pub use engine::{
 };
 pub use event::{ActorRef, Event, EventKind};
 pub use game::{Clock, Game, ManualClock, SystemClock};
-pub use ids::{EntityId, ItemId, ProtoId, RoomId, Seq, ShopId, SkillId};
+pub use ids::{EntityId, ItemId, PoolId, ProtoId, RoomId, Seq, ShopId, SkillId};
 pub use pack::WorldPack;
 pub use parser::{Command, SESSION_WORDS, parse, parse_with};
 pub use state::NameOwner;

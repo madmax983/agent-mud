@@ -53,3 +53,13 @@ rooms = ["dark_alley", "cellar_landing"]
 file = "rooms/alley.rhai"
 fn = "on_listen"
 config = { modifier = 0 }
+
+# The watch's bounty on the warden: a ledgered reward from the
+# `warden_bounty` pool of economy.toml.
+[[verbs]]
+name = "report"
+usage = "report"
+rooms = ["town_square"]
+file = "rooms/square.rhai"
+fn = "on_report"
+config = { silver = 20 }

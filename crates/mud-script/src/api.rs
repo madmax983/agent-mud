@@ -6,8 +6,12 @@
 //! do unbounded work.
 
 use mud_rules::{DamageDice, DamageType, DiceRng as _, EFFECTIVE_LIMIT, Outcome, success_roll};
+use std::collections::BTreeMap;
+
 use mud_world::hooks::{FlagValue, ScriptEffect};
 use mud_world::pack::Direction;
+use mud_world::rewards::REWARD_ITEMS_MAX;
+use mud_world::{PoolId, ProtoId};
 use rhai::{Array, Dynamic, Engine, Map, NativeCallContext};
 
 use crate::sandbox::{
@@ -51,6 +55,85 @@ fn hook_only(ctx: &NativeCallContext, name: &str, fx: ScriptEffect) -> RhaiResul
 fn direction(name: &str, d: &str) -> RhaiResult<Direction> {
     d.parse::<Direction>()
         .map_err(|()| fault(format!("{name}({d:?}): not a direction")))
+}
+
+/// The ask of `reward(pool, #{ currency, items })`: only those two keys,
+/// a currency of zero or more, and items as a map of prototype to a count
+/// of 1 to 16. The engine checks the pool, the prototypes and the budget.
+fn reward_ask(ask: &Map) -> RhaiResult<(i64, BTreeMap<ProtoId, u32>)> {
+    let mut currency = 0;
+    let mut items = BTreeMap::new();
+    for (k, v) in ask {
+        match k.as_str() {
+            "currency" => {
+                currency = v
+                    .as_int()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(|| fault("reward(): currency is an integer of 0 or more"))?;
+            }
+            "items" => {
+                let m = v
+                    .clone()
+                    .try_cast::<Map>()
+                    .ok_or_else(|| fault("reward(): items is a map of item id to count"))?;
+                for (p, n) in m {
+                    let n = n
+                        .as_int()
+                        .ok()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| (1..=REWARD_ITEMS_MAX).contains(n))
+                        .ok_or_else(|| {
+                            fault(format!(
+                                "reward(): items.{p} is a count of 1 to {REWARD_ITEMS_MAX}"
+                            ))
+                        })?;
+                    items.insert(ProtoId::new(p.as_str()), n);
+                }
+            }
+            other => {
+                return Err(fault(format!(
+                    "reward(): unknown key {other:?}; use currency and items"
+                )));
+            }
+        }
+    }
+    Ok((currency, items))
+}
+
+fn register_rewards(e: &mut Engine) {
+    e.register_fn(
+        "reward",
+        |ctx: NativeCallContext, pool: String, ask: Map| -> RhaiResult<Effect> {
+            let (currency, items) = reward_ask(&ask)?;
+            hook_only(
+                &ctx,
+                "reward",
+                ScriptEffect::Reward {
+                    pool: PoolId::new(pool),
+                    currency,
+                    items,
+                },
+            )
+        },
+    );
+    e.register_fn(
+        "reward",
+        |ctx: NativeCallContext, pool: String, currency: i64| -> RhaiResult<Effect> {
+            if currency < 0 {
+                return Err(fault("reward(): currency is an integer of 0 or more"));
+            }
+            hook_only(
+                &ctx,
+                "reward",
+                ScriptEffect::Reward {
+                    pool: PoolId::new(pool),
+                    currency,
+                    items: BTreeMap::new(),
+                },
+            )
+        },
+    );
 }
 
 fn register_effects(e: &mut Engine) {
@@ -321,6 +404,7 @@ pub fn register(e: &mut Engine) {
     register_maps(e);
     register_strings(e);
     register_effects(e);
+    register_rewards(e);
     register_dice(e);
     register_log_and_time(e);
     crate::view::register(e);

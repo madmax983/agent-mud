@@ -21,10 +21,11 @@ use crate::hooks::{
     ScriptEffect, TargetFacts, VIEW_LIST_CAP, WorldHooks, hook_allowed, hook_step, tally,
     tally_admissible, tally_reason, valid_flag_name,
 };
-use crate::ids::{EntityId, ItemId, RoomId};
+use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId};
 use crate::pack::{Direction, EntityKind};
 use crate::parser::{Command, forbidden_in_text};
-use crate::state::Entity;
+use crate::rewards::{MintRecord, MintedItem, PoolFacts};
+use crate::state::{Entity, Holder};
 
 /// The breaker state of one hook, for the observer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -76,6 +77,15 @@ impl HookCall {
             item: None,
         }
     }
+}
+
+/// One reward to mint.
+struct Mint<'a> {
+    room: &'a RoomId,
+    key: &'a str,
+    pool: &'a PoolId,
+    currency: i64,
+    items: &'a BTreeMap<ProtoId, u32>,
 }
 
 fn capped(message: &str) -> String {
@@ -322,7 +332,24 @@ impl World {
             item: call.item.and_then(|i| self.item_facts(i)),
             flags: self.state.flags.clone(),
             cast: self.cast_facts(),
+            pools: self.pool_facts(now_ms),
         }
+    }
+
+    /// What is left of every reward pool at `now_ms`.
+    #[must_use]
+    pub fn pool_facts(&self, now_ms: u64) -> BTreeMap<PoolId, PoolFacts> {
+        self.pack
+            .economy
+            .rewards
+            .iter()
+            .map(|(id, pool)| {
+                (
+                    id.clone(),
+                    pool.facts(self.state.pool_spent.get(id), now_ms),
+                )
+            })
+            .collect()
     }
 
     /// The input a dry run gives `hook` in `room`: a fresh player from the
@@ -406,7 +433,8 @@ impl World {
 
     // ------------------------------------------------------------ admission
 
-    /// Checks each effect against the world, before any is applied.
+    /// Checks each effect against the world at game time `now_ms`, before
+    /// any is applied.
     ///
     /// # Errors
     /// The first effect that cannot apply, and why.
@@ -415,6 +443,7 @@ impl World {
         room: &RoomId,
         actor: &EntityId,
         effects: &[ScriptEffect],
+        now_ms: u64,
     ) -> Result<(), String> {
         let def = self.pack.rooms.get(room);
         for fx in effects {
@@ -450,6 +479,21 @@ impl World {
                     if matches!(fx, ScriptEffect::Hurt(_)) && def.is_some_and(|r| r.safe) {
                         return Err("hurt() is not allowed in a safe room".to_owned());
                     }
+                    if !self.state.entities.get(actor).is_some_and(Entity::present) {
+                        return Err("the actor is not here".to_owned());
+                    }
+                }
+                ScriptEffect::Reward {
+                    pool,
+                    currency,
+                    items,
+                } => {
+                    let def =
+                        self.pack.economy.rewards.get(pool).ok_or_else(|| {
+                            format!("reward({pool}): no such pool in economy.toml")
+                        })?;
+                    def.admit(self.state.pool_spent.get(pool), now_ms, *currency, items)
+                        .map_err(|e| format!("reward({pool}): {e}"))?;
                     if !self.state.entities.get(actor).is_some_and(Entity::present) {
                         return Err("the actor is not here".to_owned());
                     }
@@ -500,7 +544,7 @@ impl World {
             if !tally_admissible(t, limits.max_effects, call.hook.is_command()) {
                 return Err(tally_reason(t, limits.max_effects, call.hook.is_command()));
             }
-            self.check_effects(&call.room, actor, &fx)?;
+            self.check_effects(&call.room, actor, &fx, ctx.now)?;
             Ok((fx, dice))
         });
         match checked {
@@ -615,9 +659,149 @@ impl World {
                 }
                 ScriptEffect::Heal(dice) => self.heal_actor(ctx, actor, dice),
                 ScriptEffect::Hurt(dice) => died = self.hurt_actor(ctx, actor, dice),
+                ScriptEffect::Reward {
+                    pool,
+                    currency,
+                    items,
+                } => {
+                    let mint = Mint {
+                        room: &call.room,
+                        key,
+                        pool: &pool,
+                        currency,
+                        items: &items,
+                    };
+                    if let Some(line) = self.mint(ctx, actor, &mint) {
+                        msgs.push(line);
+                    }
+                }
             }
         }
         HookRun::Applied { msgs, refused }
+    }
+
+    /// Mints an admitted reward for the actor: the pool's spent count
+    /// moves on, the money and the new items go to the actor, an event
+    /// tells the actor, and the ledger records it. Returns the line for
+    /// the actor. The ask was checked before any effect applied; it is
+    /// checked again here, and skipped (logged) if it no longer fits.
+    fn mint(&mut self, ctx: &mut Ctx, actor: &EntityId, m: &Mint<'_>) -> Option<String> {
+        let pack = Arc::clone(&self.pack);
+        let def = pack.economy.rewards.get(m.pool)?;
+        let admitted = def.admit(
+            self.state.pool_spent.get(m.pool),
+            ctx.now,
+            m.currency,
+            m.items,
+        );
+        let present = self.state.entities.get(actor).is_some_and(Entity::present);
+        let spent = match admitted {
+            Ok(s) if present => s,
+            Ok(_) => {
+                let line = format!("skipped reward({}): the actor is not here", m.pool);
+                self.script_log(ctx, m.key, actor, line);
+                return None;
+            }
+            Err(e) => {
+                let line = format!("skipped reward({}): {e}", m.pool);
+                self.script_log(ctx, m.key, actor, line);
+                return None;
+            }
+        };
+        let period = spent.period;
+        self.state.pool_spent.insert(m.pool.clone(), spent);
+        if m.currency > 0 {
+            self.change_currency(ctx, actor, m.currency);
+        }
+        let to = Holder::Entity {
+            entity: actor.clone(),
+        };
+        let mut made = Vec::new();
+        for (proto, n) in m.items {
+            for _ in 0..*n {
+                let id = self.state.new_item(proto, &pack);
+                self.state.attach(id, &to);
+                ctx.changes.push(StateChange::Item {
+                    item: id,
+                    proto: proto.clone(),
+                    from: None,
+                    to: Some(to.clone()),
+                });
+                made.push(MintedItem {
+                    id,
+                    proto: proto.clone(),
+                });
+            }
+        }
+        let line = self.reward_line(m.currency, m.items);
+        let spec = Emit {
+            only: Some(vec![actor.clone()]),
+            ..Emit::new(EventKind::System, Some(m.room.clone()), line.clone())
+                .actor(actor, "reward")
+                .tags(["script".to_owned(), m.key.to_owned(), "reward".to_owned()])
+                .data(json!({
+                    "pool": m.pool,
+                    "currency": m.currency,
+                    "items": made,
+                }))
+        };
+        let seq = self.emit(ctx, spec);
+        ctx.changes.push(StateChange::Minted {
+            pool: m.pool.clone(),
+            entity: actor.clone(),
+            currency: m.currency,
+            items: made.iter().map(|i| i.id).collect(),
+        });
+        self.audit.push(Audit::Minted {
+            hook: m.key.to_owned(),
+            entity: actor.clone(),
+            pool: m.pool.clone(),
+            currency: m.currency,
+            items: made.iter().map(|i| i.proto.clone()).collect(),
+            at_ms: ctx.now,
+        });
+        self.state.mints.push(MintRecord {
+            seq,
+            pool: m.pool.clone(),
+            period,
+            hook: m.key.to_owned(),
+            entity: actor.clone(),
+            currency: m.currency,
+            items: made,
+            at_ms: ctx.now,
+        });
+        Some(line)
+    }
+
+    /// The line a reward tells its receiver, such as `You receive 20s and
+    /// a healing draught.` Server text: pack names and numbers only.
+    fn reward_line(&self, currency: i64, items: &BTreeMap<ProtoId, u32>) -> String {
+        let mut parts = Vec::new();
+        if currency > 0 {
+            parts.push(format!("{currency}{}", self.pack.economy.currency.short));
+        }
+        for (proto, n) in items.iter().filter(|(_, n)| **n > 0) {
+            let name = self
+                .pack
+                .items
+                .get(proto)
+                .map_or_else(|| proto.to_string(), |d| d.name.clone());
+            let article = if name.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                "an"
+            } else {
+                "a"
+            };
+            parts.push(if *n == 1 {
+                format!("{article} {name}")
+            } else {
+                format!("{n} x {name}")
+            });
+        }
+        let list = match parts.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => parts.concat(),
+        };
+        format!("You receive {list}.")
     }
 
     /// Locks or unlocks an exit and its far side.

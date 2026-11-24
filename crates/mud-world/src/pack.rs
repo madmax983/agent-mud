@@ -15,7 +15,8 @@ use mud_rules::{Attributes, DamageDice, DamageType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ids::{EntityId, ProtoId, RoomId, ShopId, SkillId};
+use crate::ids::{EntityId, PoolId, ProtoId, RoomId, ShopId, SkillId};
+use crate::rewards::{POOL_CURRENCY_MAX, POOL_ITEMS_MAX, RewardPool, valid_pool_id};
 
 /// The words a command uses for the speaker. No player, and no cast
 /// entry, may answer to one.
@@ -542,6 +543,9 @@ pub struct Economy {
     /// The shops.
     #[serde(default)]
     pub shops: BTreeMap<ShopId, ShopDef>,
+    /// The reward pools world scripts may mint from (ADR 0010).
+    #[serde(default)]
+    pub rewards: BTreeMap<PoolId, RewardPool>,
 }
 
 /// What kind of entity it is, as the world shows it.
@@ -1035,6 +1039,9 @@ impl WorldPack {
                 }
             }
         }
+        for (id, pool) in &self.economy.rewards {
+            problems.extend(pool_problems(id, pool, &self.items));
+        }
         let template_items = self
             .player_template
             .inventory
@@ -1138,6 +1145,45 @@ impl WorldPack {
     pub fn trait_def(&self, name: &str) -> Option<&TraitDef> {
         self.traits.get(name)
     }
+}
+
+/// The problems of one reward pool: a valid id, a currency budget of 0 to
+/// [`POOL_CURRENCY_MAX`], known items of 1 to [`POOL_ITEMS_MAX`] each, and
+/// something to give.
+fn pool_problems(
+    id: &PoolId,
+    pool: &RewardPool,
+    items: &BTreeMap<ProtoId, ItemDef>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !valid_pool_id(id.as_str()) {
+        out.push(format!(
+            "reward pool {:?}: an id is 1 to 32 of a-z, 0-9 and _",
+            id.as_str()
+        ));
+    }
+    if !(0..=POOL_CURRENCY_MAX).contains(&pool.currency) {
+        out.push(format!(
+            "reward pool {id}: currency is 0 to {POOL_CURRENCY_MAX}"
+        ));
+    }
+    for (p, n) in &pool.items {
+        if !items.contains_key(p) {
+            out.push(format!(
+                "reward pool {id} names unknown item {:?}",
+                p.as_str()
+            ));
+        }
+        if !(1..=POOL_ITEMS_MAX).contains(n) {
+            out.push(format!(
+                "reward pool {id}: {p} is 1 to {POOL_ITEMS_MAX} a period"
+            ));
+        }
+    }
+    if pool.currency == 0 && pool.items.is_empty() {
+        out.push(format!("reward pool {id} gives nothing"));
+    }
+    out
 }
 
 fn room_check(
@@ -1260,6 +1306,45 @@ traits = [{ name = "nope", control = 12 }]
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn reward_pools_are_checked() {
+        let world = "[world]\nname = \"x\"\ntitle = \"x\"\nstart_room = \"a\"\nrespawn_room = \"a\"\n[[rooms]]\nid = \"a\"\ntitle = \"A\"\ndescription = \"a\"\n";
+        let items = "[items.ale]\nname = \"ale\"\n";
+        let load = |rewards: &str| {
+            WorldPack::from_sources(PackSources {
+                world,
+                skills: "",
+                items,
+                economy: &format!("[currency]\nname = \"gold\"\nshort = \"g\"\n{rewards}"),
+                cast: "",
+            })
+        };
+        let ok = load("[rewards.tavern_tab]\ncurrency = 5\nitems = { ale = 2 }\nper = \"day\"\n")
+            .unwrap();
+        let pool = &ok.economy.rewards[&PoolId::from("tavern_tab")];
+        assert_eq!(pool.per, crate::rewards::RewardPeriod::Day);
+        assert_eq!(pool.items[&ProtoId::from("ale")], 2);
+        let err = load(
+            "[rewards.Bad]\ncurrency = -1\nper = \"ever\"\n[rewards.empty]\nper = \"day\"\n[rewards.big]\nitems = { ghost = 0, ale = 1001 }\nper = \"day\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        for needle in [
+            "reward pool \"Bad\": an id is 1 to 32 of a-z, 0-9 and _",
+            "reward pool Bad: currency is 0 to 1000000",
+            "reward pool empty gives nothing",
+            "reward pool big names unknown item \"ghost\"",
+            "reward pool big: ghost is 1 to 1000 a period",
+            "reward pool big: ale is 1 to 1000 a period",
+        ] {
+            assert!(err.contains(needle), "{needle} missing from {err}");
+        }
+        let err = load("[rewards.x]\ncurrency = 5\nper = \"week\"\n").unwrap_err();
+        assert!(err.to_string().contains("parsing economy.toml"), "{err}");
+        let err = load("[rewards.x]\ncurrency = 5\nper = \"day\"\ncoins = 3\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

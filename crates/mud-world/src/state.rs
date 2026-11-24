@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::engine::LoginError;
 use crate::event::ActorRef;
 use crate::hooks::{FLAG_CAP, FlagValue, MARK_CAP};
-use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, ShopId, SkillId};
+use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId, Seq, ShopId, SkillId};
 use crate::pack::{
     CastDef, Direction, EntityKind, RoomDef, RoomItem, SELF_WORDS, Slot, Tier, TraitRef, WorldPack,
 };
+use crate::rewards::{MintRecord, PoolSpent};
 
 /// One entity.
 #[expect(
@@ -215,6 +216,13 @@ pub struct WorldState {
     /// off), so history says which version ran from which event.
     #[serde(default)]
     pub scripts_version: Option<String>,
+    /// What each reward pool has given in the period it counts in.
+    #[serde(default)]
+    pub pool_spent: BTreeMap<PoolId, PoolSpent>,
+    /// The ledger: every reward a script was ever given, in order. Money
+    /// and items are conserved except for these mints.
+    #[serde(default)]
+    pub mints: Vec<MintRecord>,
 }
 
 mod pairs {
@@ -349,6 +357,8 @@ impl WorldState {
             flags: BTreeMap::new(),
             hook_faults: BTreeMap::new(),
             scripts_version: None,
+            pool_spent: BTreeMap::new(),
+            mints: Vec::new(),
         };
         for (rid, def) in &pack.rooms {
             s.place_room_items(rid, def, pack);
@@ -461,6 +471,10 @@ impl WorldState {
                 self.entities.insert(id.clone(), e);
             }
         }
+        // A pool the pack dropped gives nothing more; the ledger keeps
+        // what it gave.
+        self.pool_spent
+            .retain(|p, _| pack.economy.rewards.contains_key(p));
     }
 
     /// Removes an item and everything inside it from the world.
@@ -694,12 +708,67 @@ impl WorldState {
         held + sealed
     }
 
+    /// The currency every ledgered mint made.
+    #[must_use]
+    pub fn minted_currency(&self) -> i64 {
+        self.mints.iter().map(|m| m.currency).sum()
+    }
+
+    /// Checks the ledger against the pack's pools. Returns each violation.
+    ///
+    /// - No pool has given more than its budget in the period it counts in.
+    /// - What a pool counts as given in its period is exactly the sum of
+    ///   its ledger entries for that period.
+    #[must_use]
+    pub fn check_rewards(&self, pack: &WorldPack) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (id, spent) in &self.pool_spent {
+            let Some(pool) = pack.economy.rewards.get(id) else {
+                bad.push(format!("pool {id} is spent but not in the pack"));
+                continue;
+            };
+            if i64::try_from(spent.currency).map_or(true, |c| c > pool.currency) {
+                bad.push(format!("pool {id} gave {} currency", spent.currency));
+            }
+            let ledger: Vec<&MintRecord> = self
+                .mints
+                .iter()
+                .filter(|m| &m.pool == id && m.period == spent.period)
+                .collect();
+            let money: i64 = ledger.iter().map(|m| m.currency).sum();
+            if i64::try_from(spent.currency).ok() != Some(money) {
+                bad.push(format!(
+                    "pool {id} counts {} currency; its ledger {money}",
+                    spent.currency
+                ));
+            }
+            for (proto, budget) in &pool.items {
+                let used = spent.items.get(proto).copied().unwrap_or(0);
+                if used > u64::from(*budget) {
+                    bad.push(format!("pool {id} made {used} {proto}"));
+                }
+                let made = ledger
+                    .iter()
+                    .flat_map(|m| &m.items)
+                    .filter(|i| &i.proto == proto)
+                    .count();
+                if u64::try_from(made).ok() != Some(used) {
+                    bad.push(format!(
+                        "pool {id} counts {used} {proto}; its ledger {made}"
+                    ));
+                }
+            }
+        }
+        bad
+    }
+
     /// Checks the structural invariants. Returns each violation.
     ///
     /// - Every item is in exactly one place.
     /// - Every equipped item is carried by the entity that equips it.
     /// - Every entity stands in a known room.
     /// - No entity has negative money.
+    /// - Every item the ledger names was made once, below `next_item`.
     #[must_use]
     pub fn check(&self) -> Vec<String> {
         let mut seen: BTreeMap<ItemId, usize> = BTreeMap::new();
@@ -748,6 +817,15 @@ impl WorldState {
                     "{} holds {} marks; the cap is {MARK_CAP}",
                     e.id,
                     e.marks.len()
+                ));
+            }
+        }
+        let mut minted = BTreeSet::new();
+        for item in self.mints.iter().flat_map(|m| &m.items) {
+            if item.id.0 >= self.next_item || !minted.insert(item.id) {
+                bad.push(format!(
+                    "the ledger names {} twice or ahead of time",
+                    item.id
                 ));
             }
         }

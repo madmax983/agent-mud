@@ -755,6 +755,18 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
             .into_response();
     };
     let status = app.game.read(mud_world::World::hook_status);
+    let now = app.game.now_ms();
+    let (pools, ledger) = app.game.read(|w| {
+        let mut minted: std::collections::BTreeMap<mud_world::PoolId, (usize, i64, usize)> =
+            std::collections::BTreeMap::new();
+        for m in &w.state().mints {
+            let e = minted.entry(m.pool.clone()).or_default();
+            e.0 += 1;
+            e.1 += m.currency;
+            e.2 += m.items.len();
+        }
+        (w.pool_facts(now), minted)
+    });
     let compiled = host.current();
     let max = compiled.limits.max_consecutive_faults;
     html! {
@@ -790,6 +802,22 @@ async fn observer_scripts(State(state): State<AppState>, Query(q): Query<Admin>)
                         form style="display:inline" hx-post=(format!("/observer/scripts/memory/{}/reset?token={token}", url_escape(id.as_str()))) hx-swap="none" {
                             button type="submit" { "Reset memory" }
                         }
+                    }
+                }
+            }
+        }
+        @if !pools.is_empty() {
+            table {
+                tr { th { "reward pool" } th { "left this period" } th { "ledger" } }
+                @for (id, left) in &pools {
+                    @let (mints, money, items) = ledger.get(id).copied().unwrap_or_default();
+                    tr {
+                        td { (id) " (per " (left.per.name()) ")" }
+                        td {
+                            "currency " (left.currency)
+                            @for (proto, n) in &left.items { ", " (proto) " " (n) }
+                        }
+                        td { (mints) " mints: currency " (money) ", " (items) " items" }
                     }
                 }
             }
@@ -940,6 +968,18 @@ pub fn script_line(a: &mud_world::Audit) -> Option<String> {
             if problems.len() == 1 { "" } else { "s" },
             problems.join(" · ")
         ),
+        Audit::Minted {
+            hook,
+            entity,
+            pool,
+            currency,
+            items,
+            ..
+        } => {
+            let mut what = vec![format!("currency {currency}")];
+            what.extend(items.iter().map(ToString::to_string));
+            format!("{hook} minted from {pool} ({entity}) · {}", what.join(", "))
+        }
         Audit::MindMemoryReset { entity, .. } => format!("memory reset for {entity}"),
         Audit::SelfControl { .. } | Audit::Command { .. } => return None,
     })

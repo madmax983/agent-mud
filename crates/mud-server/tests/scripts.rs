@@ -229,7 +229,7 @@ async fn a_bad_reload_keeps_the_old_scripts_and_a_good_one_changes_the_version()
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["previous"], old);
     assert_ne!(v["version"], old);
-    assert_eq!(v["files"], 6);
+    assert_eq!(v["files"], 7);
     let marker = built.mud.game.read(|w| w.state().scripts_version.clone());
     assert_eq!(
         marker.as_ref(),
@@ -316,6 +316,11 @@ async fn the_scripts_panel_shows_hooks_and_minds_escaped() {
     assert!(html.contains("Reload"), "the bundled pack re-arms: {html}");
     assert!(html.contains("0/3"), "each mind shows its faults: {html}");
     assert!(!html.contains("see feed"));
+    assert!(
+        html.contains("warden_bounty (per day)") && html.contains("currency 60, healing_draught 3"),
+        "the reward pools and what is left of them: {html}"
+    );
+    assert!(html.contains("0 mints: currency 0, 0 items"), "{html}");
     let host = built.mud.scripts.as_ref().unwrap();
     let hale = EntityId::from("guard_01");
     for _ in 0..3 {
@@ -358,6 +363,19 @@ async fn the_scripts_panel_shows_hooks_and_minds_escaped() {
         line, "verbs.pray log (pc_ada) · <b>bold</b>",
         "text for textContent"
     );
+    let line = web::script_line(&mud_world::Audit::Minted {
+        hook: "verbs.report".into(),
+        entity: EntityId::from("pc_ada"),
+        pool: mud_world::PoolId::from("warden_bounty"),
+        currency: 20,
+        items: vec![mud_world::ProtoId::from("healing_draught")],
+        at_ms: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        line,
+        "verbs.report minted from warden_bounty (pc_ada) · currency 20, healing_draught"
+    );
 }
 
 #[test]
@@ -365,7 +383,11 @@ fn check_reports_scripts_and_lists_every_problem() {
     let dir = pack_copy();
     let lines = check_pack(dir.path()).unwrap();
     assert!(lines[1].starts_with("scripts rhai-"), "{lines:?}");
-    assert!(lines[1].ends_with("(6 files: 1 mind, 2 rooms, 2 items, 2 verbs) — ok"));
+    assert!(lines[1].ends_with("(7 files: 1 mind, 2 rooms, 2 items, 3 verbs) — ok"));
+    assert!(
+        lines[0].ends_with("3 shops, 1 reward pool — ok"),
+        "{lines:?}"
+    );
     std::fs::write(dir.path().join("scripts/extra.rhai"), "fn x(ctx) { [] }").unwrap();
     let lines = check_pack(dir.path()).unwrap();
     assert_eq!(

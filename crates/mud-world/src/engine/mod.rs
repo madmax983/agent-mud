@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::event::{ActorRef, Event, EventKind};
 use crate::hooks::{WorldDice, WorldHooks};
-use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, SkillId};
+use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId, Seq, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WorldPack};
 use crate::parser::{Command, MAX_TEXT_CHARS, ParseError, forbidden_in_text, parse_with};
 use crate::state::{Entity, Holder, NameOwner, WorldState};
@@ -226,6 +226,19 @@ pub enum StateChange {
         /// The event.
         seq: Seq,
     },
+    /// A script's reward was minted from a pack pool and recorded in the
+    /// ledger. The money and the new items also appear as `currency` and
+    /// `item` changes (an item from nowhere).
+    Minted {
+        /// The pool.
+        pool: PoolId,
+        /// Who received it.
+        entity: EntityId,
+        /// The currency made.
+        currency: i64,
+        /// The items made.
+        items: Vec<ItemId>,
+    },
 }
 
 /// The result of one command. The wire form of `mud_command`.
@@ -333,6 +346,21 @@ pub enum Audit {
         version: String,
         /// Every problem found.
         problems: Vec<String>,
+        /// When.
+        at_ms: u64,
+    },
+    /// A world hook's reward was minted and recorded in the ledger.
+    Minted {
+        /// The hook key.
+        hook: String,
+        /// Who received it.
+        entity: EntityId,
+        /// The pool.
+        pool: PoolId,
+        /// The currency made.
+        currency: i64,
+        /// The prototypes of the items made.
+        items: Vec<ProtoId>,
         /// When.
         at_ms: u64,
     },

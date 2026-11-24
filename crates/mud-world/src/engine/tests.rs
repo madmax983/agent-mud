@@ -616,7 +616,12 @@ proptest! {
             w.tick(now);
             let bad = w.state.check();
             prop_assert!(bad.is_empty(), "{:?} after {}", bad, LINES[line]);
-            prop_assert_eq!(w.state.total_currency(&w.pack), money, "money is conserved");
+            prop_assert_eq!(
+                w.state.total_currency(&w.pack),
+                money + w.state.minted_currency(),
+                "money is conserved except for ledgered mints"
+            );
+            prop_assert!(w.state.mints.is_empty(), "no scripts, no mints");
         }
     }
 }
