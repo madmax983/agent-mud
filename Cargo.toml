@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/mud-rules",
     "crates/mud-world",
-    # "crates/mud-mcp",
+    "crates/mud-mcp",
     "crates/mud-supervisor",
     # "crates/mud-server",
 ]
