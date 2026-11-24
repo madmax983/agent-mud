@@ -7,6 +7,7 @@ use crate::DiceRng;
 /// How a success roll came out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// mirror-begin outcome
 pub enum Outcome {
     /// A critical success. An attack that crits cannot be defended.
     CriticalSuccess,
@@ -17,6 +18,7 @@ pub enum Outcome {
     /// A critical failure.
     CriticalFailure,
 }
+// mirror-end outcome
 
 impl Outcome {
     /// Whether the roll succeeded, critically or not.
@@ -66,6 +68,13 @@ pub struct SuccessRoll {
     pub outcome: Outcome,
 }
 
+/// The effective skill that [`classify`] sees is clamped to
+/// `-EFFECTIVE_LIMIT..=EFFECTIVE_LIMIT`, the range its Verus proof assumes.
+/// The clamp never changes an outcome: `formal/verus` proves that every
+/// total classifies the same against `effective` and against the clamped
+/// value. It only keeps `total - effective` from overflowing.
+const EFFECTIVE_LIMIT: i32 = 100;
+
 /// Rolls 3d6 against `effective`.
 pub fn success_roll(rng: &mut dyn DiceRng, effective: i32) -> SuccessRoll {
     let dice = rng.roll_3d6();
@@ -75,7 +84,7 @@ pub fn success_roll(rng: &mut dyn DiceRng, effective: i32) -> SuccessRoll {
         total,
         target: effective,
         margin: effective - i32::from(total),
-        outcome: classify(total, effective),
+        outcome: classify(total, effective.clamp(-EFFECTIVE_LIMIT, EFFECTIVE_LIMIT)),
     }
 }
 
@@ -127,6 +136,14 @@ mod tests {
                 Outcome::CriticalSuccess => 3,
             };
             prop_assert!(rank(classify(total, eff + 1)) >= rank(classify(total, eff)));
+        }
+
+        #[test]
+        fn clamping_the_skill_never_changes_the_outcome(total in any::<u8>(), eff in -100_000i32..100_000) {
+            prop_assert_eq!(
+                classify(total, eff),
+                classify(total, eff.clamp(-EFFECTIVE_LIMIT, EFFECTIVE_LIMIT))
+            );
         }
     }
 }

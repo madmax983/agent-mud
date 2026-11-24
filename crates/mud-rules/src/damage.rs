@@ -11,6 +11,7 @@ use crate::DiceRng;
 /// The type of a hit. It sets the wounding multiplier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// mirror-begin damage_type
 pub enum DamageType {
     /// Blunt force: ×1.
     Crushing,
@@ -21,6 +22,7 @@ pub enum DamageType {
     /// Fire and acid: ×1.
     Burn,
 }
+// mirror-end damage_type
 
 impl DamageType {
     /// The short tag used in world packs and logs.
@@ -46,6 +48,12 @@ impl DamageType {
         }
     }
 }
+
+/// The bound on `raw` and `dr` that the Verus proof of [`injury`] assumes:
+/// both in `-INJURY_LIMIT..=INJURY_LIMIT`, so nothing overflows. Callers
+/// clamp to it. Honest dice (faces 1 to 6, at most 255 of them) roll at
+/// most 1657, and any DR above the limit stops such a roll either way.
+pub const INJURY_LIMIT: i32 = 10_000;
 
 // mirror-begin injury
 /// The injury of a hit: penetration after DR, times the wounding
