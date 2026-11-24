@@ -175,7 +175,7 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
 fn budgets(
     pack: &WorldPack,
     given: &BTreeMap<String, u64>,
-) -> anyhow::Result<HashMap<EntityId, u64>> {
+) -> anyhow::Result<HashMap<EntityId, Option<u64>>> {
     let unknown: Vec<&str> = given
         .keys()
         .filter(|k| !pack.cast.contains_key(&EntityId::new((*k).clone())))
@@ -187,9 +187,10 @@ fn budgets(
             unknown.join(", ")
         );
     }
+    // 0 is no limit, as it is for `daily_token_budget`.
     Ok(given
         .iter()
-        .map(|(k, v)| (EntityId::new(k.clone()), *v))
+        .map(|(k, v)| (EntityId::new(k.clone()), (*v > 0).then_some(*v)))
         .collect())
 }
 
@@ -332,10 +333,14 @@ mod tests {
         let err = budgets(&pack, &stale).unwrap_err().to_string();
         assert!(err.contains("kestrel"), "{err}");
         assert!(!err.contains("torin"), "{err}");
-        let good = BTreeMap::from([("pc_kestrel".to_owned(), 600_000)]);
+        let good = BTreeMap::from([("pc_kestrel".to_owned(), 600_000), ("torin".to_owned(), 0)]);
         assert_eq!(
             budgets(&pack, &good).unwrap(),
-            HashMap::from([(EntityId::new("pc_kestrel"), 600_000)])
+            HashMap::from([
+                (EntityId::new("pc_kestrel"), Some(600_000)),
+                (EntityId::new("torin"), None),
+            ]),
+            "0 is no limit, as for daily_token_budget"
         );
     }
 

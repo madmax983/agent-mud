@@ -213,6 +213,8 @@ pub struct WakeContext {
     pub login: bool,
     /// A stable id for this wake, usable as an idempotency key.
     pub wake_id: String,
+    /// When the wake started, from the game clock (ms since the epoch).
+    pub now_ms: u64,
 }
 
 /// A mind.

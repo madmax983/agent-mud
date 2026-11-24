@@ -113,6 +113,7 @@ async fn a_reply_after_the_wake_was_given_up_is_still_charged() {
             "hello".into(),
             torin.clone(),
             Arc::clone(&sink),
+            no_ledger(&dir),
         ),
     )
     .await;
@@ -147,11 +148,122 @@ async fn a_reply_in_time_is_not_charged_twice() {
         "x".into(),
         torin.clone(),
         Arc::clone(&sink),
+        no_ledger(&dir),
     )
     .await
     .unwrap();
     assert_eq!(r.usage.tokens(), 12);
     assert!(sink.take(&torin).is_zero());
+}
+
+/// A charge with no ledger file: the daemon's reported usage stands.
+fn no_ledger(dir: &tempfile::TempDir) -> Charge {
+    Charge {
+        meter: Arc::new(LedgerMeter::new(dir.path().join("no-ledger.db"))),
+        now_ms: NOW,
+    }
+}
+
+/// A charge read from a ledger in `dir`, with `tokens` already spent.
+fn ledger_with(dir: &tempfile::TempDir, tokens: &[i64]) -> Charge {
+    let (path, conn) = crate::ledger::fake::ledger(dir.path());
+    for (i, t) in tokens.iter().enumerate() {
+        crate::ledger::fake::call(&conn, i64::try_from(i).unwrap(), *t, 0, None, NOW - 1);
+    }
+    Charge {
+        meter: Arc::new(LedgerMeter::new(path)),
+        now_ms: NOW,
+    }
+}
+
+/// Midday, some day.
+const NOW: u64 = 20_000 * 86_400_000 + 43_200_000;
+
+#[tokio::test]
+async fn a_no_answer_is_charged_from_the_ledger() {
+    // Regression: "I used every tool round" came back as a NoAnswer with
+    // no usage, so every token of the op went uncharged.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let _s = fake_daemon(
+        &sock,
+        r#"{"kind":"no_answer","reason":"I used every tool round that one message gets. Ask me to go on"}"#,
+    );
+    let torin = EntityId::from("torin");
+    let sink = Arc::new(UsageSink::default());
+    let charge = ledger_with(&dir, &[3_000, 4_000]);
+    let r = chat_charged(
+        sock,
+        "w".into(),
+        "x".into(),
+        torin.clone(),
+        Arc::clone(&sink),
+        charge,
+    )
+    .await
+    .unwrap();
+    assert!(r.text.unwrap().contains("every tool round"));
+    assert_eq!(r.usage.tokens(), 7_000);
+    assert_eq!(r.usage.calls, 2);
+    assert!(sink.take(&torin).is_zero(), "charged once, in the reply");
+}
+
+#[tokio::test]
+async fn the_ledger_replaces_reported_usage_so_nothing_is_charged_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let _s = fake_daemon(
+        &sock,
+        r#"{"kind":"reply","text":"ok","usage":{"calls":1,"input_tokens":10,"output_tokens":2,"cost_usd_micros":0}}"#,
+    );
+    let torin = EntityId::from("torin");
+    let sink = Arc::new(UsageSink::default());
+    let r = chat_charged(
+        sock,
+        "w".into(),
+        "x".into(),
+        torin.clone(),
+        Arc::clone(&sink),
+        ledger_with(&dir, &[12, 500]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.usage.tokens(), 512, "the ledger has the whole op");
+    assert!(sink.take(&torin).is_zero());
+}
+
+#[tokio::test]
+async fn a_wake_that_waits_for_approval_still_pays() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let _s = fake_daemon(&sock, r#"{"kind":"waiting","approval":3}"#);
+    let torin = EntityId::from("torin");
+    let sink = Arc::new(UsageSink::default());
+    let e = chat_charged(
+        sock,
+        "w".into(),
+        "x".into(),
+        torin.clone(),
+        Arc::clone(&sink),
+        ledger_with(&dir, &[900]),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("approval 3"));
+    assert_eq!(
+        sink.take(&torin).tokens(),
+        900,
+        "an error wake's spend goes to the sink"
+    );
+}
+
+#[tokio::test]
+async fn spend_between_wakes_is_owed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let charge = ledger_with(&dir, &[250]);
+    assert_eq!(charge.settle(&torin, Usage::default()).await.tokens(), 250);
+    assert!(charge.settle(&torin, Usage::default()).await.is_zero());
 }
 
 /// Runs a real `lg serve` when `LG_BIN` names one (the CI job that builds
@@ -189,6 +301,7 @@ async fn a_real_lg_serve_answers_a_wake() {
         macro_ticks: 1,
         login: false,
         wake_id: "wake-torin-0-1".into(),
+        now_ms: NOW,
     };
     let r = mind
         .wake(ctx, MudTools::new(game, typing, torin.clone()))
@@ -198,6 +311,13 @@ async fn a_real_lg_serve_answers_a_wake() {
     assert!(
         r.text.unwrap_or_default().contains("offline"),
         "the offline model echoes"
+    );
+    // The meter reads the live daemon's database through its own
+    // read-only handle while the daemon still holds it.
+    let live = LedgerMeter::new(dir.path().join("torin/lg.db"));
+    assert!(
+        matches!(live.charge(NOW), Ok(Some(_))),
+        "the ledger of a running lg serve is readable"
     );
     mind.shutdown().await;
 }

@@ -250,7 +250,7 @@ async fn two_macro_ticks_merged_while_busy_count_once() {
 #[tokio::test]
 async fn a_spent_budget_falls_back_to_canned_flavor() {
     let mut cfg = quiet();
-    cfg.budgets.insert(EntityId::from("torin"), 100);
+    cfg.budgets.insert(EntityId::from("torin"), Some(100));
     let r = rig(cfg);
     let mut rx = r.game.subscribe();
     r.sup.record_spend(
@@ -291,6 +291,36 @@ async fn a_spent_budget_falls_back_to_canned_flavor() {
         .find(|e| e["id"] == "torin")
         .unwrap();
     assert_eq!(torin["budget"]["level"], "hard");
+}
+
+#[test]
+fn a_per_entity_unlimited_budget_overrides_the_default() {
+    // Regression: `[supervisor.budgets] pc_kestrel = 0` meant a hard cap
+    // of zero tokens, while `daily_token_budget = 0` meant no limit.
+    let mut cfg = quiet();
+    cfg.daily_token_budget = Some(10);
+    cfg.budgets.insert(EntityId::from("torin"), None);
+    let r = rig(cfg);
+    let big = Usage {
+        calls: 1,
+        input_tokens: 1_000_000,
+        output_tokens: 1,
+        cost_usd_micros: 0,
+    };
+    r.sup.record_spend(&EntityId::from("torin"), big);
+    r.sup.record_spend(&EntityId::from("marta"), big);
+    let snap = r.sup.snapshot();
+    let level = |id: &str| {
+        snap["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap()["budget"]["level"]
+            .clone()
+    };
+    assert_eq!(level("torin"), "normal");
+    assert_eq!(level("marta"), "hard");
 }
 
 #[tokio::test]

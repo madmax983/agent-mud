@@ -295,6 +295,7 @@ mod tests {
             macro_ticks: 0,
             login: false,
             wake_id: "w1".into(),
+            now_ms: 0,
         };
         let r = mind
             .wake(ctx, MudTools::new(Arc::clone(&game), typing, guard.clone()))
@@ -382,6 +383,7 @@ mod tests {
             macro_ticks: 0,
             login: false,
             wake_id: "w1".into(),
+            now_ms: 0,
         };
         let tools = MudTools::new(Arc::clone(&game), typing, guard.clone());
         let cut = tokio::time::timeout(

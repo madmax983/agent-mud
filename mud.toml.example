@@ -42,6 +42,7 @@ bin = "lg"
 data_dir = "data/agents"
 provider = "openrouter"          # offline | claude | openai | openrouter
 # base_url = "http://127.0.0.1:8080/v1"
+max_steps = 24                   # tool rounds per wake; more ends the wake with no answer
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
 
@@ -51,5 +52,5 @@ typing_scale = 1.0               # Turing PC typing holds; 0 for demos
 macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
 first_macro_tick_secs = [30, 120]
 step_ms = 250
-[supervisor.budgets]
+[supervisor.budgets]                 # by entity id; 0 is unlimited
 pc_kestrel = 600000

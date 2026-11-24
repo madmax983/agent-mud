@@ -103,6 +103,7 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         macro_ticks: 1,
         login: false,
         wake_id: "wake-torin-0-1".into(),
+        now_ms: 0,
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
     let r = mind.wake(ctx.clone(), tools.clone()).await.unwrap();
@@ -221,6 +222,7 @@ async fn a_timed_out_wake_is_charged_when_its_job_ends() {
         macro_ticks: 0,
         login: false,
         wake_id: id.into(),
+        now_ms: 0,
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
     let cut = tokio::time::timeout(

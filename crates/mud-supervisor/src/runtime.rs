@@ -34,8 +34,8 @@ pub struct SupervisorConfig {
     pub seed: u64,
     /// The default daily token budget of each agent. `None` is unlimited.
     pub daily_token_budget: Option<u64>,
-    /// Per-entity budgets that override the default.
-    pub budgets: HashMap<EntityId, u64>,
+    /// Per-entity budgets that override the default. `None` is unlimited.
+    pub budgets: HashMap<EntityId, Option<u64>>,
     /// Scales macro-tick intervals (1.0: the cast's hours are hours).
     pub macro_tick_scale: f64,
     /// When the first macro-tick comes after start, in seconds.
@@ -166,7 +166,11 @@ impl Supervisor {
         let now = game.now_ms();
         let mut state = HashMap::new();
         for id in minds.keys() {
-            let limit = cfg.budgets.get(id).copied().or(cfg.daily_token_budget);
+            let limit = cfg
+                .budgets
+                .get(id)
+                .copied()
+                .unwrap_or(cfg.daily_token_budget);
             let h = mix(cfg.seed, &[id.as_str().as_bytes(), b"first-macro"]);
             let first = pick(
                 h,
@@ -392,6 +396,7 @@ impl Supervisor {
         let macro_ticks = lock(&self.state)
             .get(&wake.entity)
             .map_or(0, |s| s.macro_ticks);
+        let now_ms = self.game.now_ms();
         self.game.read(|w| {
             let e = w.entity(&wake.entity);
             let events: Vec<Event> = w
@@ -415,8 +420,9 @@ impl Supervisor {
                     "wake-{}-{}-{}",
                     wake.entity,
                     wake.seqs.last().map_or(0, |s| s.0),
-                    self.game.now_ms()
+                    now_ms
                 ),
+                now_ms,
             }
         })
     }

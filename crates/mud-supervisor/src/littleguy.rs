@@ -25,6 +25,7 @@ use tokio::process::{Child, Command};
 
 use tokio::sync::{Mutex, oneshot};
 
+use crate::ledger::LedgerMeter;
 use crate::mind::{
     BoxFuture, Mind, MindError, MindReply, MudTools, Usage, UsageSink, WakeContext, system_prompt,
     wake_message,
@@ -54,7 +55,8 @@ pub struct LittleguyConfig {
     pub model_name: Option<String>,
     /// `--base-url`, for an OpenAI-compatible server.
     pub base_url: Option<String>,
-    /// Tool rounds per wake.
+    /// Tool rounds per wake. A wake walks, looks, reads and speaks, each a
+    /// round, so this must leave room for a short errand.
     pub max_steps: u32,
     /// Minutes between reflection heartbeats; 0 turns them off.
     pub heartbeat_minutes: u32,
@@ -71,7 +73,7 @@ impl Default for LittleguyConfig {
             provider: "offline".into(),
             model_name: None,
             base_url: None,
-            max_steps: 8,
+            max_steps: 24,
             heartbeat_minutes: 240,
             start_timeout_secs: 30,
         }
@@ -247,29 +249,68 @@ pub async fn chat(socket: &Path, message_id: &str, text: &str) -> Result<MindRep
     }
 }
 
+/// Where a wake's spend is read from: the daemon's cost ledger, as of the
+/// wake's start.
+#[derive(Debug, Clone)]
+pub(crate) struct Charge {
+    /// The daemon's ledger.
+    pub meter: Arc<LedgerMeter>,
+    /// The wake's start, which fixes the budget day.
+    pub now_ms: u64,
+}
+
+impl Charge {
+    /// The spend to charge now: what the ledger has that was not charged
+    /// yet, or `reported` when there is no ledger to read.
+    pub async fn settle(&self, entity: &EntityId, reported: Usage) -> Usage {
+        let (meter, now) = (Arc::clone(&self.meter), self.now_ms);
+        match tokio::task::spawn_blocking(move || meter.charge(now)).await {
+            Ok(Ok(Some(spent))) => spent,
+            Ok(Ok(None)) => reported,
+            Ok(Err(e)) => {
+                tracing::warn!(%entity, error = %e, "littleguy ledger unreadable; charging the reported usage");
+                reported
+            }
+            Err(e) => {
+                tracing::warn!(%entity, error = %e, "littleguy ledger read failed; charging the reported usage");
+                reported
+            }
+        }
+    }
+}
+
 /// [`chat`] on a task of its own. `lg serve` finishes an op after its
 /// wake is given up (a timeout), so the reply is read whatever happens to
-/// the wake; if nobody waits for it any more, its usage goes to `sink`.
+/// the wake.
 ///
-/// Spend the daemon never reports (a `waiting` or `busy` answer, a daemon
-/// that dies mid-op, a reply later than [`LATE_REPLY_GRACE`]) stays
-/// uncharged: only littleguy's own cost ledger has it.
+/// Whatever the answer (a reply, no answer, a wait for approval, an error,
+/// or nothing within [`LATE_REPLY_GRACE`]), the spend is read from the
+/// daemon's ledger (see [`crate::ledger`]) and goes in exactly one place:
+/// the reply, if the wake still waits for it, else `sink`. Spend the daemon
+/// makes after that is charged by the next wake.
 pub(crate) async fn chat_charged(
     socket: PathBuf,
     message_id: String,
     text: String,
     entity: EntityId,
     sink: Arc<UsageSink>,
+    charge: Charge,
 ) -> Result<MindReply, MindError> {
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let Ok(out) =
-            tokio::time::timeout(LATE_REPLY_GRACE, chat(&socket, &message_id, &text)).await
-        else {
-            return;
-        };
-        if let Err(Ok(r)) = tx.send(out) {
-            sink.add(&entity, r.usage);
+        let out = tokio::time::timeout(LATE_REPLY_GRACE, chat(&socket, &message_id, &text)).await;
+        match out {
+            Ok(Ok(mut r)) => {
+                r.usage = charge.settle(&entity, r.usage).await;
+                if let Err(Ok(r)) = tx.send(Ok(r)) {
+                    sink.add(&entity, r.usage);
+                }
+            }
+            Ok(Err(e)) => {
+                sink.add(&entity, charge.settle(&entity, Usage::default()).await);
+                let _ = tx.send(Err(e));
+            }
+            Err(_) => sink.add(&entity, charge.settle(&entity, Usage::default()).await),
         }
     });
     rx.await
@@ -288,6 +329,7 @@ pub struct LittleguyMind {
     cfg: LittleguyConfig,
     personas: HashMap<EntityId, Persona>,
     daemons: Mutex<HashMap<EntityId, Daemon>>,
+    meters: std::sync::Mutex<HashMap<EntityId, Arc<LedgerMeter>>>,
 }
 
 impl LittleguyMind {
@@ -298,7 +340,21 @@ impl LittleguyMind {
             cfg,
             personas,
             daemons: Mutex::new(HashMap::new()),
+            meters: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The ledger meter of `entity`'s daemon.
+    fn meter(&self, entity: &EntityId) -> Arc<LedgerMeter> {
+        let mut meters = self
+            .meters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            meters.entry(entity.clone()).or_insert_with(|| {
+                Arc::new(LedgerMeter::new(self.entity_dir(entity).join("lg.db")))
+            }),
+        )
     }
 
     /// The folder of one entity.
@@ -419,6 +475,14 @@ impl Mind for LittleguyMind {
         tools: MudTools,
     ) -> BoxFuture<'_, Result<MindReply, MindError>> {
         Box::pin(async move {
+            let charge = Charge {
+                meter: self.meter(&ctx.entity),
+                now_ms: ctx.now_ms,
+            };
+            // Spend since the last wake (a heartbeat, an op that outlived
+            // its wake) is owed before this wake adds its own.
+            let between = charge.settle(&ctx.entity, Usage::default()).await;
+            tools.usage_sink().add(&ctx.entity, between);
             let socket = self.ensure(&ctx.entity).await?;
             chat_charged(
                 socket,
@@ -426,6 +490,7 @@ impl Mind for LittleguyMind {
                 wake_message(&ctx),
                 ctx.entity.clone(),
                 Arc::clone(tools.usage_sink()),
+                charge,
             )
             .await
         })

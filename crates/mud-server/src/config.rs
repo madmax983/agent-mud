@@ -220,6 +220,9 @@ pub struct LittleguySection {
     pub model_names: BTreeMap<String, String>,
     /// `--base-url`.
     pub base_url: Option<String>,
+    /// Tool rounds one wake may use. A wake that needs more ends with no
+    /// answer (and is still charged).
+    pub max_steps: u32,
 }
 
 impl Default for LittleguySection {
@@ -230,6 +233,7 @@ impl Default for LittleguySection {
             provider: "offline".into(),
             model_names: BTreeMap::new(),
             base_url: None,
+            max_steps: mud_supervisor::littleguy::LittleguyConfig::default().max_steps,
         }
     }
 }
@@ -240,7 +244,7 @@ impl Default for LittleguySection {
 pub struct SupervisorSection {
     /// Tokens per agent per UTC day. 0 means no limit.
     pub daily_token_budget: u64,
-    /// Per-entity budgets.
+    /// Per-entity budgets, by entity id. 0 means no limit.
     pub budgets: BTreeMap<String, u64>,
     /// Scales the Turing typing holds (1.0 is a real typist).
     pub typing_scale: f64,
