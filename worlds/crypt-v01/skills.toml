@@ -1,0 +1,83 @@
+# Skills of crypt-v01. Each skill names its controlling attribute and its
+# difficulty. An untrained entity rolls the default: attribute -4 (easy),
+# -5 (average) or -6 (hard). `combat` marks a weapon skill that can parry.
+# `effect` names an engine effect of a success: `pick_lock` opens a lock
+# (the lock sets the modifier), `hide` hides the actor, `haggle` takes 10%
+# off the next purchase from the target keeper. Any other skill rolls and
+# reports the result to the room; the minds decide what it means.
+[skills.shortsword]
+name = "Shortsword"
+attr = "dx"
+difficulty = "average"
+combat = true
+
+[skills.broadsword]
+name = "Broadsword"
+attr = "dx"
+difficulty = "average"
+combat = true
+
+[skills.spear]
+name = "Spear"
+attr = "dx"
+difficulty = "average"
+combat = true
+
+[skills.brawling]
+name = "Brawling"
+attr = "dx"
+difficulty = "easy"
+combat = true
+
+[skills.stealth]
+name = "Stealth"
+attr = "dx"
+difficulty = "average"
+effect = "hide"
+
+[skills.lockpicking]
+name = "Lockpicking"
+attr = "iq"
+difficulty = "average"
+effect = "pick_lock"
+
+[skills.merchant]
+name = "Merchant"
+attr = "iq"
+difficulty = "average"
+effect = "haggle"
+
+[skills.fast_talk]
+name = "Fast-Talk"
+attr = "iq"
+difficulty = "average"
+
+[skills.detect_lies]
+name = "Detect Lies"
+attr = "iq"
+difficulty = "hard"
+
+[skills.streetwise]
+name = "Streetwise"
+attr = "iq"
+difficulty = "average"
+
+[skills.smith]
+name = "Smith"
+attr = "iq"
+difficulty = "average"
+
+[skills.intimidate]
+name = "Intimidation"
+attr = "iq"
+difficulty = "average"
+
+[skills.observation]
+name = "Observation"
+attr = "iq"
+difficulty = "average"
+
+[skills.first_aid]
+name = "First Aid"
+attr = "iq"
+difficulty = "easy"

@@ -1,0 +1,4 @@
+# Matches littleguy and autumn-harvest so all three lint with one release.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

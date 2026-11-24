@@ -1,0 +1,31 @@
+# The currency and the shops of crypt-v01.
+[currency]
+name = "silver"
+short = "s"
+
+# A shop belongs to an entity of cast.toml. `stock` items start in its
+# inventory and are merchandise: the server refuses to let the keeper
+# give them away without a sale (POLICY_TRADE_REQUIRED).
+# `buys` lists the tags or item ids the keeper buys, at `buy_rate` of the
+# value. `prices` overrides the buying price of one item.
+[shops.marta]
+keeper = "marta"
+stock = ["ale", "ale", "ale", "ale", "ale", "torch", "torch", "healing_draught"]
+buys = ["loot"]
+buy_rate = 0.4
+sell_markup = 1.0
+
+[shops.torin]
+keeper = "torin"
+stock = ["broadsword", "shortsword", "dagger", "leather_jerkin", "lantern", "spear"]
+buys = ["iron_ore"]
+buy_rate = 0.5
+sell_markup = 1.0
+prices = { iron_ore = 15 }
+
+[shops.vich]
+keeper = "vich"
+stock = ["grate_key", "bandage", "bandage", "torch"]
+buys = ["loot", "ore"]
+buy_rate = 0.6
+sell_markup = 1.0
