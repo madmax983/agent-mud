@@ -19,16 +19,22 @@ cargo run -p mud-server --bin mud -- serve
 It needs no key and no network. Every mind runs on the cast's deterministic
 scripts. Then:
 
-- open <http://127.0.0.1:3000/>, type a name, and play (`help` lists the verbs);
+- open <http://127.0.0.1:3000/>, type a name, choose a password (8 or more
+  characters, typed twice), and play (`help` lists the verbs). Next time the
+  name asks for that password; tick "stay signed in" to skip it on this
+  browser, and type `logout` to make the browser forget you. `password`
+  changes it, `quit` leaves;
 - open the observer link printed in the log (`/observer?token=…`) to watch
   wake decisions, self-control rolls and token burn. For an agent played by
   littleguy, its **littleguy ↗** link signs you in to that daemon's own
   pages (goals, notes, skills, memory, history). Those pages listen on
   loopback, so open the link on the MUD's machine (or through an SSH
   tunnel);
-- or `telnet 127.0.0.1 4000` after setting `[server] telnet` in `mud.toml`.
-  Both close a client that gives no name within `login_timeout_ms` (60 s)
-  or stays silent for `idle_timeout_ms` (1 h). Together they admit at most
+- or `telnet 127.0.0.1 4000` after setting `[server] telnet` in `mud.toml`
+  (the server turns echo off at password prompts).
+  Both close a client that has not finished its login within
+  `login_timeout_ms` (5 min, name to last password) or stays silent for
+  `idle_timeout_ms` (1 h). Together they admit at most
   `max_connections` (512) clients, `max_connections_per_address` (8) from
   one address; behind a reverse proxy set `trusted_proxies`.
 
@@ -43,8 +49,42 @@ cargo run -p mud-server --bin mud -- smoke
 #15   [notice_market] kestrel studies the notice board.
 #22   [rusty_flagon_taproom] wanderer arrives from the west.
 #25   [rusty_flagon_taproom] kestrel says something. "yo wanderer you going down the cellar? need a 2nd blade for the ossuary, split 50/50"
-smoke: PASS (bounty posted, board read, human recruited)
+smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered)
 ```
+
+## Accounts
+
+Each human character has a password (ADR 0009). Passwords, bcrypt hashes
+and browser tokens live in `accounts.db`, beside `world.db` and never in
+the world: no event, view, log line or script sees them. Back up
+`world.db` and `accounts.db` together; a lost `accounts.db` makes every
+human character claimable again (the server warns at start).
+
+Characters saved before accounts are *legacy*. With `[accounts] legacy =
+"claim"` (the default) the first password typed twice claims one, within
+30 days. On a public server, and for strict Turing runs, use `"sealed"`:
+while claims are open, a probe that types a password learns whether a name
+is an unclaimed human, so the hidden PC can stand out by elimination. A
+sealed character opens only with a temporary password from its keeper:
+
+```sh
+mud account list               # origin (created, claimed, reset), logins, browsers
+mud account reset ada          # prints a temporary password once; ada must change it
+mud account lock ada           # refuses logins; live sessions end within 30 s
+mud account unlock ada
+mud account signout ada        # forgets every remembered browser, ends sessions
+```
+
+Players who cannot log in should ask the keeper of the world for a reset.
+Wrong passwords are throttled per name and address before any hashing, and
+the hidden PC answers a login exactly as a protected account does.
+
+Telnet and plain http carry passwords in clear text. On a public server,
+bind telnet to loopback (or leave it unset), put a TLS proxy in front,
+set `public_url = "https://…"` and `trusted_proxies`; the server refuses an
+https `public_url` without `trusted_proxies`, and warns about cleartext
+binds. Logs never include WebSocket frames: the `tungstenite` targets stay
+at INFO whatever `MUD_LOG` says.
 
 ## Real minds
 
@@ -107,6 +147,7 @@ flowchart LR
 |---|---|
 | `mud-rules` | The GURPS-like core: 3d6 success rolls with criticals, damage dice and the ST table, injury after DR, wound states, defenses, self-control rolls. No I/O. |
 | `mud-world` | World packs, the verb parser, the deterministic engine, events with `untrusted_text`, the SQLite store, and `Game` (shared, persistent, broadcasting). |
+| `mud-accounts` | Player accounts (ADR 0009): bcrypt hashes, web resume tokens and login throttles in `accounts.db`, the proved login route and backoff kernels. Never in the world. |
 | `mud-mcp` | The MCP server (rmcp, streamable HTTP): six tools (look, sheet, events, command, wake_me, cancel_wake), one entity per bearer token. |
 | `mud-script` | Sandboxed Rhai world scripts ([docs/scripting.md](docs/scripting.md), ADR 0010): room, item and verb hooks that return effects the engine admits and applies, and mind scripts that return command lines. The only crate with rhai. |
 | `mud-supervisor` | The attention router, anti-chatter, budgets, Turing friction, the typing gate, and the minds: scripted (TOML rules and Rhai mind scripts), fallback, littleguy, harvest, plugin-agent. |
@@ -123,6 +164,7 @@ flowchart LR
 | Zero tokens in empty rooms | event-driven wakes; macro-ticks only with no player present; anti-chatter (proved) |
 | Untrusted speech is data | `untrusted_text` never enters narratives or cues; policy codes such as `POLICY_TRADE_REQUIRED` |
 | Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops, cast and scripts are pack data |
+| Secrets stay out of the world | passwords, hashes and tokens live in `mud-accounts`; tests check no event, `Audit`, snapshot, view or trace log holds one; every name gets the same `Password:` prompt and one bcrypt verify (proved route kernel, ADR 0009) |
 | Scripts are data in, data out | hooks return effects that a proved admission kernel and `check_effects` gate; no script holds the world; player text reaches scripts only as `Untrusted` (ADR 0010) |
 
 ## Development

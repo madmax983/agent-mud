@@ -38,6 +38,8 @@ an informal Turing experiment.
 
 The MUD server owns the world and lifecycle; littleguy owns the minds.
 
+Since v0.2, humans log in with a password; accounts live outside the world, in `accounts.db` (ADR 0009).
+
 ```mermaid
 flowchart TB
   H[Human clients: web / telnet] -->|same command protocol| S

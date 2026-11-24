@@ -26,9 +26,17 @@ A text MUD where humans and littleguy agents share one world. Read
 - **Setting-agnostic engine.** New content goes in a pack. A new engine
   behavior is driven by pack data (see `SkillEffect`), not by a skill or
   item id in Rust.
-- **Determinism.** All randomness goes through `DiceRng` or the supervisor's
-  `mix(seed, …)`. No global RNG, no wall clock in the engine (`now_ms` is
-  passed in).
+- **Determinism.** All randomness that touches the world goes through
+  `DiceRng` or the supervisor's `mix(seed, …)`. No global RNG, no wall
+  clock in the engine (`now_ms` is passed in).
+- **Secrets stay out of the world.** Passwords, hashes and tokens never
+  reach `WorldState`, events, `Audit`, the observer, logs or
+  `World::execute`; they live in `mud-accounts` and `accounts.db` only.
+  Tests check it (`session::passwords_never_reach_the_world`,
+  `tests/trace_log.rs`). `mud-script` never holds an `Accounts` handle,
+  and `password`, `logout` and `quit` are never a script verb.
+- **Secrets come from the OS CSPRNG** (`getrandom`), never `DiceRng` or
+  `mix(seed, …)`.
 - **Mirrored kernels.** Code between `// mirror-begin` and `// mirror-end`
   is proved in `formal/verus`. Change both sides in one commit; the
   `verus_mirror` tests fail otherwise.
