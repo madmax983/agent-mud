@@ -9,6 +9,7 @@
 //! - `/mcp` is the MCP endpoint of `mud-mcp`, behind bearer tokens.
 
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use autumn_web::AppState;
@@ -45,6 +46,21 @@ impl Mud {
     fn admin(&self, given: Option<&str>) -> bool {
         given.is_some_and(|g| constant_eq(g.as_bytes(), self.admin_token.as_bytes()))
     }
+}
+
+/// Percent-encodes `s` for a URL query value or path segment: every byte
+/// but the RFC 3986 unreserved ones becomes `%XX`.
+#[must_use]
+pub fn url_escape(s: &str) -> String {
+    s.bytes()
+        .fold(String::with_capacity(s.len()), |mut out, b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                out.push(char::from(b));
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+            out
+        })
 }
 
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
@@ -278,8 +294,7 @@ async fn observer(State(state): State<AppState>, Query(q): Query<Admin>) -> Resp
     let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
         return forbidden();
     };
-    let token = q.token.unwrap_or_default();
-    let _ = app;
+    let token = url_escape(&app.admin_token);
     page(
         "MUD observer",
         &html! {
@@ -307,6 +322,7 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
     let Some(app) = mud(&state).filter(|m| m.admin(q.token.as_deref())) else {
         return forbidden();
     };
+    let token = url_escape(&app.admin_token);
     let snap = app.sup.snapshot();
     let tokens = snap["tokens_today"].as_u64().unwrap_or(0);
     let cost = snap["cost_usd_micros_today"].as_u64().unwrap_or(0);
@@ -333,7 +349,7 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
                     }
                     td { (e["goal"].as_str().unwrap_or("")) }
                     td { (e["macro_ticks"]) br;
-                        form hx-post=(format!("/observer/macro-tick/{}?token={}", e["id"].as_str().unwrap_or(""), q.token.as_deref().unwrap_or(""))) hx-swap="none" {
+                        form hx-post=(format!("/observer/macro-tick/{}?token={token}", url_escape(e["id"].as_str().unwrap_or("")))) hx-swap="none" {
                             button type="submit" { "tick" }
                         }
                     }
@@ -422,5 +438,12 @@ mod tests {
         assert!(constant_eq(b"abc", b"abc"));
         assert!(!constant_eq(b"abc", b"abd"));
         assert!(!constant_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn url_escape_keeps_unreserved_bytes_only() {
+        assert_eq!(url_escape("aZ09-._~"), "aZ09-._~");
+        assert_eq!(url_escape("a+b&c=d#e%f/ g"), "a%2Bb%26c%3Dd%23e%25f%2F%20g");
+        assert_eq!(url_escape("é"), "%C3%A9");
     }
 }

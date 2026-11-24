@@ -14,10 +14,22 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
 async fn boot() -> (SocketAddr, Arc<Built>) {
+    boot_with(None).await
+}
+
+/// Boots the server, with `admin_token` as the observer token if given.
+async fn boot_with(admin_token: Option<&str>) -> (SocketAddr, Arc<Built>) {
     let mut cfg = MudConfig::default();
     cfg.world.db = None;
     cfg.supervisor.typing_scale = 0.0;
-    let built = Arc::new(build(&cfg).unwrap());
+    let mut built = build(&cfg).unwrap();
+    if let Some(t) = admin_token {
+        built.mud = Arc::new(web::Mud {
+            admin_token: t.to_owned(),
+            ..(*built.mud).clone()
+        });
+    }
+    let built = Arc::new(built);
     let mud = Arc::clone(&built.mud);
     let mcp = mud_mcp::router(
         Arc::clone(&built.mud.game),
@@ -194,6 +206,51 @@ async fn the_observer_needs_the_token_and_shows_private_goals() {
         .await
         .unwrap();
     assert_eq!(tick["decision"], "queued");
+}
+
+/// The value of the first `attr="…"` in `html`, with `&amp;` undone.
+fn attr(html: &str, attr: &str) -> String {
+    let start = html.find(&format!("{attr}=\"")).unwrap() + attr.len() + 2;
+    let len = html[start..].find('"').unwrap();
+    html[start..start + len].replace("&amp;", "&")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_observer_links_carry_a_token_with_url_special_characters() {
+    let token = "abcdef0123+xyz&a=b#frag%2B/ é";
+    let (addr, _) = boot_with(Some(token)).await;
+    let encoded: String = token
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let page = http()
+        .get(format!("http://{addr}/observer?token={encoded}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let page = page.text().await.unwrap();
+    let entities = attr(&page, "hx-get");
+    let frag = http()
+        .get(format!("http://{addr}{entities}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(frag.status(), 200, "the entities link: {entities}");
+    let frag = frag.text().await.unwrap();
+    let tick = attr(&frag, "hx-post");
+    let tick = http()
+        .post(format!("http://{addr}{tick}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tick.status(), 200, "the macro-tick link");
 }
 
 #[tokio::test(flavor = "multi_thread")]

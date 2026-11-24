@@ -38,36 +38,72 @@ impl Line {
     }
 }
 
+/// The `board read` narrative followed by one `  [n] author: text` line
+/// per post in `resolution["posts"]`. The posts are player text, kept out
+/// of the engine's narrative and rendered here, at the transport; each
+/// transport then escapes for its medium. A line the narrative already
+/// holds is not repeated.
+fn with_board_posts(narrative: &str, resolution: &serde_json::Value) -> String {
+    let mut text = narrative.to_owned();
+    let posts = resolution["posts"].as_array().into_iter().flatten();
+    for (i, p) in posts.enumerate() {
+        let line = format!(
+            "  [{}] {}: {}",
+            i + 1,
+            p["author"]["name"].as_str().unwrap_or("someone"),
+            p["untrusted_text"].as_str().unwrap_or_default()
+        );
+        if !narrative.lines().any(|l| l == line) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
+    text
+}
+
 /// Counts open connections per entity, so a second tab does not log a
 /// player out when the first one closes.
+///
+/// The count and the world's online flag change together, under this
+/// mutex: a login racing the last logout of the same player runs either
+/// before it (and the logout then keeps the player online) or after it
+/// (and brings the player back online).
 #[derive(Debug, Default)]
 pub struct Presence {
     open: std::sync::Mutex<std::collections::HashMap<EntityId, usize>>,
 }
 
 impl Presence {
-    /// One more connection.
-    pub fn open(&self, id: &EntityId) {
-        *self
-            .open
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<EntityId, usize>> {
+        self.open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(id.clone())
-            .or_default() += 1;
     }
 
-    /// One fewer; returns whether it was the last.
-    pub fn close(&self, id: &EntityId) -> bool {
-        let mut open = self
-            .open
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Logs `name` in and counts one more connection for it.
+    ///
+    /// # Errors
+    /// The name is invalid or taken.
+    pub fn login(&self, game: &Game, name: &str) -> Result<EntityId, mud_world::LoginError> {
+        let mut open = self.lock();
+        let id = game.login(name)?;
+        *open.entry(id.clone()).or_default() += 1;
+        drop(open);
+        Ok(id)
+    }
+
+    /// Counts one fewer connection for `id` and, if that was the last,
+    /// takes it offline. Returns whether it was the last.
+    pub fn logout(&self, game: &Game, id: &EntityId) -> bool {
+        let mut open = self.lock();
         let n = open.entry(id.clone()).or_default();
         *n = n.saturating_sub(1);
         let last = *n == 0;
         if last {
             open.remove(id);
+            game.take_offline(id);
         }
+        drop(open);
         last
     }
 }
@@ -90,8 +126,7 @@ impl Session {
         presence: Arc<Presence>,
         name: &str,
     ) -> Result<(Self, Vec<Line>), mud_world::LoginError> {
-        let entity = game.login(name)?;
-        presence.open(&entity);
+        let entity = presence.login(&game, name)?;
         let motd = game.read(|w| w.pack().world.motd.clone());
         let mut lines = vec![Line::new(LineKind::System, motd)];
         let look = game.execute(&entity, "look");
@@ -124,7 +159,12 @@ impl Session {
         } else {
             LineKind::Error
         };
-        vec![Line::new(kind, r.narrative)]
+        let text = if r.ok && r.verb.as_deref() == Some("board_read") {
+            with_board_posts(&r.narrative, &r.resolution)
+        } else {
+            r.narrative
+        };
+        vec![Line::new(kind, text)]
     }
 
     /// The line an event shows this player, if it reaches them and is not
@@ -139,9 +179,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.presence.close(&self.entity) {
-            self.game.take_offline(&self.entity);
-        }
+        self.presence.logout(&self.game, &self.entity);
     }
 }
 
@@ -182,5 +220,65 @@ mod tests {
         drop(ada2);
         assert!(!g.read(|w| w.entity(&EntityId::from("pc_ada")).unwrap().online));
         assert!(Session::login(g, p, "kestrel").is_err());
+    }
+
+    #[test]
+    fn board_posts_are_rendered_from_the_resolution_once() {
+        let posts = serde_json::json!({ "posts": [
+            { "author": { "id": "pc_ada", "name": "ada" }, "untrusted_text": "ore wanted" },
+            { "author": { "id": "torin", "name": "Torin" }, "untrusted_text": "<b>15s</b>" },
+        ]});
+        let want = "The notice board:\n  [1] ada: ore wanted\n  [2] Torin: <b>15s</b>";
+        assert_eq!(with_board_posts("The notice board:", &posts), want);
+        assert_eq!(with_board_posts(want, &posts), want, "no duplicates");
+        assert_eq!(
+            with_board_posts("The notice board: bare wood.", &serde_json::json!({})),
+            "The notice board: bare wood."
+        );
+    }
+
+    #[test]
+    fn a_player_reads_the_board_through_a_session() {
+        let g = game();
+        let p = Arc::new(Presence::default());
+        let (ada, _) = Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
+        let _ = ada.command("n");
+        assert_eq!(
+            ada.command("board post ore wanted")[0].kind,
+            LineKind::Narrative
+        );
+        let out = ada.command("board read");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text.matches("  [1] ada: ore wanted").count(), 1);
+    }
+
+    /// A tab closing while another tab of the same player logs in must
+    /// never leave the new session attached to an offline entity.
+    #[test]
+    fn a_login_racing_the_last_logout_stays_online() {
+        let g = game();
+        let p = Arc::new(Presence::default());
+        let id = EntityId::from("pc_ada");
+        let stale = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..2_000 {
+                        let (sess, _) =
+                            Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
+                        if !g.read(|w| w.entity(&id).unwrap().online) {
+                            stale.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        drop(sess);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            stale.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a live session saw its entity offline"
+        );
+        assert!(!g.read(|w| w.entity(&id).unwrap().online));
     }
 }
