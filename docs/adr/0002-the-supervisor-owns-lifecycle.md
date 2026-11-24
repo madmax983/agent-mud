@@ -25,7 +25,16 @@ process lifecycle; littleguy owns the mind.
   keys, and its own `XDG_*` folders.
 - Each wake is a `chat` request on the daemon's socket (an attended op,
   so MCP tools are allowed). The wake id is the message id, so a retried
-  wake runs once. The reply's `usage` feeds the daily budget.
+  wake runs once.
+- Spend is read from the daemon's own cost ledger, not from the reply.
+  autumn-harvest writes every model call to `harvest_llm_ledger` in
+  `lg.db`; `mud_supervisor::ledger::LedgerMeter` reads it through a
+  read-only handle and charges each row once, to the reply while the wake
+  waits and to the usage sink otherwise. So an op that ends with no answer
+  ("I used every tool round…"), waits for an approval, outlives its wake,
+  or a heartbeat between wakes, is charged too. A reply's own `usage` is
+  used only when the daemon has no database to read. `[littleguy]
+  max_steps` (24) bounds the tool rounds of one wake.
 - littleguy's own heartbeat is kept for quiet reflection and memory
   consolidation only.
 
@@ -41,8 +50,9 @@ sequenceDiagram
   L->>M: mud_look / mud_events
   L->>M: mud_command "board post BOUNTY …"
   M->>W: execute as torin (through the typing gate)
-  L-->>S: reply {text, usage}
-  S->>S: budget.spend(usage)
+  L-->>S: reply {text}
+  S->>L: read harvest_llm_ledger (read-only)
+  S->>S: budget.spend(new ledger rows)
 ```
 
 ## Alternatives

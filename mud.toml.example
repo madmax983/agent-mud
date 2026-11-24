@@ -12,6 +12,9 @@ telnet = "127.0.0.1:4000"        # optional plain-text clients
 admin_token_env = "MUD_ADMIN_TOKEN"     # unset: a token is made at start and logged
 login_timeout_ms = 60000         # a client that gives no name in time is closed (0: never)
 idle_timeout_ms = 3600000        # a player silent this long is closed (0: never)
+max_connections = 512            # terminal + telnet connections at once (0: no cap)
+max_connections_per_address = 8  # from one address; an IPv6 /64 counts as one (0: no cap)
+# trusted_proxies = ["10.0.0.0/8"]  # behind a reverse proxy: trust its X-Forwarded-For
 
 [world]
 # pack = "worlds/crypt-v01"      # unset: the pack compiled into the binary
@@ -39,6 +42,7 @@ bin = "lg"
 data_dir = "data/agents"
 provider = "openrouter"          # offline | claude | openai | openrouter
 # base_url = "http://127.0.0.1:8080/v1"
+max_steps = 24                   # tool rounds per wake; more ends the wake with no answer
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
 
@@ -48,5 +52,5 @@ typing_scale = 1.0               # Turing PC typing holds; 0 for demos
 macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
 first_macro_tick_secs = [30, 120]
 step_ms = 250
-[supervisor.budgets]
+[supervisor.budgets]                 # by entity id; 0 is unlimited
 pc_kestrel = 600000

@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Timeouts;
+use crate::limits::ConnLimiter;
 use crate::session::{Line, Presence, Session};
 use mud_world::Game;
 
@@ -240,7 +241,7 @@ async fn handle(
 /// the default limits.
 pub async fn serve(listener: TcpListener, game: Arc<Game>, presence: Arc<Presence>) {
     serve_limited(
-        crate::MAX_CONNECTIONS,
+        ConnLimiter::new(crate::MAX_CONNECTIONS, crate::MAX_CONNECTIONS_PER_ADDRESS),
         Timeouts::default(),
         listener,
         game,
@@ -249,25 +250,27 @@ pub async fn serve(listener: TcpListener, game: Arc<Game>, presence: Arc<Presenc
     .await;
 }
 
-/// Serves telnet clients with at most `max` open at once. A client over
-/// the limit is told so and dropped; a client that stays silent past
-/// `timeouts` is closed, freeing its slot.
+/// Serves telnet clients while `limiter` admits them.
+///
+/// The limiter may be shared with the web terminal. A client over a limit
+/// is told so and dropped; a client that stays silent past `timeouts` is
+/// closed, freeing its slot.
 pub async fn serve_limited(
-    max: usize,
+    limiter: Arc<ConnLimiter>,
     timeouts: Timeouts,
     listener: TcpListener,
     game: Arc<Game>,
     presence: Arc<Presence>,
 ) {
-    let slots = Arc::new(tokio::sync::Semaphore::new(max));
     loop {
         match listener.accept().await {
             Ok((mut stream, peer)) => {
-                let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
-                    let _ = stream
-                        .write_all(b"The server is full. Try again later.\r\n")
-                        .await;
-                    continue;
+                let permit = match limiter.try_acquire(Some(peer.ip())) {
+                    Ok(p) => p,
+                    Err(refusal) => {
+                        let _ = stream.write_all(format!("{refusal}\r\n").as_bytes()).await;
+                        continue;
+                    }
                 };
                 let (g, p) = (Arc::clone(&game), Arc::clone(&presence));
                 tokio::spawn(async move {
@@ -299,7 +302,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(serve_limited(
-            1,
+            ConnLimiter::new(1, 0),
             Timeouts::default(),
             listener,
             game,
@@ -415,6 +418,14 @@ mod tests {
 
     /// A one-slot server with short timeouts.
     async fn tight(timeouts: Timeouts) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        tight_with(ConnLimiter::new(1, 0), timeouts).await
+    }
+
+    /// A server behind `limiter`.
+    async fn tight_with(
+        limiter: Arc<ConnLimiter>,
+        timeouts: Timeouts,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let game = Game::new(
             World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1),
             None,
@@ -423,7 +434,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(serve_limited(
-            1,
+            limiter,
             timeouts,
             listener,
             game,
@@ -466,6 +477,33 @@ mod tests {
         c.read_to_string(&mut out).await.unwrap();
         assert!(out.contains("Town Square"), "{out}");
         assert!(out.contains("Idle too long"), "{out}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn one_address_cannot_take_every_slot() {
+        let limiter = ConnLimiter::new(10, 1);
+        let (addr, task) = tight_with(Arc::clone(&limiter), Timeouts::default()).await;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut greeting = [0u8; 16];
+        first.read_exact(&mut greeting).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut out = String::new();
+        second.read_to_string(&mut out).await.unwrap();
+        assert!(
+            out.contains("Too many connections from your address"),
+            "{out}"
+        );
+        assert_eq!(limiter.open(), 1);
+        drop(first);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while limiter.open() > 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot was never freed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         task.abort();
     }
 }

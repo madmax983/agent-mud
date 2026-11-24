@@ -32,7 +32,9 @@ agent-only events are allowed between resets, for every `max`. The proof
 found a hole in an earlier rule (`next <= max` let everything through at
 `max = 255`).
 
-**Budgets.** Each agent has a daily token budget (UTC days). At 80% it
+**Budgets.** Each agent has a daily token budget (UTC days):
+`[supervisor] daily_token_budget`, or its own entry in
+`[supervisor.budgets]` by entity id; `0` means no limit in both. At 80% it
 goes soft: cooldowns double and ambient wakes stop. At 100% it goes hard:
 until midnight the deterministic fallback answers direct interactions
 with canned flavor ("Torin grunts and keeps hammering.") and no model is

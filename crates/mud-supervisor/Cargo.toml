@@ -12,6 +12,7 @@ mud-world.workspace = true
 autumn-harvest-agent = { version = "0.11.0", features = ["sqlite", "openai", "anthropic"] }
 autumn-harvest-sqlite = "0.11.0"
 autumn-plugin-agent = "0.5"
+jiff = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -21,6 +22,7 @@ toml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+rusqlite = { version = "0.42", features = ["bundled"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

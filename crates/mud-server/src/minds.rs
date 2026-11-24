@@ -65,6 +65,7 @@ fn littleguy_mind(
             .or_else(|| lg.model_names.get("default"))
             .cloned(),
         base_url: lg.base_url.clone(),
+        max_steps: lg.max_steps,
         ..LittleguyConfig::default()
     };
     let mut personas = HashMap::new();

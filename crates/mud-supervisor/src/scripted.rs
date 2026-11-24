@@ -242,6 +242,7 @@ mod tests {
             macro_ticks: 1,
             login: false,
             wake_id: "w".into(),
+            now_ms: 0,
         }
     }
 

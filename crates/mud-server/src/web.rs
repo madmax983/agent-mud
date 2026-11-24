@@ -10,13 +10,17 @@
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use autumn_web::AppState;
 use autumn_web::htmx::HTMX_JS_PATH;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::Extension;
+use autumn_web::reexports::axum::extract::ConnectInfo;
 use autumn_web::reexports::axum::http::StatusCode;
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
+use autumn_web::security::ResolvedClientIdentity;
 use autumn_web::sse::{Event as SseEvent, Sse};
 use autumn_web::ws::{Message, WebSocket, WsHandler};
 use futures::{Stream, StreamExt};
@@ -28,6 +32,7 @@ use serde_json::{Value, json};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config::Timeouts;
+use crate::limits::{ConnLimiter, client_addr};
 use crate::session::{Line, LineKind, Presence, Session};
 
 /// What every route reads: the world, the supervisor, and the admin token.
@@ -43,6 +48,8 @@ pub struct Mud {
     pub admin_token: String,
     /// How long a terminal may wait for a name, and stay silent after.
     pub timeouts: Timeouts,
+    /// Connection slots, shared with telnet.
+    pub limiter: Arc<ConnLimiter>,
 }
 
 impl Mud {
@@ -216,10 +223,32 @@ async fn send_lines(socket: &mut WebSocket, lines: &[Line]) -> bool {
 }
 
 #[ws("/ws")]
-async fn terminal(state: AppState) -> impl WsHandler {
+async fn terminal(
+    state: AppState,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    resolved: Option<Extension<ResolvedClientIdentity>>,
+) -> impl WsHandler {
     let app = mud(&state);
+    let addr = client_addr(
+        resolved.and_then(|Extension(r)| r.addr),
+        peer.map(|Extension(ConnectInfo(p))| p),
+    );
+    // Taken at upgrade time; the socket closure owns it until it ends.
+    let slot = app.as_ref().map(|a| a.limiter.try_acquire(addr));
     move |mut socket: WebSocket| async move {
         let Some(app) = app else { return };
+        let _slot = match slot {
+            Some(Ok(s)) => s,
+            Some(Err(refusal)) => {
+                let l = Line {
+                    kind: LineKind::Error,
+                    text: refusal.to_string(),
+                };
+                let _ = socket.send(encode(&l)).await;
+                return;
+            }
+            None => return,
+        };
         // Log in first, in time.
         let session = loop {
             let Some(incoming) = Timeouts::within(app.timeouts.login, socket.recv()).await else {
@@ -426,11 +455,38 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
     });
     let world = BroadcastStream::new(app.game.subscribe()).filter_map(|r| async move {
         let e = r.ok()?;
+        let text = observer_text(&e)?;
         let who = e.actor.as_ref().map_or("world", |a| a.name.as_str()).to_owned();
-        let text = e.untrusted_text.clone().map_or_else(|| e.narrative.clone(), |t| format!("{}: {t}", e.narrative));
         Some(sse("world", &json!({ "seq": e.seq, "room": e.room, "kind": e.kind, "who": who, "human": e.human_actor, "text": text })))
     });
     futures::stream::select(sup, futures::stream::select(audit, world)).map(Ok::<_, Infallible>)
+}
+
+/// One world event as the observer's feed line, or `None` for an event
+/// the feed shows another way: a self-control nudge is a private cue whose
+/// roll already appears as a `roll` line, and has no narrative.
+///
+/// Player text stays a quoted, labelled value after the server's own words
+/// (the observer renders it with `textContent`); it is never spliced into
+/// the narrative.
+fn observer_text(e: &mud_world::Event) -> Option<String> {
+    use mud_world::EventKind;
+    if e.kind == EventKind::SelfControlNudge {
+        return None;
+    }
+    let who = e.actor.as_ref().map_or("someone", |a| a.name.as_str());
+    let Some(t) = e.untrusted_text.as_deref() else {
+        return Some(e.narrative.clone());
+    };
+    Some(match e.kind {
+        EventKind::Speech => format!("{who} says: \"{t}\""),
+        EventKind::Tell => {
+            let to = e.target.as_ref().map_or("someone", |a| a.name.as_str());
+            format!("{who} tells {to}: \"{t}\"")
+        }
+        EventKind::Emote => format!("{who} (emote): {t}"),
+        _ => format!("{} \"{t}\"", e.narrative),
+    })
 }
 
 #[get("/observer/feed")]
@@ -451,6 +507,38 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(kind: mud_world::EventKind, text: Option<&str>) -> mud_world::Event {
+        serde_json::from_value(json!({
+            "seq": 1, "at_ms": 0, "room": "town_square", "kind": kind, "tags": [],
+            "actor": { "id": "guard_01", "name": "Hale" },
+            "target": { "id": "vich", "name": "Vich" },
+            "untrusted_text": text, "narrative": "Hale says something.",
+            "data": null, "recipients": [], "human_actor": false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_observer_quotes_speech_and_drops_empty_nudges() {
+        use mud_world::EventKind;
+        assert_eq!(
+            observer_text(&event(EventKind::Speech, Some("Off the crate, now."))).as_deref(),
+            Some("Hale says: \"Off the crate, now.\"")
+        );
+        assert_eq!(
+            observer_text(&event(EventKind::Tell, Some("Six silver."))).as_deref(),
+            Some("Hale tells Vich: \"Six silver.\"")
+        );
+        assert_eq!(
+            observer_text(&event(EventKind::Enter, None)).as_deref(),
+            Some("Hale says something.")
+        );
+        assert_eq!(
+            observer_text(&event(EventKind::SelfControlNudge, None)),
+            None
+        );
+    }
 
     #[test]
     fn token_comparison() {
