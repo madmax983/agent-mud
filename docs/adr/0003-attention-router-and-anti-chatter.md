@@ -15,15 +15,22 @@ and decides, per recipient agent, whether and when to wake it.
 | Priority  | Triggers | Delay |
 |-----------|----------|-------|
 | Immediate | attacked, a tell, a self-control nudge, speech naming it, a trade or attempt aimed at it | 0–500 ms, no cooldown, no AFK hold |
-| RoomBatch | any human action in the room | rolling 2 s window, capped at 4 s from the first |
-| Ambient   | agent or world activity | 5–10 s, plus the entity's cooldown |
-| MacroTick | the slow timer (2–6 h, jittered) | only when no human is in the room |
+| RoomBatch | any player action in the room | rolling 2 s window, capped at 4 s from the first |
+| Ambient   | NPC or world activity | 5–10 s, plus the entity's cooldown |
+| MacroTick | the slow timer (2–6 h, jittered) | only when no player is in the room |
+
+A **player** is any player character (`kind = player`), whoever plays it:
+a human, or an agent PC such as kestrel. Routing, anti-chatter and
+scripts (`who = "human"`, or its synonym `"player"`) read
+`Event::player_actor` and `World::player_present`, never `human_actor`.
+Otherwise NPCs would fall silent around an agent PC after two exchanges,
+which a human player never sees: a tell that gives the agent away.
 
 Wakes for one entity coalesce; the highest priority wins. One wake runs
 per entity at a time.
 
-**Anti-chatter.** Each room counts agent events with no human present.
-A human event or a macro-tick resets it. An agent-only event may wake
+**Anti-chatter.** Each room counts NPC events with no player present.
+A player event or a macro-tick resets it. An agent-only event may wake
 other agents only while the count before it is under
 `max_agent_only_turns` (2). Past that, every cross-agent wake in the room
 is dropped, even if the agents name each other. The kernel

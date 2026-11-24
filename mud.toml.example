@@ -42,7 +42,7 @@ bin = "lg"
 data_dir = "data/agents"
 provider = "openrouter"          # offline | claude | openai | openrouter
 # base_url = "http://127.0.0.1:8080/v1"
-max_steps = 24                   # tool rounds per wake; more ends the wake with no answer
+max_steps = 64                   # tool rounds per wake (0: no bound; the daily budget still caps spend)
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
 

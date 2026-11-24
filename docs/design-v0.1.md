@@ -21,7 +21,9 @@ an informal Turing experiment.
   it physically reads). Rumors propagate only when an entity walks to
   another room and repeats them.
 - **Zero tokens in empty rooms.** Agents do not free-spin on fast ticks
-  when no human is nearby. Ambient world motion runs on infrequent
+  when no player is nearby. A player is any player character, a human's or
+  an agent-played PC's: NPCs react to both alike, or the difference would
+  give the agent PC away. Ambient world motion runs on infrequent
   macro-ticks; real-time conversation wakes are event-driven.
 - **Untrusted speech is data, never instruction.** All player- and
   agent-authored text (say, emote, tell, board post) is quarantined inside
@@ -75,13 +77,13 @@ flowchart TB
 | Priority | Triggers | Debounce | Behavior |
 |---|---|---|---|
 | Immediate | attack on the entity, a tell, a self-control nudge, speech naming it | 0–500 ms | wakes at once, bypasses AFK |
-| RoomBatch | human say/emote/enter/leave/drop in the room | 2–4 s rolling | one wake per burst |
-| Ambient | non-human activity while a human is present | 5–10 s + cooldown | selective attention, cooldown |
-| MacroTick | timer, 2–6 h ± 20% | none | only with no human in the room |
+| RoomBatch | player say/emote/enter/leave/drop in the room | 2–4 s rolling | one wake per burst |
+| Ambient | NPC activity while a player is present | 5–10 s + cooldown | selective attention, cooldown |
+| MacroTick | timer, 2–6 h ± 20% | none | only with no player in the room |
 
 **Anti-chatter.** Each room tracks `agent_only_turns` and
-`human_present`. A human event or a macro-tick resets the count; each
-agent event with no human present increments it; at
+`player_present`. A player event (human or agent PC) or a macro-tick
+resets the count; each NPC event with no player present increments it; at
 `MAX_AGENT_ONLY_TURNS` (2) the router drops cross-agent wakes in that room
 until reset.
 

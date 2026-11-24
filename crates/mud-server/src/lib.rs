@@ -162,6 +162,7 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
                 cfg.server.max_connections_per_address,
             ),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            littleguy: minds.littleguy.clone(),
         }),
         admin_token_generated,
         tokens,

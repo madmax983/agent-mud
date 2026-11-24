@@ -98,7 +98,8 @@ fn tools() -> Vec<Tool> {
         Tool::new(
             SHEET,
             format!(
-                "Your character sheet: stats, skills, wounds, inventory, equipment and money. \
+                "Your character sheet: stats, skills, wounds, inventory, equipment and money, and, if \
+                 you keep a shop, its prices. \
                  Changes nothing. {UNTRUSTED}"
             ),
             none(),

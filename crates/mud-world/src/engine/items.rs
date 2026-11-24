@@ -245,6 +245,17 @@ impl World {
     /// haggle, but never less than what the keeper paid for it, so selling
     /// and buying back cannot drain a keeper.
     fn sale_price(&self, shop: &ShopDef, item: ItemId, buyer: &EntityId, keeper: &EntityId) -> i64 {
+        let haggled = self
+            .state
+            .entities
+            .get(buyer)
+            .is_some_and(|b| b.haggle_with.as_ref() == Some(keeper));
+        self.price_of(shop, item, haggled)
+    }
+
+    /// What `item` sells for in `shop`: its value with the markup, a tenth
+    /// off after a won haggle, never under what the keeper paid, at least 1.
+    pub(crate) fn price_of(&self, shop: &ShopDef, item: ItemId, haggled: bool) -> i64 {
         let it = self.state.items.get(&item);
         let value = it
             .and_then(|it| self.pack.items.get(&it.proto))
@@ -256,15 +267,40 @@ impl World {
             reason = "prices are small"
         )]
         let mut price = ((value as f64) * shop.sell_markup).ceil() as i64;
-        if self
-            .state
-            .entities
-            .get(buyer)
-            .is_some_and(|b| b.haggle_with.as_ref() == Some(keeper))
-        {
+        if haggled {
             price = price * 9 / 10;
         }
         price.max(paid).max(1)
+    }
+
+    /// A keeper's own price list, for its sheet: what it sells and for
+    /// how much (the same prices `list` and `buy` use), and what it buys.
+    /// `None` for an entity that keeps no shop.
+    pub(crate) fn shop_view(&self, keeper: &crate::state::Entity) -> Option<Value> {
+        let shop = keeper
+            .shop
+            .as_ref()
+            .and_then(|s| self.pack.economy.shops.get(s))?;
+        let mut sells: std::collections::BTreeMap<String, (i64, u32)> =
+            std::collections::BTreeMap::new();
+        for i in &keeper.inventory {
+            if self.state.items.get(i).is_some_and(|it| it.stock) {
+                let price = self.price_of(shop, *i, false);
+                sells.entry(self.item_name(*i)).or_insert((price, 0)).1 += 1;
+            }
+        }
+        let cur = &self.pack.economy.currency;
+        Some(json!({
+            "currency": cur.name,
+            "short": cur.short,
+            "sells": sells
+                .iter()
+                .map(|(name, (price, n))| json!({ "name": name, "price": price, "count": n }))
+                .collect::<Vec<_>>(),
+            "buys": shop.buys,
+            "buy_rate": shop.buy_rate,
+            "pays": shop.prices,
+        }))
     }
 
     fn buy_price(&self, shop: &ShopDef, item: ItemId) -> Option<i64> {

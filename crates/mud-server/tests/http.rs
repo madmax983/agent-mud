@@ -433,6 +433,27 @@ async fn the_observer_feed_ends_when_shutdown_begins() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn littleguy_pages_need_the_token_and_a_littleguy() {
+    let (addr, built) = boot().await;
+    let anon = http()
+        .get(format!("http://{addr}/observer/agents/torin/littleguy"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), 401);
+    let token = &built.mud.admin_token;
+    // The default config scripts every agent: nobody has littleguy pages.
+    let scripted = http()
+        .get(format!(
+            "http://{addr}/observer/agents/torin/littleguy?token={token}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scripted.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn autumn_starting_its_shutdown_cancels_ours() {
     let (_addr, built, state) = boot_full(None, |_| {}).await;
     assert!(!built.mud.shutdown.is_cancelled());

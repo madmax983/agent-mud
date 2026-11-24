@@ -223,7 +223,7 @@ impl Router {
         if immediate {
             return Some(Priority::Immediate);
         }
-        if ev.human_actor {
+        if ev.player_actor {
             return Some(Priority::RoomBatch);
         }
         match ev.kind {
@@ -245,16 +245,20 @@ impl Router {
         now: u64,
     ) -> Vec<RouteNote> {
         let actor = ev.actor.as_ref().and_then(|a| world.entity(&a.id));
-        let actor_is_agent = actor.is_some_and(|a| {
-            !a.human && matches!(a.tier, Tier::Ambient | Tier::Persistent | Tier::Turing)
-        });
+        // An agent here is an agent-played NPC. A player character counts
+        // as a player whoever plays it, so an agent PC resets the room and
+        // is answered exactly as a human would be.
+        let actor_is_agent = !ev.player_actor
+            && actor.is_some_and(|a| {
+                !a.human && matches!(a.tier, Tier::Ambient | Tier::Persistent | Tier::Turing)
+            });
         let allow_cross = if let Some(room) = &ev.room
             && ev.kind != EventKind::SelfControlNudge
         {
-            let input = if ev.human_actor {
+            let input = if ev.player_actor {
                 ChatterInput::Human
             } else if actor_is_agent {
-                if world.human_present(room) {
+                if world.player_present(room) {
                     ChatterInput::AgentWithHuman
                 } else {
                     ChatterInput::AgentAlone
@@ -282,7 +286,7 @@ impl Router {
                         .map(|t| &t.room),
                 )
                 .collect();
-            let input = if rooms.iter().any(|room| world.human_present(room)) {
+            let input = if rooms.iter().any(|room| world.player_present(room)) {
                 ChatterInput::AgentWithHuman
             } else {
                 ChatterInput::AgentAlone
@@ -437,7 +441,7 @@ impl Router {
         notes
     }
 
-    /// A macro-tick for `entity`. It fires only with no human in its room.
+    /// A macro-tick for `entity`. It fires only with no player in its room.
     pub fn macro_tick(&mut self, entity: &EntityId, world: &World, now: u64) -> RouteNote {
         let seq = world.last_seq();
         let Some(e) = world.entity(entity) else {
@@ -447,11 +451,11 @@ impl Router {
                 why: "unknown entity".into(),
             };
         };
-        if world.human_present(&e.room) {
+        if world.player_present(&e.room) {
             return RouteNote::Dropped {
                 entity: entity.clone(),
                 seq,
-                why: "macro-tick deferred: a human is present".into(),
+                why: "macro-tick deferred: a player is present".into(),
             };
         }
         self.rooms

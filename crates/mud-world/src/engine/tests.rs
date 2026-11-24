@@ -896,3 +896,65 @@ fn a_saved_player_with_a_reserved_name_can_still_log_in() {
     assert_eq!(w.login("me", 1), Ok(me));
     assert_eq!(w.login("self", 1), Err(LoginError::Reserved));
 }
+
+#[test]
+fn climbing_reads_as_climbing() {
+    // Regression: "kestrel arrives from the up." and "kestrel leaves down."
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    give_item(&mut w, &ada, "grate_key");
+    ok(&mut w, &ada, "s");
+    w.drain_fresh();
+    ok(&mut w, &ada, "d");
+    let text = |w: &mut World| -> Vec<String> {
+        w.drain_fresh()
+            .into_iter()
+            .filter(|e| matches!(e.kind, EventKind::Enter | EventKind::Leave))
+            .map(|e| e.narrative)
+            .collect()
+    };
+    assert_eq!(
+        text(&mut w),
+        ["ada climbs down.", "ada arrives from above."]
+    );
+    ok(&mut w, &ada, "u");
+    assert_eq!(text(&mut w), ["ada climbs up.", "ada arrives from below."]);
+    ok(&mut w, &ada, "n");
+    assert_eq!(
+        text(&mut w),
+        ["ada leaves north.", "ada arrives from the south."]
+    );
+}
+
+#[test]
+fn a_keeper_sees_its_own_prices_on_its_sheet() {
+    // Regression: Marta quoted ale at "a copper and a half" (the pack has
+    // only silver, and ale is 1s): nothing told a keeper its prices.
+    let w = world();
+    let marta = w.sheet_view(&id("marta"));
+    let shop = &marta["shop"];
+    assert_eq!(shop["currency"], "silver");
+    assert_eq!(shop["short"], "s");
+    let ale = shop["sells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "mug of ale")
+        .unwrap();
+    assert_eq!(ale["price"], 1);
+    assert_eq!(ale["count"], 5);
+    let torin = w.sheet_view(&id("torin"));
+    assert_eq!(
+        torin["shop"]["pays"]["iron_ore"], 15,
+        "a fixed buying price"
+    );
+    assert_eq!(torin["shop"]["buy_rate"], 0.5);
+    let mut w = w;
+    let ada = w.login("ada", 1).unwrap();
+    assert!(
+        w.sheet_view(&ada).get("shop").is_none(),
+        "no shop, no prices"
+    );
+    let (text, _) = w.sheet(&id("marta"));
+    assert!(text.contains("mug of ale - 1s"), "{text}");
+}

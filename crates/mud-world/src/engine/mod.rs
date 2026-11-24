@@ -469,6 +469,16 @@ impl World {
             .any(|e| e.human && e.present() && &e.room == room)
     }
 
+    /// Whether a player character is present in `room`: a human or an
+    /// agent-played PC. NPCs react to players, whoever plays them.
+    #[must_use]
+    pub fn player_present(&self, room: &RoomId) -> bool {
+        self.state
+            .entities
+            .values()
+            .any(|e| e.kind == EntityKind::Player && e.present() && &e.room == room)
+    }
+
     /// The entities present in `room`.
     pub fn present_in<'a>(&'a self, room: &'a RoomId) -> impl Iterator<Item = &'a Entity> + 'a {
         self.state
@@ -747,11 +757,9 @@ impl World {
                 recipients.push(x);
             }
         }
-        let human_actor = spec
-            .actor
-            .as_ref()
-            .and_then(|a| self.state.entities.get(a))
-            .is_some_and(|e| e.human);
+        let actor = spec.actor.as_ref().and_then(|a| self.state.entities.get(a));
+        let human_actor = actor.is_some_and(|e| e.human);
+        let player_actor = actor.is_some_and(|e| e.kind == EntityKind::Player);
         let event = Event {
             seq,
             at_ms: now,
@@ -766,6 +774,7 @@ impl World {
             data: spec.data,
             recipients,
             human_actor,
+            player_actor,
         };
         self.log.push_back(event.clone());
         while self.log.len() > EVENT_LOG_CAP {

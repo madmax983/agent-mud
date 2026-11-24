@@ -76,6 +76,41 @@ async fn a_real_lg_serve_connects_to_mcp_and_answers_a_macro_tick() {
         !log.contains("gives no tools"),
         "the MCP connection failed:\n{log}"
     );
+    // The observer links to torin's littleguy pages with a fresh sign-in.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let token = &built.mud.admin_token;
+    let table = http
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        table.contains("/observer/agents/torin/littleguy"),
+        "{table}"
+    );
+    let to_pages = http
+        .get(format!(
+            "http://{addr}/observer/agents/torin/littleguy?token={token}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(to_pages.status(), 303);
+    let link = to_pages.headers()["location"].to_str().unwrap().to_owned();
+    assert!(link.starts_with("http://127.0.0.1:"), "{link}");
+    let signed_in = http.get(&link).send().await.unwrap();
+    assert!(
+        signed_in.status().is_success() || signed_in.status().is_redirection(),
+        "the sign-in link works: {}",
+        signed_in.status()
+    );
     for t in tasks {
         t.abort();
     }
