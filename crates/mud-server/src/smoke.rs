@@ -73,6 +73,13 @@ impl Rig {
         );
         let r = game.execute(human, "say vich?");
         ensure!(r.ok, "the human could not speak: {}", r.narrative);
+        // The human is alone in the alley: the curtain must reach them,
+        // not only the event stream (a narration skips its actor).
+        ensure!(
+            r.narrative.contains("the curtain twitches"),
+            "saying the fence's name in the alley did not show the human the curtain: {}",
+            r.narrative
+        );
         self.run_for(2_000).await
     }
 }
@@ -99,12 +106,6 @@ pub async fn run() -> anyhow::Result<Transcript> {
             out.lines.push(format!("#{:<4} [{room}] {text}", ev.seq.0));
         }
     }
-    ensure!(
-        out.lines
-            .iter()
-            .any(|l| l.contains("The curtain over the east door twitches")),
-        "saying the fence's name in the alley did not stir the curtain"
-    );
     // Only Hale's Rhai mind says "evening, <name>" (his TOML rule says
     // "move along"), and it greets kestrel, an agent PC, as any player.
     ensure!(

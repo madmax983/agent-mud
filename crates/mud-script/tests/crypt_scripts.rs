@@ -131,6 +131,13 @@ fn the_ossuary_marks_its_first_visitor_once() {
         "the warden is here, in the dark: {}",
         r.narrative
     );
+    // A narration skips the actor, who is usually alone down here: the
+    // first visitor reads the welcome in their own narrative.
+    assert!(
+        r.narrative.contains("Dust sifts from the vault"),
+        "the first visitor sees the welcome: {}",
+        r.narrative
+    );
     assert_eq!(
         narrations(&mut w),
         ["Dust sifts from the vault. Nothing living has stood here in a long time."]
@@ -222,6 +229,12 @@ fn saying_vich_in_the_alley_twitches_the_curtain_without_quoting() {
     assert_eq!(narrations(&mut w), Vec::<String>::new());
     let r = w.execute(ada, "say Vich, you there? zq-secret", at(2));
     assert!(r.ok);
+    // The speaker, alone in the alley, sees the curtain too.
+    assert!(
+        r.narrative.contains("the curtain twitches"),
+        "the speaker sees the curtain: {}",
+        r.narrative
+    );
     let evs = w.drain_fresh();
     let curtain: Vec<_> = evs.iter().filter(|e| e.kind == EventKind::System).collect();
     assert_eq!(curtain.len(), 1);
@@ -234,7 +247,9 @@ fn saying_vich_in_the_alley_twitches_the_curtain_without_quoting() {
     let (mut w, ids) = world_with(&[("ada", "dark_alley")], |s, _| {
         s.entities.get_mut(&EntityId::from("vich")).unwrap().hidden = true;
     });
-    assert!(w.execute(&ids[0], "say vich", at(2)).ok);
+    let r = w.execute(&ids[0], "say vich", at(2));
+    assert!(r.ok);
+    assert!(!r.narrative.contains("curtain"), "{}", r.narrative);
     assert!(
         narrations(&mut w).is_empty(),
         "a hidden fence does not stir"

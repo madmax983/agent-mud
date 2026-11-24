@@ -5,7 +5,9 @@
 fn on_speech(ctx) {
     let v = ctx.cast.vich;
     if ctx.text.has_any(["vich", "fence"]) && v.present && v.room == "fence_backroom" {
-        return [narrate("The curtain over the east door twitches, then hangs still.")];
+        // narrate() skips the speaker, who is often alone here.
+        return [msg("Behind the east door, the curtain twitches, then hangs still."),
+                narrate("The curtain over the east door twitches, then hangs still.")];
     }
     []
 }

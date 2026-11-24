@@ -5,6 +5,8 @@ fn on_enter(ctx) {
     let fx = [];
     if !("ossuary.first_visitor" in ctx.flags) {
         fx.push(set_flag("ossuary.first_visitor", ctx.actor.name));
+        // narrate() skips the visitor, who is usually alone down here.
+        fx.push(msg("Dust sifts from the vault. Nothing living has stood here in a long time."));
         fx.push(narrate("Dust sifts from the vault. Nothing living has stood here in a long time."));
     }
     if warden_here(ctx) {
