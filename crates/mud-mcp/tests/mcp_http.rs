@@ -108,8 +108,86 @@ mod http {
             .collect()
     }
 
+    /// Remembers who booked what, and answers like the supervisor.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(EntityId, u32, String)>>);
+
+    impl mud_mcp::WakeBooker for Recorder {
+        fn wake_me(&self, entity: &EntityId, minutes: u32, note: &str) -> Value {
+            self.0
+                .lock()
+                .unwrap()
+                .push((entity.clone(), minutes, note.to_owned()));
+            json!({ "ok": true, "booked": { "id": 1, "in_minutes": minutes, "note": note } })
+        }
+
+        fn cancel_wake(&self, _: &EntityId, id: u64) -> Value {
+            json!({ "ok": id == 1 })
+        }
+    }
+
     #[tokio::test]
-    async fn tools_list_has_exactly_the_four_tools() {
+    async fn a_booked_wake_is_booked_for_the_callers_own_entity() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let game = game();
+        let tokens = Arc::new(TokenRegistry::new());
+        let recorder = Arc::new(Recorder::default());
+        let app: axum::Router = mud_mcp::router_full(
+            Arc::clone(&game),
+            Arc::clone(&tokens),
+            direct(Arc::clone(&game)),
+            Arc::clone(&recorder) as Arc<dyn mud_mcp::WakeBooker>,
+            mud_mcp::default_config(),
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let token = tokens.issue(EntityId::from("torin")).unwrap();
+        let config = StreamableHttpClientTransportConfig::with_uri(url.as_str()).auth_header(token);
+        let client: Client =
+            ().serve(StreamableHttpClientTransport::from_config(config))
+                .await
+                .unwrap();
+        let booked = call(
+            &client,
+            "mud_wake_me",
+            json!({ "minutes": 25, "note": "check the board" }),
+        )
+        .await;
+        assert_eq!(booked["booked"]["in_minutes"], 25);
+        assert_eq!(
+            recorder.0.lock().unwrap().clone(),
+            [(EntityId::from("torin"), 25, "check the board".to_owned())],
+            "as the token's entity, never one the caller names"
+        );
+        let missing = call_raw(&client, "mud_cancel_wake", json!({ "id": 9 })).await;
+        assert_eq!(missing.is_error, Some(true));
+        client.cancel().await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn without_a_supervisor_booking_says_it_is_off() {
+        let server = start(game(), direct).await;
+        let ada = server.game.login("ada").unwrap();
+        let client = server.client(&server.issue(&ada)).await;
+        let r = call_raw(&client, "mud_wake_me", json!({ "minutes": 5, "note": "x" })).await;
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            r.structured_content.unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("off")
+        );
+        client.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tools_list_has_exactly_the_tools() {
         let server = start(game(), direct).await;
         let ada = server.game.login("ada").unwrap();
         let client = server.client(&server.issue(&ada)).await;
@@ -466,6 +544,7 @@ mod http {
             Arc::clone(&game),
             Arc::clone(&tokens),
             direct(Arc::clone(&game)),
+            Arc::new(mud_mcp::NoWakes),
             stop.clone(),
         );
         let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

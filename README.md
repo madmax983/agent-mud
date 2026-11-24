@@ -107,7 +107,7 @@ flowchart LR
 |---|---|
 | `mud-rules` | The GURPS-like core: 3d6 success rolls with criticals, damage dice and the ST table, injury after DR, wound states, defenses, self-control rolls. No I/O. |
 | `mud-world` | World packs, the verb parser, the deterministic engine, events with `untrusted_text`, the SQLite store, and `Game` (shared, persistent, broadcasting). |
-| `mud-mcp` | The MCP server (rmcp, streamable HTTP): four tools, one entity per bearer token. |
+| `mud-mcp` | The MCP server (rmcp, streamable HTTP): six tools (look, sheet, events, command, wake_me, cancel_wake), one entity per bearer token. |
 | `mud-supervisor` | The attention router, anti-chatter, budgets, Turing friction, the typing gate, and the minds: scripted, fallback, littleguy, harvest, plugin-agent. |
 | `mud-server` | The `mud` binary: autumn-web terminal and observer, telnet, `/mcp`, config, smoke. |
 | `worlds/crypt-v01` | The starter pack: 11 rooms, 8 cast, 3 shops, the trait library. |

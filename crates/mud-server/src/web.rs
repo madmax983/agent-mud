@@ -417,6 +417,11 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
                         @if e["typing"] == true { br; "typing…" }
                         @if !e["afk_until_ms"].is_null() { br; span.soft { "afk" } }
                         @if !e["pending"].is_null() { br; span.muted { "wake pending" } }
+                        @for b in e["booked"].as_array().into_iter().flatten() {
+                            br; span.soft title=(b["note"].as_str().unwrap_or("")) {
+                                "booked: " (b["note"].as_str().unwrap_or("").chars().take(40).collect::<String>())
+                            }
+                        }
                     }
                 }
             }

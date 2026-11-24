@@ -450,6 +450,7 @@ async fn a_real_lg_serve_answers_a_wake() {
         login: false,
         wake_id: "wake-torin-0-1".into(),
         now_ms: NOW,
+        booked: Vec::new(),
     };
     let r = mind
         .wake(ctx, MudTools::new(game, typing, torin.clone()))

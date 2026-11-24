@@ -271,6 +271,7 @@ mod tests {
             login: false,
             wake_id: "w".into(),
             now_ms: 0,
+            booked: Vec::new(),
         }
     }
 

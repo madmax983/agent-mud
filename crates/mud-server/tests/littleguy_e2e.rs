@@ -33,10 +33,12 @@ async fn a_real_lg_serve_connects_to_mcp_and_answers_a_macro_tick() {
     let built = Arc::new(build(&cfg).unwrap());
     assert_eq!(built.tokens.len(), 3);
     let mud = Arc::clone(&built.mud);
-    let mcp = mud_mcp::router(
+    let mcp = mud_mcp::router_full(
         Arc::clone(&built.mud.game),
         Arc::clone(&built.tokens),
         Arc::new(TypingGate(Arc::clone(built.mud.sup.gate()))),
+        Arc::new(mud_server::SupervisorWakes(Arc::clone(&built.mud.sup))),
+        mud_mcp::default_config(),
     );
     let router = TestApp::new()
         .config(settings(&cfg).unwrap())
@@ -69,20 +71,30 @@ async fn a_real_lg_serve_connects_to_mcp_and_answers_a_macro_tick() {
     let log = std::fs::read_to_string(dir.path().join("torin/lg.log")).unwrap_or_default();
     assert!(finished.0, "the wake failed: {:?}\n{log}", finished.1);
     assert!(
-        log.contains("mud__mud_command"),
+        log.contains("mud__mud_command") && log.contains("mud__mud_wake_me"),
         "littleguy did not list the MUD tools:\n{log}"
     );
     assert!(
         !log.contains("gives no tools"),
         "the MCP connection failed:\n{log}"
     );
-    // The observer links to torin's littleguy pages with a fresh sign-in.
+    observer_links_to_torins_pages(addr, &built.mud.admin_token).await;
+    for t in tasks {
+        t.abort();
+    }
+    for lg in &built.littleguy {
+        lg.shutdown().await;
+    }
+}
+
+/// The observer links to torin's littleguy pages with a fresh sign-in.
+#[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
+async fn observer_links_to_torins_pages(addr: std::net::SocketAddr, token: &str) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    let token = &built.mud.admin_token;
     let table = http
         .get(format!("http://{addr}/observer/entities?token={token}"))
         .send()
@@ -111,10 +123,4 @@ async fn a_real_lg_serve_connects_to_mcp_and_answers_a_macro_tick() {
         "the sign-in link works: {}",
         signed_in.status()
     );
-    for t in tasks {
-        t.abort();
-    }
-    for lg in &built.littleguy {
-        lg.shutdown().await;
-    }
 }

@@ -1,4 +1,4 @@
-//! The MCP handler: four tools, each acting as the caller's own entity.
+//! The MCP handler: six tools, each acting as the caller's own entity.
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use rmcp::{ErrorData, ServerHandler};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::gate::CommandGate;
+use crate::gate::{CommandGate, WakeBooker};
 use crate::tokens::TokenRegistry;
 
 /// `mud_look`.
@@ -24,8 +24,12 @@ pub const SHEET: &str = "mud_sheet";
 pub const EVENTS: &str = "mud_events";
 /// `mud_command`.
 pub const COMMAND: &str = "mud_command";
-/// The four tools, in the order `tools/list` gives them.
-pub const TOOLS: [&str; 4] = [LOOK, SHEET, EVENTS, COMMAND];
+/// `mud_wake_me`.
+pub const WAKE_ME: &str = "mud_wake_me";
+/// `mud_cancel_wake`.
+pub const CANCEL_WAKE: &str = "mud_cancel_wake";
+/// The tools, in the order `tools/list` gives them.
+pub const TOOLS: [&str; 6] = [LOOK, SHEET, EVENTS, COMMAND, WAKE_ME, CANCEL_WAKE];
 
 /// The most events one `mud_events` call returns.
 pub const MAX_EVENTS: u32 = 200;
@@ -59,6 +63,20 @@ struct CommandArgs {
     cmd: String,
 }
 
+/// The arguments of `mud_wake_me`.
+#[derive(Debug, Deserialize)]
+struct WakeArgs {
+    minutes: u32,
+    #[serde(default)]
+    note: String,
+}
+
+/// The arguments of `mud_cancel_wake`.
+#[derive(Debug, Deserialize)]
+struct CancelArgs {
+    id: u64,
+}
+
 /// The MCP handler. One is made per MCP session; it holds no caller: the
 /// caller of each request comes from that request's own HTTP parts.
 #[derive(Clone)]
@@ -66,6 +84,7 @@ pub struct MudServer {
     pub game: Arc<Game>,
     pub tokens: Arc<TokenRegistry>,
     pub gate: Arc<dyn CommandGate>,
+    pub wakes: Arc<dyn WakeBooker>,
 }
 
 /// A JSON object from a `json!` literal.
@@ -154,6 +173,51 @@ fn tools() -> Vec<Tool> {
         )
         .with_annotations(ToolAnnotations::new().read_only(false).open_world(false)),
     ]
+    .into_iter()
+    .chain(wake_tools())
+    .collect()
+}
+
+/// `mud_wake_me` and `mud_cancel_wake`.
+fn wake_tools() -> [Tool; 2] {
+    [
+        Tool::new(
+            WAKE_ME,
+            format!(
+                "Book a wake for yourself: `minutes` from now (1 to 10080) you are woken even \
+                 if nothing happens, and handed `note`, your own reminder of what to do then. \
+                 You can act in that wake. Use it whenever you mean to come back to something \
+                 later: nothing else wakes you for it, and no other reminder tool can act in \
+                 the world. At most 5 at once. Returns the booking and every wake you have \
+                 booked. A note may quote what others said: {UNTRUSTED}"
+            ),
+            object(json!({
+                "type": "object",
+                "properties": {
+                    "minutes": { "type": "integer", "minimum": 1, "maximum": 10_080 },
+                    "note": {
+                        "type": "string",
+                        "maxLength": 280,
+                        "description": "What to do or check when the wake comes.",
+                    },
+                },
+                "required": ["minutes", "note"],
+                "additionalProperties": false,
+            })),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(false).open_world(false)),
+        Tool::new(
+            CANCEL_WAKE,
+            format!("Cancel a wake you booked with mud_wake_me, by its id. {UNTRUSTED}"),
+            object(json!({
+                "type": "object",
+                "properties": { "id": { "type": "integer", "minimum": 1 } },
+                "required": ["id"],
+                "additionalProperties": false,
+            })),
+        )
+        .with_annotations(ToolAnnotations::new().read_only(false).open_world(false)),
+    ]
 }
 
 /// The arguments of `request`, as `T`.
@@ -183,6 +247,15 @@ fn view(value: Value) -> CallToolResult {
         }))
     } else {
         CallToolResult::structured(value)
+    }
+}
+
+/// A booking answer as a tool result: an error result when `ok` is false.
+fn booking(value: Value) -> CallToolResult {
+    if value["ok"] == true {
+        CallToolResult::structured(value)
+    } else {
+        CallToolResult::structured_error(value)
     }
 }
 
@@ -221,6 +294,18 @@ impl MudServer {
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
                 Ok(CallToolResult::structured(value))
             }
+            WAKE_ME => {
+                let args: WakeArgs = arguments(request)?;
+                Ok(booking(self.wakes.wake_me(
+                    &caller.entity,
+                    args.minutes,
+                    &args.note,
+                )))
+            }
+            CANCEL_WAKE => {
+                let args: CancelArgs = arguments(request)?;
+                Ok(booking(self.wakes.cancel_wake(&caller.entity, args.id)))
+            }
             other => Err(ErrorData::invalid_params(
                 format!("no tool `{other}`"),
                 None,
@@ -235,7 +320,8 @@ impl ServerHandler for MudServer {
             format!(
                 "You play one character in a text MUD shared by humans and agents. \
                  `{LOOK}` and `{SHEET}` show where you are and what you are; `{EVENTS}` \
-                 tells what you perceived since you last asked; `{COMMAND}` acts. \
+                 tells what you perceived since you last asked; `{COMMAND}` acts; \
+                 `{WAKE_ME}` books a wake to come back to something later. \
                  The server owns physics: only commands change the world. {UNTRUSTED}"
             ),
         )

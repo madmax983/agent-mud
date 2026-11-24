@@ -31,6 +31,8 @@ use crate::turing::{Salience, has_keyword, mix, notices, pick};
 pub enum Priority {
     /// The slow world timer.
     MacroTick,
+    /// A wake the entity booked for itself (`mud_wake_me`).
+    Booked,
     /// Agent activity near a human.
     Ambient,
     /// Human activity in the room.
@@ -93,6 +95,10 @@ pub struct Wake {
     /// can merge into a more urgent wake).
     #[serde(default)]
     pub macro_tick: bool,
+    /// The wakes the entity booked that this wake delivers, with the notes
+    /// it left itself.
+    #[serde(default)]
+    pub booked: Vec<crate::wakes::Booking>,
 }
 
 /// A routing decision, for the observer.
@@ -133,6 +139,8 @@ struct Pending {
     cooldown_ms: u64,
     /// The latest distracted spell its non-urgent events saw.
     afk_until_ms: Option<u64>,
+    /// Booked wakes it delivers.
+    booked: Vec<crate::wakes::Booking>,
 }
 
 /// The router.
@@ -370,7 +378,7 @@ impl Router {
                 Priority::Immediate => now + self.jitter(self.cfg.immediate_ms, r, ev.seq, b"imm"),
                 Priority::RoomBatch => now + self.cfg.room_batch_ms[0],
                 Priority::Ambient => now + self.jitter(self.cfg.ambient_ms, r, ev.seq, b"amb"),
-                Priority::MacroTick => now,
+                Priority::MacroTick | Priority::Booked => now,
             };
             let mut floor = 0;
             let mut cooldown_ms = 0;
@@ -407,6 +415,7 @@ impl Router {
                 macro_tick: false,
                 cooldown_ms: 0,
                 afk_until_ms: None,
+                booked: Vec::new(),
             });
             p.seqs.push(ev.seq);
             if priority < Priority::Immediate {
@@ -474,6 +483,7 @@ impl Router {
                 macro_tick: true,
                 cooldown_ms: 0,
                 afk_until_ms: None,
+                booked: Vec::new(),
             });
         // The tick keeps its identity even inside a more urgent wake.
         p.macro_tick = true;
@@ -501,12 +511,35 @@ impl Router {
                 macro_tick: false,
                 cooldown_ms: 0,
                 afk_until_ms: None,
+                booked: Vec::new(),
             });
         if priority >= p.priority {
             p.priority = priority;
             reason.clone_into(&mut p.reason);
         }
         p.due_ms = p.due_ms.min(now);
+    }
+
+    /// Queues the booked wakes that came due for `entity`, now. They merge
+    /// into a wake already waiting, which then carries their notes.
+    pub fn deliver_booked(
+        &mut self,
+        entity: &EntityId,
+        bookings: Vec<crate::wakes::Booking>,
+        now: u64,
+    ) -> RouteNote {
+        self.force(entity, Priority::Booked, "booked wake", now);
+        let p = self.pending.get_mut(entity);
+        let (priority, due_ms) = p.map_or((Priority::Booked, now), |p| {
+            p.booked.extend(bookings);
+            (p.priority, p.due_ms)
+        });
+        RouteNote::Queued {
+            entity: entity.clone(),
+            priority,
+            due_ms,
+            seq: Seq(0),
+        }
     }
 
     /// Takes the wakes that are due, skipping entities with one in flight.
@@ -527,6 +560,7 @@ impl Router {
                     seqs: p.seqs,
                     reason: p.reason,
                     macro_tick: p.macro_tick,
+                    booked: p.booked,
                 });
             }
         }
