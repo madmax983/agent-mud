@@ -38,6 +38,29 @@ impl Line {
     }
 }
 
+/// The `board read` narrative followed by one `  [n] author: text` line
+/// per post in `resolution["posts"]`. The posts are player text, kept out
+/// of the engine's narrative and rendered here, at the transport; each
+/// transport then escapes for its medium. A line the narrative already
+/// holds is not repeated.
+fn with_board_posts(narrative: &str, resolution: &serde_json::Value) -> String {
+    let mut text = narrative.to_owned();
+    let posts = resolution["posts"].as_array().into_iter().flatten();
+    for (i, p) in posts.enumerate() {
+        let line = format!(
+            "  [{}] {}: {}",
+            i + 1,
+            p["author"]["name"].as_str().unwrap_or("someone"),
+            p["untrusted_text"].as_str().unwrap_or_default()
+        );
+        if !narrative.lines().any(|l| l == line) {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
+    text
+}
+
 /// Counts open connections per entity, so a second tab does not log a
 /// player out when the first one closes.
 ///
@@ -136,7 +159,12 @@ impl Session {
         } else {
             LineKind::Error
         };
-        vec![Line::new(kind, r.narrative)]
+        let text = if r.ok && r.verb.as_deref() == Some("board_read") {
+            with_board_posts(&r.narrative, &r.resolution)
+        } else {
+            r.narrative
+        };
+        vec![Line::new(kind, text)]
     }
 
     /// The line an event shows this player, if it reaches them and is not
@@ -192,6 +220,36 @@ mod tests {
         drop(ada2);
         assert!(!g.read(|w| w.entity(&EntityId::from("pc_ada")).unwrap().online));
         assert!(Session::login(g, p, "kestrel").is_err());
+    }
+
+    #[test]
+    fn board_posts_are_rendered_from_the_resolution_once() {
+        let posts = serde_json::json!({ "posts": [
+            { "author": { "id": "pc_ada", "name": "ada" }, "untrusted_text": "ore wanted" },
+            { "author": { "id": "torin", "name": "Torin" }, "untrusted_text": "<b>15s</b>" },
+        ]});
+        let want = "The notice board:\n  [1] ada: ore wanted\n  [2] Torin: <b>15s</b>";
+        assert_eq!(with_board_posts("The notice board:", &posts), want);
+        assert_eq!(with_board_posts(want, &posts), want, "no duplicates");
+        assert_eq!(
+            with_board_posts("The notice board: bare wood.", &serde_json::json!({})),
+            "The notice board: bare wood."
+        );
+    }
+
+    #[test]
+    fn a_player_reads_the_board_through_a_session() {
+        let g = game();
+        let p = Arc::new(Presence::default());
+        let (ada, _) = Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
+        let _ = ada.command("n");
+        assert_eq!(
+            ada.command("board post ore wanted")[0].kind,
+            LineKind::Narrative
+        );
+        let out = ada.command("board read");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text.matches("  [1] ada: ore wanted").count(), 1);
     }
 
     /// A tab closing while another tab of the same player logs in must
