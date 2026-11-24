@@ -615,3 +615,65 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn examine_entities_items_exits_and_the_board() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    let r = ok(&mut w, &ada, "examine hale");
+    assert!(r.narrative.contains("watchman"));
+    assert!(r.narrative.contains("spear"), "gear shows: {}", r.narrative);
+    assert_eq!(r.resolution["entity"]["kind"], "npc");
+    let r = ok(&mut w, &ada, "x dagger");
+    assert_eq!(r.resolution["item"]["value"], 12);
+    ok(&mut w, &ada, "s");
+    let r = ok(&mut w, &ada, "examine down");
+    assert!(r.narrative.contains("padlock"));
+    let r = ok(&mut w, &ada, "examine north");
+    assert!(r.narrative.contains("open"));
+    let r = ok(&mut w, &ada, "exits");
+    assert!(r.narrative.contains("down (locked)"));
+    assert_eq!(
+        err(&mut w, &ada, "examine unicorn"),
+        ErrorCode::NoSuchTarget
+    );
+    ok(&mut w, &ada, "n");
+    ok(&mut w, &ada, "n");
+    let r = ok(&mut w, &ada, "examine board");
+    assert!(r.narrative.contains("board read"));
+    let r = ok(&mut w, &ada, "look");
+    assert!(r.narrative.contains("notice board stands here"));
+    let r = ok(&mut w, &ada, "inventory");
+    assert!(r.narrative.contains("dagger (weapon)"));
+    assert!(r.narrative.contains("Purse: 25s"));
+}
+
+#[test]
+fn the_dark_hides_the_room_and_its_contents() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "ossuary_crypt");
+    let v = w.look_view(&ada);
+    assert_eq!(v["entities"], serde_json::json!([]));
+    assert_eq!(v["items"], serde_json::json!([]));
+    assert_eq!(err(&mut w, &ada, "examine warden"), ErrorCode::NoSuchTarget);
+    assert_eq!(err(&mut w, &ada, "take ore"), ErrorCode::NoSuchItem);
+    ok(&mut w, &ada, "equip torch");
+    let (text, v) = w.look(&ada);
+    assert!(text.contains("skeletal warden"));
+    assert!(text.contains("You see:"), "{text}");
+    assert_eq!(v["items"].as_array().map(Vec::len), Some(5));
+}
+
+#[test]
+fn wounds_show_in_look_and_sheets_list_traits() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "fence_backroom");
+    w.state.entities.get_mut(&id("vich")).unwrap().pools.hp = 2;
+    let (text, _) = w.look(&ada);
+    assert!(text.contains("(badly hurt)"), "{text}");
+    let (sheet, v) = w.sheet(&id("vich"));
+    assert!(sheet.contains("greedy(12)"));
+    assert_eq!(v["wound_state"], "staggered");
+}
