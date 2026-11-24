@@ -50,6 +50,10 @@ pub struct Mud {
     pub timeouts: Timeouts,
     /// Connection slots, shared with telnet.
     pub limiter: Arc<ConnLimiter>,
+    /// Cancelled when the server starts shutting down: long-lived
+    /// responses (the observer feed, MCP sessions) end on it so the server
+    /// can drain.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl Mud {
@@ -459,7 +463,9 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
         let who = e.actor.as_ref().map_or("world", |a| a.name.as_str()).to_owned();
         Some(sse("world", &json!({ "seq": e.seq, "room": e.room, "kind": e.kind, "who": who, "human": e.human_actor, "text": text })))
     });
-    futures::stream::select(sup, futures::stream::select(audit, world)).map(Ok::<_, Infallible>)
+    futures::stream::select(sup, futures::stream::select(audit, world))
+        .map(Ok::<_, Infallible>)
+        .take_until(app.shutdown.clone().cancelled_owned())
 }
 
 /// One world event as the observer's feed line, or `None` for an event

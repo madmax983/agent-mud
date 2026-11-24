@@ -80,6 +80,26 @@ where
     router_with_config(game, tokens, command_gate, default_config())
 }
 
+/// [`router`], with every MCP session ended when `stop` is cancelled.
+///
+/// A connected agent holds a session open as a long-lived SSE response,
+/// and a graceful HTTP shutdown waits for every open response. Cancel
+/// `stop` when shutdown begins, or the server cannot drain until each
+/// client goes away on its own.
+pub fn router_until<S>(
+    game: Arc<Game>,
+    tokens: Arc<TokenRegistry>,
+    command_gate: Arc<dyn CommandGate>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let mut config = default_config();
+    config.cancellation_token = stop;
+    router_with_config(game, tokens, command_gate, config)
+}
+
 /// [`router`] with a streamable HTTP configuration of the caller's.
 pub fn router_with_config<S>(
     game: Arc<Game>,

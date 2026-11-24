@@ -266,6 +266,78 @@ async fn spend_between_wakes_is_owed_once() {
     assert!(charge.settle(&torin, Usage::default()).await.is_zero());
 }
 
+#[tokio::test]
+async fn no_daemon_starts_after_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LittleguyConfig {
+        bin: dir.path().join("no-such-lg"),
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    mind.shutdown().await;
+    assert!(mind.is_closed());
+    let e = mind.ensure(&torin).await.unwrap_err();
+    assert!(e.to_string().contains("shutting down"), "{e}");
+    assert!(
+        !dir.path().join("torin").exists(),
+        "nothing was started or written"
+    );
+    mind.shutdown().await;
+}
+
+/// A stand-in for a daemon: a shell whose command line names `arg`.
+fn stand_in(arg: &Path) -> tokio::process::Child {
+    tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30; true")
+        .arg(arg)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_orphan_daemon_from_an_earlier_run_is_stopped() {
+    if !Path::new("/proc").exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let mut orphan = stand_in(&sock);
+    std::fs::write(dir.path().join(PID_FILE), orphan.id().unwrap().to_string()).unwrap();
+    reap_orphan(dir.path(), &sock).await;
+    let status = tokio::time::timeout(Duration::from_secs(5), orphan.wait())
+        .await
+        .expect("the orphan was stopped")
+        .unwrap();
+    assert!(!status.success());
+    assert!(!dir.path().join(PID_FILE).exists());
+}
+
+#[tokio::test]
+async fn a_recycled_pid_that_is_not_our_daemon_is_left_alone() {
+    if !Path::new("/proc").exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut stranger = stand_in(&dir.path().join("somebody-else.sock"));
+    std::fs::write(
+        dir.path().join(PID_FILE),
+        stranger.id().unwrap().to_string(),
+    )
+    .unwrap();
+    reap_orphan(dir.path(), &dir.path().join("lg.sock")).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stranger.wait())
+            .await
+            .is_err(),
+        "an unrelated process keeps running"
+    );
+    stranger.kill().await.unwrap();
+}
+
 /// Runs a real `lg serve` when `LG_BIN` names one (the CI job that builds
 /// littleguy sets it). It checks that littleguy accepts the generated
 /// config, opens its socket, and answers a wake.
@@ -319,5 +391,18 @@ async fn a_real_lg_serve_answers_a_wake() {
         matches!(live.charge(NOW), Ok(Some(_))),
         "the ledger of a running lg serve is readable"
     );
+    let pid: u32 = std::fs::read_to_string(dir.path().join("torin").join(PID_FILE))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     mind.shutdown().await;
+    assert!(!dir.path().join("torin").join(PID_FILE).exists());
+    if Path::new("/proc").exists() {
+        // Killed and reaped by `shutdown`: no zombie, no live daemon.
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "lg serve {pid} is gone"
+        );
+    }
 }

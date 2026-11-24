@@ -37,6 +37,16 @@ process lifecycle; littleguy owns the mind.
   max_steps` (24) bounds the tool rounds of one wake.
 - littleguy's own heartbeat is kept for quiet reflection and memory
   consolidation only.
+- **Shutdown.** Each daemon holds an MCP session open (an SSE response),
+  and a graceful HTTP shutdown waits for every open response. So the MUD
+  stops its minds when shutdown *begins*, not after it drains: autumn's
+  shutdown token cancels `Mud::shutdown`, which ends every MCP session
+  (rmcp's `cancellation_token`) and the observer feed, aborts the
+  supervisor's tasks, and kills and reaps every `lg serve`. After that no
+  daemon starts (`LittleguyMind` is closed). Each daemon's process id is
+  kept in `<dir>/lg.pid`; a daemon left by a run that crashed or was
+  killed is stopped before its replacement starts, if its command line
+  names that entity's socket.
 
 ```mermaid
 sequenceDiagram

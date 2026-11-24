@@ -27,6 +27,17 @@ async fn boot_cfg(
     admin_token: Option<&str>,
     tweak: impl FnOnce(&mut MudConfig),
 ) -> (SocketAddr, Arc<Built>) {
+    let (addr, built, _) = boot_full(admin_token, tweak).await;
+    (addr, built)
+}
+
+/// [`boot_cfg`], also giving the server's app state.
+async fn boot_full(
+    admin_token: Option<&str>,
+    tweak: impl FnOnce(&mut MudConfig),
+) -> (SocketAddr, Arc<Built>, autumn_web::AppState) {
+    let state = Arc::new(std::sync::Mutex::new(None::<autumn_web::AppState>));
+    let seen = Arc::clone(&state);
     let mut cfg = MudConfig::default();
     cfg.world.db = None;
     cfg.supervisor.typing_scale = 0.0;
@@ -48,7 +59,10 @@ async fn boot_cfg(
     let router = TestApp::new()
         .config(settings(&cfg).unwrap())
         .routes(web::routes())
-        .state_initializer(move |s| s.insert_extension((*mud).clone()))
+        .state_initializer(move |s| {
+            mud_server::install(s, &mud);
+            *seen.lock().unwrap() = Some(s.clone());
+        })
         .build()
         .into_router()
         .merge(mcp);
@@ -56,7 +70,8 @@ async fn boot_cfg(
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum_serve(listener, router).await });
     tokio::time::sleep(Duration::from_millis(30)).await;
-    (addr, built)
+    let state = state.lock().unwrap().clone().unwrap();
+    (addr, built, state)
 }
 
 async fn axum_serve(listener: TcpListener, router: autumn_web::reexports::axum::Router) {
@@ -395,6 +410,36 @@ async fn the_feed_streams_world_events() {
         seen.push_str(&String::from_utf8_lossy(&chunk));
     }
     assert!(seen.contains("event: world"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_observer_feed_ends_when_shutdown_begins() {
+    // Regression: an open feed (like an agent's MCP session) kept a
+    // graceful shutdown waiting.
+    let (addr, built) = boot().await;
+    let token = built.mud.admin_token.clone();
+    let mut resp = http()
+        .get(format!("http://{addr}/observer/feed?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    built.mud.shutdown.cancel();
+    let ended = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Ok(Some(_)) = resp.chunk().await {}
+    })
+    .await;
+    assert!(ended.is_ok(), "the feed closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn autumn_starting_its_shutdown_cancels_ours() {
+    let (_addr, built, state) = boot_full(None, |_| {}).await;
+    assert!(!built.mud.shutdown.is_cancelled());
+    state.trigger_shutdown_for_test();
+    tokio::time::timeout(Duration::from_secs(3), built.mud.shutdown.cancelled())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

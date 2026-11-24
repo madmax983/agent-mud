@@ -452,4 +452,44 @@ mod http {
         assert_eq!(calls.lock().unwrap().len(), 1);
         client.cancel().await.unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_the_stop_token_ends_sessions_so_the_server_can_drain() {
+        // Regression: Ctrl+C left `mud serve` waiting minutes, because each
+        // littleguy daemon held an MCP session (an SSE stream) open and a
+        // graceful shutdown waits for every open response.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let game = game();
+        let tokens = Arc::new(TokenRegistry::new());
+        let stop = tokio_util::sync::CancellationToken::new();
+        let app: axum::Router = mud_mcp::router_until(
+            Arc::clone(&game),
+            Arc::clone(&tokens),
+            direct(Arc::clone(&game)),
+            stop.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let drained = stop.clone();
+        let served = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { drained.cancelled().await })
+                .await
+        });
+        let token = tokens.issue(EntityId::from("torin")).unwrap();
+        let config = StreamableHttpClientTransportConfig::with_uri(url.as_str()).auth_header(token);
+        let client = ().serve(StreamableHttpClientTransport::from_config(config)).await.unwrap();
+        let _ = call(&client, "mud_look", json!({})).await;
+        // Let the client open its server-to-client stream.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop.cancel();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), served).await;
+        assert!(
+            ended.is_ok(),
+            "the server drained within 5 s with a client still connected"
+        );
+        drop(client);
+    }
 }

@@ -161,6 +161,7 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
                 cfg.server.max_connections,
                 cfg.server.max_connections_per_address,
             ),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }),
         admin_token_generated,
         tokens,
@@ -248,17 +249,54 @@ impl TelemetryProvider for Quiet {
 #[must_use]
 pub fn app(built: &Built, settings: AutumnConfig) -> AppBuilder {
     let mud = Arc::clone(&built.mud);
-    let mcp = mud_mcp::router::<autumn_web::AppState>(
+    let mcp = mud_mcp::router_until::<autumn_web::AppState>(
         Arc::clone(&built.mud.game),
         Arc::clone(&built.tokens),
         Arc::new(TypingGate(Arc::clone(built.mud.sup.gate()))),
+        built.mud.shutdown.child_token(),
     );
     autumn_web::app()
         .with_config_loader(Fixed(settings))
         .with_telemetry_provider(Quiet)
         .routes(web::routes())
         .merge(mcp)
-        .state_initializer(move |state| state.insert_extension((*mud).clone()))
+        .state_initializer(move |state| install(state, &mud))
+}
+
+/// Puts `mud` in the app state and ties its shutdown token to autumn's:
+/// autumn cancels its own token as shutdown begins, before it waits for
+/// open responses to finish, and `mud.shutdown` follows at once.
+pub fn install(state: &autumn_web::AppState, mud: &Mud) {
+    state.insert_extension(mud.clone());
+    let begun = state.shutdown_token();
+    let ours = mud.shutdown.clone();
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move {
+            begun.cancelled().await;
+            ours.cancel();
+        });
+    }
+}
+
+/// Stops the minds once `shutdown` is cancelled.
+///
+/// The supervisor's tasks stop first (so no wake starts a new daemon),
+/// then every littleguy daemon is killed and reaped. This runs as soon as
+/// shutdown begins, not after the HTTP server has drained, because each
+/// daemon holds an MCP session open and the drain would wait on it.
+pub async fn stop_on(
+    shutdown: tokio_util::sync::CancellationToken,
+    tasks: Vec<tokio::task::AbortHandle>,
+    littleguy: Vec<Arc<LittleguyMind>>,
+) {
+    shutdown.cancelled().await;
+    tracing::info!("shutting down: stopping the supervisor and every littleguy daemon");
+    for t in tasks {
+        t.abort();
+    }
+    for lg in &littleguy {
+        lg.shutdown().await;
+    }
 }
 
 /// Runs the server until a signal stops it.
@@ -289,13 +327,18 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
             Arc::clone(&built.mud.presence),
         )));
     }
+    let stopper = tokio::spawn(stop_on(
+        built.mud.shutdown.clone(),
+        tasks
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect(),
+        built.littleguy.clone(),
+    ));
     Box::pin(app(&built, settings).run()).await;
-    for t in tasks {
-        t.abort();
-    }
-    for lg in &built.littleguy {
-        lg.shutdown().await;
-    }
+    // However the server ended, nothing outlives it.
+    built.mud.shutdown.cancel();
+    let _ = stopper.await;
     Ok(())
 }
 
@@ -356,6 +399,35 @@ mod tests {
         assert!(proxied.security.trusted_proxies.trust_forwarded_headers);
         assert_eq!(proxied.security.trusted_proxies.ranges, ["10.0.0.0/8"]);
         assert_eq!(proxied.realtime.max_connections, Some(40));
+    }
+
+    #[tokio::test]
+    async fn stopping_aborts_the_supervisor_and_closes_every_littleguy() {
+        let dir = tempfile::tempdir().unwrap();
+        let lg = Arc::new(LittleguyMind::new(
+            mud_supervisor::littleguy::LittleguyConfig {
+                bin: dir.path().join("no-such-lg"),
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            std::collections::HashMap::new(),
+        ));
+        let forever = tokio::spawn(std::future::pending::<()>());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopper = tokio::spawn(stop_on(
+            shutdown.clone(),
+            vec![forever.abort_handle()],
+            vec![Arc::clone(&lg)],
+        ));
+        tokio::task::yield_now().await;
+        assert!(!lg.is_closed(), "nothing stops before the token");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), stopper)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lg.is_closed());
+        assert!(forever.await.unwrap_err().is_cancelled());
     }
 
     #[test]
