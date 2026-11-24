@@ -925,3 +925,36 @@ fn climbing_reads_as_climbing() {
         ["ada leaves north.", "ada arrives from the south."]
     );
 }
+
+#[test]
+fn a_keeper_sees_its_own_prices_on_its_sheet() {
+    // Regression: Marta quoted ale at "a copper and a half" (the pack has
+    // only silver, and ale is 1s): nothing told a keeper its prices.
+    let w = world();
+    let marta = w.sheet_view(&id("marta"));
+    let shop = &marta["shop"];
+    assert_eq!(shop["currency"], "silver");
+    assert_eq!(shop["short"], "s");
+    let ale = shop["sells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "mug of ale")
+        .unwrap();
+    assert_eq!(ale["price"], 1);
+    assert_eq!(ale["count"], 5);
+    let torin = w.sheet_view(&id("torin"));
+    assert_eq!(
+        torin["shop"]["pays"]["iron_ore"], 15,
+        "a fixed buying price"
+    );
+    assert_eq!(torin["shop"]["buy_rate"], 0.5);
+    let mut w = w;
+    let ada = w.login("ada", 1).unwrap();
+    assert!(
+        w.sheet_view(&ada).get("shop").is_none(),
+        "no shop, no prices"
+    );
+    let (text, _) = w.sheet(&id("marta"));
+    assert!(text.contains("mug of ale - 1s"), "{text}");
+}

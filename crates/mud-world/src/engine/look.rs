@@ -320,7 +320,7 @@ impl World {
                 )
             })
             .collect();
-        json!({
+        let mut v = json!({
             "id": me.id,
             "name": me.name,
             "attrs": me.attrs,
@@ -336,7 +336,11 @@ impl World {
             "equipped": equipped,
             "inventory": self.carried_view(me),
             "room_id": me.room,
-        })
+        });
+        if let (Some(shop), Some(obj)) = (self.shop_view(me), v.as_object_mut()) {
+            obj.insert("shop".into(), shop);
+        }
+        v
     }
 
     pub(crate) fn sheet(&self, viewer: &EntityId) -> (String, Value) {
@@ -392,6 +396,19 @@ impl World {
             "Purse: {}{}",
             v["currency"], self.pack.economy.currency.short
         );
+        if let Some(rows) = v["shop"]["sells"].as_array() {
+            let short = &self.pack.economy.currency.short;
+            let _ = write!(out, "\nYour shop sells:");
+            for r in rows {
+                let _ = write!(
+                    out,
+                    "\n  {} - {}{short} (x{})",
+                    r["name"].as_str().unwrap_or(""),
+                    r["price"],
+                    r["count"]
+                );
+            }
+        }
         (out, v)
     }
 
