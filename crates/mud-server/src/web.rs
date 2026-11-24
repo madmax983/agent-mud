@@ -975,6 +975,18 @@ pub fn script_line(a: &mud_world::Audit) -> Option<String> {
             format!("{hook} minted from {pool} ({entity}) · {}", what.join(", "))
         }
         Audit::MindMemoryReset { entity, .. } => format!("memory reset for {entity}"),
+        Audit::StoreBacklog { dropped, .. } => format!(
+            "STORE FAILING: {dropped} unsaved event{} dropped from the backlog",
+            if *dropped == 1 { "" } else { "s" }
+        ),
+        Audit::EventsArchived {
+            trimmed,
+            archived,
+            through,
+            ..
+        } => {
+            format!("events archived: {archived} written, {trimmed} trimmed, through seq {through}")
+        }
         Audit::SelfControl { .. } | Audit::Command { .. } => return None,
     })
 }
@@ -1172,6 +1184,36 @@ mod tests {
         assert!(constant_eq(b"abc", b"abc"));
         assert!(!constant_eq(b"abc", b"abd"));
         assert!(!constant_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn the_store_lines_tell_the_operator_what_happened() {
+        let backlog = script_line(&mud_world::Audit::StoreBacklog {
+            dropped: 3,
+            at_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            backlog,
+            "STORE FAILING: 3 unsaved events dropped from the backlog"
+        );
+        let one = script_line(&mud_world::Audit::StoreBacklog {
+            dropped: 1,
+            at_ms: 0,
+        })
+        .unwrap();
+        assert!(one.contains("1 unsaved event dropped"), "{one}");
+        let archived = script_line(&mud_world::Audit::EventsArchived {
+            trimmed: 40,
+            archived: 38,
+            through: mud_world::Seq(40),
+            at_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            archived,
+            "events archived: 38 written, 40 trimmed, through seq 40"
+        );
     }
 
     #[test]

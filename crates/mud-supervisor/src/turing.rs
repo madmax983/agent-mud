@@ -9,23 +9,7 @@
 use mud_world::pack::TuringSpec;
 use mud_world::schedule::{DAY_MINUTES, Window, parse_window};
 
-/// A 64-bit mix of a seed and some bytes (FNV-1a, then `SplitMix64`).
-#[must_use]
-pub fn mix(seed: u64, parts: &[&[u8]]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
-    for p in parts {
-        for b in *p {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h ^= 0xff;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let mut z = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
+pub use mud_world::hash::mix;
 
 /// A number in `lo..=hi` from a hash.
 #[must_use]

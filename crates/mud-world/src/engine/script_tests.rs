@@ -433,7 +433,7 @@ fn hook_faults_survive_a_store_round_trip() {
     let mut w = world_with(&h);
     let ada = in_alley(&mut w);
     run(&mut w, &ada, "pry");
-    let mut store = crate::store::Store::open_in_memory().unwrap();
+    let mut store = crate::store::Store::open_in_memory(1, 0).unwrap();
     store
         .save("crypt-v01", &w.snapshot(), &w.drain_fresh(), &[], 5)
         .unwrap();

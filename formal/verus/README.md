@@ -7,7 +7,7 @@ VERUS=/home/user/tools/verus-x86-linux/verus   # any Verus 0.2026.10.04.426d8b0 
 "$VERUS" formal/verus/src/lib.rs --crate-type=lib
 ```
 
-Expect `verification results:: 90 verified, 0 errors`. The release links
+Expect `verification results:: 118 verified, 0 errors`. The release links
 against rustup toolchain `1.98.1-x86_64-unknown-linux-gnu`, which must be
 installed.
 
@@ -26,6 +26,8 @@ installed.
 | `src/throttle.rs` `throttle_step`, `throttle_allows` | `crates/mud-accounts/src/throttle.rs` | S1 no overflow; S2 a success clears the key (allows at every time); S3 a failure never delays past `max_ms`, even from a larger stored delay; S4 a failure records `now` and locks until `>= now`, exactly `now + delay <= now + max` with room below `u64::MAX`; S5 free failures never delay; S6 past free, at least `min(base, max)`; S7 the count restarts at 1 after `forget_ms` of quiet, else adds one saturating; S8 allows iff `now >= locked_until_ms`. `lemma_lock_ends_by_cap`; `lemma_rate_bound`: along admitted failures in rising times with no quiet spell, the count after failure `j` is `j`, and failure `j` comes at least `min(base, max)` after failure `j - 1` once `j - 1 > free` |
 | `src/hooks.rs` `tally_step`, `tally_admissible` | `crates/mud-world/src/hooks.rs` | The saturating tally of a list counts its effects, refuses, heal/hurts and rewards exactly up to 255 (`lemma_tally_counts`); for `max <= 16` it admits a list iff the list has at most `max` effects, at most one heal/hurt, at most one reward, and a refuse only alone in a command hook (`lemma_admission_is_exact`); so an admitted list mints at most once and never with a refuse (`lemma_admitted_mints_at_most_once_and_never_with_refuse`); `tally_exec` folds a list to `tally_of` |
 | `src/rewards.rs` `pool_admit`, `pool_roll`, `pool_period` | `crates/mud-world/src/rewards.rs` | An ask is admitted iff `spent <= budget && ask <= budget - spent`; then the new count is exactly `spent + ask <= budget`, else it is unchanged; no overflow. A later period starts at 0; an earlier one keeps the later period and count; the period of a per-day pool is `now_ms / 86_400_000`, monotone in `now_ms` (`lemma_period_is_monotone`), and 0 for `ever`. Safety: for every run of asks in a period, the count never passes the budget and equals the start plus exactly the admitted asks (`lemma_run_never_passes_budget`); for every sequence of clock readings (forward, back or equal) and asks, the count of the period a pool counts in never passes its budget and that period never moves back (`lemma_every_period_keeps_its_budget`); `admit_run` folds `pool_admit` to `spent_after` |
+| `src/side.rs` `macro_queue`, `macro_consume`, `dated_max` | `crates/mud-world/src/side.rs` | Each macro op is inflationary (`below(row, r)`) and keeps `cleared <= queued`; any two macro ops commute (`lemma_macro_ops_commute`) and each is idempotent (`lemma_macro_ops_idempotent`), so a retried or reordered upsert gives the same row; every run of ops from a sound row stays sound and never goes down (`lemma_runs_stay_sound_and_grow`). The dated join `(max day, dated_max)` is commutative, associative and idempotent (`lemma_dated_join_is_a_semilattice`) and never moves a counter back (`lemma_dated_join_is_inflationary`) |
+| `src/durability.rs` `schema_verdict`, `retention_cutoff`, `archive_admits`, `pending_overflow`, `events_truncated` | `crates/mud-world/src/durability.rs` | Refuse iff `found > latest`, Upgrade iff `found < latest`, Current iff equal. The cutoff is 0 for `keep_days == 0`, at most `now`, monotone in `now` (`lemma_cutoff_is_monotone`), and never above an event younger than `keep_days` (`lemma_young_events_survive`). The archive model (`append` folds `archive_admits` row by row) stays strictly ascending (`lemma_append_keeps_ascending`), covers every row of a batch (`lemma_append_covers`), appends nothing for a covered batch, and a crash after any prefix `k` of a batch then a re-run of the whole batch gives the file of one clean run (`lemma_crash_rerun_is_idempotent`). `len - overflow <= cap`, and 0 within the cap. `events_truncated` iff `since < last` and `since + 1` is below the oldest logged seq, which is exactly "some event in `since+1..=last` left the log" (`lemma_truncated_is_exact`) |
 
 Each executable function also proves it never overflows.
 
@@ -44,6 +46,10 @@ Each executable function also proves it never overflows.
 | `tally_admissible` | `max <= 16` (the exactness lemma) | `scripts.toml` `limits.max_effects` is checked to `1..=16` (`MAX_EFFECTS_CEILING`) |
 | `login_route`, `may_bind` | none | the dialogue reads `Game::name_owner` again before every account call and before it binds |
 | `throttle_step` | none (`lemma_rate_bound` needs `ts[n] + max <= u64::MAX`) | `[accounts.throttle.*]` is checked to `1 <= base <= max <= 86_400_000 < forget`; a key past free inside `forget_ms` is never evicted |
+| `macro_queue`, `macro_consume`, `dated_max` | none | only comparisons |
+| `retention_cutoff` | `keep_days <= 36_500` (`MAX_KEEP_DAYS`) | `[world] events_keep_days` is checked to `0..=36500`; `Game::retain` clamps once more |
+| `schema_verdict`, `archive_admits`, `pending_overflow` | none | comparisons and a saturating subtraction |
+| `events_truncated` | the oldest logged seq is at most `last` | the log holds only emitted events, whose seqs are at most `last_seq` |
 | `pool_admit`, `pool_roll`, `pool_period` | none | `u64` throughout; the pack keeps budgets at 0..=1 000 000 currency and 1..=1 000 items, and a negative ask is refused before the kernel |
 
 ## Mirror guard
@@ -58,8 +64,9 @@ Verus module, white space removed. On the Verus side it drops only the
 `requires`/`ensures` clauses and the return name in `-> (r: T)`. Doc
 comments, signatures and the enums (`Outcome`, `DamageType`, `WoundState`,
 `ChatterInput`, `BudgetLevel`, `HookOutcome`, `EffectClass`, `Tally`,
-`Holder`, `Route`, `FirstAsk`, `ThrottleOp`, `ThrottlePolicy`, `Throttle`) and
-the constant `DAY_MS` are mirrored too. Proof steps a body needs
+`Holder`, `Route`, `FirstAsk`, `ThrottleOp`, `ThrottlePolicy`, `Throttle`,
+`MacroRow`, `SchemaVerdict`) and the constants `DAY_MS` and `MAX_KEEP_DAYS`
+are mirrored too. Proof steps a body needs
 live outside it (`typing.rs` broadcasts its arithmetic lemmas), so no
 `proof { }` block sits inside a mirrored region. Every module in `src/` must
 be listed in the guard's `PAIRS`.

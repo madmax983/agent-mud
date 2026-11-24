@@ -69,14 +69,21 @@ fn key(name: &str) -> anyhow::Result<NameKey> {
     NameKey::parse(name).ok_or_else(|| anyhow::anyhow!("{}", mud_world::LoginError::Invalid))
 }
 
-/// Who holds `name` in the saved world, or `None` without one.
-async fn saved_holder(world: &Path, name: &str) -> anyhow::Result<Option<Holder>> {
+/// Who holds `name` in the saved world, or `None` without one. Opening the
+/// store upgrades it and bumps its boot number, as any open does; a file
+/// newer than this code is refused.
+async fn saved_holder(
+    world: &Path,
+    name: &str,
+    seed: u64,
+    now_ms: u64,
+) -> anyhow::Result<Option<Holder>> {
     if !world.exists() {
         return Ok(None);
     }
     let (path, n) = (world.to_path_buf(), name.to_owned());
     tokio::task::spawn_blocking(move || {
-        let loaded = mud_world::store::Store::open(&path)?.load(0)?;
+        let loaded = mud_world::store::Store::open(&path, seed, now_ms)?.load(0)?;
         let Some(l) = loaded else {
             return Ok(None);
         };
@@ -122,7 +129,7 @@ pub async fn run(cfg: &MudConfig, op: AccountOp, now_ms: u64) -> anyhow::Result<
         AccountOp::Reset(name) => {
             let k = key(&name)?;
             let holder = match world {
-                Some(w) => saved_holder(w, &name).await?,
+                Some(w) => saved_holder(w, &name, cfg.world.seed, now_ms).await?,
                 None => None,
             };
             let Some(holder) = holder else {
@@ -276,7 +283,7 @@ mod tests {
             "the world file is not created"
         );
         // A world file with no snapshot yet.
-        mud_world::store::Store::open(&dir.path().join("empty.db")).unwrap();
+        mud_world::store::Store::open(&dir.path().join("empty.db"), 1, NOW).unwrap();
         cfg.world.db = Some(dir.path().join("empty.db"));
         assert_eq!(
             run(&cfg, AccountOp::Reset("old".into()), NOW)

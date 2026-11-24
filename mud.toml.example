@@ -24,6 +24,13 @@ max_connections_per_address = 8  # from one address; an IPv6 /64 counts as one (
 # pack = "worlds/crypt-v01"      # unset: the pack compiled into the binary
 db = "data/world.db"             # the SQLite world store
 seed = 1
+# Events retention: old events are appended to <archive_dir>/events-YYYY-MM.jsonl
+# (and synced) before they are trimmed from world.db; nothing is deleted outright.
+events_keep_days = 7             # 0 keeps every event in world.db
+events_keep_min = 10000          # the newest events are never trimmed (at least 10000)
+retention_every_ms = 3600000
+retention_batch = 5000           # events per transaction
+# archive_dir = "data/archive"   # unset: archive/ beside db
 
 # Which runtime thinks for each tier of the cast:
 #   scripted     the cast's script rules; no model

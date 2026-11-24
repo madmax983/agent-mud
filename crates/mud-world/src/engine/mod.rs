@@ -259,6 +259,11 @@ pub struct CommandResult {
     pub state_changes: Vec<StateChange>,
     /// The events it emitted.
     pub events: Vec<Seq>,
+    /// Whether the line was a read-only verb (or did not parse). Not on
+    /// the wire: the store uses it to tell an effectful command, whose
+    /// transaction carries the actor's staged side ops (ADR 0011).
+    #[serde(skip)]
+    pub read_only: bool,
 }
 
 /// An entry for the observer dashboard. Never shown to entities.
@@ -369,6 +374,26 @@ pub enum Audit {
     MindMemoryReset {
         /// Whose.
         entity: EntityId,
+        /// When.
+        at_ms: u64,
+    },
+    /// The store kept failing and its backlog passed the in-memory log's
+    /// size: the oldest unsaved events were dropped (they were broadcast,
+    /// but will not be in the file).
+    StoreBacklog {
+        /// How many were dropped this time.
+        dropped: u64,
+        /// When.
+        at_ms: u64,
+    },
+    /// Retention archived, then trimmed, old events from the store.
+    EventsArchived {
+        /// Rows trimmed from the table.
+        trimmed: u64,
+        /// Lines written to the archive (fewer after a crash re-run).
+        archived: u64,
+        /// The newest seq trimmed.
+        through: Seq,
         /// When.
         at_ms: u64,
     },
@@ -625,6 +650,12 @@ impl World {
             .collect()
     }
 
+    /// The seq of the oldest event the in-memory log still holds.
+    #[must_use]
+    pub fn oldest_logged(&self) -> Option<Seq> {
+        self.log.front().map(|e| e.seq)
+    }
+
     /// The last sequence number used.
     #[must_use]
     pub const fn last_seq(&self) -> Seq {
@@ -692,11 +723,13 @@ impl World {
                 resolution,
                 state_changes: ctx.changes,
                 events: ctx.events,
+                read_only: cmd.is_read_only(),
             },
             Err(fail) => {
                 let mut r = refusal(Some(cmd.display_verb()), &fail);
                 r.state_changes = ctx.changes;
                 r.events = ctx.events;
+                r.read_only = cmd.is_read_only();
                 r
             }
         }
@@ -1174,6 +1207,7 @@ pub fn refusal(verb: Option<&str>, fail: &Fail) -> CommandResult {
         resolution: Value::Null,
         state_changes: Vec::new(),
         events: Vec::new(),
+        read_only: true,
     }
 }
 

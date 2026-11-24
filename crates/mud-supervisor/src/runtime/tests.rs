@@ -579,3 +579,57 @@ async fn an_agent_out_of_the_world_keeps_its_booked_wake_until_it_is_back() {
         Some(vec!["check the grate".to_owned()])
     );
 }
+
+#[tokio::test]
+async fn the_step_archives_then_trims_old_events_off_the_workers() {
+    use mud_world::Clock;
+    use mud_world::engine::EVENT_LOG_CAP;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let arch = dir.path().join("archive");
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let clock = Arc::new(ManualClock::new(20 * 3_600_000));
+    let game = Game::open(Arc::clone(&pack), Some(&db), 5, clock.clone()).unwrap();
+    game.set_retention(mud_world::Retention {
+        keep_days: 1,
+        keep_min: 0,
+        every_ms: 60_000,
+        batch: 5_000,
+        archive_dir: arch.clone(),
+    });
+    let ada = game.login("ada").unwrap();
+    game.write(|w, now| {
+        for i in 0..EVENT_LOG_CAP + 50 {
+            w.execute(&ada, &format!("say {i}"), now);
+        }
+    });
+    let last = game.read(World::last_seq).0;
+    let typing = Gate::new(Arc::clone(&game), 5, 0.0);
+    let fallback = Arc::new(FallbackMind::from_cast(&pack.cast));
+    let sup = Supervisor::new(Arc::clone(&game), typing, HashMap::new(), fallback, quiet());
+    // Too young: the step runs retention, which finds nothing to trim.
+    for h in sup.step() {
+        h.await.unwrap();
+    }
+    assert!(!arch.exists());
+    clock.advance(2 * 86_400_000);
+    let mut audit = game.subscribe_audit();
+    for h in sup.step() {
+        h.await.unwrap();
+    }
+    let old = last - EVENT_LOG_CAP as u64;
+    assert_eq!(
+        mud_world::archive::seqs(&arch).unwrap(),
+        (1..=old).collect::<Vec<_>>()
+    );
+    let mut archived = None;
+    while let Ok(a) = audit.try_recv() {
+        if let mud_world::Audit::EventsArchived { trimmed, .. } = &*a {
+            archived = Some(*trimmed);
+        }
+    }
+    assert_eq!(archived, Some(old));
+    // Claimed until `every_ms` passes.
+    assert!(!game.retention_due(clock.now_ms()));
+    assert_eq!(game.store_errors(), 0);
+}

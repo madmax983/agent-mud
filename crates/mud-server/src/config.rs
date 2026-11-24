@@ -429,15 +429,81 @@ pub struct WorldConfig {
     pub db: Option<PathBuf>,
     /// The seed of a new world's dice.
     pub seed: u64,
+    /// Events older than this many days are archived, then trimmed from
+    /// the store; 0 keeps every event in the store (0 to 36500).
+    pub events_keep_days: u64,
+    /// The newest events never trimmed, whatever their age; below 10000
+    /// (the in-memory log) it acts as 10000 (at most 1000000000).
+    pub events_keep_min: u64,
+    /// How often retention runs, in ms (1000 to 604800000).
+    pub retention_every_ms: u64,
+    /// Events per retention transaction (1 to 100000).
+    pub retention_batch: u32,
+    /// Where `events-YYYY-MM.jsonl` go. Unset: `archive/` beside `db`.
+    pub archive_dir: Option<PathBuf>,
 }
 
 impl Default for WorldConfig {
     fn default() -> Self {
+        let r = mud_world::Retention::default();
         Self {
             pack: None,
             db: Some(PathBuf::from("data/world.db")),
             seed: 1,
+            events_keep_days: r.keep_days,
+            events_keep_min: r.keep_min,
+            retention_every_ms: r.every_ms,
+            retention_batch: r.batch,
+            archive_dir: None,
         }
+    }
+}
+
+impl WorldConfig {
+    /// The checked events retention, `None` for an in-memory world. The
+    /// archive goes in `archive_dir`, else in `archive/` beside `db`.
+    ///
+    /// # Errors
+    /// A value is out of bounds; the message names it.
+    pub fn retention(&self) -> anyhow::Result<Option<mud_world::Retention>> {
+        use anyhow::ensure;
+        ensure!(
+            self.events_keep_days <= mud_world::durability::MAX_KEEP_DAYS,
+            "[world] events_keep_days must be 0 to 36500, not {}",
+            self.events_keep_days
+        );
+        ensure!(
+            self.events_keep_min <= 1_000_000_000,
+            "[world] events_keep_min must be at most 1000000000, not {}",
+            self.events_keep_min
+        );
+        ensure!(
+            (1_000..=604_800_000).contains(&self.retention_every_ms),
+            "[world] retention_every_ms must be 1000 to 604800000, not {}",
+            self.retention_every_ms
+        );
+        ensure!(
+            (1..=100_000).contains(&self.retention_batch),
+            "[world] retention_batch must be 1 to 100000, not {}",
+            self.retention_batch
+        );
+        let Some(db) = &self.db else {
+            return Ok(None);
+        };
+        let archive_dir = self
+            .archive_dir
+            .clone()
+            .unwrap_or_else(|| db.parent().unwrap_or_else(|| Path::new("")).join("archive"));
+        Ok(Some(
+            mud_world::Retention {
+                keep_days: self.events_keep_days,
+                keep_min: self.events_keep_min,
+                every_ms: self.retention_every_ms,
+                batch: self.retention_batch,
+                archive_dir,
+            }
+            .clamped(),
+        ))
     }
 }
 
@@ -775,6 +841,48 @@ mod tests {
             .login_deadline()
             .is_none()
         );
+    }
+
+    #[test]
+    fn world_retention_defaults_and_bounds() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        assert_eq!(ex.world, WorldConfig::default());
+        let r = ex.world.retention().unwrap().unwrap();
+        assert_eq!(r.keep_days, 7);
+        assert_eq!(r.keep_min, 10_000);
+        assert_eq!(r.every_ms, 3_600_000);
+        assert_eq!(r.batch, 5_000);
+        assert_eq!(r.archive_dir, Path::new("data/archive"));
+        let own: MudConfig = toml::from_str(
+            "[world]\ndb = \"w.db\"\nevents_keep_days = 0\nevents_keep_min = 5\narchive_dir = \"elsewhere/arch\"",
+        )
+        .unwrap();
+        let r = own.world.retention().unwrap().unwrap();
+        assert_eq!(r.keep_days, 0);
+        assert_eq!(r.keep_min, 10_000, "raised to the in-memory log");
+        assert_eq!(r.archive_dir, Path::new("elsewhere/arch"));
+        let bare: MudConfig = toml::from_str("[world]\ndb = \"w.db\"").unwrap();
+        assert_eq!(
+            bare.world.retention().unwrap().unwrap().archive_dir,
+            Path::new("archive")
+        );
+        let mem = WorldConfig {
+            db: None,
+            ..WorldConfig::default()
+        };
+        assert!(mem.retention().unwrap().is_none());
+        let bad = |edit: &dyn Fn(&mut WorldConfig)| {
+            let mut w = WorldConfig::default();
+            edit(&mut w);
+            w.retention().unwrap_err().to_string()
+        };
+        assert!(bad(&|w| w.events_keep_days = 36_501).contains("events_keep_days"));
+        assert!(bad(&|w| w.events_keep_min = 1_000_000_001).contains("events_keep_min"));
+        assert!(bad(&|w| w.retention_every_ms = 999).contains("retention_every_ms"));
+        assert!(bad(&|w| w.retention_every_ms = 604_800_001).contains("retention_every_ms"));
+        assert!(bad(&|w| w.retention_batch = 0).contains("retention_batch"));
+        assert!(bad(&|w| w.retention_batch = 100_001).contains("retention_batch"));
+        assert!(toml::from_str::<MudConfig>("[world]\nevents_keep = 1").is_err());
     }
 
     #[test]

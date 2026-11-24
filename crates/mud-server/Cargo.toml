@@ -37,6 +37,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# The same SQLite build as mud-world, to write a file a newer server made.
+rusqlite = { version = "0.42", features = ["bundled"] }
 tempfile.workspace = true
 tokio-tungstenite = "0.28"
 tracing-log = "0.2"
