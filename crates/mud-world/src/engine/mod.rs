@@ -93,6 +93,8 @@ pub enum ErrorCode {
     NotOnline,
     /// The name is taken or invalid.
     BadName,
+    /// Something urgent happened before a typed command committed.
+    Interrupted,
 }
 
 /// A refused command.
@@ -105,7 +107,8 @@ pub struct Fail {
 }
 
 impl Fail {
-    pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    /// A refusal.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -984,7 +987,9 @@ fn describe_trigger(event: &Event) -> String {
     }
 }
 
-fn refusal(verb: Option<&str>, fail: &Fail) -> CommandResult {
+/// A refused command result.
+#[must_use]
+pub fn refusal(verb: Option<&str>, fail: &Fail) -> CommandResult {
     CommandResult {
         ok: false,
         verb: verb.map(str::to_owned),

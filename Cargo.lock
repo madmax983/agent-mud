@@ -259,6 +259,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mud-supervisor"
+version = "0.1.0"
+dependencies = [
+ "mud-world",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mud-world"
 version = "0.1.0"
 dependencies = [
