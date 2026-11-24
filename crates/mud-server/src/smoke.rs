@@ -106,14 +106,6 @@ pub async fn run() -> anyhow::Result<Transcript> {
             out.lines.push(format!("#{:<4} [{room}] {text}", ev.seq.0));
         }
     }
-    // Only Hale's Rhai mind says "evening, <name>" (his TOML rule says
-    // "move along"), and it greets kestrel, an agent PC, as any player.
-    ensure!(
-        out.lines
-            .iter()
-            .any(|l| l.contains("Hale says") && l.contains("\"evening, kestrel.")),
-        "Hale did not greet a player on his Rhai mind"
-    );
     while let Ok(e) = obs.try_recv() {
         if let ObserverEvent::WakeStarted {
             entity,
@@ -125,6 +117,16 @@ pub async fn run() -> anyhow::Result<Transcript> {
             out.wakes.push(format!("{entity} ({priority:?}): {reason}"));
         }
     }
+    // Only Hale's Rhai mind says "evening, <name>" (his TOML rule says
+    // "move along"), and it greets kestrel, an agent PC, as any player.
+    ensure!(
+        out.lines
+            .iter()
+            .any(|l| l.contains("Hale says") && l.contains("\"evening, kestrel.")),
+        "Hale did not greet a player on his Rhai mind: {:?} {:?}",
+        out.lines,
+        out.wakes
+    );
     Ok(out)
 }
 

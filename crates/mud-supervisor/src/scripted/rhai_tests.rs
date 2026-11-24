@@ -376,3 +376,40 @@ async fn hale_greets_kestrel_exactly_as_a_human() {
     assert_eq!(memory["warned"]["pc_ada"], 2);
     assert_eq!(memory["warned"]["pc_kestrel"], 2);
 }
+
+#[tokio::test]
+async fn hale_counts_one_visit_per_wake() {
+    let rig = Rig::new();
+    let pack = pack();
+    let bundled = Arc::new(ScriptHost::bundled_crypt_v01(&pack).unwrap());
+    let m = mind(&rig, &bundled);
+    let kestrel = EntityId::from("pc_kestrel");
+    rig.game.bring_online(&kestrel);
+    // kestrel walks in, out, in and out again: the router batches both
+    // arrivals into one wake, which comes after kestrel has left.
+    let evs = rig.events_of(|g| {
+        for line in ["w", "e", "w", "e"] {
+            assert!(g.execute(&kestrel, line).ok);
+        }
+    });
+    m.wake(ctx(evs, "w1"), rig.tools("guard_01")).await.unwrap();
+    assert_eq!(
+        rig.hale_said(),
+        ["move along. and stay out of the alley after dark."]
+    );
+    let hale = EntityId::from("guard_01");
+    assert_eq!(rig.game.script_memory(&hale, 1)["warned"]["pc_kestrel"], 1);
+    // A full batch (a ctx far over the sandbox caps) stays within work.
+    let evs = rig.events_of(|g| {
+        for _ in 0..20 {
+            assert!(g.execute(&kestrel, "w").ok);
+            assert!(g.execute(&kestrel, "e").ok);
+        }
+    });
+    assert!(evs.len() > 32);
+    let r = m.wake(ctx(evs, "w3"), rig.tools("guard_01")).await.unwrap();
+    assert!(
+        r.text.as_deref().unwrap_or("").starts_with("rhai: 1 lines"),
+        "{r:?}"
+    );
+}

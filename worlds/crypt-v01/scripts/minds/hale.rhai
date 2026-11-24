@@ -2,6 +2,11 @@
 // the world: ev.actor.kind is "player" for a human and for kestrel alike,
 // and no script can tell them apart. Night is config.night_from to
 // config.night_to, UTC hours. Speech is opaque: Hale tests words in it.
+//
+// One wake can batch several arrivals of one player: Hale counts a visit
+// once per wake. He does not ask who is still here: ambient wakes come in
+// batches, after the fact, so most arrivals have walked on by then.
+
 fn on_wake(ctx) {
     let today = day_utc(ctx.now_ms);
     let mem = ctx.memory;
@@ -11,12 +16,15 @@ fn on_wake(ctx) {
     let h = hour_utc(ctx.now_ms);
     let night = h >= ctx.config.night_from || h < ctx.config.night_to;
     let lines = [];
+    let greeted = #{};
     for ev in ctx.events {
         if ev.is_self || ev.actor == () || ev.actor.kind != "player" { continue; }
         let id = ev.actor.id;
         let name = ev.actor.name;
         let times = if id in mem.warned { mem.warned[id] } else { 0 };
         if ev.kind == "enter" {
+            if id in greeted { continue; }
+            greeted[id] = true;
             mem.warned[id] = times + 1;
             if times == 0 && night {
                 lines.push(`say evening, ${name}. the alley's shut after dark. go down that grate and the watch won't come for you.`);
