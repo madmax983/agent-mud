@@ -7,8 +7,10 @@ use std::net::{IpAddr, Ipv6Addr};
 pub enum Peer {
     /// A real client address, already bucketed (IPv4 `/32`, IPv6 `/64`).
     Addr(IpAddr),
-    /// Unknown, or behind an untrusted proxy: shared by many players.
-    /// Address-keyed throttles and caps are off for it.
+    /// No address is known (or an operator's own CLI): address-keyed
+    /// throttles and caps are off for it. A client never chooses it: a
+    /// web client is keyed by its TCP peer unless a trusted proxy names
+    /// it.
     Shared,
 }
 

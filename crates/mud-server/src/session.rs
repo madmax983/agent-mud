@@ -226,6 +226,9 @@ impl std::fmt::Debug for Change {
     }
 }
 
+/// The answer to a line over the transport's limit.
+pub const TOO_LONG: &str = "That line is too long; nothing was done.";
+
 /// The help line for the session words.
 pub const ACCOUNT_HELP: &str =
     "Account: password (change it) · logout (forget this browser) · quit";
@@ -358,6 +361,17 @@ impl Session {
             }
             _ => Output::lines(self.command(text)),
         }
+    }
+
+    /// A line over the transport's limit, which never runs. A pending
+    /// password change is cancelled with it, so no secret prompt is left
+    /// waiting while the client echoes again.
+    pub fn too_long(&mut self) -> Output {
+        let mut lines = vec![Line::new(LineKind::Error, TOO_LONG)];
+        if self.pending.take().is_some() {
+            lines.push(Line::new(LineKind::System, "Password change cancelled."));
+        }
+        Output::lines(lines)
     }
 
     fn new_prompt(&self) -> Line {

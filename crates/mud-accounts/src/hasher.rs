@@ -3,7 +3,9 @@
 //! bcrypt 0.19's `non_truncating_*` functions refuse inputs of 72 bytes or
 //! more, so this uses the truncating `hash` and `verify` behind its own
 //! 72-byte check: `hash` refuses longer input, and `verify` checks the
-//! first 72 bytes of a longer input against a dummy and answers `false`.
+//! first 72 bytes of a longer input against the same hash a shorter
+//! answer to that name would meet (so at the same cost) and answers
+//! `false`.
 //!
 //! A name with no hash (no account, an agent PC, a sealed legacy human)
 //! verifies against a dummy hash. The dummy's cost follows the mix of the
@@ -57,6 +59,25 @@ fn make_dummy(cost: u32) -> Result<String, AccountError> {
     let mut raw = Zeroizing::new([0u8; 32]);
     random(raw.as_mut())?;
     Ok(bcrypt::hash(hex(raw.as_ref()), cost)?)
+}
+
+/// The hash one verify checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    /// The stored hash.
+    Real(String),
+    /// The dummy at this cost.
+    Dummy(u32),
+}
+
+impl Target {
+    #[cfg(test)]
+    fn cost(&self) -> Option<u32> {
+        match self {
+            Self::Real(h) => cost_of(h),
+            Self::Dummy(c) => Some(*c),
+        }
+    }
 }
 
 /// Hashes and checks passwords on blocking threads, a bounded number at a
@@ -143,9 +164,28 @@ impl Hasher {
         Ok(tokio::task::spawn_blocking(move || bcrypt::hash(&*input, cost)).await??)
     }
 
+    /// What one verify of an answer `len` bytes long to `key` checks
+    /// against, and whether a match may count.
+    fn target(&self, key: &NameKey, hash: Option<&str>, len: usize) -> (Target, bool) {
+        let real = match hash {
+            Some(h) if cost_of(h).is_some() => Some(h.to_owned()),
+            Some(_) => {
+                tracing::warn!(target: "mud::auth", name = %key, "a stored password hash does not parse; it can never match");
+                None
+            }
+            None => None,
+        };
+        let counts = real.is_some() && len <= Self::MAX_BYTES;
+        let t = real.map_or_else(|| Target::Dummy(self.dummy_cost(key)), Target::Real);
+        (t, counts)
+    }
+
     /// Checks `pw` against `hash`, with exactly one bcrypt verify whatever
-    /// the input: a missing or malformed hash, or a password over 72
-    /// bytes, checks the name's dummy and answers `false`.
+    /// the input. A missing or malformed hash checks the name's dummy and
+    /// answers `false`. A password over 72 bytes checks its first 72
+    /// bytes against the stored hash when there is one (the dummy when
+    /// not), so its cost is the cost of any other answer to that name,
+    /// and answers `false`.
     ///
     /// # Errors
     /// bcrypt or the blocking pool failed.
@@ -156,36 +196,28 @@ impl Hasher {
         hash: Option<&str>,
     ) -> Result<bool, AccountError> {
         let bytes = pw.expose().as_bytes();
-        let real = match hash {
-            Some(h) if cost_of(h).is_some() => Some(h.to_owned()),
-            Some(_) => {
-                tracing::warn!(target: "mud::auth", name = %key, "a stored password hash does not parse; it can never match");
-                None
-            }
-            None => None,
+        let (target, counts) = self.target(key, hash, bytes.len());
+        let dummy = match &target {
+            Target::Dummy(c) => lock(&self.dummies).get(c).cloned(),
+            Target::Real(_) => None,
         };
-        let real = real.filter(|_| bytes.len() <= Self::MAX_BYTES);
-        let counts = real.is_some();
-        let dummy_cost = self.dummy_cost(key);
-        let dummy = lock(&self.dummies).get(&dummy_cost).cloned();
         let input = Zeroizing::new(bytes[..bytes.len().min(Self::MAX_BYTES)].to_vec());
         let permit = self.permit().await?;
         let (ok, made) = tokio::task::spawn_blocking(move || {
-            let (target, made) = match (real, dummy) {
-                (Some(h), _) => (h, None),
-                (None, Some(d)) => (d, None),
-                (None, None) => {
-                    let d = make_dummy(dummy_cost)?;
-                    (d.clone(), Some(d))
+            let (against, made) = match (target, dummy) {
+                (Target::Real(h), _) | (Target::Dummy(_), Some(h)) => (h, None),
+                (Target::Dummy(c), None) => {
+                    let d = make_dummy(c)?;
+                    (d.clone(), Some((c, d)))
                 }
             };
-            Ok::<_, AccountError>((bcrypt::verify(&*input, &target)?, made))
+            Ok::<_, AccountError>((bcrypt::verify(&*input, &against)?, made))
         })
         .await??;
         drop(permit);
         self.verifications.fetch_add(1, Ordering::Relaxed);
-        if let Some(d) = made {
-            lock(&self.dummies).entry(dummy_cost).or_insert(d);
+        if let Some((c, d)) = made {
+            lock(&self.dummies).entry(c).or_insert(d);
         }
         Ok(counts && ok)
     }
@@ -305,6 +337,37 @@ mod tests {
         let cold = Hasher::for_tests(4);
         assert!(!cold.verify(&key("ada"), &pw, None).await.unwrap());
         assert_eq!(cold.verifications(), 1);
+    }
+
+    /// The cost of the hash an answer is checked against depends on the
+    /// name only, never on the answer's length: a long answer to a human
+    /// account must not run at a dummy's cost.
+    #[tokio::test]
+    async fn the_cost_checked_never_depends_on_the_answer_length() {
+        // Nearly every stored hash is at cost 5; ada's is at cost 4.
+        let h = Hasher::new(5, [3; 32], BTreeMap::from([(5, 1_000), (4, 1)]), 1);
+        let ada = key("ada");
+        assert_eq!(h.dummy_cost(&ada), 5);
+        let stored = Hasher::for_tests(4)
+            .hash(&Secret::from("lantern-and-jerkin"))
+            .await
+            .unwrap();
+        for len in [0, 20, 72, 73, 100, 1_024] {
+            let (t, counts) = h.target(&ada, Some(&stored), len);
+            assert_eq!(t.cost(), Some(4), "{len} bytes");
+            assert_eq!(counts, len <= Hasher::MAX_BYTES, "{len} bytes");
+            let (none, _) = h.target(&key("kestrel"), None, len);
+            assert_eq!(none.cost(), Some(h.dummy_cost(&key("kestrel"))));
+        }
+        let (bad, counts) = h.target(&ada, Some("not a hash"), 20);
+        assert_eq!((bad, counts), (Target::Dummy(5), false));
+        // And the long answer to the real hash never matches, even when
+        // its first 72 bytes are the password.
+        let real = "b".repeat(72);
+        let at4 = Hasher::for_tests(4);
+        let hash = at4.hash(&Secret::from(real.as_str())).await.unwrap();
+        let longer = Secret::from(format!("{real}c").as_str());
+        assert!(!at4.verify(&ada, &longer, Some(&hash)).await.unwrap());
     }
 
     #[test]

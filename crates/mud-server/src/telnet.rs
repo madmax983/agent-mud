@@ -27,9 +27,6 @@ const MAX_LINE: usize = 1_024;
 /// UTF-8 bytes each.
 const MAX_LINE_BYTES: usize = MAX_LINE * 4;
 
-/// What the server says to a line over [`MAX_LINE`].
-const TOO_LONG: &str = "That line is too long; nothing was done.";
-
 /// One line from the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Input {
@@ -301,15 +298,11 @@ async fn play(
                     break;
                 };
                 echo_on(w, &mut echo_off).await?;
-                let line = match line? {
+                let out = match line? {
                     None => break,
-                    Some(Input::TooLong) => {
-                        w.write_all(format!("{TOO_LONG}\r\n").as_bytes()).await?;
-                        continue;
-                    }
-                    Some(Input::Line(line)) => line,
+                    Some(Input::TooLong) => session.too_long(),
+                    Some(Input::Line(line)) => session.input(Secret::new(line)).await,
                 };
-                let out = session.input(Secret::new(line)).await;
                 echo_off = write_lines(w, &out.lines).await?;
                 if out.close.is_some() {
                     echo_on(w, &mut echo_off).await?;

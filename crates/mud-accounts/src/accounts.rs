@@ -22,7 +22,7 @@ use crate::policy::{PasswordRejection, check_new_password};
 use crate::route::{Holder, Route, login_route, may_bind};
 use crate::secret::Secret;
 use crate::store::{self, AccountRow, AccountStore, NewAccount, NewDevice, Origin};
-use crate::throttle::{CreateRefusal, Held, ThrottlePolicies, Throttles};
+use crate::throttle::{Attempt, CreateRefusal, CreationSlot, Held, ThrottlePolicies, Throttles};
 
 pub use crate::store::AccountSummary;
 
@@ -180,12 +180,25 @@ impl Authenticated {
 }
 
 /// A right password whose account must choose a new one first. Single
-/// use.
-#[derive(Debug)]
+/// use, and void once the account is reset again, locked, or its password
+/// changes.
 pub struct ResetTicket {
     key: NameKey,
     name: String,
     holder: Holder,
+    /// The stored hash the right password matched; a new password is set
+    /// only over this one.
+    hash: String,
+}
+
+impl std::fmt::Debug for ResetTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResetTicket")
+            .field("key", &self.key)
+            .field("name", &self.name)
+            .field("holder", &self.holder)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResetTicket {
@@ -222,6 +235,13 @@ struct AccountStats {
     created: AtomicU64,
     resumed: AtomicU64,
     resume_rejected: AtomicU64,
+}
+
+const fn create_refusal(r: CreateRefusal) -> AuthError {
+    match r {
+        CreateRefusal::PerAddress => AuthError::NewPerAddress,
+        CreateRefusal::PerDay => AuthError::NewPerDay,
+    }
 }
 
 fn bump(n: &AtomicU64) {
@@ -461,6 +481,16 @@ impl Accounts {
             .map_err(|h| self.held(h))
     }
 
+    /// Takes a new character's place in today's counts.
+    fn reserve_creation(&self, peer: Peer, now_ms: u64) -> Result<CreationSlot<'_>, AuthError> {
+        if !self.cfg.allow_new {
+            return Err(AuthError::ClosedToNew);
+        }
+        self.throttles
+            .reserve_creation(peer, now_ms)
+            .map_err(create_refusal)
+    }
+
     /// Whether `peer` may make a new character now.
     ///
     /// # Errors
@@ -471,58 +501,56 @@ impl Accounts {
         }
         self.throttles
             .may_create(peer, now_ms)
-            .map_err(|r| match r {
-                CreateRefusal::PerAddress => AuthError::NewPerAddress,
-                CreateRefusal::PerDay => AuthError::NewPerDay,
-            })
+            .map_err(create_refusal)
     }
 
-    /// The checks before a hash: throttles, the one check in flight per
-    /// (name, address), and the address's work. Returns the row, whether
-    /// the pair is known, and the in-flight guard.
+    /// The checks before a hash: the throttles, the one check in flight
+    /// per (name, address) and the address's work, gated and charged at
+    /// once. Returns the row and the admitted attempt.
     async fn admit(
         &self,
         key: &NameKey,
         peer: Peer,
         now_ms: u64,
-    ) -> Result<(Option<AccountRow>, bool, crate::throttle::InFlight<'_>), AuthError> {
+    ) -> Result<(Option<AccountRow>, Attempt<'_>), AuthError> {
         let (row, known) = self.row_and_known(key, peer).await?;
-        self.throttles
-            .check(key, peer, known, now_ms)
+        let attempt = self
+            .throttles
+            .admit(key, peer, known, now_ms)
             .map_err(|h| self.held(h))?;
-        let guard = self.throttles.begin(key, peer).map_err(|h| self.held(h))?;
-        self.throttles
-            .spend(peer, known, now_ms)
-            .map_err(|h| self.held(h))?;
-        Ok((row, known, guard))
+        Ok((row, attempt))
     }
 
-    /// Steps 1 to 7 of a sign-in: the row of a right, unlocked password.
+    /// Steps 1 to 7 of a sign-in: the row of a right, unlocked password,
+    /// and its attempt, still to be settled.
     async fn check_password(
         &self,
         key: &NameKey,
         pw: &Secret,
         peer: Peer,
         now_ms: u64,
-    ) -> Result<AccountRow, AuthError> {
-        let (row, _known, _guard) = self.admit(key, peer, now_ms).await?;
+    ) -> Result<(AccountRow, Attempt<'_>), AuthError> {
+        let (row, attempt) = self.admit(key, peer, now_ms).await?;
         let ok = self
             .hasher
             .verify(key, pw, row.as_ref().map(|r| r.password_hash.as_str()))
             .await?;
         let row = match row {
             Some(r) if ok => r,
-            _ => {
-                self.throttles.fail(key, peer, now_ms);
-                bump(&self.stats.failed);
-                tracing::info!(target: "mud::auth", name = %key, "a password was refused");
-                return Err(AuthError::WrongPassword);
-            }
+            _ => return Err(self.wrong(key, attempt)),
         };
         if row.locked {
             return Err(AuthError::Locked);
         }
-        Ok(row)
+        Ok((row, attempt))
+    }
+
+    /// Settles a refused password.
+    fn wrong(&self, key: &NameKey, attempt: Attempt<'_>) -> AuthError {
+        attempt.failed();
+        bump(&self.stats.failed);
+        tracing::info!(target: "mud::auth", name = %key, "a password was refused");
+        AuthError::WrongPassword
     }
 
     fn mint(
@@ -555,7 +583,6 @@ impl Accounts {
         peer: Peer,
         now_ms: u64,
     ) -> Result<(), AuthError> {
-        self.throttles.succeed(key, peer, now_ms);
         let rehash = match (pw, stored_hash) {
             (Some(pw), Some(h)) if self.hasher.needs_rehash(h) => {
                 Some((cost_of(h), self.hasher.hash(pw).await?))
@@ -595,11 +622,12 @@ impl Accounts {
         peer: Peer,
         now_ms: u64,
     ) -> Result<SignIn, AuthError> {
-        let row = self.check_password(key, pw, peer, now_ms).await?;
+        let (row, attempt) = self.check_password(key, pw, peer, now_ms).await?;
         if !may_bind(holder, true) {
             tracing::warn!(target: "mud::auth", name = %key, "an account's password matched, but the name is not a human's; refused");
-            return Err(AuthError::WrongPassword);
+            return Err(self.wrong(key, attempt));
         }
+        attempt.succeeded();
         self.record_login(key, Some(pw), Some(&row.password_hash), peer, now_ms)
             .await?;
         if row.must_change {
@@ -607,6 +635,7 @@ impl Accounts {
                 key: key.clone(),
                 name: row.name,
                 holder,
+                hash: row.password_hash,
             }));
         }
         Self::mint(key, &row.name, holder, AuthVia::Password, now_ms).map(SignIn::Ok)
@@ -625,8 +654,10 @@ impl Accounts {
         peer: Peer,
         now_ms: u64,
     ) -> Result<Result<(), PasswordRejection>, AuthError> {
-        let (_row, _known, _guard) = self.admit(key, peer, now_ms).await?;
+        let (_row, attempt) = self.admit(key, peer, now_ms).await?;
         let _ = self.hasher.verify(key, pw, None).await?;
+        // A claim answer is not a guess: only its work stays charged.
+        attempt.refund();
         Ok(self.check_new_password(pw, name).await)
     }
 
@@ -665,9 +696,10 @@ impl Accounts {
         if self.route(key, holder, now_ms).await? != want {
             return Err(AuthError::NameJustTaken);
         }
-        if purpose == NewPurpose::Create {
-            self.may_create(peer, now_ms)?;
-        }
+        let slot = match purpose {
+            NewPurpose::Create => Some(self.reserve_creation(peer, now_ms)?),
+            NewPurpose::Claim => None,
+        };
         self.check_new_password(pw, name)
             .await
             .map_err(AuthError::Weak)?;
@@ -707,7 +739,7 @@ impl Accounts {
         let via = match purpose {
             NewPurpose::Create => {
                 bump(&self.stats.created);
-                let n = self.throttles.created(peer, now_ms);
+                let n = slot.map_or(0, CreationSlot::commit);
                 if n.is_multiple_of(50) {
                     tracing::warn!(target: "mud::auth", "{n} new characters today");
                 }
@@ -721,10 +753,14 @@ impl Accounts {
         Self::mint(key, name.trim(), holder, via, now_ms)
     }
 
-    /// Sets the new password a reset demanded.
+    /// Sets the new password a reset demanded, if the account is still
+    /// the one the ticket was issued for: unlocked, still due a change,
+    /// and still on the password the ticket proved.
     ///
     /// # Errors
-    /// The password breaks a rule, a hold applies, or the service failed.
+    /// [`AuthError::Locked`] or [`AuthError::ResetStale`] when the account
+    /// changed since the ticket; the password breaks a rule, a hold
+    /// applies, or the service failed.
     pub async fn finish_reset(
         &self,
         ticket: ResetTicket,
@@ -739,16 +775,25 @@ impl Accounts {
             .spend(peer, false, now_ms)
             .map_err(|h| self.held(h))?;
         let hash = self.hasher.hash(pw).await?;
-        let k = ticket.key.clone();
-        let old = self
+        let (k, proved) = (ticket.key.clone(), ticket.hash.clone());
+        let (written, locked) = self
             .store
             .call(move |c| {
-                let old = store::get(c, &k)?.and_then(|r| cost_of(&r.password_hash));
-                store::set_password(c, &k, &hash, now_ms, false)?;
-                Ok(old)
+                let n = store::finish_reset(c, &k, &proved, &hash, now_ms)?;
+                let locked = n == 0 && store::get(c, &k)?.is_some_and(|r| r.locked);
+                Ok((n > 0, locked))
             })
             .await?;
-        self.hasher.note_cost(old, self.hasher.cost());
+        if !written {
+            tracing::info!(target: "mud::auth", name = %ticket.key, "a reset ticket outlived its account's state; refused");
+            return Err(if locked {
+                AuthError::Locked
+            } else {
+                AuthError::ResetStale
+            });
+        }
+        self.hasher
+            .note_cost(cost_of(&ticket.hash), self.hasher.cost());
         Self::mint(
             &ticket.key,
             &ticket.name,
@@ -772,10 +817,10 @@ impl Accounts {
         peer: Peer,
         now_ms: u64,
     ) -> Result<(), AuthError> {
-        let row = self
+        let (row, attempt) = self
             .check_password(&auth.key, current, peer, now_ms)
             .await?;
-        self.throttles.succeed(&auth.key, peer, now_ms);
+        attempt.succeeded();
         self.check_new_password(new, &auth.name)
             .await
             .map_err(AuthError::Weak)?;

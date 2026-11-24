@@ -1,6 +1,7 @@
 use tokio::io::AsyncReadExt;
 
 use super::*;
+use crate::session::TOO_LONG;
 use crate::test_support::{PW, accounts, game};
 
 const WILL_ECHO: [u8; 3] = [IAC, WILL, ECHO];
@@ -299,6 +300,32 @@ async fn an_endless_line_is_refused_and_the_session_goes_on() {
     assert!(!out.contains("You say, \"aaa"), "{out}");
     assert!(out.contains("You say, \"still here\""), "{out}");
     assert!(out.contains("Farewell."), "{out}");
+}
+
+#[tokio::test]
+async fn an_overlong_line_during_a_password_change_never_leaves_echo_on() {
+    // `password`, then a line over the limit at `Current password:`, then
+    // what the player types next with echo back on.
+    let mut input = b"password\r\n".to_vec();
+    input.resize(input.len() + MAX_LINE + 5, b'x');
+    input.extend_from_slice(b"\r\nsay my-current-secret\r\nquit\r\n");
+    let out = exchange_bytes(&input).await;
+    let refused = has(&out, TOO_LONG.as_bytes()).unwrap();
+    let tail = &out[refused..];
+    // Echo is on after the refusal, so no secret prompt is open: the
+    // change is cancelled and the next line is an ordinary command.
+    assert!(has(tail, &WILL_ECHO).is_none(), "{}", text(tail));
+    assert!(
+        has(tail, b"Password change cancelled.").is_some(),
+        "{}",
+        text(tail)
+    );
+    assert!(has(tail, b"New password").is_none(), "{}", text(tail));
+    assert!(
+        has(tail, b"You say, \"my-current-secret\"").is_some(),
+        "{}",
+        text(tail)
+    );
 }
 
 #[tokio::test]

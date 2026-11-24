@@ -450,6 +450,105 @@ async fn reset_forces_a_new_password_once() {
     assert_eq!(a.admin_list().await.unwrap()[0].origin, Origin::Reset);
 }
 
+async fn reset_ticket(a: &Accounts, name: &str, p: Peer, now: u64) -> (Secret, ResetTicket) {
+    let temp = a
+        .admin_reset(name, &key(name), Holder::Human, now)
+        .await
+        .unwrap();
+    match sign(a, name, temp.expose(), Holder::Human, p, now + 1).await {
+        Ok(SignIn::MustChange(t)) => (temp, t),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reset_ticket_is_void_once_the_account_changes() {
+    let a = accounts().await;
+    let p = addr("10.0.0.1");
+    // A second reset: the leaked first ticket no longer sets a password.
+    let (_, leaked) = reset_ticket(&a, "old", p, T0).await;
+    let second = a
+        .admin_reset("old", &key("old"), Holder::Human, T0 + 10)
+        .await
+        .unwrap();
+    let r = a
+        .finish_reset(leaked, &pw("the-attackers-choice"), p, T0 + 11)
+        .await;
+    assert!(matches!(r, Err(AuthError::ResetStale)), "{r:?}");
+    assert!(matches!(
+        sign(&a, "old", "the-attackers-choice", Holder::Human, p, T0 + 12).await,
+        Err(AuthError::WrongPassword)
+    ));
+    assert!(matches!(
+        sign(&a, "old", second.expose(), Holder::Human, p, T0 + 13).await,
+        Ok(SignIn::MustChange(_))
+    ));
+    // A lock: the ticket is refused as locked, and nothing is written.
+    let (_, ticket) = reset_ticket(&a, "bo", p, T0 + 20).await;
+    a.admin_set_locked(&key("bo"), true, T0 + 22).await.unwrap();
+    let r = a
+        .finish_reset(ticket, &pw("the-attackers-choice"), p, T0 + 23)
+        .await;
+    assert!(matches!(r, Err(AuthError::Locked)), "{r:?}");
+    assert!(
+        a.admin_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.name == "bo" && s.must_change)
+    );
+    // A ticket redeemed once cannot be replayed through a second sign-in's
+    // ticket either: after a finish, must_change is off.
+    let (_, first) = reset_ticket(&a, "cy", p, T0 + 30).await;
+    let (_, twin) = {
+        let list = a.admin_list().await.unwrap();
+        assert!(list.iter().any(|s| s.name == "cy" && s.must_change));
+        let temp_again = a
+            .admin_reset("cy", &key("cy"), Holder::Human, T0 + 31)
+            .await
+            .unwrap();
+        match sign(&a, "cy", temp_again.expose(), Holder::Human, p, T0 + 32).await {
+            Ok(SignIn::MustChange(t)) => (temp_again, t),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(matches!(
+        a.finish_reset(first, &pw("a-fine-new-password"), p, T0 + 33)
+            .await,
+        Err(AuthError::ResetStale)
+    ));
+    a.finish_reset(twin, &pw("a-fine-new-password"), p, T0 + 34)
+        .await
+        .unwrap();
+}
+
+/// An account whose name an agent PC or an NPC holds (a pack once
+/// dropped the cast and a human took the name) never signs in, even with
+/// the right password: it reads as a wrong one, at one verify, and counts
+/// as one.
+#[tokio::test]
+async fn a_right_password_never_binds_an_agent_pc_or_an_npc() {
+    let a = accounts().await;
+    let p = addr("10.0.0.1");
+    make(&a, "kestrel", ADA_PW, p, T0).await;
+    for (i, holder) in [Holder::OtherPlayer, Holder::NonPlayer]
+        .into_iter()
+        .enumerate()
+    {
+        let (before, failed) = (a.verifications(), a.stats().failed);
+        let r = sign(&a, "kestrel", ADA_PW, holder, p, T0 + 1 + i as u64).await;
+        assert!(matches!(r, Err(AuthError::WrongPassword)), "{r:?}");
+        assert_eq!(a.verifications(), before + 1);
+        assert_eq!(a.stats().failed, failed + 1);
+        let minted = Accounts::mint(&key("kestrel"), "kestrel", holder, AuthVia::Password, T0);
+        assert!(
+            matches!(minted, Err(AuthError::WrongPassword)),
+            "{minted:?}"
+        );
+    }
+    signed(sign(&a, "kestrel", ADA_PW, Holder::Human, p, T0 + 5).await);
+}
+
 #[tokio::test]
 async fn a_locked_account_is_refused_only_after_the_right_password() {
     let a = accounts().await;
@@ -694,6 +793,161 @@ async fn concurrent_creation_of_one_name_makes_one_account() {
     }
     assert_eq!(ok, 1);
     assert_eq!(a.admin_list().await.unwrap().len(), 1);
+}
+
+/// Guesses that start together from many addresses are gated and charged
+/// one at a time: the name key admits at most `free + 1` at one instant,
+/// as the proved rate bound says, however many run at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_guesses_from_many_addresses_share_the_name_key() {
+    let mut c = cfg();
+    c.throttle.name.free = 0;
+    let a = Arc::new(open_with(c).await);
+    make(&a, "ada", ADA_PW, addr("10.0.0.1"), T0).await;
+    let start = Arc::new(tokio::sync::Barrier::new(32));
+    let mut tasks = Vec::new();
+    for i in 0..32u8 {
+        let (a, start) = (Arc::clone(&a), Arc::clone(&start));
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            sign(
+                &a,
+                "ada",
+                "guess-guess-guess",
+                Holder::Human,
+                addr(&format!("10.9.0.{i}")),
+                T0 + 1,
+            )
+            .await
+        }));
+    }
+    let mut wrong = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Err(AuthError::WrongPassword) => wrong += 1,
+            Err(AuthError::NameHeld { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(wrong, 1, "free + 1 at one instant");
+    // The owner at home is not held: a right password from a known pair
+    // skips the name key, and an earlier success there made it known.
+    signed(sign(&a, "ada", ADA_PW, Holder::Human, addr("10.0.0.1"), T0 + 2).await);
+}
+
+/// A right password from a new address is not left charged to the loose
+/// keys: only failures count there.
+#[tokio::test]
+async fn a_right_password_is_not_counted_as_a_failure() {
+    let mut c = cfg();
+    c.throttle.name.free = 1;
+    c.throttle.address.free = 1;
+    let a = open_with(c).await;
+    make(&a, "ada", ADA_PW, addr("10.0.0.1"), T0).await;
+    for i in 0..5u8 {
+        signed(
+            sign(
+                &a,
+                "ada",
+                ADA_PW,
+                Holder::Human,
+                addr(&format!("10.3.0.{i}")),
+                T0,
+            )
+            .await,
+        );
+    }
+    // Five first logins from five addresses: the name key never filled.
+    let r = sign(
+        &a,
+        "ada",
+        "guess-guess-guess",
+        Holder::Human,
+        addr("10.4.0.1"),
+        T0,
+    )
+    .await;
+    assert!(matches!(r, Err(AuthError::WrongPassword)), "{r:?}");
+}
+
+/// Creations that start together from one address count against its cap
+/// before any of them hashes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_creations_from_one_address_respect_the_cap() {
+    let a = Arc::new(
+        open_with(AccountsConfig {
+            new_characters_per_address_per_day: 1,
+            ..cfg()
+        })
+        .await,
+    );
+    let start = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for i in 0..8u8 {
+        let (a, start) = (Arc::clone(&a), Arc::clone(&start));
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            let name = format!("n{i}");
+            a.create(
+                &name,
+                &key(&name),
+                Holder::Free,
+                &pw(ADA_PW),
+                NewPurpose::Create,
+                addr("10.0.0.5"),
+                T0,
+            )
+            .await
+        }));
+    }
+    let mut made = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(_) => made += 1,
+            Err(AuthError::NewPerAddress) => {}
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert_eq!(made, 1);
+    assert_eq!(a.admin_list().await.unwrap().len(), 1);
+}
+
+/// A creation that fails after its slot was taken gives the slot back.
+#[tokio::test]
+async fn a_failed_creation_frees_its_slot() {
+    let a = open_with(AccountsConfig {
+        new_characters_per_address_per_day: 1,
+        ..cfg()
+    })
+    .await;
+    let p = addr("10.0.0.5");
+    let weak = a
+        .create(
+            "ada",
+            &key("ada"),
+            Holder::Free,
+            &pw("short"),
+            NewPurpose::Create,
+            p,
+            T0,
+        )
+        .await;
+    assert!(matches!(weak, Err(AuthError::Weak(_))), "{weak:?}");
+    make(&a, "ada", ADA_PW, p, T0).await;
+    // The name is taken now: the second try loses the race, not the slot.
+    let taken = a
+        .create(
+            "ada",
+            &key("ada"),
+            Holder::Free,
+            &pw(ADA_PW),
+            NewPurpose::Create,
+            addr("10.0.0.6"),
+            T0,
+        )
+        .await;
+    assert!(matches!(taken, Err(AuthError::NameJustTaken)), "{taken:?}");
+    make(&a, "bo", ADA_PW, addr("10.0.0.6"), T0).await;
 }
 
 #[tokio::test]

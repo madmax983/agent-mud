@@ -247,6 +247,35 @@ impl<K: Eq + Hash + Clone> KeyTable<K> {
         g
     }
 
+    /// Charges `k` one failure inside a held lock and returns what undoes
+    /// it, if it was recorded.
+    fn charge_in(&self, map: &mut HashMap<K, Throttle>, k: &K, now: u64) -> Option<Undo<K>> {
+        let prev = map.get(k).copied();
+        self.fail_in(map, k, now);
+        map.get(k).copied().map(|post| Undo {
+            key: k.clone(),
+            prev,
+            post,
+        })
+    }
+
+    /// Takes back a charge if nothing stepped the key since: the key is
+    /// then as if the charge never happened. Otherwise the charge stays,
+    /// which only ever holds more.
+    fn undo(&self, u: Undo<K>) {
+        let mut map = lock(&self.map);
+        if map.get(&u.key) == Some(&u.post) {
+            match u.prev {
+                Some(t) => {
+                    map.insert(u.key, t);
+                }
+                None => {
+                    map.remove(&u.key);
+                }
+            }
+        }
+    }
+
     fn succeed(&self, k: &K, now: u64) {
         if let Some(t) = lock(&self.map).get_mut(k) {
             *t = throttle_step(*t, ThrottleOp::Succeed, now, &self.policy);
@@ -257,6 +286,14 @@ impl<K: Eq + Hash + Clone> KeyTable<K> {
     fn get(&self, k: &K) -> Option<Throttle> {
         lock(&self.map).get(k).copied()
     }
+}
+
+/// A charge on one key, and the state it replaced.
+#[derive(Debug)]
+struct Undo<K> {
+    key: K,
+    prev: Option<Throttle>,
+    post: Throttle,
 }
 
 /// The policies of the four keys.
@@ -311,9 +348,11 @@ struct Creations {
     total: u64,
 }
 
+const DAY_MS: u64 = 86_400_000;
+
 impl Creations {
     fn roll(&mut self, now_ms: u64) {
-        let day = now_ms / 86_400_000;
+        let day = now_ms / DAY_MS;
         if day != self.day {
             self.day = day;
             self.per.clear();
@@ -333,6 +372,104 @@ pub struct Throttles {
     per_address_per_day: u32,
     per_day: u64,
     in_flight: Mutex<HashSet<(NameKey, Peer)>>,
+}
+
+/// A password check admitted by [`Throttles::admit`].
+///
+/// Its keys were gated and charged one failure under one lock, so checks
+/// that start together are counted one after another, as the proved rate
+/// bound assumes. Settle it with [`Attempt::failed`], [`Attempt::succeeded`]
+/// or [`Attempt::refund`]; dropped unsettled, the charges stay.
+#[derive(Debug)]
+pub struct Attempt<'a> {
+    throttles: &'a Throttles,
+    key: NameKey,
+    peer: Peer,
+    known: bool,
+    now_ms: u64,
+    name_address: Option<Undo<(NameKey, Peer)>>,
+    name: Option<Undo<NameKey>>,
+    address: Option<Undo<IpAddr>>,
+    _flight: InFlight<'a>,
+}
+
+impl Attempt<'_> {
+    /// A wrong password. Its charges stand; a known pair, whose loose
+    /// keys were not gated, records its failure on them now.
+    pub fn failed(self) {
+        if self.known {
+            self.throttles.name.fail(&self.key, self.now_ms);
+            if let Peer::Addr(ip) = self.peer {
+                self.throttles.address.fail(&ip, self.now_ms);
+            }
+        }
+    }
+
+    /// A right password: clears the (name, address) key and takes back
+    /// the loose keys' charges, so a success is never a failure there.
+    pub fn succeeded(self) {
+        let t = self.throttles;
+        t.name_address
+            .succeed(&(self.key.clone(), self.peer), self.now_ms);
+        if let Some(u) = self.name {
+            t.name.undo(u);
+        }
+        if let Some(u) = self.address {
+            t.address.undo(u);
+        }
+    }
+
+    /// Not a password check after all (a claim's answer): takes back
+    /// every charge but the work.
+    pub fn refund(self) {
+        let t = self.throttles;
+        if let Some(u) = self.name_address {
+            t.name_address.undo(u);
+        }
+        if let Some(u) = self.name {
+            t.name.undo(u);
+        }
+        if let Some(u) = self.address {
+            t.address.undo(u);
+        }
+    }
+}
+
+/// A new character's place in today's counts, taken before hashing.
+/// Dropped without [`CreationSlot::commit`], it is given back.
+#[derive(Debug)]
+pub struct CreationSlot<'a> {
+    throttles: &'a Throttles,
+    bucket: Option<IpAddr>,
+    day: u64,
+    committed: bool,
+}
+
+impl CreationSlot<'_> {
+    /// The character was made. Returns today's count across addresses.
+    #[must_use]
+    pub fn commit(mut self) -> u64 {
+        self.committed = true;
+        lock(&self.throttles.created).total
+    }
+}
+
+impl Drop for CreationSlot<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut c = lock(&self.throttles.created);
+        if c.day != self.day {
+            return;
+        }
+        if let Some(b) = self.bucket
+            && let Some(n) = c.per.get_mut(&b)
+        {
+            *n = n.saturating_sub(1);
+        }
+        c.total = c.total.saturating_sub(1);
+    }
 }
 
 /// A (name, address) check in progress; dropping it ends the check.
@@ -403,6 +540,86 @@ impl Throttles {
             Gate::Full => Err(Held::Busy),
             Gate::Open => Ok(()),
         }
+    }
+
+    /// Admits one password check: gates the (name, address), address,
+    /// name and work keys as [`Throttles::check`] and
+    /// [`Throttles::spend`] do, starts the one check of the pair allowed
+    /// at a time, and charges every gated key one failure, all under the
+    /// tables' locks, so no other check passes a key in between. `known`:
+    /// this pair logged in before (the loose keys are skipped).
+    ///
+    /// # Errors
+    /// The hold that applies; nothing is charged.
+    pub fn admit(
+        &self,
+        key: &NameKey,
+        peer: Peer,
+        known: bool,
+        now_ms: u64,
+    ) -> Result<Attempt<'_>, Held> {
+        // One lock order everywhere several are held: name_address,
+        // address, name, work, then in_flight.
+        let mut na = lock(&self.name_address.map);
+        let mut addr = lock(&self.address.map);
+        let mut name = lock(&self.name.map);
+        let mut work = lock(&self.work.map);
+        let pair = (key.clone(), peer);
+        match self.name_address.gate_in(&na, &pair, now_ms) {
+            Gate::Locked(wait_ms) => return Err(Held::Name { wait_ms }),
+            Gate::Full if !known => return Err(Held::Busy),
+            Gate::Open | Gate::Full => {}
+        }
+        let ip = match peer {
+            Peer::Addr(ip) if !known => Some(ip),
+            _ => None,
+        };
+        if !known {
+            if let Some(ip) = ip {
+                match self.address.gate_in(&addr, &ip, now_ms) {
+                    Gate::Locked(wait_ms) => return Err(Held::Address { wait_ms }),
+                    Gate::Full => return Err(Held::Busy),
+                    Gate::Open => {}
+                }
+            }
+            match self.name.gate_in(&name, key, now_ms) {
+                Gate::Locked(wait_ms) => return Err(Held::Name { wait_ms }),
+                Gate::Full => return Err(Held::Busy),
+                Gate::Open => {}
+            }
+            if let Some(ip) = ip {
+                match self.work.gate_in(&work, &ip, now_ms) {
+                    Gate::Locked(wait_ms) => return Err(Held::Work { wait_ms }),
+                    Gate::Full => return Err(Held::Busy),
+                    Gate::Open => {}
+                }
+            }
+        }
+        let flight = self.begin(key, peer)?;
+        let name_address = self.name_address.charge_in(&mut na, &pair, now_ms);
+        let (address, name_undo) = if known {
+            (None, None)
+        } else {
+            if let Some(ip) = ip {
+                self.work.fail_in(&mut work, &ip, now_ms);
+            }
+            (
+                ip.and_then(|ip| self.address.charge_in(&mut addr, &ip, now_ms)),
+                self.name.charge_in(&mut name, key, now_ms),
+            )
+        };
+        drop((na, addr, name, work));
+        Ok(Attempt {
+            throttles: self,
+            key: key.clone(),
+            peer,
+            known,
+            now_ms,
+            name_address,
+            name: name_undo,
+            address,
+            _flight: flight,
+        })
     }
 
     /// Starts the one check of (name, address) allowed at a time.
@@ -479,15 +696,37 @@ impl Throttles {
         Ok(())
     }
 
-    /// Counts a new character; returns today's count across addresses.
-    pub fn created(&self, peer: Peer, now_ms: u64) -> u64 {
+    /// Takes a new character's place in today's counts, checking the caps
+    /// and counting it under one lock, so creations that start together
+    /// cannot all pass a cap.
+    ///
+    /// # Errors
+    /// The cap that applies; nothing is counted.
+    pub fn reserve_creation(
+        &self,
+        peer: Peer,
+        now_ms: u64,
+    ) -> Result<CreationSlot<'_>, CreateRefusal> {
         let mut c = lock(&self.created);
         c.roll(now_ms);
-        if let Some(b) = peer.creation_bucket() {
+        let bucket = peer.creation_bucket();
+        let here = bucket.map_or(0, |b| c.per.get(&b).copied().unwrap_or(0));
+        if bucket.is_some() && self.per_address_per_day > 0 && here >= self.per_address_per_day {
+            return Err(CreateRefusal::PerAddress);
+        }
+        if self.per_day > 0 && c.total >= self.per_day {
+            return Err(CreateRefusal::PerDay);
+        }
+        if let Some(b) = bucket {
             *c.per.entry(b).or_default() += 1;
         }
         c.total += 1;
-        c.total
+        Ok(CreationSlot {
+            throttles: self,
+            bucket,
+            day: c.day,
+            committed: false,
+        })
     }
 }
 
@@ -728,7 +967,7 @@ mod tests {
         ));
         for _ in 0..3 {
             assert_eq!(t.may_create(Peer::Shared, 5), Ok(()));
-            t.created(Peer::Shared, 5);
+            let _ = t.reserve_creation(Peer::Shared, 5).unwrap().commit();
         }
     }
 
@@ -771,6 +1010,134 @@ mod tests {
     }
 
     #[test]
+    fn admit_gates_and_charges_under_one_lock() {
+        let t = Throttles::new(tight(), 0, 0);
+        let ada = key("ada");
+        let (a, b, c) = (addr("10.0.0.1"), addr("10.0.0.2"), addr("10.0.0.3"));
+        // Two checks admitted before either settles: the name key counts
+        // both (free 1, so the second sets the first delay).
+        let first = t.admit(&ada, a, false, 5).unwrap();
+        let second = t.admit(&ada, b, false, 5).unwrap();
+        assert_eq!(
+            t.admit(&ada, c, false, 5).unwrap_err(),
+            Held::Name { wait_ms: 1_000 }
+        );
+        assert_eq!(t.name.get(&ada).unwrap().failures, 2);
+        // A held admit charges nothing, and the pair in flight is Busy.
+        assert_eq!(t.address.get(&"10.0.0.3".parse().unwrap()), None);
+        assert_eq!(t.admit(&ada, a, true, 5).unwrap_err(), Held::Busy);
+        // The first was wrong: its charges stand. Nothing stepped the
+        // name key after the second's charge, so its success takes that
+        // charge back.
+        first.failed();
+        second.succeeded();
+        assert_eq!(t.name.get(&ada).unwrap().failures, 1);
+        assert_eq!(t.address.get(&"10.0.0.2".parse().unwrap()), None);
+        assert_eq!(t.name_address.get(&(ada.clone(), b)).unwrap().failures, 0);
+        assert_eq!(
+            t.work.get(&"10.0.0.2".parse().unwrap()).unwrap().failures,
+            1
+        );
+    }
+
+    #[test]
+    fn a_charge_stepped_over_is_never_taken_back() {
+        let t = Throttles::new(tight(), 0, 0);
+        let ada = key("ada");
+        let first = t.admit(&ada, addr("10.0.0.1"), false, 5).unwrap();
+        let second = t.admit(&ada, addr("10.0.0.2"), false, 5).unwrap();
+        first.succeeded();
+        assert_eq!(t.name.get(&ada).unwrap().failures, 2, "stepped over: kept");
+        second.refund();
+        assert_eq!(t.name.get(&ada).unwrap().failures, 1);
+        assert_eq!(
+            t.name_address.get(&(ada.clone(), addr("10.0.0.2"))),
+            None,
+            "a refund takes back the pair's charge too"
+        );
+    }
+
+    #[test]
+    fn a_known_pair_is_charged_on_its_own_key_and_fails_onto_the_loose_ones() {
+        let t = Throttles::new(tight(), 0, 0);
+        let (ada, home) = (key("ada"), addr("10.0.0.1"));
+        let ip = "10.0.0.1".parse().unwrap();
+        t.admit(&ada, home, true, 5).unwrap().failed();
+        assert_eq!(
+            t.name_address.get(&(ada.clone(), home)).unwrap().failures,
+            1
+        );
+        assert_eq!(t.name.get(&ada).unwrap().failures, 1);
+        assert_eq!(t.address.get(&ip).unwrap().failures, 1);
+        assert_eq!(t.work.get(&ip), None, "a known pair spends no work");
+        t.admit(&ada, home, true, 6).unwrap().succeeded();
+        assert_eq!(t.name_address.get(&(ada, home)).unwrap().failures, 0);
+        // Shared peers have no address or work key to charge.
+        let bo = key("bo");
+        t.admit(&bo, Peer::Shared, false, 7).unwrap().failed();
+        assert_eq!(t.name.get(&bo).unwrap().failures, 1);
+    }
+
+    #[test]
+    fn admit_holds_on_the_address_and_the_work() {
+        let t = Throttles::new(tight(), 0, 0);
+        let here = addr("10.0.0.1");
+        for n in ["aa", "bb"] {
+            t.admit(&key(n), here, false, 5).unwrap().failed();
+        }
+        assert!(matches!(
+            t.admit(&key("cc"), here, false, 5),
+            Err(Held::Address { .. })
+        ));
+        let w = Throttles::new(tight(), 0, 0);
+        let away = addr("10.0.0.9");
+        for n in ["aa", "bb"] {
+            w.admit(&key(n), away, false, 5).unwrap().succeeded();
+        }
+        assert!(matches!(
+            w.admit(&key("cc"), away, false, 5),
+            Err(Held::Work { .. })
+        ));
+        let full = Throttles::with_cap(tight(), 0, 0, 1);
+        for n in ["aa", "aa"] {
+            let _ = full.admit(&key(n), here, false, 5).map(Attempt::failed);
+        }
+        assert_eq!(
+            full.admit(&key("zz"), addr("10.0.0.2"), false, 5)
+                .unwrap_err(),
+            Held::Busy
+        );
+    }
+
+    #[test]
+    fn creation_slots_count_at_once_and_come_back_unless_committed() {
+        let t = Throttles::new(tight(), 1, 0);
+        let p = addr("10.0.0.1");
+        let slot = t.reserve_creation(p, 5).unwrap();
+        assert_eq!(
+            t.reserve_creation(p, 5).unwrap_err(),
+            CreateRefusal::PerAddress
+        );
+        drop(slot);
+        let again = t.reserve_creation(p, 5).unwrap();
+        assert_eq!(again.commit(), 1);
+        assert_eq!(
+            t.reserve_creation(p, 6).unwrap_err(),
+            CreateRefusal::PerAddress
+        );
+        // A slot from yesterday gives nothing back to today.
+        let late = t.reserve_creation(addr("10.0.0.2"), DAY_MS - 1).unwrap();
+        let today = t.reserve_creation(addr("10.0.0.3"), DAY_MS).unwrap();
+        drop(late);
+        assert_eq!(today.commit(), 1);
+        let g = Throttles::new(tight(), 0, 1);
+        let only = g.reserve_creation(Peer::Shared, 1).unwrap();
+        assert_eq!(g.reserve_creation(p, 1).unwrap_err(), CreateRefusal::PerDay);
+        drop(only);
+        assert!(g.reserve_creation(p, 1).is_ok());
+    }
+
+    #[test]
     fn new_characters_are_capped_per_address_and_per_day() {
         let t = Throttles::new(tight(), 5, 0);
         let day = 86_400_000;
@@ -779,14 +1146,14 @@ mod tests {
         for i in 0..5 {
             let p = if i % 2 == 0 { a } else { b };
             assert_eq!(t.may_create(p, day), Ok(()));
-            t.created(p, day);
+            let _ = t.reserve_creation(p, day).unwrap().commit();
         }
         assert_eq!(t.may_create(b, day + 1), Err(CreateRefusal::PerAddress));
         assert_eq!(t.may_create(addr("10.0.0.1"), day + 1), Ok(()));
         assert_eq!(t.may_create(b, 2 * day), Ok(()), "the next UTC day");
         let g = Throttles::new(tight(), 0, 2);
-        assert_eq!(g.created(addr("10.0.0.1"), 1), 1);
-        assert_eq!(g.created(addr("10.0.0.2"), 1), 2);
+        assert_eq!(g.reserve_creation(addr("10.0.0.1"), 1).unwrap().commit(), 1);
+        assert_eq!(g.reserve_creation(addr("10.0.0.2"), 1).unwrap().commit(), 2);
         assert_eq!(
             g.may_create(addr("10.0.0.3"), 1),
             Err(CreateRefusal::PerDay)
@@ -794,7 +1161,10 @@ mod tests {
         let off = Throttles::new(tight(), 0, 0);
         for i in 0..100 {
             assert_eq!(off.may_create(Peer::Shared, 1), Ok(()));
-            assert_eq!(off.created(Peer::Shared, 1), i + 1);
+            assert_eq!(
+                off.reserve_creation(Peer::Shared, 1).unwrap().commit(),
+                i + 1
+            );
         }
     }
 }

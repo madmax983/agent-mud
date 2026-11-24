@@ -68,25 +68,39 @@ no hash — an agent PC, a sealed legacy human, a free name typed at the
 password prompt — verifies against a dummy hash. The dummy's cost follows
 the mix of the stored hashes' costs, chosen per name from a salted hash of
 it, so a dormant account at an old cost does not stand out from kestrel.
+An answer over 72 bytes checks its first 72 bytes against the same hash a
+shorter answer to that name meets (so at the same cost) and never
+matches: the length of an answer never tells a real hash from a dummy.
 autumn-web supplies the password policy (length, its 10k weak list, the
 name as context) and the remember-token primitives.
 
-**Throttles before hashing.** Four keys on the proved backoff step
+**Throttles before hashing, charged on admission.** Four keys on the proved backoff step
 `throttle_step` (`formal/verus/src/throttle.rs`, S1–S8 and
 `lemma_rate_bound`): (name, address), always checked; name, address, and
 bcrypt work per address, all skipped for a (name, address) pair that has
 logged in before, so an attacker elsewhere cannot hold the owner out at an
 address the owner uses. Keys exist with or without an account, so kestrel
 throttles exactly like a human. A success clears only the (name, address)
-key. A key past its free count inside `forget_ms` is never evicted, so the
+key. A check is admitted by `Throttles::admit`, which gates every key that
+applies and charges each one failure under the tables' locks, before the
+hash: checks that start together from many addresses are counted one after
+another, so each admitted step meets `throttle_allows` on the state before
+it, as `lemma_rate_bound` assumes. A right password takes its loose-key
+charges back only if nothing stepped the key since (otherwise they stay,
+which only holds more); a wrong one keeps them. A key past its free count
+inside `forget_ms` is never evicted, so the
 rate bound holds for every such key: a window of `L` ms admits at most
 `free + 1 + L / min(base, max)` checked failures. One check per (name,
 address) at a time, a semaphore around bcrypt, three wrong passwords per
 connection, 20 answers per connection, and the login timeout is now a
 total deadline (300 s). New characters are capped per IPv6 `/48` (or IPv4
-address) per UTC day. The server refuses to start with an https
-`public_url` and no `trusted_proxies`, and treats a forwarded request
-without trusted proxies as `Peer::Shared` (no address keys).
+address) per UTC day; a creation takes its place in the count before it
+hashes and gives it back if it fails. The server refuses to start with an
+https `public_url` and no `trusted_proxies`. A client's own
+`X-Forwarded-For`, `Forwarded` or `X-Real-IP` never changes its key: with
+no trusted proxy every web client is keyed by its TCP peer (one warning
+when such a header arrives), so a spoofed header lands in the sender's own
+buckets. Only a client with no address at all is `Peer::Shared`.
 
 **Web resume tokens.** A per-browser `series:token` is sent as an explicit
 WebSocket message, never in a cookie, and is not rotated. "Stay signed in"
@@ -102,7 +116,8 @@ cross-site origin, a failed revalidation). The terminal reconnects by
 itself only after an abnormal close.
 
 **Telnet** sends `IAC WILL ECHO` before a secret prompt and `IAC WONT
-ECHO` after the next input, and a CR ends a line (a following LF or NUL
+ECHO` after the next input (a line over the limit at a session's secret
+prompt cancels the password change, so no secret is asked with echo on), and a CR ends a line (a following LF or NUL
 is swallowed), for clients that send `CR NUL` with echo off. Telnet never
 remembers a login.
 
@@ -124,7 +139,9 @@ character within `legacy_claim_days` (30) of the first start with
 accounts; claims are recorded (`origin = 'claimed'`, logged at info).
 `"sealed"` leaves them closed (they answer `Wrong password.`) until
 `mud account reset <name>` prints a temporary password that must be
-changed at the next login. The operator CLI is `mud account
+changed at the next login. The new password is written only over the hash
+the temporary one matched, while the change is still due and the account
+unlocked; a second reset or a lock in between voids the first ticket. The operator CLI is `mud account
 list|reset|lock|unlock|signout`.
 
 ```mermaid
@@ -182,7 +199,9 @@ sequenceDiagram
 - Throttles reset on restart. At a new address the owner can be held by
   distributed guessing, at most `name.max_ms` after the last failure.
   Attackers behind the owner's NAT share the owner's (name, address) key.
-  Behind an untrusted proxy the address keys are off.
+  Behind a proxy that is not in `trusted_proxies`, every player shares the
+  proxy's address keys (stricter, never looser). A right password that
+  races a guess on the same loose key may stay counted as a failure.
 - Squatted names are permanent entities and grow the snapshot.
 - Telnet and plain http carry passwords in clear text; the server warns
   when either is bound off loopback without TLS in front.

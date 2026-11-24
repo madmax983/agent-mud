@@ -89,15 +89,17 @@ pub fn client_addr(resolved: Option<IpAddr>, peer: Option<SocketAddr>) -> Option
     resolved.or_else(|| peer.map(|p| p.ip()))
 }
 
-/// What the login throttles key a web client by.
+/// What the login throttles key a web client by: the address the
+/// trusted-proxy layer resolved, else the TCP peer, bucketed; with
+/// neither, [`Peer::Shared`].
 ///
-/// 1. A request that came through a proxy (`X-Forwarded-For`, `Forwarded`
-///    or `X-Real-IP`) while no proxy is trusted: [`Peer::Shared`], with
-///    one warning, because the TCP peer is the proxy and every player
-///    would share its address.
-/// 2. The address the trusted-proxy layer resolved, bucketed.
-/// 3. The TCP peer, bucketed.
-/// 4. Otherwise [`Peer::Shared`].
+/// A client's own `X-Forwarded-For`, `Forwarded` or `X-Real-IP` never
+/// changes the key: with no trusted proxy the layer resolves the TCP peer,
+/// so a spoofed header lands in the sender's own buckets. A request that
+/// carries such a header while no proxy is trusted logs one warning,
+/// because behind a real proxy every player then shares its address
+/// (stricter limits, never looser ones; an https `public_url` without
+/// `trusted_proxies` is refused at start).
 ///
 /// [`Peer::Shared`]: mud_accounts::Peer::Shared
 #[must_use]
@@ -112,12 +114,11 @@ pub fn account_peer(
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             tracing::warn!(
-                "a web client came through a proxy, but [server] trusted_proxies is empty; address-based login limits are off for such clients"
+                "a web client sent a forwarding header, but [server] trusted_proxies is empty; login limits key it by its TCP peer"
             );
         });
-        return Peer::Shared;
     }
-    bucket(resolved.or_else(|| peer.map(|p| p.ip()))).map_or(Peer::Shared, Peer::Addr)
+    bucket(client_addr(resolved, peer)).map_or(Peer::Shared, Peer::Addr)
 }
 
 #[derive(Debug, Default)]
@@ -301,11 +302,15 @@ mod tests {
             account_peer(Some(real), Some(proxy), true, true),
             Peer::Addr(real)
         );
-        assert_eq!(account_peer(None, Some(proxy), true, false), Peer::Shared);
+        // Untrusted: a client's own header never lowers its key; the TCP
+        // peer (the proxy, when one is in front) is the key.
+        assert_eq!(
+            account_peer(None, Some(proxy), true, false),
+            Peer::Addr(proxy.ip())
+        );
         assert_eq!(
             account_peer(Some(proxy.ip()), Some(proxy), true, false),
-            Peer::Shared,
-            "untrusted: whatever was resolved is the proxy"
+            Peer::Addr(proxy.ip()),
         );
         assert_eq!(
             account_peer(None, Some(proxy), false, false),

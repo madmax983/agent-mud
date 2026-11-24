@@ -549,6 +549,23 @@ pub(crate) fn set_password(
     )?)
 }
 
+/// Sets the password a reset demanded, only over the hash `proved`
+/// matched, while a change is still due and the account is unlocked.
+/// Returns the rows written (0 or 1).
+pub(crate) fn finish_reset(
+    conn: &Connection,
+    key: &NameKey,
+    proved: &str,
+    hash: &str,
+    now: u64,
+) -> Result<usize, AccountError> {
+    Ok(conn.execute(
+        "UPDATE accounts SET password_hash = ?3, password_changed_ms = ?4, sessions_revoked_ms = ?4, must_change = 0
+         WHERE name_key = ?1 AND password_hash = ?2 AND must_change = 1 AND locked = 0",
+        params![key.as_str(), proved, hash, to_i64(now)],
+    )?)
+}
+
 /// Locks or unlocks; a lock ends live sessions.
 pub(crate) fn set_locked(
     conn: &Connection,

@@ -93,6 +93,10 @@ pub enum AuthError {
     /// Someone made the name between the question and the answer.
     #[error("Someone just took that name.")]
     NameJustTaken,
+    /// The account was reset again, locked or changed while a reset's new
+    /// password was being chosen.
+    #[error("Your password changed while you chose a new one. Sign in again.")]
+    ResetStale,
     /// A resume token did not open a session.
     #[error("Your saved login has expired.")]
     ResumeRejected,

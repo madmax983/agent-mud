@@ -120,6 +120,53 @@ async fn kestrel_reads_exactly_like_a_protected_account() {
     );
 }
 
+/// Who holds a name is read again just before a login binds: a name an
+/// agent PC took while the new password was typed is refused, and nothing
+/// is handed on to bind.
+#[tokio::test]
+async fn a_name_an_agent_takes_mid_dialogue_never_binds() {
+    let (g, a) = (game(), accounts().await);
+    make(&g, &a, "zed").await;
+    let key = NameKey::parse("zed").unwrap();
+    let temp = a
+        .admin_reset("zed", &key, Holder::Free, g.now_ms())
+        .await
+        .unwrap();
+    let mut d = dialogue(&g, &a, home());
+    assert_eq!(texts(&say(&mut d, "zed").await), [(CUR, "Password:")]);
+    let reply = say(&mut d, temp.expose()).await;
+    assert_eq!(reply.lines[0].kind, NEW, "{:?}", texts(&reply));
+    assert_eq!(texts(&say(&mut d, PW).await), [(NEW, "Type it again:")]);
+    // The agent PC kestrel now answers to Zed (as when a pack renames a
+    // cast member).
+    g.write(|w, _| {
+        let mut st = w.snapshot();
+        if let Some(e) = st
+            .entities
+            .get_mut(&mud_world::EntityId::from("pc_kestrel"))
+        {
+            e.name = "Zed".to_owned();
+            e.aliases.clear();
+        }
+        *w = mud_world::World::from_state(Arc::clone(w.pack()), st, Vec::new());
+    });
+    assert_eq!(d.holder("zed"), Holder::OtherPlayer);
+    let reply = say(&mut d, PW).await;
+    assert_eq!(
+        texts(&reply),
+        [(LineKind::Error, "that name is taken. What is your name?")]
+    );
+    assert!(!matches!(reply.next, Next::Done(_)));
+    // And a right password for it now binds nothing either.
+    let mut again = dialogue(&g, &a, home());
+    say(&mut again, "zed").await;
+    let reply = say(&mut again, PW).await;
+    assert_eq!(
+        texts(&reply),
+        [(LineKind::Error, "Wrong password."), (CUR, "Password:")]
+    );
+}
+
 /// Answers from a mix of names and passwords; whatever the order, a
 /// dialogue that finishes is bound to a human or a new character, never
 /// to an agent PC or an NPC.

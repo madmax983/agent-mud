@@ -749,23 +749,45 @@ async fn wrong_passwords_from_one_address_are_held() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_forwarded_client_without_trusted_proxies_is_shared() {
+async fn a_forwarded_header_never_lifts_the_limits_of_a_direct_client() {
+    // No trusted proxies: a client-supplied header names nobody, so the
+    // TCP peer is the key whatever the header says.
     let (addr, _) = boot_cfg(None, |c| c.accounts.new_characters_per_address_per_day = 1).await;
-    let fwd = [("x-forwarded-for", "203.0.113.9")];
-    for name in ["ada", "bo"] {
-        let mut c = ws_with(addr, &fwd).await;
-        register(&mut c, name, false).await;
+    let mut first = ws_with(addr, &[("x-forwarded-for", "203.0.113.9")]).await;
+    register(&mut first, "ada", false).await;
+    for fwd in [
+        ("x-forwarded-for", "198.51.100.1"),
+        ("forwarded", "for=198.51.100.2"),
+        ("x-real-ip", "198.51.100.3"),
+    ] {
+        let mut c = ws_with(addr, &[fwd]).await;
+        send(&mut c, json!({ "line": "bo" })).await;
+        until(&mut c, "Too many new characters from your address today").await;
     }
-    // Without the header the TCP peer counts, and has made none yet.
     let mut direct = ws(addr).await;
-    register(&mut direct, "cy", false).await;
-    let mut again = ws(addr).await;
-    send(&mut again, json!({ "line": "dee" })).await;
+    send(&mut direct, json!({ "line": "cy" })).await;
     until(
-        &mut again,
+        &mut direct,
         "Too many new characters from your address today",
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_header_never_lifts_the_address_hold() {
+    let (addr, _) = boot_cfg(None, |c| {
+        c.accounts.throttle.address.free = 0;
+    })
+    .await;
+    let fwd = [("x-forwarded-for", "203.0.113.9")];
+    let mut c = ws_with(addr, &fwd).await;
+    send(&mut c, json!({ "line": "kestrel" })).await;
+    until(&mut c, "Password:").await;
+    send(&mut c, json!({ "line": "wrong-pass-123" })).await;
+    until(&mut c, "Wrong password.").await;
+    let mut again = ws_with(addr, &[("x-forwarded-for", "198.51.100.7")]).await;
+    send(&mut again, json!({ "line": "nobody" })).await;
+    until(&mut again, "Too many failed logins from your address").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -813,5 +835,45 @@ async fn the_stay_signed_in_box_follows_remember_days() {
             "{days}"
         );
         assert!(page.contains("Type logout to make this browser forget you."));
+    }
+}
+
+/// Waits up to `secs` for a message whose text holds `needle`.
+async fn until_within(ws: &mut Ws, needle: &str, secs: u64) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}"))
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["text"].as_str().is_some_and(|s| s.contains(needle)) {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_out_or_locked_browser_is_closed_at_revalidation() {
+    let (addr, built) = boot_cfg(None, |c| c.accounts.revalidate_secs = 5).await;
+    let accounts = &built.mud.accounts;
+    let mut ada = ws(addr).await;
+    register(&mut ada, "ada", false).await;
+    let mut bo = ws(addr).await;
+    register(&mut bo, "bo", false).await;
+    let now = built.mud.game.now_ms();
+    let key = |n| mud_accounts::NameKey::parse(n).unwrap();
+    accounts.admin_signout(&key("ada"), now + 1).await.unwrap();
+    accounts
+        .admin_set_locked(&key("bo"), true, now + 1)
+        .await
+        .unwrap();
+    for c in [&mut ada, &mut bo] {
+        let bye = until_within(c, "Your account changed elsewhere. Farewell.", 8).await;
+        assert_eq!(bye["kind"], "system");
+        assert_eq!(close_code(c).await, Some(1008));
     }
 }
