@@ -800,7 +800,8 @@ impl Supervisor {
     /// Turing PC between sessions, an agent out cold, at its hard cap, away
     /// or chatter-held) keeps its booking, stored, until it is ready: an
     /// agent out cold gets it with the wake it has when it comes to. A
-    /// booking overdue past `booking_max_late_ms` is dropped, as at boot.
+    /// booking overdue past `booking_max_late_ms` is dropped, held or not,
+    /// as at boot.
     /// Readiness is read before the wake book's lock is taken.
     fn booked_wakes(&self, now: u64, online: &HashSet<EntityId>, held: &HashSet<EntityId>) {
         let (stopped, away): (HashSet<EntityId>, HashSet<EntityId>) = {

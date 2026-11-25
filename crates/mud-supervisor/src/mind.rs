@@ -731,7 +731,7 @@ pub fn persistent_habits() -> String {
     "\n- To come back to something later, book a wake with mud_wake_me (minutes, and a note \
      to yourself). Nothing else wakes you for it, and no other reminder tool can act in the \
      world. A wake you booked that comes due while you are out cold waits for the wake you \
-     get when you come to."
+     get when you come to, unless it is long overdue by then: then it is dropped."
         .to_owned()
 }
 

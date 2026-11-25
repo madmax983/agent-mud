@@ -54,6 +54,20 @@ fn smith(id: EntityId) -> HashMap<EntityId, HarvestPersona> {
     )])
 }
 
+/// The system text of a request the model saw.
+fn system_of(request: &ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == autumn_harvest_agent::ChatRole::System)
+        .flat_map(|m| &m.content)
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn call(id: &str, name: &str, args: Value) -> ChatResponse {
     ChatResponse {
         content: vec![ContentPart::ToolCall {
@@ -142,6 +156,8 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
             "mud_cancel_wake"
         ]
     );
+    let system = system_of(&model.seen.lock().unwrap()[0]);
+    assert!(system.ends_with(&persistent_habits()), "{system}");
 
     // The same wake again is a duplicate: no new model calls, no new post.
     let calls = model.seen.lock().unwrap().len();
@@ -164,6 +180,58 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
             .iter()
             .any(|e| e["kind"] == "board_post")
     );
+}
+
+/// An ambient harvest mind (`wakes: false`) is shown the four world tools
+/// and no wake habit: it may not book (ADR 0005).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ambient_harvest_mind_sees_no_wake_tools_or_habit() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let model = Arc::new(Scripted::default());
+    let hale = EntityId::from("guard_01");
+    let mut personas = smith(hale.clone());
+    if let Some(p) = personas.get_mut(&hale) {
+        p.wakes = false;
+    }
+    let mind = HarvestMind::new(Arc::clone(&model) as Arc<dyn AgentModel>, None, personas);
+    let ctx = WakeContext {
+        entity: hale.clone(),
+        name: "Hale".into(),
+        priority: Priority::MacroTick,
+        reason: "macro-tick".into(),
+        events: vec![],
+        event_views: vec![],
+        look: game.look(&hale),
+        you: serde_json::Value::Null,
+        macro_tick: true,
+        macro_ticks: 1,
+        login: false,
+        wake_id: "wake-guard_01-0-1".into(),
+        now_ms: 0,
+        booked: Vec::new(),
+    };
+    let tools = MudTools::new(Arc::clone(&game), typing, hale.clone());
+    mind.wake(ctx, tools).await.unwrap();
+    let seen = model.seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "the model was asked");
+    let names: Vec<String> = seen[0].tools.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(
+        names,
+        ["mud_look", "mud_sheet", "mud_events", "mud_command"]
+    );
+    let system = system_of(&seen[0]);
+    assert!(
+        system.contains("Ore."),
+        "the persona's own prompt: {system}"
+    );
+    assert!(!system.contains("mud_wake_me"), "{system}");
+    assert!(!system.contains(&persistent_habits()), "{system}");
 }
 
 /// Looks once, then answers; holds call `hold_at` until released.

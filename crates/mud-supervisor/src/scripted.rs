@@ -292,10 +292,7 @@ impl Scripts {
                     tracing::info!(entity = %e, "memory reset during the wake; not saved");
                 }
                 if let Some((minutes, note)) = &plan.wake_me {
-                    let booked = tools.wake_me_on_turn(&ctx.wake_id, *minutes, note);
-                    if booked["ok"] != true {
-                        tracing::info!(entity = %e, answer = %booked, "a mind script's wake was not booked");
-                    }
+                    book_for_script(e, tools, &ctx.wake_id, *minutes, note);
                 }
                 let n = plan.lines.len();
                 Decision::Lines(plan.lines, format!("rhai: {n} lines"))
@@ -322,6 +319,20 @@ impl Scripts {
                 ))
             }
         }
+    }
+}
+
+/// Books the wake a mind script asked for, on its wake's turn. A refusal
+/// is logged by its code only: the answer's `pending` list holds the
+/// notes, the agent's own text, which stay out of the log.
+fn book_for_script(e: &EntityId, tools: &MudTools, wake_id: &str, minutes: u32, note: &str) {
+    let booked = tools.wake_me_on_turn(wake_id, minutes, note);
+    if booked["ok"] != true {
+        tracing::info!(
+            entity = %e,
+            code = %booked["error_code"],
+            "a mind script's wake was not booked"
+        );
     }
 }
 

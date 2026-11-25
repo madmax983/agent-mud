@@ -24,7 +24,9 @@ far too late for "back in 25 minutes".
   causes). They merge into a wake already waiting. Budgets apply as to any
   wake (a hard-capped agent gets the fallback), one wake runs per entity
   at a time, and the mind may act. An agent that is not in the world (a
-  Turing PC between sessions) keeps its booking until it is back.
+  Turing PC between sessions) keeps its booking until it is back, but no
+  longer than `booking_max_late_ms` past its due time (see Live expiry
+  below).
 - **The note comes back as the agent's own words, as data.** The wake
   message says, in fixed text, that a booked wake is due, and gives the
   notes on a line of their own, `booked: [{"id":…,"untrusted_text":…}]`.
@@ -94,10 +96,13 @@ sequenceDiagram
   only for minds that book.
 - **Holds.** A due booking waits while its agent is offline, out cold, at
   its hard cap, away for a spell (`afk_until`), or chatter-held (ADR
-  0003). It fires at the agent's next ready step; nothing is lost.
+  0003). It fires at the agent's next ready step, unless it is overdue
+  by more than `booking_max_late_ms` (24 hours by default) by then: a
+  hold never outlasts that limit, and the booking is dropped (see Live
+  expiry).
 - **Live expiry.** A booking overdue by more than `booking_max_late_ms`
-  is dropped while the server runs too, by the same proved
-  `booking_disposition` the boot uses, so a running server and a
+  is dropped while the server runs too, held or not, with a `dropped`
+  line, by the same proved `booking_disposition` the boot uses, so a running server and a
   restarted one agree. Its row is deleted through `Game::persist` (a lost
   delete is redone at the next boot).
 - **The observer feed** shows `booking` lines: `booked`, `fired` (a wake

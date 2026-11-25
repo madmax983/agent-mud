@@ -123,6 +123,19 @@ fn effective_runtime(
     tier_runtime
 }
 
+/// The harvest persona of cast member `c`. Only a Persistent or Turing
+/// entity books its own wakes (ADR 0008): an ambient one gets neither the
+/// wake tools nor the wake habit.
+fn harvest_persona(c: &CastDef, body: &str) -> HarvestPersona {
+    HarvestPersona {
+        name: c.name.clone(),
+        persona: c.persona.clone(),
+        goal: c.goal.clone(),
+        body: body.to_owned(),
+        wakes: matches!(c.mind.tier, Tier::Persistent | Tier::Turing),
+    }
+}
+
 /// Builds every mind.
 ///
 /// Littleguy entities get a fresh MCP token each, whose `mud_events`
@@ -182,18 +195,7 @@ pub fn build(
                 );
                 let personas = members
                     .iter()
-                    .map(|(id, c)| {
-                        (
-                            (*id).clone(),
-                            HarvestPersona {
-                                name: c.name.clone(),
-                                persona: c.persona.clone(),
-                                goal: c.goal.clone(),
-                                body: body.clone(),
-                                wakes: matches!(c.mind.tier, Tier::Persistent | Tier::Turing),
-                            },
-                        )
-                    })
+                    .map(|(id, c)| ((*id).clone(), harvest_persona(c, &body)))
                     .collect();
                 Arc::new(
                     HarvestMind::new(client, Some(cfg.littleguy.data_dir.clone()), personas)
@@ -363,6 +365,19 @@ mod tests {
         assert!(system.contains("every 5 minutes"), "{system}");
         assert!(!system.contains("every minute"), "{system}");
         assert!(!system.contains("roll"), "{system}");
+    }
+
+    #[test]
+    fn only_agents_that_book_get_the_wake_tools_on_harvest() {
+        let pack = WorldPack::crypt_v01().unwrap();
+        let wakes = |id: &str| harvest_persona(&pack.cast[&EntityId::from(id)], "b").wakes;
+        assert!(!wakes("guard_01"), "ambient");
+        assert!(wakes("torin"), "persistent");
+        assert!(wakes("pc_kestrel"), "turing");
+        assert_eq!(
+            harvest_persona(&pack.cast[&EntityId::from("torin")], "b").body,
+            "b"
+        );
     }
 
     #[test]

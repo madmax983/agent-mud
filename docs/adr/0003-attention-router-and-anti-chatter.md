@@ -122,4 +122,6 @@ there. A lone agent is never held by it. The hold ends with the next
 reset (a human's act or a macro tick) or when a player arrives, and the
 booking fires then; the observer shows `booking ... held` once per hold.
 A booking also waits while its agent is away for a spell (`afk_until`),
-offline, out cold or at its hard cap.
+offline, out cold or at its hard cap. No hold outlasts
+`booking_max_late_ms` past the booking's due time: after that the
+booking is dropped (ADR 0008, Live expiry).

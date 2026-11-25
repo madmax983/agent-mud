@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use mud_world::{EntityId, RoomId};
 use serde_json::{Value, json};
 
-use super::persist_tests::{Disk, Run, T0, marta, quiet, start, torin};
+use super::persist_tests::{DAY, Disk, Run, T0, marta, quiet, start, torin};
 use super::*;
 use crate::mind::{BoxFuture, MindError};
 use crate::wakes::BookingAction;
@@ -311,4 +311,31 @@ async fn ambient_and_mindless_entities_cannot_book() {
     assert!(ta.iter().any(|a| a["ok"] == true), "{ta:?}");
     assert_eq!(r.sup.wakes().pending(&guard), Vec::new());
     assert!(r.sup.wakes().all().keys().all(|e| e == &torin()));
+}
+
+/// The day's count is stored with each booking and comes back at boot:
+/// a restart on the same game day does not reopen the daily cap.
+#[tokio::test]
+async fn the_daily_cap_survives_a_restart() {
+    let disk = Disk::new();
+    let smith = Arc::new(Booker::default());
+    let r = start(&disk, T0, quiet(), minds(&[(&torin(), &smith)]));
+    let cap = crate::wakes::MAX_PER_DAY;
+    for _ in 0..cap {
+        let answer = r.sup.book_wake(&torin(), 5, "x");
+        assert_eq!(answer["ok"], true, "{answer}");
+        let id = answer["booked"]["id"].as_u64().unwrap();
+        assert_eq!(r.sup.cancel_wake(&torin(), id)["ok"], true);
+    }
+    assert_eq!(r.sup.wakes().booked_today(&torin(), T0), cap);
+    drop(r);
+    let r = start(&disk, T0, quiet(), minds(&[(&torin(), &smith)]));
+    assert_eq!(r.sup.wakes().booked_today(&torin(), T0), cap, "restored");
+    assert_eq!(r.sup.wakes().pending(&torin()), Vec::new());
+    let answer = r.sup.book_wake(&torin(), 5, "x");
+    assert_eq!(answer["error_code"], "daily_cap", "{answer}");
+    drop(r);
+    // The next game day opens a fresh count.
+    let r = start(&disk, T0 + DAY, quiet(), minds(&[(&torin(), &smith)]));
+    assert_eq!(r.sup.book_wake(&torin(), 5, "x")["ok"], true);
 }

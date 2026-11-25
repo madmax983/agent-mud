@@ -82,7 +82,7 @@ wake_timeout_ms = 120000
 # down. A tell, an attack or a mention by name that no committed wake of its
 # agent consumed is replayed once as an Immediate wake; nothing else is.
 replay_max_age_ms = 120000       # such an event, or a reactive plan, older than this is not replayed (0..=1 day)
-booking_max_late_ms = 86400000   # a booking overdue by more is dropped (0..=30 days)
+booking_max_late_ms = 86400000   # a booking overdue by more is dropped, held or not, live or at boot (0..=30 days)
 catchup_spread_ms = 120000       # a missed macro tick fires once, within this of boot (0..=1 h)
 [supervisor.wake_timeout_ms_by_tier] # ambient, persistent, turing; unset: wake_timeout_ms
 turing = 180000
