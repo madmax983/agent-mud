@@ -246,9 +246,12 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
     }
 
     /// Restores the counters the mind persisted for `entity` (the scripted
-    /// mind's rule counts), at boot. The default keeps none.
-    fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) {
+    /// mind's rule counts), at boot, and returns the stale ones: counts of
+    /// rules the mind no longer has (edited or removed), for the caller to
+    /// drop from the store. The default keeps none and calls none stale.
+    fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) -> Vec<RuleCountRow> {
         let _ = (entity, counts);
+        Vec::new()
     }
 }
 
@@ -349,6 +352,19 @@ impl MudTools {
         book_wake(&self.wakes, &self.entity, self.game.now_ms(), minutes, note)
     }
 
+    /// `mud_wake_me` for a deterministic mind's decision: the booking rides
+    /// on the open turn of `wake_id` ([`WakeBook::book_on_turn`]), so it
+    /// is in the store with the decision's first effect, or at the close,
+    /// and never without it.
+    #[must_use]
+    pub fn wake_me_on_turn(&self, wake_id: &str, minutes: u32, note: &str) -> Value {
+        let now = self.game.now_ms();
+        let booked = self
+            .wakes
+            .book_on_turn(&self.entity, wake_id, now, minutes, note);
+        book_answer(&self.wakes, &self.entity, now, minutes, booked)
+    }
+
     /// `mud_cancel_wake`.
     #[must_use]
     pub fn cancel_wake(&self, id: u64) -> Value {
@@ -440,7 +456,24 @@ pub fn book_wake(
     minutes: u32,
     note: &str,
 ) -> Value {
-    match book.book(entity, now_ms, minutes, note) {
+    book_answer(
+        book,
+        entity,
+        now_ms,
+        minutes,
+        book.book(entity, now_ms, minutes, note),
+    )
+}
+
+/// The answer of `mud_wake_me` to a booking's outcome.
+fn book_answer(
+    book: &WakeBook,
+    entity: &EntityId,
+    now_ms: u64,
+    minutes: u32,
+    booked: Result<crate::wakes::Booking, crate::wakes::BookError>,
+) -> Value {
+    match booked {
         Ok(b) => json!({
             "ok": true,
             "booked": { "id": b.id, "in_minutes": minutes, "note": b.note },

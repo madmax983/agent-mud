@@ -269,14 +269,19 @@ impl Scripts {
         match outcome {
             Ok(plan) => {
                 self.host.step_mind(e, since, HookOutcome::Ran);
+                // The memory and the booking ride on the wake's turn: they
+                // commit with the plan's first effect, or at the close, so
+                // a crash before either leaves no half of the decision.
                 // An operator's reset during the wake wins over this save.
                 if let Some(m) = plan.memory.filter(|m| *m != memory)
-                    && !self.game.save_script_memory_if(e, schema, resets, m)
+                    && !self
+                        .game
+                        .stage_script_memory_if(e, &ctx.wake_id, schema, resets, m)
                 {
                     tracing::info!(entity = %e, "memory reset during the wake; not saved");
                 }
                 if let Some((minutes, note)) = &plan.wake_me {
-                    let booked = tools.wake_me(*minutes, note);
+                    let booked = tools.wake_me_on_turn(&ctx.wake_id, *minutes, note);
                     if booked["ok"] != true {
                         tracing::info!(entity = %e, answer = %booked, "a mind script's wake was not booked");
                     }
@@ -455,17 +460,22 @@ impl Mind for ScriptedMind {
         "scripted"
     }
 
-    fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) {
-        let Some(keys) = self.keys.get(entity) else {
-            return;
-        };
+    /// A count whose rule is gone or was edited matches no rule: it is
+    /// stale, and returned to be dropped.
+    fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) -> Vec<RuleCountRow> {
+        let keys = self.keys.get(entity).map_or(&[][..], Vec::as_slice);
         let mut fired = self.fired.lock().unwrap_or_else(PoisonError::into_inner);
         for (idx, (digest, dup)) in keys.iter().enumerate() {
-            // A count whose rule is gone or was edited matches nothing.
             if let Some(row) = counts.iter().find(|r| r.digest == *digest && r.dup == *dup) {
                 fired.insert((entity.clone(), idx), row.count);
             }
         }
+        drop(fired);
+        counts
+            .iter()
+            .filter(|r| !keys.contains(&(r.digest, r.dup)))
+            .copied()
+            .collect()
     }
 
     fn wake(

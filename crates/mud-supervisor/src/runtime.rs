@@ -12,13 +12,13 @@
 //! staged on its turn and commit with the mind's first effectful command,
 //! or at the turn's close; [`Supervisor::open`] restores the rows at boot.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mud_world::pack::Tier;
-use mud_world::side::{MacroRow, SideState, macro_consume, macro_queue};
+use mud_world::side::{BookingRow, MacroRow, PlanRow, SideState, macro_consume, macro_queue};
 use mud_world::{EntityId, Event, EventKind, Game, Seq, SideOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::budget::{Budget, BudgetLevel};
 use crate::gate::Gate;
+use crate::held::{assert_none_held, lock};
 use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
 use crate::persist::{macro_open, plan_resume, restore_macro, wake_id_key};
 use crate::router::{EntityRuntime, Priority, Resume, RouteNote, Router, RouterConfig, Wake};
@@ -205,7 +206,7 @@ struct EntityState {
 /// take only it, while `Game::act` and `Game::close_turn` take the world
 /// first, so they are never called with `router`, `state` or the wake
 /// book held (ADR 0002, ADR 0011). Breaking this order deadlocks the whole
-/// world.
+/// world; a debug build checks it (`crate::held`).
 #[derive(Debug)]
 pub struct Supervisor {
     game: Arc<Game>,
@@ -221,12 +222,15 @@ pub struct Supervisor {
     last_world_tick: AtomicU64,
     /// The wakes each agent booked for itself.
     wakes: Arc<WakeBook>,
-    /// The number of the next wake of this boot (see [`wake_id_key`]).
-    wake_n: AtomicU64,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Each entity's wakes so far in this boot: the `n` of its next wake
+    /// id (see [`wake_id_key`]). Counted per entity, so an id, and the
+    /// dice of a Rhai mind seeded by it, never depend on other entities'
+    /// wakes or on which task the scheduler runs first.
+    wake_n: Mutex<HashMap<EntityId, u64>>,
+    /// What the boot reconcile dropped or abandoned, kept for observers
+    /// that subscribe after [`Supervisor::open`] (see
+    /// [`Supervisor::boot_report`]).
+    boot_report: Mutex<Vec<Arc<ObserverEvent>>>,
 }
 
 impl Supervisor {
@@ -308,7 +312,8 @@ impl Supervisor {
             last_world_tick: AtomicU64::new(now),
             usage: Arc::default(),
             wakes,
-            wake_n: AtomicU64::new(1),
+            wake_n: Mutex::new(HashMap::new()),
+            boot_report: Mutex::new(Vec::new()),
         })
     }
 
@@ -342,8 +347,11 @@ impl Supervisor {
 
     /// Boot reconcile (ADR 0011): restores the rows and writes back what
     /// it changed (a clamped or caught-up macro time, dropped bookings,
-    /// finished or abandoned plans). Those writes may be lost to a crash:
-    /// the next boot redoes them.
+    /// finished or abandoned plans, the counts of rules that are gone).
+    /// Those writes may be lost to a crash: the next boot redoes them.
+    /// Each dropped booking and abandoned plan is logged and kept in the
+    /// boot report, since nobody can subscribe to the feed before `open`
+    /// returns.
     fn reconcile(&self, restored: SideState) {
         let now = self.game.now_ms();
         let SideState {
@@ -354,13 +362,19 @@ impl Supervisor {
             rule_counts,
             ..
         } = restored;
+        let mut ops = Vec::new();
         for (e, rows) in &rule_counts {
             if let Some(m) = self.minds.get(e) {
-                m.restore(e, rows);
+                let stale = m.restore(e, rows);
+                if !stale.is_empty() {
+                    ops.push(SideOp::RuleCountsDrop {
+                        entity: e.clone(),
+                        keys: stale.iter().map(|r| (r.digest, r.dup)).collect(),
+                    });
+                }
             }
         }
         let spans = self.macro_spans();
-        let mut ops = Vec::new();
         {
             let mut st = lock(&self.state);
             for (e, row) in &entities {
@@ -392,24 +406,51 @@ impl Supervisor {
             }
             drop(st);
         }
-        let dropped = self.wakes.restore(
-            bookings.into_values(),
-            next_booking_id,
-            now,
-            self.cfg.booking_max_late_ms,
-        );
+        self.reconcile_bookings(bookings.into_values(), next_booking_id, now, &mut ops);
+        self.reconcile_plans(plans, now, &mut ops);
+        if !ops.is_empty() {
+            self.game.persist(ops);
+        }
+    }
+
+    /// Restores the bookings: each waits, fires when its entity is ready,
+    /// or is dropped (deleted, logged and reported) when it is too late.
+    fn reconcile_bookings(
+        &self,
+        bookings: impl IntoIterator<Item = BookingRow>,
+        next_booking_id: u64,
+        now: u64,
+        ops: &mut Vec<SideOp>,
+    ) {
+        let dropped =
+            self.wakes
+                .restore(bookings, next_booking_id, now, self.cfg.booking_max_late_ms);
         if !dropped.is_empty() {
             ops.push(SideOp::BookingDelete {
                 ids: dropped.iter().map(|b| b.id).collect(),
             });
         }
         for b in dropped {
-            self.publish(ObserverEvent::BookingDropped {
+            // The note is the agent's own text: it stays out of the log.
+            tracing::warn!(
+                entity = %b.entity,
+                id = b.id,
+                due_ms = b.due_ms,
+                now_ms = now,
+                "a booked wake was too late at boot and was dropped"
+            );
+            self.report(ObserverEvent::BookingDropped {
                 entity: b.entity,
                 id: b.id,
                 due_ms: b.due_ms,
             });
         }
+    }
+
+    /// Queues a resume for each unfinished plan that may still run (an
+    /// errand, or a reactive plan within `replay_max_age_ms`); the rest are
+    /// done, and an abandoned one is logged and reported.
+    fn reconcile_plans(&self, plans: BTreeMap<EntityId, PlanRow>, now: u64, ops: &mut Vec<SideOp>) {
         for (e, plan) in plans {
             let len = u32::try_from(plan.lines.len()).unwrap_or(u32::MAX);
             let start = plan_resume(plan.cursor, len);
@@ -426,7 +467,15 @@ impl Supervisor {
                 continue;
             }
             if start < len {
-                self.publish(ObserverEvent::PlanAbandoned {
+                tracing::warn!(
+                    entity = %e,
+                    wake_id = %plan.wake_id,
+                    cursor = plan.cursor,
+                    len,
+                    started_ms = plan.started_ms,
+                    "a plan found at boot was abandoned, not resumed"
+                );
+                self.report(ObserverEvent::PlanAbandoned {
                     entity: e.clone(),
                     wake_id: plan.wake_id.clone(),
                     cursor: plan.cursor,
@@ -437,9 +486,6 @@ impl Supervisor {
                 entity: e,
                 wake_id: plan.wake_id,
             });
-        }
-        if !ops.is_empty() {
-            self.game.persist(ops);
         }
     }
 
@@ -488,14 +534,31 @@ impl Supervisor {
         }
     }
 
-    /// Subscribes to the observer feed.
+    /// Subscribes to the observer feed. It carries what happens from now
+    /// on; what the boot did is in [`Supervisor::boot_report`].
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<ObserverEvent>> {
         self.observer.subscribe()
     }
 
+    /// What the boot reconcile dropped (bookings too late to fire) and
+    /// abandoned (reactive plans too old to resume), in order. It happened
+    /// inside [`Supervisor::open`], before anyone could subscribe, so an
+    /// observer shows it ahead of the live feed.
+    #[must_use]
+    pub fn boot_report(&self) -> Vec<Arc<ObserverEvent>> {
+        lock(&self.boot_report).clone()
+    }
+
     fn publish(&self, e: ObserverEvent) {
         let _ = self.observer.send(Arc::new(e));
+    }
+
+    /// Publishes a boot event and keeps it in the boot report.
+    fn report(&self, e: ObserverEvent) {
+        let e = Arc::new(e);
+        lock(&self.boot_report).push(Arc::clone(&e));
+        let _ = self.observer.send(e);
     }
 
     fn runtimes(&self, now: u64) -> HashMap<EntityId, EntityRuntime> {
@@ -844,7 +907,10 @@ impl Supervisor {
             lock(&self.router).finish(&wake.entity, start);
             return;
         };
-        let n = self.wake_n.fetch_add(1, Ordering::Relaxed);
+        let n = *lock(&self.wake_n)
+            .entry(wake.entity.clone())
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
         let wake_id = wake_id_key(self.game.epoch(), self.game.boot(), n).id(&wake.entity);
         self.publish(ObserverEvent::WakeStarted {
             entity: wake.entity.clone(),
@@ -909,6 +975,7 @@ impl Supervisor {
             took_ms: end.saturating_sub(start),
         });
         mind.settled(&wake.entity).await;
+        assert_none_held("closing a turn");
         let closed = self.game.close_turn(
             &wake.entity,
             &turn,
@@ -918,8 +985,8 @@ impl Supervisor {
             }],
         );
         if let Err(e) = closed {
-            // The store logged and counted it; the rows it kept come back
-            // at the next boot.
+            // The store logged and counted it; the close's ops wait in its
+            // backlog for the next commit.
             tracing::warn!(entity = %wake.entity, error = %e, "a wake's turn did not close");
         }
         lock(&self.router).finish(&wake.entity, self.game.now_ms());

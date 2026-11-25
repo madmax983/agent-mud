@@ -918,3 +918,42 @@ async fn a_signed_out_or_locked_browser_is_closed_at_revalidation() {
         assert_eq!(close_code(c).await, Some(1008));
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_feed_opens_with_what_the_boot_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let torin = mud_world::EntityId::from("torin");
+    let note = "zq-private reminder";
+    {
+        let db = db.clone();
+        let (_, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+        // Booked three days ago for a minute later: far too late now.
+        let then = built.mud.game.now_ms() - 3 * 86_400_000;
+        built.mud.sup.wakes().book(&torin, then, 1, note).unwrap();
+    }
+    let (addr, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+    assert!(built.mud.sup.wakes().pending(&torin).is_empty(), "dropped");
+    let token = built.mud.admin_token.clone();
+    let mut resp = http()
+        .get(format!("http://{addr}/observer/feed?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !seen.contains("booking_dropped") {
+        let chunk = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .expect("the boot report never came")
+            .unwrap()
+            .unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.contains("\"entity\":\"torin\""), "{seen}");
+    assert!(
+        !seen.contains("zq-private"),
+        "the note stays out of the feed"
+    );
+}

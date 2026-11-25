@@ -37,9 +37,13 @@ struct Disk {
 
 impl Disk {
     fn new() -> Self {
+        Self::with(WorldPack::crypt_v01().unwrap())
+    }
+
+    fn with(pack: WorldPack) -> Self {
         Self {
             dir: tempfile::tempdir().unwrap(),
-            pack: Arc::new(WorldPack::crypt_v01().unwrap()),
+            pack: Arc::new(pack),
         }
     }
 
@@ -76,6 +80,8 @@ struct Run {
     clock: Arc<ManualClock>,
     rx: broadcast::Receiver<Arc<Event>>,
     obs: broadcast::Receiver<Arc<ObserverEvent>>,
+    /// The boot report, ahead of the feed, as the observer page shows it.
+    boot: Vec<Arc<ObserverEvent>>,
 }
 
 fn quiet() -> SupervisorConfig {
@@ -85,9 +91,9 @@ fn quiet() -> SupervisorConfig {
     }
 }
 
-/// Starts a process at `now`: opens the world, builds the supervisor,
-/// subscribes to its feed, and only then reconciles, so the feed sees what
-/// the boot dropped or abandoned.
+/// Starts a process at `now` as the server does: opens the world, opens
+/// the supervisor on what the world restored, and only then subscribes to
+/// its feed.
 fn start(
     disk: &Disk,
     now: u64,
@@ -95,18 +101,31 @@ fn start(
     minds: HashMap<EntityId, Arc<dyn Mind>>,
 ) -> Run {
     let (game, clock) = disk.game(now);
+    start_on(disk, game, clock, cfg, minds)
+}
+
+/// [`start`] on a world the caller opened (a mind needs its game first).
+fn start_on(
+    disk: &Disk,
+    game: Arc<Game>,
+    clock: Arc<ManualClock>,
+    cfg: SupervisorConfig,
+    minds: HashMap<EntityId, Arc<dyn Mind>>,
+) -> Run {
     let typing = Gate::new(Arc::clone(&game), 5, 0.0);
     let fallback = Arc::new(FallbackMind::from_cast(&disk.pack.cast));
     let rx = game.subscribe();
-    let sup = Supervisor::build(Arc::clone(&game), typing, minds, fallback, cfg);
+    let restored = game.take_restored().unwrap_or_default();
+    let sup = Supervisor::open(Arc::clone(&game), typing, minds, fallback, cfg, restored);
     let obs = sup.subscribe();
-    sup.reconcile(game.take_restored().unwrap_or_default());
+    let boot = sup.boot_report();
     Run {
         sup,
         game,
         clock,
         rx,
         obs,
+        boot,
     }
 }
 
@@ -128,9 +147,9 @@ impl Run {
         }
     }
 
-    /// Every feed entry so far.
+    /// Every feed entry so far: the boot report first.
     fn feed(&mut self) -> Vec<Arc<ObserverEvent>> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.boot);
         while let Ok(e) = self.obs.try_recv() {
             out.push(e);
         }
@@ -620,9 +639,17 @@ async fn hard_budget_requeue_keeps_booking_rows() {
     assert_eq!(disk.booking_ids(), [b.id], "the row stays");
     assert!(!r.sup.wakes().in_flight(b.id), "given back");
     assert_eq!(r.sup.wakes().pending(&torin()).len(), 1);
-    // At the hard cap it is not taken again.
+    // At the hard cap it is not taken again: no wake at all, not even
+    // the fallback's.
     r.run_for(2_000, 500).await;
     assert!(m.seen().is_empty(), "empty");
+    let again = r.feed();
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(&**e, ObserverEvent::WakeStarted { .. })),
+        "{again:?}"
+    );
     // The next UTC day the budget rolls and the booking fires.
     r.clock.set(DAY + 3_600_000);
     r.run_for(1_000, 500).await;
@@ -1024,4 +1051,398 @@ fn inserting_a_rule_above_keeps_counts_and_an_edited_rule_counts_again() {
     edited.restore(&marta(), &rows);
     assert_eq!(edited.count(&marta(), 0), 0);
     assert_eq!(edited.count(&marta(), 1), 1);
+}
+
+// ---- the boot report reaches the feed ----
+
+#[tokio::test]
+async fn a_boot_through_open_reports_a_dropped_booking_and_an_abandoned_plan() {
+    let disk = Disk::new();
+    let m = probe(&[], false);
+    {
+        let r = start(&disk, T0, quiet(), only(&torin(), &m));
+        r.sup.wakes().book(&torin(), T0, 1, "secret note").unwrap();
+        plant_plan(&r.game, &marta(), &["say x", "say y"], 1, false, T0);
+    }
+    let minds = HashMap::from([
+        (torin(), Arc::clone(&m) as Arc<dyn Mind>),
+        (marta(), Arc::new(ScriptedMind::default()) as Arc<dyn Mind>),
+    ]);
+    // Two days down: the booking is too late, the reactive plan too old.
+    let mut r = start(&disk, T0 + 2 * DAY, quiet(), minds);
+    let feed = r.feed();
+    assert!(
+        feed.iter().any(
+            |e| matches!(&**e, ObserverEvent::BookingDropped { entity, .. } if *entity == torin())
+        ),
+        "a subscriber after open sees the drop: {feed:?}"
+    );
+    assert!(
+        feed.iter().any(
+            |e| matches!(&**e, ObserverEvent::PlanAbandoned { entity, .. } if *entity == marta())
+        ),
+        "and the abandoned plan: {feed:?}"
+    );
+    assert!(disk.booking_ids().is_empty(), "the row is gone");
+}
+
+// ---- a failed close ----
+
+#[tokio::test]
+async fn a_failed_close_keeps_its_consume_for_the_next_commit() {
+    let disk = Disk::new();
+    // The mind only looks; then the disk fills before the turn closes.
+    let m = probe(&["look"], true);
+    let mut r = start(&disk, T0, quiet(), only(&torin(), &m));
+    m.arm(&r.game);
+    let b = r.sup.wakes().book(&torin(), T0, 1, "x").unwrap();
+    r.clock.set(b.due_ms);
+    r.run_for(0, 500).await;
+    assert_eq!(m.seen().len(), 1);
+    assert_eq!(disk.booking_ids(), [b.id], "the close could not write");
+    assert!(
+        r.sup.wakes().pending(&torin()).is_empty(),
+        "the wake took it"
+    );
+    // The disk recovers: the next commit carries the close's consume, so
+    // the store agrees with the book again.
+    r.game.refuse_store_writes(false).unwrap();
+    r.game.tick();
+    assert!(
+        disk.booking_ids().is_empty(),
+        "consumed with the next commit"
+    );
+}
+
+// ---- the lock order ----
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a supervisor lock is held")]
+fn a_durable_write_under_a_supervisor_lock_fails_in_debug_builds() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 5),
+        None,
+        Arc::new(ManualClock::new(T0)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 5, 0.0);
+    let sup = Supervisor::new(
+        game,
+        typing,
+        HashMap::new(),
+        Arc::new(FallbackMind::from_cast(&pack.cast)),
+        quiet(),
+    );
+    let held = lock(&sup.state);
+    let booked = sup.wakes().book(&torin(), T0, 1, "x");
+    drop(held);
+    drop(booked);
+}
+
+// ---- wake ids and the Rhai seed ----
+
+/// The wake ids torin's first wake gets, with marta woken first or not, on
+/// an in-memory world at `T0`.
+async fn torin_first_wake_id(marta_first: bool) -> String {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 5),
+        None,
+        Arc::new(ManualClock::new(T0)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 5, 0.0);
+    let (t, m) = (probe(&[], false), probe(&[], false));
+    let sup = Supervisor::new(
+        game,
+        typing,
+        HashMap::from([
+            (torin(), Arc::clone(&t) as Arc<dyn Mind>),
+            (marta(), Arc::clone(&m) as Arc<dyn Mind>),
+        ]),
+        Arc::new(FallbackMind::from_cast(&pack.cast)),
+        quiet(),
+    );
+    if marta_first {
+        for _ in 0..3 {
+            sup.fire_macro_tick(&marta());
+            for h in sup.step() {
+                h.await.unwrap();
+            }
+        }
+    }
+    sup.fire_macro_tick(&torin());
+    for h in sup.step() {
+        h.await.unwrap();
+    }
+    t.seen()[0].wake_id.clone()
+}
+
+#[tokio::test]
+async fn an_entitys_wake_ids_do_not_depend_on_other_entities_wakes() {
+    // The id seeds a Rhai mind's dice: another agent's wakes must not
+    // shift it.
+    assert_eq!(
+        torin_first_wake_id(false).await,
+        torin_first_wake_id(true).await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_step_wakes_get_the_same_ids_on_every_run() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let mut first: Option<Vec<(EntityId, String)>> = None;
+    for _ in 0..20 {
+        let game = Game::new(
+            World::new(Arc::clone(&pack), 5),
+            None,
+            Arc::new(ManualClock::new(T0)),
+        );
+        let typing = Gate::new(Arc::clone(&game), 5, 0.0);
+        let probes: Vec<(EntityId, Arc<Probe>)> = ["torin", "marta", "guard_01", "pc_kestrel"]
+            .into_iter()
+            .map(|e| (EntityId::from(e), probe(&[], false)))
+            .collect();
+        let sup = Supervisor::new(
+            Arc::clone(&game),
+            typing,
+            probes
+                .iter()
+                .map(|(e, p)| (e.clone(), Arc::clone(p) as Arc<dyn Mind>))
+                .collect(),
+            Arc::new(FallbackMind::from_cast(&pack.cast)),
+            quiet(),
+        );
+        for (e, _) in &probes {
+            game.bring_online(e);
+            lock(&sup.router).force(e, Priority::Immediate, "test", T0);
+        }
+        for h in sup.step() {
+            h.await.unwrap();
+        }
+        let ids: Vec<(EntityId, String)> = probes
+            .iter()
+            .map(|(e, p)| (e.clone(), p.seen()[0].wake_id.clone()))
+            .collect();
+        match &first {
+            None => first = Some(ids),
+            Some(f) => assert_eq!(f, &ids, "a wake id depends on the scheduler"),
+        }
+    }
+}
+
+// ---- stale rule counts ----
+
+#[tokio::test]
+async fn a_stale_rule_count_row_is_dropped_at_boot() {
+    let disk = Disk::new();
+    let mind = |cast: std::collections::BTreeMap<EntityId, mud_world::pack::CastDef>| {
+        HashMap::from([(
+            marta(),
+            Arc::new(ScriptedMind::from_cast(&cast)) as Arc<dyn Mind>,
+        )])
+    };
+    let original = login_cast(&disk.pack, false);
+    let mut edited = original.clone();
+    if let Some(c) = edited.get_mut(&marta()) {
+        c.script[0].commands = vec!["say hello again".into()];
+    }
+    let mut r = start(&disk, T0, quiet(), mind(original.clone()));
+    login_once(&mut r).await;
+    assert_eq!(r.said(&marta()), ["first login"]);
+    drop(r);
+    let rows = || {
+        disk.sql(
+            "SELECT count FROM sup_rule_count WHERE entity = 'marta'",
+            |r| r.get::<_, i64>(0),
+        )
+        .len()
+    };
+    assert_eq!(rows(), 2);
+    // The edit leaves the first rule's row matching nothing: it goes.
+    let r = start(&disk, T0 + 1_000, quiet(), mind(edited));
+    drop(r);
+    assert_eq!(rows(), 1, "the stale row is dropped");
+    // Reverted, the first rule counts from 0 again: it fires.
+    let mut r = start(&disk, T0 + 2_000, quiet(), mind(original));
+    login_once(&mut r).await;
+    assert_eq!(
+        r.said(&marta()),
+        ["first login", "first login", "second login"]
+    );
+}
+
+// ---- errands resume after any outage ----
+
+#[tokio::test]
+async fn a_login_errand_resumes_after_a_long_outage() {
+    let disk = Disk::new();
+    let mut cast = login_cast(&disk.pack, false);
+    if let Some(c) = cast.get_mut(&marta()) {
+        c.script = vec![ScriptRule {
+            on: ScriptTrigger::Login,
+            nth: Some(1),
+            who: mud_world::pack::Who::Any,
+            room: None,
+            keywords: Vec::new(),
+            commands: vec!["say one".into(), "say two".into()],
+        }];
+    }
+    let mind = || {
+        HashMap::from([(
+            marta(),
+            Arc::new(ScriptedMind::from_cast(&cast)) as Arc<dyn Mind>,
+        )])
+    };
+    let mut r = start(&disk, T0, quiet(), mind());
+    crash_after(&r.game, &marta(), 1);
+    login_once(&mut r).await;
+    drop(r);
+    let mut r = start(&disk, T0 + 30 * DAY, quiet(), mind());
+    let plan = r.game.plan_of(&marta()).unwrap();
+    assert!(plan.errand, "a login's plan is an errand");
+    r.run_for(4_000, 500).await;
+    assert_eq!(r.said(&marta()), ["one", "two"], "it resumed a month later");
+}
+
+#[tokio::test]
+async fn a_booked_rhai_errand_resumes_after_a_long_outage() {
+    let disk = Disk::new();
+    let hale = EntityId::from("guard_01");
+    let mut sources = mud_script::ScriptSources {
+        manifest: Some("[minds.guard_01]\nfile = \"h.rhai\"\nruntime = \"rhai\"\n".into()),
+        ..mud_script::ScriptSources::default()
+    };
+    sources.files.insert(
+        "h.rhai".into(),
+        "fn on_wake(ctx) { if ctx.booked.len() > 0 { [\"say one\", \"say two\"] } else { [] } }\n"
+            .into(),
+    );
+    let host = Arc::new(mud_script::ScriptHost::from_sources(&sources, &disk.pack).unwrap());
+    let mind = |game: &Arc<Game>| {
+        HashMap::from([(
+            hale.clone(),
+            Arc::new(ScriptedMind::from_cast(&disk.pack.cast).with_scripts(
+                Arc::clone(&host),
+                Arc::clone(game),
+                7,
+            )) as Arc<dyn Mind>,
+        )])
+    };
+    let (game, clock) = disk.game(T0);
+    let mut r = start_on(&disk, game.clone(), clock, quiet(), mind(&game));
+    let b = r.sup.wakes().book(&hale, T0, 1, "rounds").unwrap();
+    r.clock.set(b.due_ms);
+    crash_after(&r.game, &hale, 1);
+    r.run_for(1_000, 500).await;
+    drop(r);
+    let (game, clock) = disk.game(T0 + 30 * DAY);
+    let mut r = start_on(&disk, game.clone(), clock, quiet(), mind(&game));
+    let plan = r.game.plan_of(&hale).unwrap();
+    assert!(plan.errand, "a booked wake's plan is an errand");
+    r.run_for(4_000, 500).await;
+    assert_eq!(r.said(&hale), ["one", "two"], "it resumed a month later");
+}
+
+// ---- a crash inside a resume ----
+
+#[tokio::test]
+async fn a_crash_inside_a_resume_never_repeats_its_effects() {
+    let disk = Disk::new();
+    let mut r = start(&disk, T0, quiet(), scripted_torin(&disk.pack));
+    r.sup.fire_macro_tick(&torin());
+    crash_after(&r.game, &torin(), 1);
+    r.run_for(2_000, 500).await;
+    drop(r);
+    // The resume runs `move n` and the post, and dies right after it.
+    let mut r = start(&disk, T0 + 1_000, quiet(), scripted_torin(&disk.pack));
+    crash_after(&r.game, &torin(), 2);
+    r.run_for(4_000, 500).await;
+    assert_eq!(r.posts("Torin", "BOUNTY"), 1);
+    drop(r);
+    let mut r = start(&disk, T0 + 2_000, quiet(), scripted_torin(&disk.pack));
+    assert_eq!(
+        r.game.plan_of(&torin()).map(|p| p.cursor),
+        Some(3),
+        "the resume's cursor went with the post"
+    );
+    r.run_for(4_000, 500).await;
+    assert_eq!(
+        r.posts("Torin", "BOUNTY"),
+        1,
+        "one BOUNTY after two crashes"
+    );
+    assert_eq!(
+        r.game
+            .read(|w| w.entity(&torin()).unwrap().room.to_string()),
+        "smithy"
+    );
+    assert_eq!(r.game.plan_of(&torin()), None);
+}
+
+// ---- taken bookings given back ----
+
+#[tokio::test]
+async fn a_turing_logout_gives_its_taken_booking_back() {
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    let kestrel = EntityId::from("pc_kestrel");
+    if let Some(spec) = pack
+        .cast
+        .get_mut(&kestrel)
+        .and_then(|c| c.mind.turing.as_mut())
+    {
+        spec.active_windows_utc = vec!["20:00-21:00".into()];
+        spec.daily_offset_minutes = 0;
+    }
+    let disk = Disk::with(pack);
+    let m = probe(&[], false);
+    let mut r = start(&disk, T0, quiet(), only(&kestrel, &m));
+    r.run_for(0, 500).await;
+    assert!(
+        r.game.read(|w| w.entity(&kestrel).unwrap().online),
+        "in session"
+    );
+    let b = r.sup.wakes().book(&kestrel, T0, 1, "x").unwrap();
+    // Taken and waiting for its wake when the session ends.
+    for (e, list) in r.sup.wakes().take_due(b.due_ms, |_| true) {
+        drop(lock(&r.sup.router).deliver_booked(&e, list, b.due_ms));
+    }
+    assert!(r.sup.wakes().in_flight(b.id));
+    let out = T0 + 90 * 60_000;
+    r.clock.set(out);
+    r.sup.turing_sessions(out);
+    assert!(
+        !r.game.read(|w| w.entity(&kestrel).unwrap().online),
+        "logged out"
+    );
+    assert!(!r.sup.wakes().in_flight(b.id), "given back");
+    // The next session: the booking fires in this process.
+    r.clock.set(DAY + T0);
+    r.run_for(60_000, 5_000).await;
+    assert!(
+        m.seen().iter().any(|s| s.booked == [b.id]),
+        "{:?}",
+        m.seen()
+    );
+    assert!(disk.booking_ids().is_empty(), "empty");
+}
+
+#[tokio::test]
+async fn a_wake_whose_entity_left_before_it_ran_gives_its_booking_back() {
+    let disk = Disk::new();
+    let m = probe(&["say on it"], false);
+    let mut r = start(&disk, T0, quiet(), only(&torin(), &m));
+    let b = r.sup.wakes().book(&torin(), T0, 1, "x").unwrap();
+    for (e, list) in r.sup.wakes().take_due(b.due_ms, |_| true) {
+        drop(lock(&r.sup.router).deliver_booked(&e, list, b.due_ms));
+    }
+    r.clock.set(b.due_ms);
+    r.game.take_offline(&torin());
+    r.run_for(0, 500).await;
+    assert!(m.seen().is_empty(), "offline: the wake did not run");
+    assert!(!r.sup.wakes().in_flight(b.id), "given back");
+    r.game.bring_online(&torin());
+    r.run_for(1_000, 500).await;
+    assert_eq!(m.seen()[0].booked, [b.id], "it fires on return");
+    assert!(disk.booking_ids().is_empty(), "empty");
 }

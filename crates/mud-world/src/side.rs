@@ -294,6 +294,26 @@ pub enum SideOp {
         /// The counts.
         rows: Vec<RuleCountRow>,
     },
+    /// Forgets the counts of rules that are gone (edited or removed from
+    /// the pack): their `(digest, dup)` keys.
+    RuleCountsDrop {
+        /// Whose.
+        entity: EntityId,
+        /// The keys.
+        keys: Vec<(u64, u32)>,
+    },
+    /// Saves a mind's script memory (last writer wins). It rides on the
+    /// wake's turn, so a decision's memory commits with the decision's
+    /// first effect, or at the close, and never without it. It is not a
+    /// side row: [`SideState`] does not hold it.
+    ScriptMemory {
+        /// Whose.
+        entity: EntityId,
+        /// The memory schema of the mind script.
+        schema: u32,
+        /// The memory.
+        body: serde_json::Value,
+    },
     /// Joins a day's spend ([`Tally::join`]); `harvest_tokens_seen` is
     /// raised.
     Spend {
@@ -487,6 +507,15 @@ impl SideState {
                 }
                 list.sort();
             }
+            SideOp::RuleCountsDrop { entity, keys } => {
+                if let Some(list) = self.rule_counts.get_mut(entity) {
+                    list.retain(|r| !keys.contains(&(r.digest, r.dup)));
+                    if list.is_empty() {
+                        self.rule_counts.remove(entity);
+                    }
+                }
+            }
+            SideOp::ScriptMemory { .. } => {}
             SideOp::Spend {
                 entity,
                 day,
@@ -653,6 +682,30 @@ pub(crate) fn apply_sql(tx: &Transaction<'_>, op: &SideOp, now_ms: u64) -> Resul
                     i64::from(r.count)
                 ])?;
             }
+        }
+        SideOp::RuleCountsDrop { entity, keys } => {
+            let mut del = tx.prepare_cached(
+                "DELETE FROM sup_rule_count WHERE entity = ?1 AND digest = ?2 AND dup = ?3",
+            )?;
+            for (digest, dup) in keys {
+                del.execute(params![entity.as_str(), bits(*digest), i64::from(*dup)])?;
+            }
+        }
+        SideOp::ScriptMemory {
+            entity,
+            schema,
+            body,
+        } => {
+            tx.prepare_cached(
+                "INSERT INTO script_memory (entity, schema, body, saved_ms) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (entity) DO UPDATE SET schema = ?2, body = ?3, saved_ms = ?4",
+            )?
+            .execute(params![
+                entity.as_str(),
+                i64::from(*schema),
+                serde_json::to_string(body)?,
+                int(now_ms)
+            ])?;
         }
         SideOp::Spend {
             entity,

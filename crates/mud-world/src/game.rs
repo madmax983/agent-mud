@@ -376,16 +376,55 @@ impl Game {
         true
     }
 
+    /// Saves a mind's script memory, as [`Game::save_script_memory_if`]
+    /// does, on `entity`'s open turn of `wake_id`: the store's row changes
+    /// with the turn's first effectful command, or at its close, so a
+    /// crash before either leaves the memory the wake started from, and
+    /// the obligations that come back decide again from it. With no such
+    /// turn (a mind run outside a wake) the store is written now. Returns
+    /// whether it saved.
+    pub fn stage_script_memory_if(
+        &self,
+        entity: &EntityId,
+        wake_id: &str,
+        schema: u32,
+        resets: u64,
+        body: serde_json::Value,
+    ) -> bool {
+        let mut m = lock(&self.memory);
+        if m.resets.get(entity).copied().unwrap_or(0) != resets {
+            return false;
+        }
+        let op = SideOp::ScriptMemory {
+            entity: entity.clone(),
+            schema,
+            body: body.clone(),
+        };
+        if self.stage(entity, wake_id, vec![op]).is_err() {
+            self.store_memory(entity, schema, &body);
+        }
+        m.values.insert(entity.clone(), (schema, body));
+        true
+    }
+
     /// Forgets a mind's script memory, and records who asked in the audit.
+    /// A save still staged on a turn, or waiting in the backlog, is dropped
+    /// with it: the reset wins.
     pub fn reset_script_memory(&self, entity: &EntityId) {
         {
             // The memory lock covers the store too, so no save interleaves.
             let mut m = lock(&self.memory);
-            if let Some(cell) = &self.store
-                && let Err(e) = lock(cell).store.clear_script_memory(entity)
-            {
-                self.store_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(error = %e, "clearing script memory failed");
+            if let Some(cell) = &self.store {
+                let mut c = lock(cell);
+                let other = |op: &SideOp| !matches!(op, SideOp::ScriptMemory { entity: e, .. } if e == entity);
+                if let Some(t) = c.turns.get_mut(entity) {
+                    t.staged.retain(other);
+                }
+                c.pending.ops.retain(other);
+                if let Err(e) = c.store.clear_script_memory(entity) {
+                    self.store_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(error = %e, "clearing script memory failed");
+                }
             }
             m.values.remove(entity);
             let next = m.resets.get(entity).copied().unwrap_or(0).saturating_add(1);
@@ -599,11 +638,18 @@ impl Game {
     /// staged (a mind that never acted consumes here) and `ops`, as
     /// [`Game::act`] does, and forgets the turn.
     ///
+    /// Unlike an act, a close makes no promise to anyone, so a failed one
+    /// loses nothing: its ops wait in the backlog and go with the next
+    /// commit that works, as a failed world save's do. The supervisor has
+    /// already moved on from the obligations they consume; the store
+    /// follows it then (or, after a crash first, the obligations come
+    /// back at boot).
+    ///
     /// # Errors
     /// [`SideError::StaleTurn`] when the open turn is another wake's (it
     /// is left as it is, and nothing is written); [`SideError::Store`]
-    /// when the store failed (the turn is gone, and its obligations stay
-    /// unconsumed).
+    /// when the store failed (the turn is gone, and its ops wait in the
+    /// backlog).
     pub fn close_turn(
         &self,
         entity: &EntityId,
@@ -628,6 +674,9 @@ impl Game {
         };
         all.extend(ops);
         let out = self.act_locked(&w, &mut c, &all);
+        if out.is_err() {
+            c.pending.ops.extend(all);
+        }
         drop(c);
         drop(w);
         out

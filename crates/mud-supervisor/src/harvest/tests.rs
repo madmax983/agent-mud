@@ -262,3 +262,80 @@ async fn a_timed_out_wake_is_charged_when_its_job_ends() {
     );
     assert!(tools.usage_sink().take(&torin).is_zero(), "charged once");
 }
+
+/// Answers only when released.
+#[derive(Debug, Default)]
+struct Held {
+    go: tokio::sync::Notify,
+}
+
+impl AgentModel for Held {
+    fn chat<'a>(
+        &'a self,
+        _request: &'a ChatRequest,
+    ) -> HBoxFuture<'a, Result<ChatResponse, AgentError>> {
+        Box::pin(async move {
+            self.go.notified().await;
+            Ok(ChatResponse {
+                content: vec![ContentPart::Text("done".into())],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::new(1, 1),
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_wake_settles_only_once_its_job_is_done() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let model = Arc::new(Held::default());
+    let torin = EntityId::from("torin");
+    let mind = HarvestMind::new(
+        Arc::clone(&model) as Arc<dyn AgentModel>,
+        None,
+        HashMap::from([(
+            torin.clone(),
+            HarvestPersona {
+                name: "Torin".into(),
+                persona: "A smith.".into(),
+                goal: "Ore.".into(),
+            },
+        )]),
+    );
+    let ctx = WakeContext {
+        entity: torin.clone(),
+        name: "Torin".into(),
+        priority: Priority::Booked,
+        reason: "test".into(),
+        events: vec![],
+        event_views: vec![],
+        look: game.look(&torin),
+        macro_tick: false,
+        macro_ticks: 0,
+        login: false,
+        wake_id: "wake-torin-0-1".into(),
+        now_ms: 0,
+        booked: Vec::new(),
+    };
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
+    let cut =
+        tokio::time::timeout(std::time::Duration::from_millis(300), mind.wake(ctx, tools)).await;
+    assert!(cut.is_err(), "the wake timed out");
+    let mut settled = mind.settled(&torin);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut settled)
+            .await
+            .is_err(),
+        "the job still runs: not settled"
+    );
+    model.go.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), settled)
+        .await
+        .expect("settled once the job was done");
+}

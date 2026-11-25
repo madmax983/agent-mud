@@ -82,8 +82,11 @@ sequenceDiagram
   supervisor never calls them while it holds `router`, `state` or the wake
   book. The wake book's own writer lock, which serializes a book or a
   cancel around its durable write, comes before the world: it is taken
-  only from a tool call, never inside a world closure, and the book's
-  bookings lock is released before `Game::act` runs.
+  only from a tool call or a mind's decision, never inside a world
+  closure, and the book's bookings lock is released before `Game::act`
+  runs. A debug build checks the rule: every supervisor lock is counted
+  per thread, and the count must be zero before a booking's `Game::act`
+  and before `Game::close_turn`.
 - **Open order.** `Game::open` migrates `world.db`, mints its epoch once,
   bumps its boot number (one `synchronous = FULL` transaction), reloads the
   whole in-memory event log, and drops side rows of entities the pack no

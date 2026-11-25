@@ -20,6 +20,7 @@ use mud_world::side::{BookingRow, MetaKey};
 use mud_world::{EntityId, Game, SideOp};
 use serde::{Deserialize, Serialize};
 
+use crate::held::{Held, assert_none_held};
 use crate::persist::{BookingDisposition, booking_disposition, next_booking_id};
 
 /// The most wakes one entity may have booked at once.
@@ -113,8 +114,19 @@ fn clean(note: &str) -> String {
         .to_owned()
 }
 
+/// The `writer` lock: it comes before the world, so it is not one of the
+/// supervisor locks that [`assert_none_held`] counts.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where a booking's rows go.
+enum Lane<'a> {
+    /// Now, durably ([`Game::act`]): the agent is told ok only after it.
+    Act,
+    /// On the entity's open turn of this wake: with its first effectful
+    /// command, or at its close.
+    Turn(&'a str),
 }
 
 impl WakeBook {
@@ -128,11 +140,12 @@ impl WakeBook {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        lock(&self.inner)
+    fn lock(&self) -> Held<'_, Inner> {
+        crate::held::lock(&self.inner)
     }
 
     fn write(&self, ops: &[SideOp]) -> Result<(), BookError> {
+        assert_none_held("a booking's write");
         self.game
             .as_ref()
             .map_or(Ok(()), |g| g.act(ops).map_err(|_| BookError::Store))
@@ -146,6 +159,39 @@ impl WakeBook {
     /// the store failed (nothing is kept).
     pub fn book(
         &self,
+        entity: &EntityId,
+        now_ms: u64,
+        minutes: u32,
+        note: &str,
+    ) -> Result<Booking, BookError> {
+        self.book_through(&Lane::Act, entity, now_ms, minutes, note)
+    }
+
+    /// Books a wake as [`WakeBook::book`] does, for a deterministic mind's
+    /// decision: the booking's row is staged on `entity`'s open turn of
+    /// `wake_id`, so it is in the store with the decision's first effect
+    /// or at the turn's close. A crash before either loses the decision
+    /// and the booking together, and the redelivered wake books again
+    /// once. The id is reserved in the store at once, so it never
+    /// repeats. With no such turn (a mind run outside a wake) the booking
+    /// is written now.
+    ///
+    /// # Errors
+    /// As [`WakeBook::book`].
+    pub fn book_on_turn(
+        &self,
+        entity: &EntityId,
+        wake_id: &str,
+        now_ms: u64,
+        minutes: u32,
+        note: &str,
+    ) -> Result<Booking, BookError> {
+        self.book_through(&Lane::Turn(wake_id), entity, now_ms, minutes, note)
+    }
+
+    fn book_through(
+        &self,
+        lane: &Lane<'_>,
         entity: &EntityId,
         now_ms: u64,
         minutes: u32,
@@ -167,7 +213,7 @@ impl WakeBook {
             due_ms: now_ms.saturating_add(u64::from(minutes) * 60_000),
             note: clean(note),
         };
-        self.write(&[
+        let ops = vec![
             SideOp::BookingInsert {
                 row: BookingRow {
                     id,
@@ -181,7 +227,23 @@ impl WakeBook {
                 key: MetaKey::NextBookingId,
                 value: id,
             },
-        ])?;
+        ];
+        if let (Lane::Turn(_), Some(game)) = (lane, &self.game) {
+            // The id is reserved now, whatever becomes of the turn.
+            game.persist(vec![SideOp::MetaMax {
+                key: MetaKey::NextBookingId,
+                value: id,
+            }]);
+        }
+        // A turn that is gone (the mind runs outside a wake) stages
+        // nothing: the rows are written now, as a plain book's are.
+        let staged = match (lane, &self.game) {
+            (Lane::Turn(wake_id), Some(game)) => game.stage(entity, wake_id, ops.clone()).is_ok(),
+            _ => false,
+        };
+        if !staged {
+            self.write(&ops)?;
+        }
         let mut inner = self.lock();
         inner.next_id = inner.next_id.max(id.saturating_add(1));
         let list = inner.by_entity.entry(entity.clone()).or_default();

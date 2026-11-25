@@ -244,7 +244,11 @@ gate like any mind's. `memory` holds plain data only (bools, integers,
 strings of at most 200 chars, lists and maps of at most 64 entries, three
 levels, 8 KiB as JSON) and persists across restarts. `wake_me` books a
 wake through `mud_wake_me` (1 to 10080 minutes, a note of at most 280
-chars).
+chars). The memory, the booking and the lines are one decision: the memory
+and the booking are stored with the first line that takes effect (or when
+the wake ends), never without it. If the server dies before that, the wake
+comes back and your script decides again from the memory it had before
+(ADR 0011).
 
 A mind script runs for an entity whose tier's runtime is `scripted`, or
 for any entity whose binding sets `runtime = "rhai"` (unless mud.toml sets

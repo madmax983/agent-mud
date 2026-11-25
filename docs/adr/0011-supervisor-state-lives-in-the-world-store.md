@@ -72,9 +72,13 @@ In the same opening transaction, run with `synchronous = FULL`:
 - `boot` is raised by one.
 
 An in-memory world mints its epoch per process and has boot 0. From phase
-2, wake ids are `wake-{epoch:016x}-{boot}-{entity}-{n}` with `n` a per-boot
-counter: no id repeats across restarts (boot grows), across a world reset
-(a new epoch), or across in-memory runs, and no write per wake is needed.
+2, wake ids are `wake-{epoch:016x}-{boot}-{entity}-{n}` with `n` the
+entity's own wake count in this boot: no id repeats across restarts (boot
+grows), across a world reset (a new epoch), or across in-memory runs, and
+no write per wake is needed. The count is per entity, not one counter for
+the boot, because the id seeds a Rhai mind's dice: with one counter an
+entity's id (and its rolls) would depend on how many wakes other entities
+had and on which wake task the scheduler ran first.
 
 ### Side ops: plain data, idempotent, monotone (phase 1)
 
@@ -96,6 +100,8 @@ rows never enter `WorldState`: they are not physics, and no view shows them.
 | `PlanCursor` | `cursor = max`, only for the plan's own wake id |
 | `PlanDone` | deletes the plan, only of that wake id |
 | `RuleCounts` | `count = max` |
+| `RuleCountsDrop` | deletes the counts of rules that are gone, by `(digest, dup)` |
+| `ScriptMemory` | a Rhai mind's memory, last writer wins (it rides on the wake's turn; not a side row) |
 | `Spend`, `Booked` | the dated join: the later UTC day wins; the same day takes the larger value; `harvest_tokens_seen = max` |
 | `BookingInsert` / `BookingDelete` | insert once by id / delete |
 | `MetaMax` | raises `next_booking_id` (never `epoch` or `boot`) |
@@ -112,7 +118,8 @@ turns (`entity → { wake_id, staged ops }`) and the backlog of a failed save.
    turn replaces an old one, whose obligations then stay unconsumed.
 2. `stage(entity, wake_id, ops)` adds to the turn only if the wake id
    matches, else `StaleTurn` and nothing is staged. Minds stage
-   `PlanSet`, `PlanCursor` and `RuleCounts`.
+   `PlanSet`, `PlanCursor` and `RuleCounts`; a Rhai mind's decision also
+   stages its memory (`ScriptMemory`) and its `wake_me` booking.
 3. **The effectful-drain rule.** `Game::execute(actor, line)` drains
    `actor`'s staged ops into the command's own transaction only when the
    command is effectful: it parsed, is not read-only, and worked. A look, a
@@ -126,7 +133,12 @@ turns (`entity → { wake_id, staged ops }`) and the backlog of a failed save.
 5. `close_turn(entity, wake_id, ops)` is an `act` that also drains what the
    turn still has staged (a mind that never acted consumes at close) and
    forgets the turn. Another wake's id is refused (`StaleTurn`) and writes
-   nothing.
+   nothing. Unlike an `act`, a close promises nothing to anyone, so a
+   close that fails loses nothing: its ops wait in the backlog and go with
+   the next commit that works. The supervisor has already moved on from
+   the obligations they consume (a booking the wake took is gone from the
+   book), and the store follows it; a crash first brings them back at
+   boot.
 6. `persist(ops)` takes the cell only. It writes at once when no world
    change waits, else it defers behind the backlog (`Durability::Deferred`).
    Only ops whose loss is a safe regression use it: a macro schedule, a
@@ -145,7 +157,10 @@ snapshot. Before this, a failed save lost its events.
 **Lock order** (amends ADR 0002): `world → (router | state | wakebook, one
 at a time) → store cell`. `open_turn`, `stage`, `persist` and `retain` take
 only the leaf; `act` and `close_turn` take the world first, so they are
-never called while a supervisor lock is held.
+never called while a supervisor lock is held. Every supervisor lock goes
+through one helper that counts the locks a thread holds, and a debug build
+asserts the count is zero before a booking's `act` and before
+`close_turn`.
 
 ### Wake lifecycle (phase 2)
 
@@ -175,19 +190,31 @@ phase 3):
   `PlanSet { errand }` (`errand` when the wake carried a macro tick, a
   booking or a login) and, before each line, `PlanCursor { i + 1 }`.
   `plan_step` mirrors what is durable: the cursor passes a line only with
-  its effect. Only the TOML plan stages `RuleCounts`.
+  its effect. Only the TOML plan stages `RuleCounts`. A Rhai mind's
+  decision is one unit with its plan: the memory it returns
+  (`ScriptMemory`) and its `wake_me` booking are staged on the turn too,
+  so they commit with the first effectful line (or at close) and never
+  without the plan. A crash before that leaves the old memory and no
+  booking, and the wake that comes back decides again from the memory it
+  started from. The booking id is reserved in the store at once, so it
+  never repeats. An operator's memory reset drops a staged save.
 - **Close.** `PlanDone` is in every close, whether the mind finished or
   timed out: in one process a plan runs once, and only a crash leaves a
-  plan to resume. A close that fails is logged; what it kept comes back at
-  the next boot.
+  plan to resume. A close that fails is logged, and its ops wait in the
+  backlog for the next commit (see the turns above).
 - **Not ready.** An agent at its hard budget cap is not ready for its
   bookings (`take_due` skips it), so its bookings wait in the table; a
   booking taken just before the cap was reached is given back
   (`requeue`), never consumed by the fallback. A Turing PC that logs out
-  gives back the bookings of the wake it had waiting.
+  gives back the bookings of the wake it had waiting, and so does a wake
+  whose entity left the world before it ran.
 - **Feed.** `WakeStarted` carries the wake id; a booking dropped at boot is
   `booking_dropped` (its note stays out of the feed) and an abandoned plan
-  is `plan_abandoned`.
+  is `plan_abandoned`. Both happen inside `Supervisor::open`, before
+  anyone can subscribe, so the supervisor also keeps them as its boot
+  report (`Supervisor::boot_report`), which the observer feed sends first,
+  and logs each one (entity, id or wake id, due time or cursor; never the
+  note).
 
 The entity stays `busy` until it settles, so a late littleguy command
 lands in its own turn and never consumes the next wake. A wake is never
@@ -212,7 +239,9 @@ fresh ids through the normal, ready-gated paths.
   `catchup_spread_ms`, an owed tick (`queued > cleared`) delivered with its
   number, also within `catchup_spread_ms` of boot rather than at a stored
   time hours away, and without queuing another. Rule counts return to the
-  scripted mind by digest. Plans resume:
+  scripted mind by digest; a count whose rule is gone (edited or removed)
+  is deleted (`RuleCountsDrop`), so reverting an edit counts that rule
+  from 0 and the table does not grow with every edit. Plans resume:
   a plan whose cursor reached its end is done; an **errand** (a wake that
   carried a macro tick, a booking or a login) resumes at its cursor
   **however long the server was down**; a reactive plan resumes only within
@@ -311,7 +340,10 @@ A line that changed nothing (a refusal, a look) may run again after a
 crash, which is harmless. An unfinished plan resumes from its cursor, so
 **each effectful line of the plan takes effect exactly once**: torin's
 BOUNTY is posted once whether the crash comes before `move e`, after it,
-after `move n` or after the post.
+after `move n` or after the post, and after a second crash inside the
+resume. A Rhai mind's memory and `wake_me` booking commit with the plan,
+so a crash between its decision and the first line loses neither the line
+nor the memory, and books once.
 
 **LLM minds (littleguy, harvest, plugin-agent, ambient; phase 2).** A
 wake's obligations (the booking, the macro tick number, the addressed
