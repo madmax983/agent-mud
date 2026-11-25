@@ -386,13 +386,19 @@ pub async fn reload_scripts(mud: &Mud) -> Result<ReloadOk, ReloadError> {
 pub fn check_pack(dir: &Path) -> anyhow::Result<Vec<String>> {
     let p = Arc::new(WorldPack::load(dir)?);
     let mut out = vec![format!(
-        "{}: {} rooms, {} items, {} skills, {} cast, {} shops — ok",
+        "{}: {} rooms, {} items, {} skills, {} cast, {} shops, {} reward pool{} — ok",
         p.world.name,
         p.rooms.len(),
         p.items.len(),
         p.skills.len(),
         p.cast.len(),
-        p.economy.shops.len()
+        p.economy.shops.len(),
+        p.economy.rewards.len(),
+        if p.economy.rewards.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     )];
     let sources = ScriptSources::read_dir(dir)?;
     let compiled = mud_script::load::compile(&sources, &p)?;

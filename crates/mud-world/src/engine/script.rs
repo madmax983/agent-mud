@@ -5,7 +5,7 @@
 //! another: effects are applied with the engine's own helpers, which run
 //! no hooks, and login, respawn and ticks run none either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -21,10 +21,33 @@ use crate::hooks::{
     ScriptEffect, TargetFacts, VIEW_LIST_CAP, WorldHooks, hook_allowed, hook_step, tally,
     tally_admissible, tally_reason, valid_flag_name,
 };
-use crate::ids::{EntityId, ItemId, RoomId};
+use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId};
 use crate::pack::{Direction, EntityKind};
 use crate::parser::{Command, forbidden_in_text};
-use crate::state::Entity;
+use crate::rewards::{AskError, MintRecord, MintedItem, PoolFacts};
+use crate::state::{Entity, Holder};
+
+/// What the actor reads when a verb or `use` hook declines: server text.
+pub const DECLINED: &str = "Nothing comes of that just now.";
+
+/// Why an effect list cannot be applied.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Inadmissible {
+    /// A script bug: the hook faults, and its breaker counts it.
+    #[error("{0}")]
+    Fault(String),
+    /// The world cannot take it now (a pool spent for the period, marks or
+    /// flags full): the hook declines, nothing applies, and its breaker
+    /// does not move, so no player can take a hook down by asking again.
+    #[error("{0}")]
+    Declined(String),
+}
+
+impl From<String> for Inadmissible {
+    fn from(message: String) -> Self {
+        Self::Fault(message)
+    }
+}
 
 /// The breaker state of one hook, for the observer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,6 +69,9 @@ pub enum HookRun {
     Skipped,
     /// It faulted; nothing was applied.
     Faulted,
+    /// The world could not take its effects now; nothing was applied, and
+    /// its breaker did not move.
+    Declined,
     /// Its effects were applied.
     Applied {
         /// The lines for the actor, in order.
@@ -76,6 +102,15 @@ impl HookCall {
             item: None,
         }
     }
+}
+
+/// One reward to mint.
+struct Mint<'a> {
+    room: &'a RoomId,
+    key: &'a str,
+    pool: &'a PoolId,
+    currency: i64,
+    items: &'a BTreeMap<ProtoId, u32>,
 }
 
 fn capped(message: &str) -> String {
@@ -291,6 +326,7 @@ impl World {
                         room: present.then(|| e.room.clone()),
                         alive: e.dead_until_ms.is_none(),
                         present,
+                        deaths: e.deaths,
                     },
                 )
             })
@@ -322,7 +358,24 @@ impl World {
             item: call.item.and_then(|i| self.item_facts(i)),
             flags: self.state.flags.clone(),
             cast: self.cast_facts(),
+            pools: self.pool_facts(now_ms),
         }
+    }
+
+    /// What is left of every reward pool at `now_ms`.
+    #[must_use]
+    pub fn pool_facts(&self, now_ms: u64) -> BTreeMap<PoolId, PoolFacts> {
+        self.pack
+            .economy
+            .rewards
+            .iter()
+            .map(|(id, pool)| {
+                (
+                    id.clone(),
+                    pool.facts(self.state.pool_spent.get(id), now_ms),
+                )
+            })
+            .collect()
     }
 
     /// The input a dry run gives `hook` in `room`: a fresh player from the
@@ -361,6 +414,7 @@ impl World {
             last_attacked_by: None,
             haggle_with: None,
             marks: BTreeMap::new(),
+            deaths: 0,
         };
         let actor = ActorFacts {
             id: probe.id.clone(),
@@ -406,17 +460,28 @@ impl World {
 
     // ------------------------------------------------------------ admission
 
-    /// Checks each effect against the world, before any is applied.
+    /// Checks each effect against the world at game time `now_ms`, before
+    /// any is applied. The list is applied whole or not at all, so a mark
+    /// or a flag that could not be kept (its table full) declines the whole
+    /// list: a reward never pays when its once-per-player guard is lost.
     ///
     /// # Errors
-    /// The first effect that cannot apply, and why.
+    /// The first effect that cannot apply, and why: a fault, or a decline.
     pub fn check_effects(
         &self,
         room: &RoomId,
         actor: &EntityId,
         effects: &[ScriptEffect],
-    ) -> Result<(), String> {
+        now_ms: u64,
+    ) -> Result<(), Inadmissible> {
         let def = self.pack.rooms.get(room);
+        let mut marks: BTreeSet<&str> = self
+            .state
+            .entities
+            .get(actor)
+            .map(|e| e.marks.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut flags: BTreeSet<&str> = self.state.flags.keys().map(String::as_str).collect();
         for fx in effects {
             match fx {
                 ScriptEffect::Msg(t) | ScriptEffect::Narrate(t) | ScriptEffect::Refuse(t) => {
@@ -429,10 +494,10 @@ impl World {
                         } else {
                             "lock"
                         };
-                        return Err(format!(
+                        return Err(Inadmissible::Fault(format!(
                             "{which}({:?}): no lock on that exit here",
                             d.short()
-                        ));
+                        )));
                     }
                 }
                 ScriptEffect::SetFlag(n, v) | ScriptEffect::Mark(n, v) => {
@@ -440,18 +505,57 @@ impl World {
                     if let FlagValue::Text(t) = v
                         && t.chars().count() > FLAG_TEXT_MAX
                     {
-                        return Err(format!(
+                        return Err(Inadmissible::Fault(format!(
                             "the value of {n} is over {FLAG_TEXT_MAX} characters"
-                        ));
+                        )));
                     }
+                    let (table, cap, what) = if matches!(fx, ScriptEffect::Mark(..)) {
+                        (&mut marks, MARK_CAP, "marks")
+                    } else {
+                        (&mut flags, FLAG_CAP, "flags")
+                    };
+                    if !table.contains(n.as_str()) && table.len() >= cap {
+                        return Err(Inadmissible::Declined(format!(
+                            "{what} full ({cap}); {n} would not be kept"
+                        )));
+                    }
+                    table.insert(n);
                 }
-                ScriptEffect::ClearFlag(n) | ScriptEffect::Unmark(n) => check_name(n)?,
+                ScriptEffect::ClearFlag(n) => {
+                    check_name(n)?;
+                    flags.remove(n.as_str());
+                }
+                ScriptEffect::Unmark(n) => {
+                    check_name(n)?;
+                    marks.remove(n.as_str());
+                }
                 ScriptEffect::Heal(_) | ScriptEffect::Hurt(_) => {
                     if matches!(fx, ScriptEffect::Hurt(_)) && def.is_some_and(|r| r.safe) {
-                        return Err("hurt() is not allowed in a safe room".to_owned());
+                        return Err(Inadmissible::Fault(
+                            "hurt() is not allowed in a safe room".to_owned(),
+                        ));
                     }
                     if !self.state.entities.get(actor).is_some_and(Entity::present) {
-                        return Err("the actor is not here".to_owned());
+                        return Err(Inadmissible::Fault("the actor is not here".to_owned()));
+                    }
+                }
+                ScriptEffect::Reward {
+                    pool,
+                    currency,
+                    items,
+                } => {
+                    let def = self.pack.economy.rewards.get(pool).ok_or_else(|| {
+                        Inadmissible::Fault(format!("reward({pool}): no such pool in economy.toml"))
+                    })?;
+                    def.admit(self.state.pool_spent.get(pool), now_ms, *currency, items)
+                        .map_err(|e| match e {
+                            AskError::Bad(m) => Inadmissible::Fault(format!("reward({pool}): {m}")),
+                            AskError::Spent(m) => {
+                                Inadmissible::Declined(format!("reward({pool}): {m}"))
+                            }
+                        })?;
+                    if !self.state.entities.get(actor).is_some_and(Entity::present) {
+                        return Err(Inadmissible::Fault("the actor is not here".to_owned()));
                     }
                 }
             }
@@ -495,14 +599,21 @@ impl World {
                 at_ms: ctx.now,
             });
         }
-        let checked = reply.outcome.and_then(|(fx, dice)| {
-            let t = tally(&fx);
-            if !tally_admissible(t, limits.max_effects, call.hook.is_command()) {
-                return Err(tally_reason(t, limits.max_effects, call.hook.is_command()));
-            }
-            self.check_effects(&call.room, actor, &fx)?;
-            Ok((fx, dice))
-        });
+        let checked = reply
+            .outcome
+            .map_err(Inadmissible::Fault)
+            .and_then(|(fx, dice)| {
+                let t = tally(&fx);
+                if !tally_admissible(t, limits.max_effects, call.hook.is_command()) {
+                    return Err(Inadmissible::Fault(tally_reason(
+                        t,
+                        limits.max_effects,
+                        call.hook.is_command(),
+                    )));
+                }
+                self.check_effects(&call.room, actor, &fx, ctx.now)?;
+                Ok((fx, dice))
+            });
         match checked {
             Ok((fx, dice)) => {
                 self.dice = dice;
@@ -516,7 +627,15 @@ impl World {
                 });
                 self.apply_effects(ctx, actor, call, &key, fx)
             }
-            Err(message) => {
+            Err(Inadmissible::Declined(message)) => {
+                // Not the script's fault: nothing applies, the dice are
+                // untouched, and the breaker stays where it was.
+                let (next, _) = hook_step(faults, HookOutcome::Declined, limits.max_faults);
+                self.store_faults(&key, next);
+                self.script_log(ctx, &key, actor, format!("declined: {}", capped(&message)));
+                HookRun::Declined
+            }
+            Err(Inadmissible::Fault(message)) => {
                 let (next, allowed) = hook_step(faults, HookOutcome::Faulted, limits.max_faults);
                 self.store_faults(&key, next);
                 self.audit.push(Audit::ScriptFault {
@@ -615,9 +734,152 @@ impl World {
                 }
                 ScriptEffect::Heal(dice) => self.heal_actor(ctx, actor, dice),
                 ScriptEffect::Hurt(dice) => died = self.hurt_actor(ctx, actor, dice),
+                ScriptEffect::Reward {
+                    pool,
+                    currency,
+                    items,
+                } => {
+                    let mint = Mint {
+                        room: &call.room,
+                        key,
+                        pool: &pool,
+                        currency,
+                        items: &items,
+                    };
+                    if let Some(line) = self.mint(ctx, actor, &mint) {
+                        msgs.push(line);
+                    }
+                }
             }
         }
         HookRun::Applied { msgs, refused }
+    }
+
+    /// Mints an admitted reward for the actor: the pool's spent count
+    /// moves on, the money and the new items go to the actor, an event
+    /// tells the actor, and the ledger records it. Returns the line for
+    /// the actor. The ask was checked before any effect applied; it is
+    /// checked again here, and skipped (logged) if it no longer fits.
+    fn mint(&mut self, ctx: &mut Ctx, actor: &EntityId, m: &Mint<'_>) -> Option<String> {
+        let pack = Arc::clone(&self.pack);
+        let def = pack.economy.rewards.get(m.pool)?;
+        let admitted = def.admit(
+            self.state.pool_spent.get(m.pool),
+            ctx.now,
+            m.currency,
+            m.items,
+        );
+        let present = self.state.entities.get(actor).is_some_and(Entity::present);
+        let spent = match admitted {
+            Ok(s) if present => s,
+            Ok(_) => {
+                let line = format!("skipped reward({}): the actor is not here", m.pool);
+                self.script_log(ctx, m.key, actor, line);
+                return None;
+            }
+            Err(e) => {
+                let line = format!("skipped reward({}): {e}", m.pool);
+                self.script_log(ctx, m.key, actor, line);
+                return None;
+            }
+        };
+        let period = spent.period;
+        self.state.pool_spent.insert(m.pool.clone(), spent);
+        if m.currency > 0 {
+            self.change_currency(ctx, actor, m.currency);
+        }
+        let to = Holder::Entity {
+            entity: actor.clone(),
+        };
+        let mut made = Vec::new();
+        for (proto, n) in m.items {
+            for _ in 0..*n {
+                let id = self.state.new_item(proto, &pack);
+                self.state.attach(id, &to);
+                ctx.changes.push(StateChange::Item {
+                    item: id,
+                    proto: proto.clone(),
+                    from: None,
+                    to: Some(to.clone()),
+                });
+                made.push(MintedItem {
+                    id,
+                    proto: proto.clone(),
+                });
+            }
+        }
+        let line = self.reward_line(m.currency, m.items);
+        let spec = Emit {
+            only: Some(vec![actor.clone()]),
+            ..Emit::new(EventKind::System, Some(m.room.clone()), line.clone())
+                .actor(actor, "reward")
+                .tags(["script".to_owned(), m.key.to_owned(), "reward".to_owned()])
+                .data(json!({
+                    "pool": m.pool,
+                    "currency": m.currency,
+                    "items": made,
+                }))
+        };
+        let seq = self.emit(ctx, spec);
+        ctx.changes.push(StateChange::Minted {
+            pool: m.pool.clone(),
+            entity: actor.clone(),
+            currency: m.currency,
+            items: made.iter().map(|i| i.id).collect(),
+        });
+        self.audit.push(Audit::Minted {
+            hook: m.key.to_owned(),
+            entity: actor.clone(),
+            pool: m.pool.clone(),
+            currency: m.currency,
+            items: made.iter().map(|i| i.proto.clone()).collect(),
+            at_ms: ctx.now,
+        });
+        let record = MintRecord {
+            seq,
+            pool: m.pool.clone(),
+            period,
+            hook: m.key.to_owned(),
+            entity: actor.clone(),
+            currency: m.currency,
+            items: made,
+            at_ms: ctx.now,
+        };
+        let totals = self.state.minted.entry(m.pool.clone()).or_default();
+        *totals = totals.with(&record);
+        self.mints.push(record);
+        Some(line)
+    }
+
+    /// The line a reward tells its receiver, such as `You receive 20s and
+    /// a healing draught.` Server text: pack names and numbers only.
+    fn reward_line(&self, currency: i64, items: &BTreeMap<ProtoId, u32>) -> String {
+        let mut parts = Vec::new();
+        if currency > 0 {
+            parts.push(format!("{currency}{}", self.pack.economy.currency.short));
+        }
+        for (proto, n) in items.iter().filter(|(_, n)| **n > 0) {
+            let name = self
+                .pack
+                .items
+                .get(proto)
+                .map_or_else(|| proto.to_string(), |d| d.name.clone());
+            let article = if name.starts_with(['a', 'e', 'i', 'o', 'u']) {
+                "an"
+            } else {
+                "a"
+            };
+            parts.push(if *n == 1 {
+                format!("{article} {name}")
+            } else {
+                format!("{n} x {name}")
+            });
+        }
+        let list = match parts.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => parts.concat(),
+        };
+        format!("You receive {list}.")
     }
 
     /// Locks or unlocks an exit and its far side.
@@ -771,6 +1033,7 @@ impl World {
                 };
                 Ok((narrative, json!({ "script": key })))
             }
+            HookRun::Declined => Err(Fail::new(ErrorCode::Refused, DECLINED)),
             HookRun::Absent | HookRun::Skipped | HookRun::Faulted => {
                 Err(Fail::new(ErrorCode::ScriptFailed, "Nothing happens."))
             }
@@ -831,7 +1094,7 @@ impl World {
         };
         match self.run_hook(ctx, actor, &call) {
             HookRun::Applied { msgs, .. } => msgs,
-            HookRun::Absent | HookRun::Skipped | HookRun::Faulted => Vec::new(),
+            HookRun::Absent | HookRun::Skipped | HookRun::Faulted | HookRun::Declined => Vec::new(),
         }
     }
 }

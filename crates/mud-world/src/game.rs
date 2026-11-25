@@ -164,7 +164,13 @@ impl Game {
             Some(loaded) => World::from_state(pack, loaded.state, loaded.recent),
             None => {
                 let w = World::new(pack, seed);
-                store.save(&w.pack().world.name, &w.snapshot(), &[], clock.now_ms())?;
+                store.save(
+                    &w.pack().world.name,
+                    &w.snapshot(),
+                    &[],
+                    &[],
+                    clock.now_ms(),
+                )?;
                 w
             }
         };
@@ -303,9 +309,13 @@ impl Game {
     fn commit(&self, w: &mut World, now: u64) {
         let fresh = w.drain_fresh();
         let audit = w.drain_audit();
+        // The ledger's rows go to the store with their events; the
+        // snapshot keeps only the totals. Without a store they are told
+        // in the events and the audit, and not kept.
+        let mints = w.drain_mints();
         if let Some(store) = &self.store {
             let snapshot = w.snapshot();
-            let saved = lock(store).save(&w.pack().world.name, &snapshot, &fresh, now);
+            let saved = lock(store).save(&w.pack().world.name, &snapshot, &fresh, &mints, now);
             if let Err(e) = saved {
                 self.store_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(error = %e, "saving the world failed");
@@ -525,7 +535,7 @@ mod tests {
         let db = dir.path().join("w.db");
         let mut s = Store::open(&db).unwrap();
         let state = crate::state::WorldState::from_pack(&pack(), 1);
-        s.save("other-world", &state, &[], 0).unwrap();
+        s.save("other-world", &state, &[], &[], 0).unwrap();
         drop(s);
         let err = Game::open(pack(), Some(&db), 1, Arc::new(SystemClock)).unwrap_err();
         assert!(err.to_string().contains("other-world"));
@@ -539,7 +549,7 @@ mod tests {
         w.execute(&ada, "say one", 6);
         w.execute(&ada, "say two", 7);
         let fresh = w.drain_fresh();
-        s.save("crypt-v01", &w.snapshot(), &fresh, 8).unwrap();
+        s.save("crypt-v01", &w.snapshot(), &fresh, &[], 8).unwrap();
         assert_eq!(s.event_count().unwrap(), 3);
         let after = s.events_after(1, 10).unwrap();
         assert_eq!(after.len(), 2);

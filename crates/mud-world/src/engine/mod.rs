@@ -11,7 +11,7 @@ mod look;
 mod script;
 mod social;
 
-pub use script::HookStatus;
+pub use script::{DECLINED, HookStatus, Inadmissible};
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -22,9 +22,10 @@ use serde_json::{Value, json};
 
 use crate::event::{ActorRef, Event, EventKind};
 use crate::hooks::{WorldDice, WorldHooks};
-use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, SkillId};
+use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId, Seq, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WorldPack};
 use crate::parser::{Command, MAX_TEXT_CHARS, ParseError, forbidden_in_text, parse_with};
+use crate::rewards::MintRecord;
 use crate::state::{Entity, Holder, NameOwner, WorldState};
 
 /// How many events the world keeps in memory for `mud_events`.
@@ -226,6 +227,19 @@ pub enum StateChange {
         /// The event.
         seq: Seq,
     },
+    /// A script's reward was minted from a pack pool and recorded in the
+    /// ledger. The money and the new items also appear as `currency` and
+    /// `item` changes (an item from nowhere).
+    Minted {
+        /// The pool.
+        pool: PoolId,
+        /// Who received it.
+        entity: EntityId,
+        /// The currency made.
+        currency: i64,
+        /// The items made.
+        items: Vec<ItemId>,
+    },
 }
 
 /// The result of one command. The wire form of `mud_command`.
@@ -333,6 +347,21 @@ pub enum Audit {
         version: String,
         /// Every problem found.
         problems: Vec<String>,
+        /// When.
+        at_ms: u64,
+    },
+    /// A world hook's reward was minted and recorded in the ledger.
+    Minted {
+        /// The hook key.
+        hook: String,
+        /// Who received it.
+        entity: EntityId,
+        /// The pool.
+        pool: PoolId,
+        /// The currency made.
+        currency: i64,
+        /// The prototypes of the items made.
+        items: Vec<ProtoId>,
         /// When.
         at_ms: u64,
     },
@@ -462,6 +491,8 @@ pub struct World {
     log: VecDeque<Event>,
     fresh: Vec<Event>,
     audit: Vec<Audit>,
+    /// Ledger rows not yet saved: the store appends them with the events.
+    mints: Vec<MintRecord>,
     hooks: Option<Arc<dyn WorldHooks>>,
 }
 
@@ -495,6 +526,7 @@ impl World {
             log: recent.into_iter().collect(),
             fresh: Vec::new(),
             audit: Vec::new(),
+            mints: Vec::new(),
             hooks: None,
         }
     }
@@ -541,6 +573,18 @@ impl World {
     /// Takes the observer audit entries since the last call.
     pub fn drain_audit(&mut self) -> Vec<Audit> {
         std::mem::take(&mut self.audit)
+    }
+
+    /// The ledger rows minted since the last [`World::drain_mints`].
+    #[must_use]
+    pub fn fresh_mints(&self) -> &[MintRecord] {
+        &self.mints
+    }
+
+    /// Takes the ledger rows minted since the last call, for the store's
+    /// `mints` table. The snapshot keeps only their running totals.
+    pub fn drain_mints(&mut self) -> Vec<MintRecord> {
+        std::mem::take(&mut self.mints)
     }
 
     /// Whether a human is present in `room`.

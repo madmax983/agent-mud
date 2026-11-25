@@ -1,7 +1,8 @@
 # ADR 0010: Sandboxed Rhai scripts: data in, data out
 
-Status: accepted (v0.2). Ledgered rewards: proposed, on the roadmap
-(see "Future: ledgered rewards").
+Status: accepted (v0.2). Amended: ledgered rewards are accepted and built
+(see "Ledgered rewards"); scripts may mint money and items as quest
+rewards, only from pack pools and only into the ledger.
 
 ## Context
 
@@ -28,9 +29,11 @@ flowchart LR
   H -->|read-only HookInput + cloned world dice| R[mud-script: Rhai sandbox]
   R -->|Vec of ScriptEffect + advanced dice| A{tally_admissible<br/>Verus-proved}
   A -->|no| F[fault: nothing applied, no dice used, breaker steps]
-  A -->|yes| C{check_effects}
-  C -->|no| F
+  A -->|yes| C{check_effects<br/>pool_admit, Verus-proved}
+  C -->|bug| F
+  C -->|world full or spent now| D[decline: nothing applied, no dice used, breaker unmoved]
   C -->|yes| E[engine helpers apply effects in the same command]
+  E -->|reward| L[(ledger: store table mints; snapshot: pool_spent, minted totals)]
   W[mind wake] --> M[Rhai on_wake: lines, memory, wake_me]
   M --> G[typing gate] --> P
 ```
@@ -40,12 +43,13 @@ flowchart LR
 - **World hooks** (a room's `on_enter`/`on_speech`, an item's
   `on_take`/`on_use`, a custom verb) return a closed list of effects:
   `msg`, `narrate`, `refuse`, `unlock`, `lock`, `set_flag`, `clear_flag`,
-  `mark`, `unmark`, `heal`, `hurt`. The engine admits the list
+  `mark`, `unmark`, `heal`, `hurt`, `reward`. The engine admits the list
   all-or-nothing through `tally_step`/`tally_admissible` (at most
-  `max_effects`, at most one heal/hurt, a `refuse` only alone and only in
-  a verb or `on_use` hook), then `check_effects` validates each effect
-  against the world (texts 1 to 500 printable characters, a lock on that
-  exit, valid flag names, no `hurt` in a safe room, the actor present).
+  `max_effects`, at most one heal/hurt, at most one reward, a `refuse`
+  only alone and only in a verb or `on_use` hook), then `check_effects`
+  validates each effect against the world (texts 1 to 500 printable
+  characters, a lock on that exit, valid flag names, no `hurt` in a safe
+  room, the actor present, a reward within its pool's budget).
   Only then does it apply them with its own helpers, in the same `Ctx`,
   `CommandResult`, events and commit.
 - **Mind scripts** return command lines (and optionally memory and a
@@ -129,9 +133,13 @@ kestrel exactly as a human (tested).
 `hook_step`/`hook_allowed` and `tally_step`/`tally_admissible` live in
 `crates/mud-world/src/hooks.rs`, mirrored in `formal/verus/src/hooks.rs`
 (ADR 0006): a hook runs at most `max` consecutive faulting times for every
-`max`, stays tripped until the scripts change or are reloaded, and the
+`max`, stays tripped until the scripts change or are reloaded, a decline
+never moves the count (`lemma_declines_never_trip`), and the
 saturating tally admits exactly the lists the plain rule admits
-(`max <= 16`). Hook breakers persist in `WorldState.hook_faults`; mind
+(`max <= 16`), at most one reward among them. The reward pools' kernels
+(`pool_admit`, `pool_roll`, `pool_period`) live in
+`crates/mud-world/src/rewards.rs`, mirrored in
+`formal/verus/src/rewards.rs` (see "Ledgered rewards"). Hook breakers persist in `WorldState.hook_faults`; mind
 breakers live in memory in the `ScriptHost`, where the Scripts panel shows
 them (faults/max, TRIPPED), and reset on any new version, reload or
 re-arm. A fault from a wake that started before a reload counts for
@@ -195,48 +203,137 @@ on `Engine::new_raw` with the curated natives, never `Engine::new()` or
   clone.
 - **Effect trees, cascades and ticks.** One hook per command keeps cost and
   reasoning bounded.
-- **Item and money creation (for v0.2).** See below.
+- **Unledgered item and money creation.** A script that could make money
+  or items directly would break conservation with nothing to audit. A
+  reward comes only from a pack pool and is always in the ledger (below).
+- **A pool in `scripts.toml`.** A pool is physics; an operator reloading
+  scripts must not be able to change how much money the world makes.
+- **Partial rewards.** Paying what is left of an ask would let a script
+  drain a pool to the coin without knowing it; an ask fits whole or the
+  hook declines, and `ctx.pools` lets the script check first.
+- **A spent pool as a fault.** It stepped the breaker, so any player could
+  trip a reward hook for everyone, until a reload, by asking an empty pool
+  three times; and a pool runs dry as a normal daily state. It declines
+  instead (below).
+- **Paying the rest of a list without its reward, or a reward without its
+  guard.** A mark or flag skipped at apply time (its table full) let a
+  hook pay a player again and again; a reward skipped while its guard was
+  set would spend the player's claim for nothing. The list is admitted
+  whole or declined whole.
+- **Per-period counts kept forever.** Only the current period of a pool is
+  counted (`pool_spent`); the ledger keeps the history.
+- **The ledger in the snapshot.** The snapshot is cloned, serialized and
+  rewritten after every command; a `Vec` of every mint ever made grew it
+  without bound (100 000 mints: 9.6 KB to 16.9 MB, 0.4 ms to 770 ms a
+  save). The rows go to the store's own append-only table instead.
+- **A cap on mints per period.** Once the rows left the snapshot, a mint
+  costs one row in `mints` as its event costs one in `events`, so the
+  ledger grows no faster than the event log every command already
+  appends to; a count cap would add a pack knob with no bound it alone
+  gives.
 - **A `by_human` flag.** It would leak tiers.
 - **Storing sources for replay.** Deferred.
 
-## Future: ledgered rewards (roadmap)
+## Ledgered rewards (accepted)
 
-The owner asked for quest rewards as a future roadmap item. v0.2 scripts
-mint nothing: random play tests that money and items are conserved and no
-item id is ever made by a script. When rewards land, they follow this
-design, in one PR with its proof:
+The owner chose that scripts may create items and money as quest rewards,
+through a ledgered reward source. Earlier v0.2 scripts minted nothing, and
+random play tested exactly that; now random play tests that money and
+items are conserved **except for ledgered mints, which it counts exactly**.
 
-- **A pack-declared source.** `economy.toml` gains `[rewards.<pool>]`:
-  `currency = 50`, `items = { bone_charm = 2 }`, `per = "day"` (UTC day
-  of `now_ms`) or `"ever"`. A pool is physics, so it lives in the world
-  pack, not in `scripts.toml`; the pack validator checks the item ids.
+- **A pack-declared source.** `economy.toml` declares
+  `[rewards.<pool>]`: `currency = 60`, `items = { healing_draught = 3 }`,
+  `per = "day"` (the UTC day of the game clock `now_ms`) or `"ever"`
+  (never refills). A pool is physics, so it lives in the world pack, not
+  in `scripts.toml`; the pack validator checks the id (1 to 32 of
+  `[a-z0-9_]`), the currency (0 to 1 000 000), the item ids and counts
+  (1 to 1 000 each), that the pool gives something, and refuses unknown
+  keys.
 - **One engine-validated effect.** `reward(pool, #{ currency, items })`
-  builds `ScriptEffect::Reward { pool, currency, items }` of a new class
-  `Mint`. Admission allows at most one mint per hook, never alongside
-  `refuse`. `check_effects` refuses an unknown pool, an item the pool does
-  not offer, an absent actor, and any ask past what is left of the pool's
-  budget for the period: never past it, and never partly.
-- **Every mint recorded.** `WorldState.mints` (a ledger: seq, pool,
-  entity, currency, the item ids and prototypes made, `at_ms`) and
-  `WorldState.pool_spent` (by pool and period), both `serde(default)`; a
-  `StateChange::Minted`, an event with the reward in `data`, and an
-  `Audit::Minted` for the observer. Items are made with `new_item` and
-  attached to the actor; the ledger names every id.
-- **Conservation, counted.** The property tests change from "conserved" to
-  "conserved except for ledgered mints, which they count exactly": total
-  money equals the start plus the ledger's currency; every item id above
-  the start's `next_item` was made by a login, a shop restock or a ledger
-  entry, and each ledger item exists once or was used up; a pool's
-  `spent` never passes its budget.
-- **The proof.** The admission tally gains a `mints` count
-  (`tally_admissible` adds `t.mints <= 1 && (t.mints == 0 || t.refuses ==
-  0)`), and a new mirrored kernel `pool_admit(spent, budget, ask) -> (bool,
-  u64)` proves that an admitted ask never takes `spent` past `budget`, for
-  every sequence of asks in a period, without overflow. Both sides change
-  in one commit; `PAIRS`, ADR 0006 and `formal/verus/README.md` list it.
+  (or `reward(pool, n)`) builds `ScriptEffect::Reward { pool, currency,
+  items }` of the class `Mint`. Admission allows at most one mint per
+  hook; a refuse stands alone, so a refused command never mints.
+  `check_effects` faults an unknown pool, an item the pool does not
+  offer, a negative or empty ask, more than 16 items in one reward, an
+  ask past a whole period's budget (it can never be paid), and an absent
+  actor. An ask that fits the budget but not what is left of this period
+  is **declined**: never past the budget, and never partly. Hooks see
+  what is left in `ctx.pools`, so a careful script asks only for what
+  fits. Mind scripts cannot mint (`reward` is a hook-only constructor).
+- **Declines never trip a breaker.** `HookOutcome::Declined` (mirrored,
+  proved) leaves the fault count where it was: neither a fault nor a
+  clean run. `lemma_declines_never_trip` proves that over any run of
+  faults and declines the count is the faults alone, so after it the hook
+  may run iff its faults are under `max`, however often a player made it
+  decline. A decline applies nothing, uses no dice, logs `declined: …` to
+  the observer's feed, fails a verb or `use` with `Refused` and the server
+  line `Nothing comes of that just now.`, and leaves an event hook's
+  command alone. The same decline covers a new mark past `MARK_CAP` (32)
+  or a new flag past `FLAG_CAP` (256), counted through the list in order
+  (an `unmark` or `clear_flag` first makes room): a guard that could not
+  be kept never lets its reward pay, and a full table is world state, not
+  a script bug, so it cannot be used to trip a hook either.
+- **Every mint recorded, outside the snapshot.** The ledger is the
+  store's append-only `mints` table: one `MintRecord` per mint (the event
+  seq, pool, period, hook, entity, currency, every item id and prototype
+  made, `at_ms`), held in `World` until `Game::commit` drains it and
+  `Store::save` appends it in the same transaction as the command's
+  events, so a row is saved exactly when its event is. The snapshot keeps
+  only bounded counts: `WorldState.pool_spent` (what each pool has given
+  in the period it counts in) and `WorldState.minted` (each pool's
+  running totals of mints, currency and items); both are
+  `serde(default)`, so old snapshots load. It no longer grows with the
+  ledger. A mint emits
+  `StateChange::Minted` (beside the `currency` change and an `item` change
+  from nowhere), a `system` event only the receiver perceives, with the
+  reward in `data`, and an `Audit::Minted` for the observer's feed. The
+  Scripts panel lists each pool, what is left, and its running totals: a
+  read that costs the same however long the world has run.
+  Items are made with `new_item` and given to the actor: never stock,
+  never a sale. A scripted death before the reward skips it, logged; a
+  pool the pack drops gives nothing more, and its totals and ledger stay.
+- **Periods on the game clock.** A period is `now_ms / 86 400 000` for a
+  per-day pool and 0 for `ever`. Only the current period is counted: a
+  later period starts from zero, and a clock set back keeps the later
+  count, so it never refills a pool. No wall clock is read.
+- **Conservation, counted.** The engine and script property tests assert
+  that total money equals the start plus the ledger's currency, that
+  every item id above the start's `next_item` is named by the ledger (no
+  login happens during the run), that each is held once or was used up,
+  and that `WorldState::check_rewards(pack, ledger)` holds against the
+  rows collected: no pool past its budget, each pool's count equal to its
+  ledger for the period, each pool's totals equal to its ledger's sums,
+  and no item named twice or ahead of `next_item`.
+- **The proof.** The admission tally gains a `mints` count, and
+  `tally_admissible` adds `t.mints <= 1`; `lemma_admission_is_exact`
+  covers it and `lemma_admitted_mints_at_most_once_and_never_with_refuse`
+  states the consequence. A new mirrored module,
+  `crates/mud-world/src/rewards.rs` and `formal/verus/src/rewards.rs`,
+  proves `pool_admit(spent, budget, ask) -> (bool, u64)` (admitted iff it
+  fits in what is left; admitted means exactly `spent + ask <= budget`;
+  refused changes nothing; no overflow), `pool_roll` (a later period
+  starts at zero; the period never moves back) and `pool_period`; and,
+  for every sequence of asks in a period, spent never passes the budget
+  and equals the start plus exactly the admitted asks
+  (`lemma_run_never_passes_budget`), and for every sequence of clock
+  readings and asks across periods, the count of the period a pool counts
+  in never passes its budget (`lemma_every_period_keeps_its_budget`).
+  `PAIRS`, ADR 0006 and `formal/verus/README.md` list it.
 - **Untouched rules.** Rewards never take player text; the amounts are
-  pack integers or script integers within the pool. A reward is not a
-  sale: shops and the `PolicyTradeRequired` rule are unchanged.
+  pack integers or script integers within the pool, and the receiver's
+  line names only numbers and pack item names. A reward is not a sale:
+  shops and the `PolicyTradeRequired` rule are unchanged.
+- **crypt-v01 uses it.** `report` in the Town Square (`rooms/square.rhai`):
+  with the skeletal warden down and its notched grave-blade in hand, Hale
+  pays 20s and a healing draught from `warden_bounty` (60s and three
+  draughts a day), **once per warden death** (the world flag
+  `warden_bounty.paid` holds the `ctx.cast.skeletal_warden.deaths` it paid
+  for; `Entity.deaths` counts every death and survives respawn), once a
+  day per player (a mark), and says so when the purse is spent. The warden
+  drops its only blade and respawns without one, so a blade is a token
+  that outlives its kill; the per-death guard is what makes the bounty pay
+  for putting the warden down, not for holding the blade. The guards and
+  the reward are one admitted list.
 
 ## Consequences
 
@@ -245,6 +342,12 @@ design, in one PR with its proof:
 - A faulting hook is visible in the observer (feed and Scripts panel) and
   trips after `max_consecutive_faults`; the Reload button reopens it.
 - History is keyed by script version.
+- Money and items grow only by ledgered mints, each bounded by a pack
+  pool's budget per period. The ledger grows by at most one row per
+  command (as the event log does), in its own table; the snapshot holds a
+  fixed number of counts per pool whatever the ledger's length.
+- No player can take a reward hook down: a spent pool or a full mark or
+  flag table declines, and declines never move a breaker (proved).
 - Rhai minds run live where a binding opts in; without one, nothing
   changes for LLM-run entities.
 - `mud check`, `mud serve` and every reload compile, validate and dry-run

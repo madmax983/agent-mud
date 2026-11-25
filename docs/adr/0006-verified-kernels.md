@@ -18,10 +18,11 @@ verbatim in `formal/verus/src/`, where Verus proves their properties:
 | `budget_level` | mud-supervisor | Hard/Soft/Normal exactly at the thresholds, monotonic |
 | `typing_delay_ms` | mud-supervisor | no overflow, at least the reaction time, monotonic |
 | `conn_step` | mud-server | an open is admitted only under both caps; no underflow; caps hold for every sequence |
-| `hook_step` | mud-world | a world hook runs at most `max` consecutive faulting times, for every `max`; tripped is absorbing until a reload; no overflow |
-| `tally_admissible` | mud-world | admits exactly the effect lists of at most `max` effects with at most one heal/hurt, and a refuse only alone in a command hook (ADR 0010) |
+| `hook_step` | mud-world | a world hook runs at most `max` consecutive faulting times, for every `max`; tripped is absorbing until a reload; a decline (a spent pool, a full mark or flag table) never moves the count, so declines never trip a hook; no overflow |
+| `tally_admissible` | mud-world | admits exactly the effect lists of at most `max` effects with at most one heal/hurt, at most one reward, and a refuse only alone in a command hook, so a refused command never mints (ADR 0010) |
 | `login_route`, `first_ask_of`, `may_bind` | mud-accounts | an agent PC is asked exactly what any human account is asked; only free names create; only open legacy humans claim; refused iff an NPC; nothing binds an agent PC or an NPC (ADR 0009) |
 | `throttle_step`, `throttle_allows` | mud-accounts | no overflow; never locked past the cap; free failures never delay; past free at least `min(base, max)`; a quiet spell forgets; checked failures are spaced (`lemma_rate_bound`) (ADR 0009) |
+| `pool_admit`, `pool_roll`, `pool_period` | mud-world | a reward ask is admitted whole iff it fits in what is left of its pool; no run of asks takes a pool past its budget, and the count is exactly the admitted asks; a later period starts at zero and the clock set back never refills a pool; no overflow (ADR 0010) |
 
 The `verus_mirror` tests in `mud-rules` (which also guards the mud-world
 kernels), `mud-supervisor`, `mud-server` and `mud-accounts` fail when the

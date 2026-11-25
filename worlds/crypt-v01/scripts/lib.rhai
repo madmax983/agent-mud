@@ -11,3 +11,13 @@ fn warden_here(ctx) {
 fn done_today(marks, key, now_ms) {
     key in marks && marks[key] == day_utc(now_ms)
 }
+
+/// Whether `actor` carries an item of prototype `proto`.
+fn carries(actor, proto) {
+    for p in actor.inventory {
+        if p == proto {
+            return true;
+        }
+    }
+    false
+}

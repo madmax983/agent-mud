@@ -12,10 +12,11 @@ macro_rules! script {
 }
 
 /// Every script of crypt-v01, by its path under `scripts/`.
-pub const CRYPT_V01_FILES: [(&str, &str); 6] = [
+pub const CRYPT_V01_FILES: [(&str, &str); 7] = [
     script!("lib.rhai"),
     script!("rooms/ossuary.rhai"),
     script!("rooms/alley.rhai"),
+    script!("rooms/square.rhai"),
     script!("items/iron_ore.rhai"),
     script!("items/bone_charm.rhai"),
     script!("minds/hale.rhai"),

@@ -11,7 +11,9 @@
 //!
 //! Two kernels here are mirrored in `formal/verus/src/hooks.rs`:
 //! [`hook_step`] (the breaker of a faulting hook) and
-//! [`tally_step`]/[`tally_admissible`] (effect admission).
+//! [`tally_step`]/[`tally_admissible`] (effect admission, at most one
+//! reward per hook). The reward pools have their own kernels in
+//! [`crate::rewards`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,8 +21,9 @@ use std::fmt;
 use mud_rules::{DamageDice, DiceRng, FixedDice, SeededDice};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{EntityId, ItemId, ProtoId, RoomId};
+use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId};
 use crate::pack::Direction;
+use crate::rewards::PoolFacts;
 
 /// The most world flags a world keeps.
 pub const FLAG_CAP: usize = 256;
@@ -326,6 +329,9 @@ pub struct CastFacts {
     pub alive: bool,
     /// In the world, alive and not hidden.
     pub present: bool,
+    /// How many times it has died: one death of a respawning mob from the
+    /// next, so a bounty can pay once per kill.
+    pub deaths: u64,
 }
 
 /// Everything a world hook reads. Built by the engine; never holds player
@@ -354,6 +360,9 @@ pub struct HookInput {
     pub flags: BTreeMap<String, FlagValue>,
     /// The NPCs and mobs of the cast.
     pub cast: BTreeMap<EntityId, CastFacts>,
+    /// What is left of each reward pool in its period.
+    #[serde(default)]
+    pub pools: BTreeMap<PoolId, PoolFacts>,
 }
 
 /// One thing a hook asks the engine to do.
@@ -381,6 +390,17 @@ pub enum ScriptEffect {
     Heal(DamageDice),
     /// Hurt the actor (crushing, after DR).
     Hurt(DamageDice),
+    /// Give the actor money and items from a pack reward pool, recorded
+    /// in the ledger. At most one per hook, only within what is left of
+    /// the pool's budget for the period.
+    Reward {
+        /// The pool.
+        pool: PoolId,
+        /// The currency.
+        currency: i64,
+        /// The items, by prototype.
+        items: BTreeMap<ProtoId, u32>,
+    },
 }
 
 impl ScriptEffect {
@@ -391,6 +411,7 @@ impl ScriptEffect {
             Self::Msg(_) | Self::Narrate(_) => EffectClass::Text,
             Self::Refuse(_) => EffectClass::Refuse,
             Self::Heal(_) | Self::Hurt(_) => EffectClass::Body,
+            Self::Reward { .. } => EffectClass::Mint,
             Self::Unlock(_)
             | Self::Lock(_)
             | Self::SetFlag(..)
@@ -422,6 +443,15 @@ impl ScriptEffect {
             Self::Unmark(n) => format!("unmark({n})"),
             Self::Heal(d) => format!("heal({d})"),
             Self::Hurt(d) => format!("hurt({d})"),
+            Self::Reward {
+                pool,
+                currency,
+                items,
+            } => {
+                let mut ask = vec![format!("currency {currency}")];
+                ask.extend(items.iter().map(|(p, n)| format!("{p} x{n}")));
+                format!("reward({pool}, {})", ask.join(", "))
+            }
         }
     }
 }
@@ -450,6 +480,10 @@ pub enum HookOutcome {
     Faulted,
     /// The scripts were loaded or reloaded.
     Reloaded,
+    /// The hook ran, but the world could not take its effects now (a pool
+    /// spent for the period, marks or flags full): nothing applied, and
+    /// the count stays where it was.
+    Declined,
 }
 // mirror-end hook_outcome
 
@@ -478,6 +512,7 @@ pub const fn hook_step(faults: u8, outcome: HookOutcome, max: u8) -> (u8, bool) 
             let next = faults.saturating_add(1);
             (next, next < max)
         }
+        HookOutcome::Declined => (faults, faults < max),
     }
 }
 // mirror-end hook_step
@@ -496,6 +531,8 @@ pub enum EffectClass {
     Body,
     /// lock, unlock, flags and marks.
     State,
+    /// reward: money or items minted from a pack pool, into the ledger.
+    Mint,
 }
 // mirror-end effect_class
 
@@ -509,6 +546,8 @@ pub struct Tally {
     pub refuses: u8,
     /// `heal()` and `hurt()` effects seen (saturating).
     pub bodies: u8,
+    /// `reward()` effects seen (saturating).
+    pub mints: u8,
 }
 // mirror-end effect_tally
 
@@ -522,16 +561,25 @@ pub const fn tally_step(t: Tally, class: EffectClass) -> Tally {
             effects,
             refuses: t.refuses.saturating_add(1),
             bodies: t.bodies,
+            mints: t.mints,
         },
         EffectClass::Body => Tally {
             effects,
             refuses: t.refuses,
             bodies: t.bodies.saturating_add(1),
+            mints: t.mints,
+        },
+        EffectClass::Mint => Tally {
+            effects,
+            refuses: t.refuses,
+            bodies: t.bodies,
+            mints: t.mints.saturating_add(1),
         },
         EffectClass::Text | EffectClass::State => Tally {
             effects,
             refuses: t.refuses,
             bodies: t.bodies,
+            mints: t.mints,
         },
     }
 }
@@ -541,7 +589,10 @@ pub const fn tally_step(t: Tally, class: EffectClass) -> Tally {
 /// Whether a finished tally may be applied.
 #[must_use]
 pub const fn tally_admissible(t: Tally, max: u8, command_hook: bool) -> bool {
-    t.effects <= max && t.bodies <= 1 && (t.refuses == 0 || (command_hook && t.effects == 1))
+    t.effects <= max
+        && t.bodies <= 1
+        && t.mints <= 1
+        && (t.refuses == 0 || (command_hook && t.effects == 1))
 }
 // mirror-end tally_admissible
 
@@ -561,6 +612,8 @@ pub fn tally_reason(t: Tally, max: u8, command_hook: bool) -> String {
         format!("more than {max} effects")
     } else if t.bodies > 1 {
         "at most one heal() or hurt() per hook".to_owned()
+    } else if t.mints > 1 {
+        "at most one reward() per hook".to_owned()
     } else if t.refuses > 0 && !command_hook {
         "refuse() is only for verb and on_use scripts".to_owned()
     } else {
@@ -573,8 +626,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    use EffectClass::{Body, Refuse, State, Text};
-    use HookOutcome::{Faulted, Ran, Reloaded};
+    use EffectClass::{Body, Mint, Refuse, State, Text};
+    use HookOutcome::{Declined, Faulted, Ran, Reloaded};
 
     #[test]
     fn hook_step_matches_its_spec_table() {
@@ -586,6 +639,13 @@ mod tests {
         assert_eq!(hook_step(255, Faulted, 255), (255, false));
         assert_eq!(hook_step(9, Reloaded, 3), (0, true));
         assert_eq!(hook_step(9, Reloaded, 0), (0, false));
+        assert_eq!(
+            hook_step(2, Declined, 3),
+            (2, true),
+            "a decline does not count"
+        );
+        assert_eq!(hook_step(3, Declined, 3), (3, false), "nor reopen");
+        assert_eq!(hook_step(0, Declined, 3), (0, true));
         assert!(hook_allowed(2, 3));
         assert!(!hook_allowed(3, 3));
     }
@@ -594,6 +654,7 @@ mod tests {
         let count = |c| s.iter().filter(|x| **x == c).count();
         s.len() <= usize::from(max)
             && count(Body) <= 1
+            && count(Mint) <= 1
             && (count(Refuse) == 0 || (cmd && s.len() == 1))
     }
 
@@ -616,6 +677,20 @@ mod tests {
         assert!(admit(&[Refuse], 8, true));
         assert!(!admit(&[Refuse, Text], 8, true));
         assert!(!admit(&[Refuse], 8, false), "no refuse in an event hook");
+        assert!(
+            admit(&[Mint, Body, Text], 8, false),
+            "a reward in an event hook"
+        );
+        assert!(!admit(&[Mint, Mint], 8, true), "at most one reward");
+        assert!(
+            !admit(&[Refuse, Mint], 8, true),
+            "never a reward with a refuse"
+        );
+        let t = [Mint, Mint]
+            .iter()
+            .copied()
+            .fold(Tally::default(), tally_step);
+        assert_eq!(tally_reason(t, 8, true), "at most one reward() per hook");
         let t = [Refuse, Text]
             .iter()
             .copied()
@@ -664,14 +739,24 @@ mod tests {
             ScriptEffect::Msg("a".repeat(50)).describe().chars().count(),
             48
         );
+        let reward = ScriptEffect::Reward {
+            pool: PoolId::from("bounty"),
+            currency: 20,
+            items: BTreeMap::from([(ProtoId::from("healing_draught"), 1)]),
+        };
+        assert_eq!(
+            reward.describe(),
+            "reward(bounty, currency 20, healing_draught x1)"
+        );
+        assert_eq!(reward.class(), Mint);
     }
 
     fn class() -> impl Strategy<Value = EffectClass> {
-        prop::sample::select(vec![Text, Refuse, Body, State])
+        prop::sample::select(vec![Text, Refuse, Body, State, Mint])
     }
 
     fn outcome() -> impl Strategy<Value = HookOutcome> {
-        prop::sample::select(vec![Ran, Faulted, Reloaded])
+        prop::sample::select(vec![Ran, Faulted, Reloaded, Declined])
     }
 
     proptest! {
@@ -682,6 +767,21 @@ mod tests {
             cmd in any::<bool>(),
         ) {
             prop_assert_eq!(admit(&s, max, cmd), admissible_spec(&s, max, cmd));
+        }
+
+        #[test]
+        fn declines_never_trip_a_breaker(
+            steps in prop::collection::vec(prop::sample::select(vec![Faulted, Declined]), 0..300),
+            max in 0u8..=255,
+        ) {
+            // lemma_declines_never_trip: the count is the faults alone.
+            let mut faults = 0u8;
+            for s in &steps {
+                faults = hook_step(faults, *s, max).0;
+            }
+            let n = steps.iter().filter(|s| **s == Faulted).count();
+            prop_assert_eq!(usize::from(faults), n.min(255));
+            prop_assert_eq!(hook_allowed(faults, max), n < usize::from(max));
         }
 
         #[test]

@@ -59,6 +59,10 @@ string_id!(
     /// A shop of `economy.toml`.
     ShopId
 );
+string_id!(
+    /// A reward pool of `economy.toml`.
+    PoolId
+);
 
 /// One item instance in the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

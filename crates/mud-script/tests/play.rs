@@ -7,10 +7,10 @@ use std::sync::Arc;
 use mud_script::ScriptHost;
 use mud_world::hooks::WorldHooks;
 use mud_world::state::Holder;
-use mud_world::{EntityId, Event, HooksChange, ProtoId, RoomId, Seq, World, WorldPack};
+use mud_world::{EntityId, Event, HooksChange, ItemId, ProtoId, RoomId, Seq, World, WorldPack};
 use proptest::prelude::*;
 
-const LINES: [&str; 30] = [
+const LINES: [&str; 32] = [
     "n",
     "s",
     "e",
@@ -41,9 +41,13 @@ const LINES: [&str; 30] = [
     "give 2s to vich",
     "help",
     "pray for rain",
+    "report",
+    "report",
 ];
 
-/// Two players in the crypt with a light and a charm, a third in town.
+/// Two players in the crypt with a light, a charm and a grave-blade, a
+/// third in town. On odd seeds the warden is down and the third stands in
+/// the square, so Hale's ledgered bounty is paid out in play.
 fn world(seed: u64) -> (World, [EntityId; 3]) {
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
     let mut w = World::new(Arc::clone(&pack), seed);
@@ -53,13 +57,23 @@ fn world(seed: u64) -> (World, [EntityId; 3]) {
         w.login("cy", 1).unwrap(),
     ];
     let mut s = w.snapshot();
-    for (id, room) in ids
-        .iter()
-        .zip(["ossuary_crypt", "cellar_landing", "dark_alley"])
-    {
+    let town = if seed % 2 == 1 {
+        "town_square"
+    } else {
+        "dark_alley"
+    };
+    for (id, room) in ids.iter().zip(["ossuary_crypt", "cellar_landing", town]) {
         s.entities.get_mut(id).unwrap().room = RoomId::from(room);
-        let charm = s.new_item(&ProtoId::from("bone_charm"), &pack);
-        s.attach(charm, &Holder::Entity { entity: id.clone() });
+        for proto in ["bone_charm", "warden_blade"] {
+            let item = s.new_item(&ProtoId::from(proto), &pack);
+            s.attach(item, &Holder::Entity { entity: id.clone() });
+        }
+    }
+    if seed % 2 == 1 {
+        s.entities
+            .get_mut(&EntityId::from("skeletal_warden"))
+            .unwrap()
+            .dead_until_ms = Some(u64::MAX);
     }
     let mut w = World::from_state(Arc::clone(&pack), s, Vec::new());
     let host = Arc::new(ScriptHost::bundled_crypt_v01(&pack).unwrap());
@@ -96,6 +110,7 @@ proptest! {
         let money = w.state().total_currency(w.pack());
         let next_item = w.state().next_item;
         let mut items = w.state().items.len();
+        let mut minted_items = 0;
         let mut now = 1_700_000_000_000;
         let mut last = w.last_seq();
         for (line, who) in steps {
@@ -109,11 +124,33 @@ proptest! {
             last = last.max(w.last_seq());
             let bad = w.state().check();
             prop_assert!(bad.is_empty(), "{:?} after {}", bad, LINES[line]);
-            prop_assert_eq!(w.state().total_currency(w.pack()), money, "scripts mint no money");
-            prop_assert_eq!(w.state().next_item, next_item, "scripts make no items");
+            let bad = w.state().check_rewards(w.pack(), w.fresh_mints());
+            prop_assert!(bad.is_empty(), "{:?} after {}", bad, LINES[line]);
+            prop_assert_eq!(
+                w.state().total_currency(w.pack()),
+                money + w.state().minted_currency(),
+                "scripts mint money only through the ledger"
+            );
+            let ledger: Vec<ItemId> = w
+                .fresh_mints()
+                .iter()
+                .flat_map(|m| m.items.iter().map(|i| i.id))
+                .collect();
+            prop_assert_eq!(
+                w.state().next_item - next_item,
+                u64::try_from(ledger.len()).unwrap(),
+                "scripts make items only through the ledger"
+            );
+            for id in w.state().items.keys().filter(|i| i.0 >= next_item) {
+                prop_assert!(ledger.contains(id), "{} is not in the ledger", id);
+            }
             let now_items = w.state().items.len();
-            prop_assert!(now_items <= items, "items are only ever used up");
+            prop_assert!(
+                now_items <= items + (ledger.len() - minted_items),
+                "items are only ever used up, or minted"
+            );
             items = now_items;
+            minted_items = ledger.len();
             prop_assert!(w.state().flags.len() <= 256);
         }
     }
@@ -132,5 +169,7 @@ fn the_same_play_twice_gives_the_same_snapshot_and_log() {
         la.iter().any(|e| e.tags.iter().any(|t| t == "script")),
         "scripts ran"
     );
+    assert!(!a.fresh_mints().is_empty(), "the bounty was paid");
+    assert_eq!(a.fresh_mints(), b.fresh_mints());
     assert!(a.last_seq() > Seq(10));
 }

@@ -253,6 +253,7 @@ fn hook_ctx(input: &HookInput, entry: &HookEntry) -> Result<Dynamic, String> {
     );
     m.insert("flags".into(), view_of(&input.flags)?);
     m.insert("cast".into(), view_of(&input.cast)?);
+    m.insert("pools".into(), view_of(&input.pools)?);
     m.insert(
         "config".into(),
         Dynamic::from(View::new((*entry.config).clone())),

@@ -29,3 +29,16 @@ stock = ["grate_key", "bandage", "bandage", "torch"]
 buys = ["loot", "ore"]
 buy_rate = 0.6
 sell_markup = 1.0
+
+# Reward pools (ADR 0010, docs/scripting.md). A world script may mint
+# money and items as a quest reward only from a pool, and never past what
+# is left of its budget for the period: `per = "day"` refills every UTC day
+# of the game clock, `per = "ever"` never. Every mint is in the ledger.
+#
+# Hale pays the watch's bounty to whoever brings back the skeletal
+# warden's notched grave-blade while the ossuary is quiet
+# (scripts/rooms/square.rhai, `report`). Three bounties a day.
+[rewards.warden_bounty]
+currency = 60
+items = { healing_draught = 3 }
+per = "day"

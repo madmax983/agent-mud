@@ -7,7 +7,7 @@ VERUS=/home/user/tools/verus-x86-linux/verus   # any Verus 0.2026.10.04.426d8b0 
 "$VERUS" formal/verus/src/lib.rs --crate-type=lib
 ```
 
-Expect `verification results:: 72 verified, 0 errors`. The release links
+Expect `verification results:: 90 verified, 0 errors`. The release links
 against rustup toolchain `1.98.1-x86_64-unknown-linux-gnu`, which must be
 installed.
 
@@ -21,10 +21,11 @@ installed.
 | `src/budget.rs` `budget_level` | `crates/mud-supervisor/src/budget.rs` | Hard iff `limit == 0 \|\| used >= limit`; Soft iff not Hard and `used*5 >= limit*4` (exact, `u128`); otherwise Normal; non-decreasing in `used` |
 | `src/connections.rs` `conn_step` | `crates/mud-server/src/limits.rs` | An open is admitted iff `total < max_total && here < max_here` and adds one to each; a close takes effect iff `here > 0 && total > 0` and takes one from each; a refused step changes nothing; the step never overflows; `here <= total <= max_total && here <= max_here` survives every step. Safety (`lemma_run_keeps_caps`): every sequence of opens and closes from a fresh limiter keeps that invariant |
 | `src/typing.rs` `typing_delay_ms` | `crates/mud-supervisor/src/turing.rs` | No overflow; equals `reaction + (chars*12000/max(wpm,1))*jitter/1000`; `>= reaction`; non-decreasing in `chars` |
-| `src/hooks.rs` `hook_step`, `hook_allowed` | `crates/mud-world/src/hooks.rs` | The flag is exactly `count < max`; a reload resets to 0; a good run under the limit clears the count; a tripped hook (`faults >= max`) stays tripped until a reload; a fault adds 1, saturating. Safety (`lemma_at_most_max_consecutive_faults`): after `n` consecutive faults the hook may run iff `n < max`, for every `max`, 255 included |
+| `src/hooks.rs` `hook_step`, `hook_allowed` | `crates/mud-world/src/hooks.rs` | The flag is exactly `count < max`; a reload resets to 0; a good run under the limit clears the count; a tripped hook (`faults >= max`) stays tripped until a reload; a fault adds 1, saturating; a decline leaves the count and the flag as they were. Safety (`lemma_at_most_max_consecutive_faults`): after `n` consecutive faults the hook may run iff `n < max`, for every `max`, 255 included. `lemma_declines_never_trip`: over any run of faults and declines the count is the faults alone (saturating), so declines a player causes on purpose never trip a hook |
 | `src/login_route.rs` `login_route`, `first_ask_of`, `may_bind` | `crates/mud-accounts/src/route.rs` | R1 (`lemma_agent_pc_asks_like_a_human`): an agent PC (`OtherPlayer`) and a human, for every account and legacy state of either, are first asked `Password`; R2: `Create` only for a free name with no account; R3: `Claim` only for a human with no account while legacy is open; R4: `Refuse` iff an NPC or a mob holds the name; R5: `may_bind` iff the secret is proved and the holder is a human or a free name |
 | `src/throttle.rs` `throttle_step`, `throttle_allows` | `crates/mud-accounts/src/throttle.rs` | S1 no overflow; S2 a success clears the key (allows at every time); S3 a failure never delays past `max_ms`, even from a larger stored delay; S4 a failure records `now` and locks until `>= now`, exactly `now + delay <= now + max` with room below `u64::MAX`; S5 free failures never delay; S6 past free, at least `min(base, max)`; S7 the count restarts at 1 after `forget_ms` of quiet, else adds one saturating; S8 allows iff `now >= locked_until_ms`. `lemma_lock_ends_by_cap`; `lemma_rate_bound`: along admitted failures in rising times with no quiet spell, the count after failure `j` is `j`, and failure `j` comes at least `min(base, max)` after failure `j - 1` once `j - 1 > free` |
-| `src/hooks.rs` `tally_step`, `tally_admissible` | `crates/mud-world/src/hooks.rs` | The saturating tally of a list counts its effects, refuses and heal/hurts exactly up to 255 (`lemma_tally_counts`); for `max <= 16` it admits a list iff the list has at most `max` effects, at most one heal/hurt, and a refuse only alone in a command hook (`lemma_admission_is_exact`); `tally_exec` folds a list to `tally_of` |
+| `src/hooks.rs` `tally_step`, `tally_admissible` | `crates/mud-world/src/hooks.rs` | The saturating tally of a list counts its effects, refuses, heal/hurts and rewards exactly up to 255 (`lemma_tally_counts`); for `max <= 16` it admits a list iff the list has at most `max` effects, at most one heal/hurt, at most one reward, and a refuse only alone in a command hook (`lemma_admission_is_exact`); so an admitted list mints at most once and never with a refuse (`lemma_admitted_mints_at_most_once_and_never_with_refuse`); `tally_exec` folds a list to `tally_of` |
+| `src/rewards.rs` `pool_admit`, `pool_roll`, `pool_period` | `crates/mud-world/src/rewards.rs` | An ask is admitted iff `spent <= budget && ask <= budget - spent`; then the new count is exactly `spent + ask <= budget`, else it is unchanged; no overflow. A later period starts at 0; an earlier one keeps the later period and count; the period of a per-day pool is `now_ms / 86_400_000`, monotone in `now_ms` (`lemma_period_is_monotone`), and 0 for `ever`. Safety: for every run of asks in a period, the count never passes the budget and equals the start plus exactly the admitted asks (`lemma_run_never_passes_budget`); for every sequence of clock readings (forward, back or equal) and asks, the count of the period a pool counts in never passes its budget and that period never moves back (`lemma_every_period_keeps_its_budget`); `admit_run` folds `pool_admit` to `spent_after` |
 
 Each executable function also proves it never overflows.
 
@@ -43,6 +44,7 @@ Each executable function also proves it never overflows.
 | `tally_admissible` | `max <= 16` (the exactness lemma) | `scripts.toml` `limits.max_effects` is checked to `1..=16` (`MAX_EFFECTS_CEILING`) |
 | `login_route`, `may_bind` | none | the dialogue reads `Game::name_owner` again before every account call and before it binds |
 | `throttle_step` | none (`lemma_rate_bound` needs `ts[n] + max <= u64::MAX`) | `[accounts.throttle.*]` is checked to `1 <= base <= max <= 86_400_000 < forget`; a key past free inside `forget_ms` is never evicted |
+| `pool_admit`, `pool_roll`, `pool_period` | none | `u64` throughout; the pack keeps budgets at 0..=1 000 000 currency and 1..=1 000 items, and a negative ask is refused before the kernel |
 
 ## Mirror guard
 
@@ -56,8 +58,8 @@ Verus module, white space removed. On the Verus side it drops only the
 `requires`/`ensures` clauses and the return name in `-> (r: T)`. Doc
 comments, signatures and the enums (`Outcome`, `DamageType`, `WoundState`,
 `ChatterInput`, `BudgetLevel`, `HookOutcome`, `EffectClass`, `Tally`,
-`Holder`, `Route`, `FirstAsk`, `ThrottleOp`, `ThrottlePolicy`, `Throttle`) are
-mirrored too. Proof steps a body needs
+`Holder`, `Route`, `FirstAsk`, `ThrottleOp`, `ThrottlePolicy`, `Throttle`) and
+the constant `DAY_MS` are mirrored too. Proof steps a body needs
 live outside it (`typing.rs` broadcasts its arithmetic lemmas), so no
 `proof { }` block sits inside a mirrored region. Every module in `src/` must
 be listed in the guard's `PAIRS`.

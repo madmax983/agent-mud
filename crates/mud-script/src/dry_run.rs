@@ -48,7 +48,11 @@ impl Compiled {
                 if !tally_admissible(t, max, hook.is_command()) {
                     return Err(tally_reason(t, max, hook.is_command()));
                 }
-                world.check_effects(&room, &probe, &fx)
+                // A fresh world declines nothing a sound hook asks: its
+                // pools are full and the probe holds no marks.
+                world
+                    .check_effects(&room, &probe, &fx, DRY_RUN_NOW_MS)
+                    .map_err(|e| e.to_string())
             });
             if let Err(e) = checked {
                 problems.push(format!("dry run {}: {e}", hook.key()));
