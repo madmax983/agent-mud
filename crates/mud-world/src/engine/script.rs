@@ -191,6 +191,10 @@ impl World {
     #[must_use]
     pub fn help_text(&self, actor: &EntityId) -> String {
         let mut help = crate::parser::HELP.to_owned();
+        help.push_str("\nrecovery: ");
+        help.push_str(&self.recovery_rule());
+        help.push(' ');
+        help.push_str(&self.death_rule());
         let here = self.verbs_here(actor);
         if let Some(h) = &self.hooks
             && !here.is_empty()
@@ -923,14 +927,15 @@ impl World {
         };
         let amount = roll.min((e.pools.hp_max - e.pools.hp).max(0));
         e.pools.hp += amount;
-        if e.unconscious && e.pools.hp > 0 {
-            e.unconscious = false;
-        }
+        let hp = e.pools.hp;
         ctx.changes.push(StateChange::Hp {
             entity: actor.clone(),
             delta: amount,
-            hp: e.pools.hp,
+            hp,
         });
+        if hp > 0 {
+            self.come_to(ctx, actor);
+        }
     }
 
     /// Hurts the actor. Returns whether it died of it.

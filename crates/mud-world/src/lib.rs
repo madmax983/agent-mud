@@ -23,7 +23,8 @@ pub mod state;
 pub mod store;
 
 pub use engine::{
-    Audit, CommandResult, ErrorCode, HookStatus, HooksChange, LoginError, StateChange, World,
+    Audit, CAME_TO_TAG, CommandResult, ErrorCode, HookStatus, HooksChange, LoginError, StateChange,
+    TickOutcome, World,
 };
 pub use event::{ActorRef, Event, EventKind};
 pub use game::{

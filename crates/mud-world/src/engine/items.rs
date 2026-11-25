@@ -591,7 +591,12 @@ impl World {
             return Err(Fail::new(ErrorCode::CannotUse, "pick it up first"));
         }
         // Using up merchandise would hand out its worth without a sale.
-        let consumed = def.currency.is_some() || def.heal_dice().is_some();
+        let sealed = self
+            .state
+            .items
+            .get(&item)
+            .and_then(|i| i.sealed_currency(&self.pack));
+        let consumed = sealed.is_some() || def.heal_dice().is_some();
         if consumed && me.shop.is_some() && self.state.items.get(&item).is_some_and(|i| i.stock) {
             return Err(Fail::new(
                 ErrorCode::PolicyTradeRequired,
@@ -599,7 +604,7 @@ impl World {
             ));
         }
         // Money sealed in an item.
-        if let Some(n) = def.currency {
+        if let Some(n) = sealed {
             self.destroy_item(ctx, item);
             self.change_currency(ctx, actor, n);
             let cur = self.pack.economy.currency.short.clone();
@@ -671,9 +676,6 @@ impl World {
             let room_to_max = (t.pools.hp_max - t.pools.hp).max(0);
             amount = amount.min(room_to_max);
             t.pools.hp += amount;
-            if t.unconscious && t.pools.hp > 0 {
-                t.unconscious = false;
-            }
             (t.name.clone(), t.pools.hp)
         };
         ctx.changes.push(StateChange::Hp {
@@ -690,6 +692,9 @@ impl World {
         .target(&target)
         .data(json!({ "healed": amount }));
         self.emit(ctx, spec);
+        if hp > 0 {
+            self.come_to(ctx, &target);
+        }
         Ok((
             format!("You use the {}. {tname} recovers {amount} HP.", def.name),
             json!({ "healed": amount, "hp": hp, "skill_roll": skill_roll }),

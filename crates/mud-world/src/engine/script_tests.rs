@@ -1140,7 +1140,10 @@ fn look_and_help_list_the_verbs_usable_here() {
         plain.look_view(&id("guard_01"))["verbs"],
         serde_json::json!([])
     );
-    assert_eq!(plain.help_text(&id("guard_01")), crate::parser::HELP);
+    let plain_help = plain.help_text(&id("guard_01"));
+    assert!(plain_help.starts_with(crate::parser::HELP));
+    assert!(!plain_help.contains("here:"), "{plain_help}");
+    assert!(plain_help.contains("\nrecovery: "), "{plain_help}");
 }
 
 // ------------------------------------------------------------ compatibility

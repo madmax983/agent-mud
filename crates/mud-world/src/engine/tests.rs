@@ -98,6 +98,14 @@ fn look_shows_the_room_and_hides_who_is_an_agent() {
     for leak in ["turing", "tier", "human", "littleguy"] {
         assert!(!text.contains(leak), "look leaks {leak}");
     }
+    // The sheet, which a wake's `you:` block is cut from, out cold too.
+    let k = id("pc_kestrel");
+    w.state.entities.get_mut(&k).unwrap().unconscious = true;
+    let sheet = w.sheet_view(&k).to_string();
+    assert!(sheet.contains("\"unconscious\":true"), "{sheet}");
+    for leak in ["turing", "tier", "human", "littleguy", "mind"] {
+        assert!(!sheet.contains(leak), "the sheet leaks {leak}: {sheet}");
+    }
 }
 
 #[test]

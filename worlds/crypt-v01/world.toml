@@ -8,6 +8,20 @@ respawn_room = "town_square"
 darkness_penalty = -3
 motd = "Harrow's Rest. Rain on the cobbles, light in the Flagon's windows, and something wrong under the alley grate."
 
+# Coming to: every minute each body in the world regains 1 HP, and one
+# that is out cold above -HP rolls HT to come to before regen gets it
+# past 0. Anyone in the room sees it stir.
+[recovery]
+come_to_roll = "ht"
+every_secs = 60
+
+# Death costs more than a collapse: the dead wake in the square with a
+# third of their HP, and their coins stay where they fell.
+[death]
+respawn_hp_frac = 0.34
+drop_purse = true
+purse_item = "dropped_purse"
+
 # ------------------------------------------------------------------ town
 [[rooms]]
 id = "notice_market"

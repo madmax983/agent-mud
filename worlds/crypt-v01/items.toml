@@ -123,6 +123,15 @@ value = 0
 currency = 14
 tags = ["loot"]
 
+# What the dead leave behind ([death] in world.toml). Each one holds the
+# coins its owner carried; `use` empties it.
+[items.dropped_purse]
+name = "dropped purse"
+aliases = ["purse", "coins"]
+description = "A purse someone dropped when they fell. It is heavy with coin."
+value = 0
+currency = 0
+
 [items.rat_tail]
 name = "rat tail"
 aliases = ["tail"]

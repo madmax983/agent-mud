@@ -1,5 +1,7 @@
 //! Movement and combat: move, flee, attack, defend, wounds and death.
 
+use std::sync::Arc;
+
 use mud_rules::{
     AttackInput, DamageType, DefenseKind, WoundState, basic_dodge, defense_from_skill,
     resolve_attack, success_roll,
@@ -234,12 +236,24 @@ impl World {
             }
             return;
         }
-        // People wake at the respawn room, whole, with their gear.
+        // People wake at the respawn room with their gear, with the share
+        // of their HP the pack gives back (`[death]`), and maybe without
+        // their purse, which stays where they fell.
+        if self.pack.death.drop_purse {
+            self.drop_purse(ctx, victim, &v.room);
+        }
         let to = self.pack.world.respawn_room.clone();
+        let frac = self.pack.death.clone();
         if let Some(e) = self.state.entities.get_mut(victim) {
             e.pools = mud_rules::Pools::full(&e.attrs);
+            e.pools.hp = frac.respawn_hp(e.pools.hp_max);
             e.unconscious = false;
             e.room = to.clone();
+            ctx.changes.push(StateChange::Hp {
+                entity: victim.clone(),
+                delta: e.pools.hp - v.pools.hp,
+                hp: e.pools.hp,
+            });
         }
         ctx.changes.push(StateChange::Moved {
             entity: victim.clone(),
@@ -255,6 +269,52 @@ impl World {
             ),
         )
         .actor(victim, "respawn");
+        self.emit(ctx, spec);
+    }
+
+    /// Moves everything `victim` carries in its purse into one purse item
+    /// (`[death] purse_item`) on the floor of `room`. The coins move, so
+    /// the world's money stays what it was.
+    fn drop_purse(&mut self, ctx: &mut Ctx, victim: &EntityId, room: &RoomId) {
+        let (Some(proto), Some(n)) = (
+            self.pack.death.purse_item.clone(),
+            self.state
+                .entities
+                .get(victim)
+                .map(|e| e.currency)
+                .filter(|n| *n > 0),
+        ) else {
+            return;
+        };
+        let pack = Arc::clone(&self.pack);
+        let purse = self.state.new_item(&proto, &pack);
+        if let Some(it) = self.state.items.get_mut(&purse) {
+            it.currency = Some(n);
+        }
+        self.change_currency(ctx, victim, -n);
+        let to = Holder::Room { room: room.clone() };
+        self.state.attach(purse, &to);
+        ctx.changes.push(StateChange::Item {
+            item: purse,
+            proto,
+            from: None,
+            to: Some(to),
+        });
+        let (name, purse_name) = (
+            self.state
+                .entities
+                .get(victim)
+                .map_or_else(String::new, |e| e.name.clone()),
+            self.item_name(purse),
+        );
+        let spec = Emit::new(
+            EventKind::ItemDrop,
+            Some(room.clone()),
+            format!("{name}'s {purse_name} falls where {name} fell."),
+        )
+        .target(victim)
+        .tags(["loot".to_owned()])
+        .data(json!({ "amount": n }));
         self.emit(ctx, spec);
     }
 
