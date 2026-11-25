@@ -414,6 +414,7 @@ fn an_older_save_moves_the_keepers_stock_into_the_fixtures() {
     let mut json = serde_json::to_value(old.snapshot()).unwrap();
     let obj = json.as_object_mut().unwrap();
     obj.remove("shop_fixtures");
+    obj.remove("cast_gear");
     let state: WorldState = serde_json::from_value(json).unwrap();
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
     let mut w = World::from_state(Arc::clone(&pack), state, Vec::new());
@@ -602,4 +603,207 @@ fn a_fixture_shop_in_another_room_trades_there() {
     );
     place(&mut w, &id("marta"), "town_square");
     ok(&mut w, &ada, "buy ale");
+}
+
+/// The proto of each item `who` has equipped, by slot.
+fn equipped_protos(w: &World, who: &EntityId) -> Vec<(Slot, String)> {
+    w.entity(who)
+        .unwrap()
+        .equipped
+        .iter()
+        .map(|(s, i)| (*s, w.state.items[i].proto.to_string()))
+        .collect()
+}
+
+/// The protos `who` carries, sorted.
+fn carried_protos(w: &World, who: &EntityId) -> Vec<String> {
+    let mut v: Vec<String> = w
+        .entity(who)
+        .unwrap()
+        .inventory
+        .iter()
+        .map(|i| w.state.items[i].proto.to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// The save the owner's log ran on: crypt-v01 before fixtures, with the
+/// old loadouts (Torin unarmed, kestrel with only a shortsword).
+fn the_owners_old_save() -> WorldState {
+    let mut pack = body_stock_pack();
+    let torin = pack.cast.get_mut(&id("torin")).unwrap();
+    torin.inventory.clear();
+    torin.equip.clear();
+    let kestrel = pack.cast.get_mut(&id("pc_kestrel")).unwrap();
+    kestrel.inventory = vec![ProtoId::from("shortsword")];
+    kestrel.equip = vec![ProtoId::from("shortsword")];
+    let old = World::new(Arc::new(pack), 42);
+    let mut json = serde_json::to_value(old.snapshot()).unwrap();
+    let obj = json.as_object_mut().unwrap();
+    obj.remove("shop_fixtures");
+    obj.remove("cast_gear");
+    serde_json::from_value(json).unwrap()
+}
+
+#[test]
+fn an_older_save_gives_the_existing_cast_its_new_starting_gear() {
+    let old = the_owners_old_save();
+    let before = old.items.len();
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let money = old.total_currency(&pack);
+    let w = World::from_state(Arc::clone(&pack), old, Vec::new());
+    let torin = id("torin");
+    assert_eq!(carried_protos(&w, &torin), ["broadsword", "leather_jerkin"]);
+    assert_eq!(
+        equipped_protos(&w, &torin),
+        [
+            (Slot::Weapon, "broadsword".to_owned()),
+            (Slot::Torso, "leather_jerkin".to_owned())
+        ]
+    );
+    assert!(!carries_stock(&w, &torin), "his own gear is not stock");
+    let rack = w.state.shop_fixtures[&ShopId::from("torin")];
+    assert_eq!(
+        w.state.items[&rack].contents.len(),
+        6,
+        "the rack keeps all six"
+    );
+    let kestrel = id("pc_kestrel");
+    assert_eq!(
+        carried_protos(&w, &kestrel),
+        ["bandage", "shortsword", "torch"]
+    );
+    assert!(
+        equipped_protos(&w, &kestrel).contains(&(Slot::Light, "torch".to_owned())),
+        "kestrel holds a lit torch"
+    );
+    assert_eq!(
+        w.state.items.len(),
+        before + 3 + 4,
+        "three fixtures, Torin's two and kestrel's two"
+    );
+    assert_eq!(w.state.total_currency(&pack), money);
+    assert_eq!(w.state.check(), Vec::<String>::new());
+    // The migration runs once: a second load makes nothing more.
+    let count = w.state.items.len();
+    let again = World::from_state(Arc::clone(&pack), w.snapshot(), Vec::new());
+    assert_eq!(again.state.items.len(), count);
+    assert_eq!(again.snapshot(), w.snapshot());
+}
+
+#[test]
+fn starting_gear_a_cast_member_lost_does_not_come_back_on_load() {
+    let mut w = crypt();
+    let torin = id("torin");
+    ok(&mut w, &torin, "drop broadsword");
+    let count = w.state.items.len();
+    let pack = Arc::clone(&w.pack);
+    let w = World::from_state(Arc::clone(&pack), w.snapshot(), Vec::new());
+    assert_eq!(w.state.items.len(), count, "no second broadsword");
+    assert_eq!(carried_protos(&w, &torin), ["leather_jerkin"]);
+}
+
+#[test]
+fn a_pack_that_adds_starting_gear_gives_only_the_new_piece() {
+    let w = crypt();
+    let count = w.state.items.len();
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    let def = pack.cast.get_mut(&id("torin")).unwrap();
+    def.inventory.push(ProtoId::from("lantern"));
+    def.equip.push(ProtoId::from("lantern"));
+    // Money sealed in an item is never made by a pack edit.
+    def.inventory.push(ProtoId::from("old_coin_pouch"));
+    let pack = Arc::new(pack);
+    let money = w.state.total_currency(&pack);
+    let w = World::from_state(Arc::clone(&pack), w.snapshot(), Vec::new());
+    assert_eq!(w.state.items.len(), count + 1, "only the lantern");
+    assert_eq!(
+        carried_protos(&w, &id("torin")),
+        ["broadsword", "lantern", "leather_jerkin"]
+    );
+    assert!(equipped_protos(&w, &id("torin")).contains(&(Slot::Light, "lantern".to_owned())));
+    assert_eq!(w.state.total_currency(&pack), money);
+    assert_eq!(w.state.check(), Vec::<String>::new());
+}
+
+#[test]
+fn a_pack_that_moves_a_shop_room_moves_its_fixture_on_load() {
+    let mut w = crypt();
+    let shelf_id = shelf(&w);
+    let count = w.state.items.len();
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    pack.economy
+        .shops
+        .get_mut(&ShopId::from("marta"))
+        .unwrap()
+        .room = Some(RoomId::from("town_square"));
+    w = World::from_state(Arc::new(pack), w.snapshot(), Vec::new());
+    assert_eq!(shelf(&w), shelf_id, "the same shelf, moved");
+    assert_eq!(
+        w.state.holder_of(shelf_id),
+        Some(Holder::Room {
+            room: RoomId::from("town_square")
+        })
+    );
+    assert_eq!(on_shelf(&w, "ale"), 5, "its stock moves with it");
+    assert_eq!(w.state.items.len(), count);
+    assert_eq!(w.state.check(), Vec::<String>::new());
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &id("marta"), "town_square");
+    ok(&mut w, &ada, "examine shelf");
+    ok(&mut w, &ada, "buy ale");
+    ok(&mut w, &ada, "e");
+    assert_eq!(
+        refused(&mut w, &ada, "examine shelf").error_code,
+        Some(ErrorCode::NoSuchTarget),
+        "no shelf is left in the taproom"
+    );
+}
+
+/// A pack with no fixture whose keeper is a mob: the goblin trader keeps
+/// Vich's stock on its body.
+fn mob_keeper_pack() -> WorldPack {
+    let mut pack = body_stock_pack();
+    let sid = ShopId::from("vich");
+    pack.economy.shops.get_mut(&sid).unwrap().keeper = id("giant_rat_1");
+    pack.cast.get_mut(&id("vich")).unwrap().shop = None;
+    pack.cast.get_mut(&id("giant_rat_1")).unwrap().shop = Some(sid);
+    pack
+}
+
+#[test]
+fn a_mob_keeper_that_dies_drops_its_stock_as_plain_loot() {
+    let mut w = World::new(Arc::new(mob_keeper_pack()), 42);
+    let rat = id("giant_rat_1");
+    assert!(carries_stock(&w, &rat));
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "wine_vault");
+    let mut ctx = Ctx {
+        now: 1_000,
+        ..Ctx::default()
+    };
+    w.wound(&mut ctx, &rat, 1_000, &ada);
+    assert!(w.entity(&rat).unwrap().dead_until_ms.is_some());
+    let floor = &w.state.rooms[&RoomId::from("wine_vault")].items;
+    assert!(floor.iter().all(|i| !w.state.items[i].stock));
+    assert_eq!(w.state.check(), Vec::<String>::new());
+    ok(&mut w, &ada, "take key");
+}
+
+#[test]
+fn the_check_flags_stock_outside_a_shop() {
+    let mut w = crypt();
+    let ale = w.state.items[&shelf(&w)].contents[0];
+    w.state.move_item(
+        ale,
+        &Holder::Room {
+            room: RoomId::from("town_square"),
+        },
+    );
+    let bad = w.state.check();
+    assert!(
+        bad.iter().any(|m| m.contains("is stock outside a shop")),
+        "{bad:?}"
+    );
 }

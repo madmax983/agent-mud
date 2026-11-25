@@ -375,11 +375,12 @@ impl CombatRules {
         if self.retreat_free {
             "With a hostile in the room, you may walk back out the way you came in; any other \
              way needs flee, a DX check, and each hostile strikes you if it fails. A bare flee \
-             runs back the way you came, else to a room with no hostile in it."
+             runs back the way you came when no hostile waits there, else to a room with no \
+             hostile in it."
         } else {
             "With a hostile in the room, every way out needs flee, a DX check, and each hostile \
-             strikes you if it fails. A bare flee runs back the way you came, else to a room \
-             with no hostile in it."
+             strikes you if it fails. A bare flee runs back the way you came when no hostile \
+             waits there, else to a room with no hostile in it."
         }
     }
 }

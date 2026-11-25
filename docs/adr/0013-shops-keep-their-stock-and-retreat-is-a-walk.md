@@ -42,7 +42,14 @@ normal move; any other exit needs `flee`.
   item is made or lost; a keeper new to the save gets the pack's stock in
   its fixture. A fixture the pack no longer names goes: its stock moves to
   the new fixture or back onto the keeper's body, and the stock of a shop
-  the pack dropped stays on the floor as plain goods.
+  the pack dropped stays on the floor as plain goods. A fixture the save
+  has in another room than the shop's (the pack moved `room`, or the
+  keeper's starting room) moves to the shop room with its stock inside.
+- **Stock lies only in a shop.** `WorldState::check` flags an item marked
+  `stock` that is neither in a fixture nor on a keeper's body, since
+  nobody may take stock and it would be stuck for good. A mob keeper that
+  dies (a shop with no fixture) drops its stock as plain loot, as
+  reconcile does for a retired keeper.
 - **A soft post (`post = { rooms = [...] }` on a cast entry).** Nothing
   holds the entity there. Its own sheet shows `post` (the rooms, whether it
   is at its post, and, away from it, the room to go back to and the way,
@@ -56,8 +63,14 @@ normal move; any other exit needs `flee`.
   it). With `retreat_free`, walking back to `came_from` is a normal move
   with no flee roll and no strike, even with a hostile in the room; any
   other exit still needs `flee`. The strike on entering a lair stays. A
-  bare `flee` runs back to `came_from`, else to a room with no hostile,
-  else to the first open exit; it never takes a locked exit.
+  bare `flee` runs back to `came_from` when no hostile is there, else to a
+  room with no hostile, else back to `came_from`, else to the first open
+  exit; it never takes a locked exit. The way back goes first only when it
+  is clear, which refines the owner's order: a retreat into a lair makes
+  that lair the new `came_from`, and in the owner's log (ossuary, then the
+  wine vault) a bare flee would otherwise bounce between the warden and
+  the rat, drawing a strike on every arrival. A refused walk names the way
+  back as a hint only when no hostile waits there.
 - **Mobs leave a body alone.** In a mob round, each mob strikes only a
   victim that can still act, so a second mob never strikes the body the
   first one dropped.
@@ -72,6 +85,18 @@ normal move; any other exit needs `flee`.
   mind says "locked" only when he stands at the grate and `ctx.here`
   shows it locked, and he steps back toward his post. The grate re-locks
   after 30 minutes; from below, the way up is never locked.
+- **New starting gear reaches a saved world once.** `WorldState.cast_gear`
+  (serde default) records the starting gear (`inventory`) each cast
+  entity last got from the pack. On load, reconcile gives an entity
+  already in the save the pieces its entry gained since, equipping each
+  one its entry equips into a free slot. A save from before the field
+  counts what the entity carries, stock aside. So on the owner's world,
+  Torin gets his broadsword and jerkin and kestrel its torch and bandage;
+  gear lost in play does not come back on the next load, and nothing an
+  entity carries is taken. An item that holds money is never made this
+  way, so money stays conserved. Players are not cast entries: a player
+  made before the template change keeps its gear as it is, and holds its
+  torch with `hold torch`.
 
 ## Consequences
 

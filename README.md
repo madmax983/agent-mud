@@ -92,7 +92,10 @@ behind the bar, not on Marta, and it sells while she stands there to sell
 it. A keeper may roam; a soft post in the pack makes her quiet wakes give
 the way home. In a fight, walking back out the way you came in is a normal
 move in crypt-v01; any other way needs `flee`, and a bare `flee` runs back
-the way you came, else to a room with no hostile in it.
+the way you came when no hostile waits there, else to a room with no
+hostile in it. A saved world picks up a pack's new fixtures, shop rooms
+and cast starting gear when it loads: Torin gets his broadsword and
+jerkin once, and gear lost in play does not come back.
 
 What changes with every event is not stored; the boot derives it from the
 reloaded event log. A tell, an attack or a mention by name that no

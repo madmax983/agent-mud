@@ -218,6 +218,13 @@ impl World {
                     .and_then(|p| self.pack.items.get(&p))
                     .is_some_and(|d| d.hidden);
                 if !hidden {
+                    // A mob keeper's stock is loot once it falls: only a
+                    // fixture or a keeper's body holds merchandise, and
+                    // nobody may take merchandise from the floor.
+                    if let Some(it) = self.state.items.get_mut(&item) {
+                        it.stock = false;
+                        it.paid = None;
+                    }
                     self.relocate_item(
                         ctx,
                         item,
@@ -326,9 +333,13 @@ impl World {
         self.pack.combat.retreat_free && me.came_from.as_ref() == Some(to)
     }
 
-    /// The way a bare `flee` runs: back to the room `me` came in from,
-    /// else to a room with no hostile in it, else the first open exit.
-    /// A locked exit is never a way out.
+    /// The way a bare `flee` runs: back to the room `me` came in from
+    /// when no hostile is there, else to a room with no hostile in it,
+    /// else back the way it came, else the first open exit. A locked exit
+    /// is never a way out. The way back is not first when it leads into a
+    /// lair: a retreat into a lair records that lair as the way back, and
+    /// a bare flee would otherwise bounce between two lairs, drawing a
+    /// strike on every arrival.
     fn flee_way(&self, me: &Entity) -> Option<Direction> {
         let def = self.pack.rooms.get(&me.room)?;
         let open: Vec<(Direction, &RoomId)> = def
@@ -338,12 +349,27 @@ impl World {
             .map(|(d, r)| (*d, r))
             .collect();
         let back = open.iter().find(|(_, r)| me.came_from.as_ref() == Some(*r));
-        let quiet = || {
-            open.iter()
-                .find(|(_, r)| self.hostiles(r, &me.id).is_empty())
-        };
-        back.or_else(quiet)
+        let clear = |(_, r): &&(Direction, &RoomId)| self.hostiles(r, &me.id).is_empty();
+        back.filter(clear)
+            .or_else(|| open.iter().find(clear))
+            .or(back)
             .or_else(|| open.first())
+            .map(|(d, _)| *d)
+    }
+
+    /// The way back the way `me` came, when `[combat] retreat_free` makes
+    /// it a walk, the exit is open, and no hostile waits there: the hint a
+    /// refused walk gives. A way back into a lair is not offered.
+    fn safe_way_back(&self, me: &Entity) -> Option<Direction> {
+        if !self.pack.combat.retreat_free {
+            return None;
+        }
+        let back = me.came_from.as_ref()?;
+        let def = self.pack.rooms.get(&me.room)?;
+        def.exits
+            .iter()
+            .find(|(d, r)| *r == back && !self.exit_is_locked(&me.room, **d))
+            .filter(|(_, r)| self.hostiles(r, &me.id).is_empty())
             .map(|(d, _)| *d)
     }
 
@@ -395,11 +421,9 @@ impl World {
             && !self.is_retreat(&me, &to)
             && !self.hostiles(&me.room, actor).is_empty()
         {
-            let back = if self.pack.combat.retreat_free {
-                " (or go back the way you came)"
-            } else {
-                ""
-            };
+            let back = self.safe_way_back(&me).map_or_else(String::new, |d| {
+                format!(" (or go back {}, the way you came)", d.name())
+            });
             return Err(Fail::new(
                 ErrorCode::InCombat,
                 format!("something hostile blocks you; flee instead{back}"),

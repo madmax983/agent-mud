@@ -76,6 +76,78 @@ fn a_bare_flee_from_the_vault_after_arriving_from_the_landing_goes_back() {
     assert_eq!(strikes_on(&w, &r, &ada), 0, "no strike");
 }
 
+/// The owner's log: Ada comes in through the cistern and takes the
+/// warden's strike in the ossuary, breaks away northwest into the wine
+/// vault and takes the rat's. The way she came in is now the warden's
+/// lair, so a bare flee runs east to the empty landing, not back south.
+#[test]
+fn the_logs_path_through_the_ossuary_flees_to_the_landing_not_the_warden() {
+    let mut w = crypt();
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "flooded_cistern");
+    w.fix_dice([6, 6, 6]);
+    let r = ok(&mut w, &ada, "s");
+    assert_eq!(strikes_on(&w, &r, &ada), 1, "the warden strikes on entry");
+    // DX 10: 1+1+1 breaks away; the rat then misses with 6s.
+    w.fix_dice([1, 1, 1, 6, 6, 6]);
+    let r = ok(&mut w, &ada, "flee nw");
+    assert_eq!(room_of(&w, &ada), "wine_vault");
+    assert_eq!(strikes_on(&w, &r, &ada), 1, "the rat strikes on entry");
+    assert_eq!(
+        w.entity(&ada).unwrap().came_from,
+        Some(RoomId::from("ossuary_crypt"))
+    );
+    // Walking east still needs flee, and the hint does not send her back
+    // to the warden.
+    let r = w.execute(&ada, "e", 1_000);
+    assert_eq!(r.error_code, Some(ErrorCode::InCombat));
+    assert!(!r.narrative.contains("the way you came"), "{r:?}");
+    w.fix_dice([1, 1, 1]);
+    let r = ok(&mut w, &ada, "flee");
+    assert_eq!(room_of(&w, &ada), "cellar_landing", "east, not south");
+    assert!(r.narrative.starts_with("You break away!"), "{r:?}");
+    assert_eq!(strikes_on(&w, &r, &ada), 0);
+}
+
+/// A retreat into a lair does not make a bare flee bounce: Ada falls back
+/// from the warden into the vault, and the next bare flee leaves the rat
+/// for the empty landing, not for the warden she just left.
+#[test]
+fn a_bare_flee_never_bounces_between_two_lairs() {
+    let mut w = crypt();
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "ossuary_crypt");
+    w.state.entities.get_mut(&ada).unwrap().came_from = Some(RoomId::from("wine_vault"));
+    w.fix_dice([6, 6, 6]);
+    let r = ok(&mut w, &ada, "nw");
+    assert_eq!(room_of(&w, &ada), "wine_vault");
+    assert_eq!(strikes_on(&w, &r, &ada), 1, "the rat strikes on entry");
+    w.fix_dice([1, 1, 1]);
+    let r = ok(&mut w, &ada, "flee");
+    assert_eq!(room_of(&w, &ada), "cellar_landing", "{r:?}");
+    assert_eq!(strikes_on(&w, &r, &ada), 0);
+}
+
+#[test]
+fn a_bare_flee_takes_the_way_back_into_a_lair_only_when_every_room_is_hostile() {
+    let mut w = crypt();
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "wine_vault");
+    w.state.entities.get_mut(&ada).unwrap().came_from = Some(RoomId::from("rat_warren"));
+    place(&mut w, &id("giant_rat_2"), "rat_warren");
+    let torin = id("torin");
+    place(&mut w, &torin, "cellar_landing");
+    w.state.entities.get_mut(&torin).unwrap().hostile = true;
+    w.fix_dice([6, 6, 6]);
+    let r = ok(&mut w, &ada, "flee");
+    assert_eq!(
+        room_of(&w, &ada),
+        "rat_warren",
+        "the way back, not the old order"
+    );
+    assert!(r.narrative.starts_with("You fall back the way you came."));
+}
+
 #[test]
 fn walking_back_the_way_you_came_is_a_move_and_other_ways_need_flee() {
     let mut w = crypt();
@@ -83,7 +155,10 @@ fn walking_back_the_way_you_came_is_a_move_and_other_ways_need_flee() {
     assert_eq!(err(&mut w, &ada, "w"), ErrorCode::InCombat);
     let r = w.execute(&ada, "s", 1_000);
     assert_eq!(r.error_code, Some(ErrorCode::InCombat));
-    assert!(r.narrative.contains("go back the way you came"), "{r:?}");
+    assert!(
+        r.narrative.contains("or go back east, the way you came"),
+        "{r:?}"
+    );
     let r = ok(&mut w, &ada, "e");
     assert_eq!(strikes_on(&w, &r, &ada), 0);
     assert_eq!(room_of(&w, &ada), "cellar_landing");
@@ -346,7 +421,7 @@ fn help_says_how_to_leave_a_fight() {
     assert!(
         w.pack
             .body_rules()
-            .contains("A bare flee runs back the way you came")
+            .contains("A bare flee runs back the way you came when no hostile waits there")
     );
     let mut s = strict();
     let bo = s.login("bo", 1).unwrap();

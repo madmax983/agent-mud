@@ -130,8 +130,8 @@ respawn on their own timer. Leaving a fight (ADR 0013, pack `[combat]`):
 with a hostile in the room every way out needs `flee` (DX; each hostile
 strikes on a failure), except that with `retreat_free` (crypt-v01) the
 way you came in is a normal walk; a bare `flee` runs back the way you
-came, else to a room with no hostile. Mobs strike only a body that still
-acts. Attack → Dodge/Parry/Block
+came when no hostile waits there, else to a room with no hostile, else
+back the way you came. Mobs strike only a body that still acts. Attack → Dodge/Parry/Block
 (bypassed on a critical) → `(raw − DR).max(0) × multiplier` (crushing and
 burn ×1, cutting ×1.5, impaling ×2). Traits with self-control numbers
 (greedy 12, cowardly 12, impatient 12) roll when a trigger reaches the
