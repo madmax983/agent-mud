@@ -24,7 +24,17 @@
 //! - **One move above the baseline.** First contact puts and activates an
 //!   empty `{}` baseline (or pauses as `preexisting` when lg already has an
 //!   active overlay). Every text goes on from the baseline, so one Roll
-//!   back always lands on `{}`.
+//!   back after a text lands on `{}`.
+//! - **lg's store, not the row's numbers.** lg numbers versions per store.
+//!   A listing that lacks a version the row holds, lists one of the
+//!   Steward's under another author, or ends below `known_max` means the
+//!   store was reset: the row forgets it and starts from first contact.
+//!   A version put earlier is shown (`overlay_show`) and matched before it
+//!   is activated again.
+//! - **Late is bounded.** An activate given up on stays late until the
+//!   daemon restarts or its window ends. A late move to `{}` while a text
+//!   of the Steward's is active looks like a human's Roll back, so it is
+//!   taken as one.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -43,6 +53,10 @@ use crate::runtime::Supervisor;
 
 /// The author lg records for every put and activate of the MUD.
 pub const MUD_AUTHOR: &str = "operator:mud";
+
+/// A late activate lives this many `activate_wait_secs`: past that, lg's
+/// loop is taken to have dropped it, and a move to it is a human's.
+pub const LATE_WAITS: u64 = 6;
 
 /// What `overlays` answered.
 #[derive(Debug, Clone)]
@@ -103,6 +117,19 @@ impl Steward {
         now: u64,
         level: BudgetLevel,
     ) {
+        if run
+            .row
+            .intent
+            .as_ref()
+            .is_some_and(|i| i.action.is_overlay())
+        {
+            // A reset store first: an open intent names versions of the
+            // old one.
+            let Some(ov) = self.read_overlays(socket).await else {
+                return;
+            };
+            self.check_store(e, run, &ov, now);
+        }
         if let Some(intent) = run.row.intent.clone()
             && intent.action.is_overlay()
             && !self
@@ -126,6 +153,10 @@ impl Steward {
         let Some(ov) = self.read_overlays(socket).await else {
             return;
         };
+        self.check_store(e, run, &ov, now);
+        if run.row.overlay.expire_late(now, self.late_window_ms()) {
+            run.dirty = true;
+        }
         // Versions up to here are known: a lost put is looked for above.
         if let Some(max) = ov.entries.iter().map(|x| x.version).max()
             && run.row.overlay.known_max.is_none_or(|k| k < max)
@@ -140,7 +171,7 @@ impl Steward {
                 return;
             }
             Next::Undo { to, late } if can_act => {
-                run.row.overlay.late.retain(|v| *v != late);
+                run.row.overlay.drop_late(late);
                 run.dirty = true;
                 self.publish(
                     e,
@@ -196,6 +227,106 @@ impl Steward {
         })
     }
 
+    /// How long a late activate stays late, in game-clock ms.
+    const fn late_window_ms(&self) -> u64 {
+        self.cfg
+            .activate_wait_secs
+            .saturating_mul(1_000)
+            .saturating_mul(LATE_WAITS)
+    }
+
+    /// Checks lg's listing against the versions the row holds. A missing
+    /// one, one of the Steward's under another author, or a highest
+    /// version below `known_max` means lg's store was reset (its data
+    /// deleted): the row forgets it. Returns whether it did.
+    fn check_store(&self, e: &EntityId, run: &mut Run, ov: &Overlays, now: u64) -> bool {
+        let listed: BTreeMap<u64, &str> = ov
+            .entries
+            .iter()
+            .map(|x| (x.version, x.author.as_str()))
+            .collect();
+        let row = &run.row.overlay;
+        let max = listed.keys().next_back().copied();
+        let shrank = row.known_max.is_some_and(|k| max.is_none_or(|m| m < k));
+        let gone = row.recorded().iter().any(|(v, ours)| {
+            listed
+                .get(v)
+                .is_none_or(|author| *ours && *author != MUD_AUTHOR)
+        });
+        if shrank || gone {
+            self.store_reset(e, run, now);
+        }
+        shrank || gone
+    }
+
+    /// lg's overlay store is not the one the row knows: forget it (the
+    /// pause and the veto list stay) and start again from first contact.
+    fn store_reset(&self, e: &EntityId, run: &mut Run, now: u64) {
+        tracing::warn!(entity = %e, "lg's overlay store was reset; refine starts again from first contact");
+        run.row.overlay.forget_store();
+        if let Some(i) = run.row.intent.take_if(|i| i.action.is_overlay())
+            && i.action == IntentAction::Propose
+        {
+            run.row.overlay.last_refine_ms = Some(now);
+            run.row.wakes_since_refine = 0;
+        }
+        run.dirty = true;
+        self.publish(e, "overlay", None, "reset", "store_reset", None, None);
+        self.write(e, run, true);
+    }
+
+    /// Whether lg's `version` holds exactly the guardrails `text` (`""`
+    /// for the baseline). Checked before a version put earlier is
+    /// activated again. Another text there means the store was reset: the
+    /// row forgets it. No answer confirms nothing.
+    async fn confirm(
+        &self,
+        e: &EntityId,
+        socket: &Path,
+        run: &mut Run,
+        version: u64,
+        text: &str,
+        now: u64,
+    ) -> bool {
+        let req = OwnerRequest::OverlayShow { version };
+        match owner::request(socket, &req, self.read_timeout).await {
+            Ok(OwnerResponse::Overlay { overlay, .. }) => {
+                let same = vet::overlay_matches(&overlay, text);
+                if !same {
+                    self.store_reset(e, run, now);
+                }
+                same
+            }
+            other => {
+                tracing::warn!(entity = %e, version, answer = ?other, "an overlay version could not be shown; it is not activated");
+                false
+            }
+        }
+    }
+
+    /// With refine off, nothing settles an open overlay intent, and it
+    /// would hold the goal step forever: give it up. lg's pointer is not
+    /// read, so an activate goes on the late list.
+    pub(super) fn refine_off(&self, e: &EntityId, run: &mut Run, now: u64) {
+        let Some(intent) = run.row.intent.take_if(|i| i.action.is_overlay()) else {
+            return;
+        };
+        let id = match intent.action {
+            IntentAction::Activate { version, .. } => {
+                run.row.overlay.add_late(version, now);
+                as_id(version)
+            }
+            IntentAction::Propose => {
+                run.row.overlay.last_refine_ms = Some(now);
+                run.row.wakes_since_refine = 0;
+                None
+            }
+            _ => None,
+        };
+        run.dirty = true;
+        self.publish(e, "overlay", id, "stuck", "refine_off", None, None);
+    }
+
     /// lg's overlay listing; `None` when it does not answer (or refine is
     /// off in that daemon).
     pub(super) async fn read_overlays(&self, socket: &Path) -> Option<Overlays> {
@@ -217,7 +348,7 @@ impl Steward {
             && ov.baseline.is_none()
             && ov.authored.is_empty()
             && ov.paused.is_none();
-        let late = lg.is_some_and(|v| ov.late.contains(&v));
+        let late = lg.is_some_and(|v| ov.is_late(v));
         match vet::pointer_verdict(lg, expected, late) {
             PointerVerdict::Same => {
                 if ov.baseline.is_none() && ov.paused.is_none() {
@@ -230,13 +361,20 @@ impl Steward {
                 let Some(v) = lg else {
                     return Next::Nothing;
                 };
-                if ov.is_empty_version(v) {
-                    // A move to `{}` is always safe: adopt it.
+                if ov.is_empty_version(v) && ov.active.is_some() {
+                    // The late Clear of a text, or a human's Roll back off
+                    // it: they look the same, so it is taken as the human's.
+                    run.row.overlay.drop_late(v);
+                    self.human_moved(e, run, lg, now, "unconfirmed");
+                    Next::Nothing
+                } else if ov.is_empty_version(v) {
+                    // A move to `{}` from `{}` is always safe: adopt it.
                     let ov = &mut run.row.overlay;
-                    ov.late.retain(|x| *x != v);
+                    ov.drop_late(v);
                     ov.pointer = Some(v);
                     ov.baseline = ov.baseline.or(Some(v));
                     ov.active = None;
+                    ov.rollback_to = None;
                     run.dirty = true;
                     self.publish(e, "overlay", as_id(v), "activated", "baseline", None, None);
                     Next::Nothing
@@ -277,6 +415,7 @@ impl Steward {
             if ov.pointer != lg {
                 ov.pointer = lg;
                 ov.active = ov.text_at(lg);
+                ov.rollback_to = None;
                 run.dirty = true;
             }
             return;
@@ -286,6 +425,7 @@ impl Steward {
         }
         let ov = &mut run.row.overlay;
         ov.pointer = lg;
+        ov.rollback_to = None;
         // A human may roll back onto an older text of the Steward's: that
         // is their choice.
         ov.active = ov.text_at(lg);
@@ -330,12 +470,17 @@ impl Steward {
             .rev()
             .find(|a| {
                 a.source == OverlaySource::Baseline
-                    && !ov.late.contains(&a.version)
+                    && !ov.is_late(a.version)
                     && Some(a.version) != from
             })
             .map(|a| a.version);
         let b = match reuse {
-            Some(b) => b,
+            Some(b) => {
+                if !self.confirm(e, socket, run, b, "", now).await {
+                    return;
+                }
+                b
+            }
             None => match self.put(e, socket, run, OverlaySource::Baseline, now).await {
                 Some(b) => b,
                 None => return,
@@ -402,6 +547,7 @@ impl Steward {
                     version,
                     digest,
                     source,
+                    text: text.to_owned(),
                 });
                 run.row.intent = None;
                 run.dirty = true;
@@ -454,7 +600,7 @@ impl Steward {
         {
             Sent::Answer { version, previous } => {
                 if vet::pointer_verdict(previous, from, false) == PointerVerdict::Same {
-                    self.applied(e, run, v, &purpose);
+                    self.applied(e, run, v, from, &purpose);
                     return Activated::Done;
                 }
                 // A human moved the pointer to `previous` between the
@@ -469,6 +615,7 @@ impl Steward {
                     run.row.veto(a.digest);
                 }
                 run.row.overlay.pointer = Some(version);
+                run.row.overlay.rollback_to = None;
                 run.dirty = true;
                 match previous {
                     Some(p) => {
@@ -549,11 +696,13 @@ impl Steward {
         }
     }
 
-    /// The move of `purpose` to `v` happened exactly as meant.
-    fn applied(&self, e: &EntityId, run: &mut Run, v: u64, purpose: &Purpose) {
+    /// The move of `purpose` to `v` happened as meant; `from` is where lg
+    /// was before it, when lg said so (what its Roll back returns to).
+    fn applied(&self, e: &EntityId, run: &mut Run, v: u64, from: Option<u64>, purpose: &Purpose) {
         let ov = &mut run.row.overlay;
         ov.pointer = Some(v);
-        ov.late.retain(|x| *x != v);
+        ov.rollback_to = from;
+        ov.drop_late(v);
         run.dirty = true;
         match purpose {
             Purpose::Baseline => {
@@ -565,13 +714,17 @@ impl Steward {
                 ov.active = None;
                 self.publish(e, "overlay", as_id(v), "activated", "clear", None, None);
             }
-            Purpose::Text { digest, source } => {
+            Purpose::Text {
+                digest,
+                source,
+                text,
+            } => {
                 ov.active = Some(Authored {
                     version: v,
                     digest: *digest,
                     source: source.clone(),
+                    text: text.clone(),
                 });
-                let text = self.source_text(source);
                 self.publish_full(StewardEvent {
                     entity: e.clone(),
                     item: "overlay".into(),
@@ -619,7 +772,7 @@ impl Steward {
                 if version == to
                     && vet::pointer_verdict(previous, from, false) == PointerVerdict::Same
                 {
-                    self.applied(e, run, to, &Purpose::Restore);
+                    self.applied(e, run, to, from, &Purpose::Restore);
                     self.publish(e, "overlay", as_id(to), "restored", "restored", None, None);
                     true
                 } else {
@@ -647,7 +800,12 @@ impl Steward {
                 }
                 false
             }
-            Sent::NotWritten => false,
+            Sent::NotWritten => {
+                // The Steward's own move stays, over someone else's
+                // choice: nothing more may move.
+                self.pause(e, run, now, "unconfirmed", true);
+                false
+            }
         }
     }
 
@@ -657,6 +815,7 @@ impl Steward {
         let ov = &mut run.row.overlay;
         ov.pointer = lg;
         ov.active = ov.text_at(lg);
+        ov.rollback_to = None;
         run.dirty = true;
         self.publish(
             e,
@@ -695,7 +854,7 @@ impl Steward {
         if lg == from {
             // Not applied; it may still wait in lg's queue. If it applies
             // later, the pointer check undoes it.
-            run.row.overlay.add_late(v);
+            run.row.overlay.add_late(v, now);
             self.publish(
                 e,
                 "overlay",
@@ -710,7 +869,8 @@ impl Steward {
         if lg == Some(v) {
             return match purpose {
                 Purpose::Baseline | Purpose::Clear => {
-                    self.applied(e, run, v, &purpose);
+                    // Its `previous` is unknown: so is what Roll back does.
+                    self.applied(e, run, v, None, &purpose);
                     Activated::Done
                 }
                 Purpose::Text { .. } => {
@@ -719,6 +879,7 @@ impl Steward {
                     // baseline, and pause.
                     run.row.overlay.pointer = Some(v);
                     run.row.overlay.active = None;
+                    run.row.overlay.rollback_to = None;
                     match from {
                         Some(b) => {
                             if self.restore(e, socket, run, b, Some(v), now).await {
@@ -739,7 +900,7 @@ impl Steward {
             self.adopt_unconfirmed(e, run, lg, now);
             return Activated::Not;
         }
-        run.row.overlay.add_late(v);
+        run.row.overlay.add_late(v, now);
         self.human_moved(e, run, lg, now, "rolled_back");
         Activated::Not
     }
@@ -849,6 +1010,7 @@ impl Steward {
                     version: entry.version,
                     digest,
                     source,
+                    text,
                 };
                 if found.source.is_text() {
                     run.row.overlay.pending = Some(found.clone());
@@ -903,12 +1065,7 @@ impl Steward {
             return;
         };
         let pointer = run.row.overlay.pointer;
-        if pointer != Some(b)
-            && self
-                .activate(e, socket, run, b, pointer, Purpose::Clear, now)
-                .await
-                != Activated::Done
-        {
+        if pointer != Some(b) && !self.clear(e, socket, run, b, pointer, now).await {
             return;
         }
         self.activate(
@@ -920,10 +1077,29 @@ impl Steward {
             Purpose::Text {
                 digest: text.digest,
                 source: text.source,
+                text: text.text,
             },
             now,
         )
         .await;
+    }
+
+    /// Back to the baseline `b` from `from`, once lg shows `b` is still
+    /// `{}`. Returns whether lg made exactly that move.
+    async fn clear(
+        &self,
+        e: &EntityId,
+        socket: &Path,
+        run: &mut Run,
+        b: u64,
+        from: Option<u64>,
+        now: u64,
+    ) -> bool {
+        self.confirm(e, socket, run, b, "", now).await
+            && self
+                .activate(e, socket, run, b, from, Purpose::Clear, now)
+                .await
+                == Activated::Done
     }
 
     /// Runs lg's proposer under a claim (9.4), then the menu ballot (9.6).
@@ -997,7 +1173,13 @@ impl Steward {
     /// job, idempotent on an unchanged config) until one answers, for at
     /// most `refine_drain_secs`. Returns whether one answered.
     async fn drain(&self, socket: &Path) -> bool {
-        let deadline = tokio::time::Instant::now() + self.refine_drain;
+        let start = tokio::time::Instant::now();
+        let Some(deadline) = start
+            .checked_add(self.refine_drain)
+            .or_else(|| start.checked_add(super::MAX_WAIT))
+        else {
+            return false;
+        };
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() {
@@ -1034,6 +1216,7 @@ impl Steward {
             }) => ids.clone(),
             _ => Vec::new(),
         };
+        let current_digest = run.row.overlay.active.as_ref().map(|a| a.digest);
         let Some((picks, reasons)) = self.menu_votes(d, e, &current, evidence).await else {
             return;
         };
@@ -1058,7 +1241,15 @@ impl Steward {
             text: Some(ids.join(", ")),
             reasons: reasons.clone(),
         };
-        if ids == current {
+        let text = vet::render_guardrails(&self.menu, &ids);
+        let digest = vet::overlay_digest(&text);
+        // By the text, not the ids: an edited menu text is put again.
+        let kept = if ids.is_empty() {
+            current_digest.is_none()
+        } else {
+            current_digest == Some(digest)
+        };
+        if kept {
             self.publish_full(event("kept", "kept"));
             return;
         }
@@ -1068,17 +1259,11 @@ impl Steward {
                 return;
             };
             self.publish_full(event("voted", "clear"));
-            if self
-                .activate(e, socket, run, b, pointer, Purpose::Clear, now)
-                .await
-                == Activated::Done
-            {
+            if self.clear(e, socket, run, b, pointer, now).await {
                 self.note_plain(e, "overlay_off");
             }
             return;
         }
-        let text = vet::render_guardrails(&self.menu, &ids);
-        let digest = vet::overlay_digest(&text);
         if run.row.is_vetoed(digest) {
             self.publish_full(event("declined", "vetoed"));
             return;
@@ -1090,10 +1275,15 @@ impl Steward {
             .authored
             .iter()
             .rev()
-            .find(|a| a.digest == digest && a.source == source && !ov.late.contains(&a.version))
+            .find(|a| a.digest == digest && a.source == source && !ov.is_late(a.version))
             .map(|a| a.version);
         let v = match reuse {
-            Some(v) => v,
+            Some(v) => {
+                if !self.confirm(e, socket, run, v, &text, now).await {
+                    return;
+                }
+                v
+            }
             None => match self.put(e, socket, run, source.clone(), now).await {
                 Some(v) => v,
                 None => return,
@@ -1107,6 +1297,7 @@ impl Steward {
                 version: v,
                 digest,
                 source,
+                text,
             },
             now,
         )
@@ -1180,6 +1371,7 @@ impl Steward {
             baseline: ov.baseline,
             source: ov.active.as_ref().map(|a| a.source.label()),
             paused: ov.paused.as_ref().map(|p| p.code.clone()),
+            rollback_to: ov.rollback_to,
             chain: ov
                 .authored
                 .iter()
@@ -1187,7 +1379,7 @@ impl Steward {
                 .map(|a| super::ChainEntry {
                     version: a.version,
                     label: a.source.label(),
-                    text: self.source_text(&a.source),
+                    text: a.text.clone(),
                     active: ov.pointer == Some(a.version),
                 })
                 .collect(),

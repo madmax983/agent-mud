@@ -774,9 +774,10 @@ fn autonomy_cell(a: &Value) -> Markup {
 }
 
 /// The Steward's overlays of one agent (ADR 0015): lg's active version,
-/// the pause, and the Steward's own versions with their full text, newest
-/// first. The text is escaped by maud. lg's own Roll back button, on the
-/// page the littleguy link opens, is the veto.
+/// the pause, what lg's Roll back would do, and the Steward's own versions
+/// with the text each holds, newest first. The text is escaped by maud.
+/// lg's own Roll back button, on the page the littleguy link opens, is
+/// the veto.
 fn overlay_lines(o: &Value) -> Markup {
     let version = |v: &Value| {
         v.as_u64()
@@ -787,7 +788,20 @@ fn overlay_lines(o: &Value) -> Markup {
         @if let Some(src) = o["source"].as_str() { span.muted { " · " (src) } }
         @if let Some(code) = o["paused"].as_str() { br; span.hard { "refine paused: " (code) } }
         @if let Some(b) = o["baseline"].as_u64() {
-            br; span.muted { "Roll back on the littleguy page returns to the empty baseline (version " (b) ")." }
+            br;
+            // lg's Roll back reverses lg's last move, which is not always
+            // a move off the baseline.
+            @match o["rollback_to"].as_u64() {
+                Some(to) if to == b => {
+                    span.muted { "Roll back on the littleguy page returns to the empty baseline (version " (b) ")." }
+                }
+                Some(to) => {
+                    span.soft { "Roll back on the littleguy page brings back version " (to) ", not the empty baseline (version " (b) ")." }
+                }
+                None => {
+                    span.muted { "The empty baseline is version " (b) " on the littleguy refine tab." }
+                }
+            }
         }
         @for c in o["chain"].as_array().into_iter().flatten() {
             br;

@@ -298,6 +298,10 @@ pub struct OverlayView {
     pub source: Option<String>,
     /// Why refine is paused, if it is.
     pub paused: Option<String>,
+    /// The version lg's Roll back button would activate, as far as the
+    /// Steward knows (`None`: unknown).
+    #[serde(default)]
+    pub rollback_to: Option<u64>,
     /// The Steward's own versions, newest first, with their full text.
     pub chain: Vec<ChainEntry>,
 }
@@ -309,8 +313,8 @@ pub struct ChainEntry {
     pub version: u64,
     /// `baseline`, or the menu ids.
     pub label: String,
-    /// Its guardrails text (`""` for the baseline): operator text in menu
-    /// mode, escaped on render.
+    /// Its guardrails text as put (`""` for the baseline): operator text
+    /// in menu mode, escaped on render.
     pub text: String,
     /// Whether lg has it active.
     pub active: bool,
@@ -502,7 +506,7 @@ impl Steward {
             read_timeout: READ_TIMEOUT,
             activate_wait: Duration::from_secs(cfg.activate_wait_secs.max(1)),
             refine_timeout: Duration::from_secs(cfg.refine_timeout_secs.max(1)),
-            refine_drain: Duration::from_secs(cfg.refine_drain_secs),
+            refine_drain: Duration::from_secs(cfg.refine_drain_secs).min(MAX_WAIT),
             drain_every: DRAIN_EVERY,
             menu: cfg.menu(),
             cfg,
@@ -656,8 +660,16 @@ impl Steward {
         self.quiet(d, e, socket, level, run).await;
         let key = d.start_key(e).await;
         if key.is_some() && key != run.checked {
+            if run.checked.is_some() && !run.row.overlay.late.is_empty() {
+                // A restarted lg holds no queued activate of ours.
+                run.row.overlay.late.clear();
+                run.dirty = true;
+            }
             self.check_approvals(e, socket).await;
             run.checked = key;
+        }
+        if !self.cfg.refine.is_on() {
+            self.refine_off(e, run, now);
         }
         let mut view = AutonomyView {
             pass_ms: now,
@@ -1397,6 +1409,9 @@ impl Steward {
 
 /// How often a drain probes lg's loop after a propose timed out.
 pub const DRAIN_EVERY: Duration = Duration::from_secs(10);
+
+/// The longest drain after a propose timed out: one day.
+pub const MAX_WAIT: Duration = Duration::from_hours(24);
 
 /// Ends, at this boot, the refine pause of each entity `resume_refine`
 /// names, if an earlier boot recorded it; warns about a name that is not

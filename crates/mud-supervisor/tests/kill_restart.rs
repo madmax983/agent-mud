@@ -831,9 +831,10 @@ async fn kill_after_overlay_put_before_activate_intent() {
     assert_eq!(marked, "OverlayStored");
     assert_eq!(daemon.count("overlay_put"), 1);
     assert_eq!(daemon.count("overlay_activate"), 0);
-    // The restart finds the version by its content (`overlay_show`).
+    // The restart finds the version by its content (`overlay_show`), and
+    // shows it again before it activates it.
     refine_after_kill(dir.path(), &daemon).await;
-    assert_eq!(daemon.count("overlay_show"), 1);
+    assert_eq!(daemon.count("overlay_show"), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

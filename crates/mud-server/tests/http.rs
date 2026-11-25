@@ -1278,6 +1278,7 @@ async fn the_autonomy_panel_shows_the_overlay_chain_escaped() {
                 baseline: Some(1),
                 source: None,
                 paused: Some("rolled_back".into()),
+                rollback_to: Some(1),
                 chain: vec![
                     mud_supervisor::steward::ChainEntry {
                         version: 3,
@@ -1315,4 +1316,40 @@ async fn the_autonomy_panel_shows_the_overlay_chain_escaped() {
     );
     assert!(html.contains("v1 baseline:  (active)"));
     assert!(!html.contains("<b>Keep"));
+    // After a clear lg's last move is text -> baseline: Roll back brings
+    // the text back, and the panel says so.
+    for (rollback_to, want) in [
+        (
+            Some(3),
+            "Roll back on the littleguy page brings back version 3, not the empty baseline (version 1).",
+        ),
+        (
+            None,
+            "The empty baseline is version 1 on the littleguy refine tab.",
+        ),
+    ] {
+        built.mud.sup.set_autonomy(
+            &torin,
+            mud_supervisor::steward::AutonomyView {
+                overlay: Some(mud_supervisor::steward::OverlayView {
+                    mode: "menu".into(),
+                    pointer: Some(1),
+                    baseline: Some(1),
+                    rollback_to,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let html = http()
+            .get(format!("http://{addr}/observer/entities?token={token}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains(want), "{html}");
+        assert!(!html.contains("returns to the empty baseline"), "{html}");
+    }
 }

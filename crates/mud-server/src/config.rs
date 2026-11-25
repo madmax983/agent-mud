@@ -781,6 +781,16 @@ impl LittleguySection {
             s.activate_wait_secs >= 1 && s.refine_timeout_secs >= 1,
             "[littleguy.steward] activate_wait_secs and refine_timeout_secs must be at least 1"
         );
+        for (key, secs) in [
+            ("activate_wait_secs", s.activate_wait_secs),
+            ("refine_timeout_secs", s.refine_timeout_secs),
+            ("refine_drain_secs", s.refine_drain_secs),
+        ] {
+            ensure!(
+                secs <= 86_400,
+                "[littleguy.steward] {key} must be at most 86400 (a day), not {secs}"
+            );
+        }
         ensure!(
             (1..=16).contains(&s.max_guardrails),
             "[littleguy.steward] max_guardrails must be 1 to 16, not {}",
@@ -1243,6 +1253,11 @@ mod tests {
         assert!(bad(&|s| s.steward.deny_phrases = vec![" ".into()]).contains("deny_phrases"));
         assert!(bad(&|s| s.steward.max_guardrails = 0).contains("max_guardrails"));
         assert!(bad(&|s| s.steward.activate_wait_secs = 0).contains("activate_wait_secs"));
+        assert!(
+            bad(&|s| s.steward.refine_drain_secs = u64::MAX).contains("refine_drain_secs"),
+            "an unbounded drain is refused"
+        );
+        assert!(bad(&|s| s.steward.activate_wait_secs = 86_401).contains("activate_wait_secs"));
         assert!(bad(&|s| s.steward.resume_refine = vec![String::new()]).contains("resume_refine"));
         assert!(bad(&|s| s.steward.deny_phrases = vec!["é".into()]).contains("deny_phrases"));
         let one = LittleguySection {

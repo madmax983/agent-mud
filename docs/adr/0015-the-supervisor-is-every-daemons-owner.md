@@ -140,7 +140,13 @@ move:
 - **The pointer check**, every pass: `overlays` (a read beside lg's loop)
   and the proved `pointer_verdict(lg, pointer, lg is late)`. `Same`:
   nothing. `OwnLate` (an activate the Steward gave up on applied later):
-  a move to `{}` is adopted, a text is undone (`late_undone`). `Human`
+  a text is undone (`late_undone`); a move to `{}` is adopted when no
+  text of the Steward's was active, and otherwise taken as a human's
+  Roll back (paused `unconfirmed`, the text vetoed), because the Steward's
+  late Clear and a human's Roll back off the text look the same. A
+  version stays late until the daemon restarts (its queue is gone) or
+  `6 × activate_wait_secs` pass; a move to it after that is a human's.
+  `Human`
   (lg's Roll back button, or an activation on lg's refine tab): refine
   pauses for that entity (`rolled_back`, written with `act`), the
   Steward's text there is vetoed, the pointer follows the human, and the
@@ -149,6 +155,16 @@ move:
 - **First contact** puts and activates an empty `{}` **baseline**. If lg
   already has an active overlay, nobody's text is replaced: the Steward
   adopts it and pauses (`preexisting`).
+- **lg's store, not the row's numbers.** lg numbers versions per store,
+  so a deleted lg data dir starts again at 1. A listing that lacks a
+  version the row holds, lists one of the Steward's under an author other
+  than `operator:mud`, or ends below `known_max` means the store was
+  reset: the row forgets every version number (the pause and `vetoed`
+  stay), publishes `reset store_reset`, and goes back to first contact.
+  A version put in an earlier pass (the baseline for a Clear, a menu text
+  picked again) is shown (`overlay_show`) and matched with
+  `overlay_matches` before it is activated; another text there is a reset
+  too.
 - **Activate** re-reads `overlays` right before (a version other than the
   expected one goes to the pointer check, and nothing is sent), writes the
   intent `Activate{version, expected_previous, purpose}` with `act`, and
@@ -156,12 +172,17 @@ move:
   `previous` is not the expected one means a human moved the pointer in
   between and the activate overwrote it: the Steward activates that
   `previous` again (a restore, which never chains), vetoes the text, and
-  pauses. **An activate is never resent.** A lost answer is settled from
-  lg's pointer: not applied, the version goes on the `late` list (if it
-  applies later, the pointer check undoes it); applied, a move to `{}` is
-  adopted and a text is undone and refine pauses (`unconfirmed`), since a
-  human move in the window cannot be ruled out; anything else is the
-  human path.
+  pauses. A restore whose intent cannot be written pauses too
+  (`unconfirmed`): the Steward's move then stands over the human's, and
+  nothing more may move. **An activate is never resent.** A lost answer
+  is settled from lg's pointer: not applied, the version goes on the
+  `late` list (if it applies later, the pointer check undoes it);
+  applied, a move to `{}` is adopted and a text is undone and refine
+  pauses (`unconfirmed`), since a human move in the window cannot be ruled
+  out; anything else is the human path. With `refine = "off"` nothing
+  reads lg's pointer, so an open overlay intent is given up (`stuck
+  refine_off`; an activate goes on the `late` list) and goals are decided
+  again.
 - **Put** writes `Put{digest, source}` with `act`, then `overlay_put`. A
   lost answer is found by its content: the next pass shows each newer
   `operator:mud` version (`overlay_show`) and tests `overlay_matches`; no
@@ -169,8 +190,10 @@ move:
   is harmless; only a recorded version is activated).
 - **One move above the baseline.** lg's Roll back reverses the last move
   only. Every Steward text goes on from the baseline (text A, then back to
-  the baseline, then text B), so lg's last move is always baseline to
-  text, and **one Roll back always lands on `{}`**.
+  the baseline, then text B), so while a text runs lg's last move is
+  baseline to text, and **one Roll back lands on `{}`**. After a Clear
+  (no item picked) or an undo, lg's last move ends on the baseline, and a
+  Roll back would bring the earlier text back; the observer says which.
 - **Propose**, when the proved `refine_due` holds (never paused, never
   below `Normal`, `refine_every_hours >= 24` and `refine_min_wakes >= 1`
   since the last one, both floors checked at start), a judge exists, a
@@ -186,18 +209,20 @@ move:
   (`[[littleguy.steward.guardrail]]`, or six setting-agnostic defaults);
   an item a strict majority picks is selected, in menu order, at most
   `max_guardrails`. The Steward puts only `{"guardrails": "- item\n- item"}`
-  of operator text. No pick returns to the baseline; the same pick is
-  `kept`; a vetoed text is never put again (`vetoed` is never evicted,
+  of operator text, and keeps the text it put. No pick returns to the
+  baseline; the same text is `kept` (by its digest, so an item whose menu
+  text the operator edited is put again); a vetoed text is never put again (`vetoed` is never evicted,
   apart from the goal declines).
 - **Resume.** Only the operator ends a pause: `[littleguy.steward]
   resume_refine = ["<entity>"]` clears, at boot, a pause from an earlier
   boot and publishes `resumed`; the Steward warns at every boot while it
   names an entity that is not paused. A resume never clears `vetoed`.
 - **Observer.** Overlay events (`activated`, `paused`, `restored`,
-  `unconfirmed`, `late_undone`, `kept`, `declined`, `resumed`, `stuck`)
-  and, per agent, the pointer, the baseline version ("Roll back on the
-  littleguy page returns to the empty baseline (version N)"), the pause,
-  and the Steward's versions with their full text, newest first, escaped.
+  `unconfirmed`, `late_undone`, `kept`, `declined`, `resumed`, `reset`,
+  `stuck`) and, per agent, the pointer, the baseline version, what lg's
+  Roll back would do (to the baseline only when the Steward's last
+  confirmed move left it), the pause, and the Steward's versions with the
+  text each holds as put, newest first, escaped.
 
 ```mermaid
 flowchart LR

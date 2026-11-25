@@ -120,6 +120,7 @@ title_chars = 120
 why_chars = 800
 deny_phrases = []                # added to the built-in phrases, never replacing them
 quiet_on_hard = true             # at the hard cap: no heartbeat, no memory, no tick spend
+# The next three are 1 to 86400 (a day).
 activate_wait_secs = 600         # one overlay_activate answer is awaited this long, never resent
 refine_timeout_secs = 120        # lg's proposer may run this long under a claim
 refine_drain_secs = 600          # then the claim waits for lg's loop at most this long

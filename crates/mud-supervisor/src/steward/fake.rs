@@ -537,6 +537,16 @@ impl FakeDaemon {
         self.state.lock().unwrap().store("operator:mud", overlay)
     }
 
+    /// The operator deletes the agent's lg data: a fresh overlay store,
+    /// numbered from 1 again, with nothing active and nothing queued.
+    pub fn reset_store(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.versions.clear();
+        st.active = None;
+        st.moves.clear();
+        st.held.clear();
+    }
+
     /// Applies the activates held in the queue, as lg's loop would.
     pub fn apply_held(&self) {
         let mut st = self.state.lock().unwrap();

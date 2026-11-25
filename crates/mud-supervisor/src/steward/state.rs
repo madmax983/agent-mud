@@ -196,6 +196,8 @@ pub enum Purpose {
         digest: u64,
         /// Where it came from.
         source: OverlaySource,
+        /// The guardrails text, as put.
+        text: String,
     },
     /// Back to a version someone else chose, undoing its own move.
     Restore,
@@ -309,6 +311,20 @@ pub struct Authored {
     pub digest: u64,
     /// Where it came from.
     pub source: OverlaySource,
+    /// The guardrails text as put (`""` for the baseline): what lg runs,
+    /// even after the operator edits the menu.
+    #[serde(default)]
+    pub text: String,
+}
+
+/// An activate whose answer never came and that had not applied when
+/// last checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Late {
+    /// The version.
+    pub version: u64,
+    /// When it was given up on, by the game clock.
+    pub at_ms: u64,
 }
 
 /// Why refine is paused for an entity, and since when. Only the operator
@@ -337,8 +353,9 @@ pub struct OverlayRow {
     /// The Steward's own puts, oldest first, at most [`AUTHORED_CAP`].
     pub authored: Vec<Authored>,
     /// Activates whose answer never came and that had not applied when
-    /// last checked, at most [`LATE_CAP`].
-    pub late: Vec<u64>,
+    /// last checked, at most [`LATE_CAP`]. Each lives until the daemon
+    /// restarts or its window ends; a move to it after that is a human's.
+    pub late: Vec<Late>,
     /// The Steward's text at `pointer`, if any.
     pub active: Option<Authored>,
     /// A text put and not yet activated: the next pass activates it.
@@ -347,6 +364,10 @@ pub struct OverlayRow {
     pub paused: Option<Pause>,
     /// When the last propose ran, by the game clock.
     pub last_refine_ms: Option<u64>,
+    /// The version lg's Roll back would activate, as far as the Steward
+    /// knows: where lg was before the Steward's last confirmed move.
+    /// `None` after a move of anyone else's or one never answered.
+    pub rollback_to: Option<u64>,
 }
 
 impl OverlayRow {
@@ -402,13 +423,59 @@ impl OverlayRow {
         }
     }
 
-    /// Remembers an activate given up on; past [`LATE_CAP`] the oldest go.
-    pub fn add_late(&mut self, version: u64) {
-        if !self.late.contains(&version) {
-            self.late.push(version);
-        }
+    /// Remembers an activate given up on at `now_ms`; past [`LATE_CAP`]
+    /// the oldest go.
+    pub fn add_late(&mut self, version: u64, now_ms: u64) {
+        self.late.retain(|l| l.version != version);
+        self.late.push(Late {
+            version,
+            at_ms: now_ms,
+        });
         let over = self.late.len().saturating_sub(LATE_CAP);
         self.late.drain(..over);
+    }
+
+    /// Whether an activate of `version` was given up on.
+    #[must_use]
+    pub fn is_late(&self, version: u64) -> bool {
+        self.late.iter().any(|l| l.version == version)
+    }
+
+    /// Forgets `version` as late.
+    pub fn drop_late(&mut self, version: u64) {
+        self.late.retain(|l| l.version != version);
+    }
+
+    /// Forgets every late activate given up on `window_ms` or more before
+    /// `now_ms`. Returns whether one went.
+    pub fn expire_late(&mut self, now_ms: u64, window_ms: u64) -> bool {
+        let before = self.late.len();
+        self.late
+            .retain(|l| now_ms.saturating_sub(l.at_ms) < window_ms);
+        self.late.len() != before
+    }
+
+    /// Every version the row holds as lg's: the pointer, and the ones the
+    /// Steward put (with whether lg must list it as the MUD's).
+    #[must_use]
+    pub fn recorded(&self) -> Vec<(u64, bool)> {
+        let mut out: Vec<(u64, bool)> = self.pointer.map(|p| (p, false)).into_iter().collect();
+        out.extend(self.baseline.map(|b| (b, true)));
+        out.extend(self.authored.iter().map(|a| (a.version, true)));
+        out.extend(self.active.iter().map(|a| (a.version, true)));
+        out.extend(self.pending.iter().map(|a| (a.version, true)));
+        out
+    }
+
+    /// Forgets lg's store: its overlay store was reset, so no version
+    /// number the row holds means what it did. Keeps the pause (only the
+    /// operator ends it) and the time of the last propose.
+    pub fn forget_store(&mut self) {
+        *self = Self {
+            paused: self.paused.take(),
+            last_refine_ms: self.last_refine_ms,
+            ..Self::default()
+        };
     }
 
     /// Raises `known_max` to `version`.
@@ -542,11 +609,13 @@ mod tests {
             source: OverlaySource::Menu {
                 ids: vec!["brevity".into()],
             },
+            text: "- Keep it short.".into(),
         };
         ov.record(Authored {
             version: 1,
             digest: 0,
             source: OverlaySource::Baseline,
+            text: String::new(),
         });
         ov.active = Some(menu(2));
         for v in 2..60 {
@@ -562,10 +631,22 @@ mod tests {
         assert_eq!(ov.text_at(Some(1)), None, "the baseline is no text");
         assert_eq!(ov.text_at(None), None);
         for v in 0..20 {
-            ov.add_late(v);
-            ov.add_late(v);
+            ov.add_late(v, 100 + v);
+            ov.add_late(v, 100 + v);
         }
-        assert_eq!(ov.late, (12..20).collect::<Vec<_>>());
+        assert_eq!(
+            ov.late.iter().map(|l| l.version).collect::<Vec<_>>(),
+            (12..20).collect::<Vec<_>>()
+        );
+        assert!(ov.is_late(15) && !ov.is_late(3));
+        ov.drop_late(15);
+        assert!(!ov.is_late(15));
+        assert!(!ov.expire_late(150, 100), "none is 100 ms old");
+        assert!(ov.expire_late(216, 100), "112 to 116 are");
+        assert_eq!(
+            ov.late.iter().map(|l| l.version).collect::<Vec<_>>(),
+            [17, 18, 19]
+        );
         ov.see(5);
         assert_eq!(ov.known_max, Some(59));
         let mut row = StewardRow::default();
@@ -582,12 +663,43 @@ mod tests {
                 Purpose::Restore,
                 Purpose::Text {
                     digest: 1,
-                    source: OverlaySource::Baseline
+                    source: OverlaySource::Baseline,
+                    text: String::new(),
                 }
             ]
             .map(|p| p.name()),
             ["baseline", "clear", "restore", "text"]
         );
+    }
+
+    #[test]
+    fn a_forgotten_store_keeps_only_the_pause_and_the_last_propose() {
+        let mut ov = OverlayRow {
+            known_max: Some(9),
+            pointer: Some(3),
+            baseline: Some(1),
+            last_refine_ms: Some(5),
+            rollback_to: Some(1),
+            paused: Some(Pause {
+                at_ms: 1,
+                boot: 2,
+                code: "rolled_back".into(),
+            }),
+            ..OverlayRow::default()
+        };
+        ov.add_late(4, 1);
+        assert_eq!(ov.recorded(), [(3, false), (1, true)]);
+        let paused = ov.paused.clone();
+        ov.forget_store();
+        assert_eq!(
+            ov,
+            OverlayRow {
+                paused,
+                last_refine_ms: Some(5),
+                ..OverlayRow::default()
+            }
+        );
+        assert_eq!(ov.recorded(), []);
     }
 
     #[test]
@@ -602,6 +714,7 @@ mod tests {
                     source: OverlaySource::Menu {
                         ids: vec!["pacing".into()],
                     },
+                    text: "- Pace.".into(),
                 },
             },
             5,

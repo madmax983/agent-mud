@@ -133,9 +133,10 @@ heartbeat, no memory), and lg's own goals page stays the veto. With
 `[littleguy] refine` (the default is `menu`), the Steward also runs lg's
 refine proposer now and then, lets the council pick operator menu items
 from it as evidence, and activates them itself one move above an empty
-baseline, checking lg's pointer before and after each move; one press of
-lg's Roll back button returns to the baseline and pauses refine for that
-agent.
+baseline, checking lg's pointer before and after each move; while a
+text runs, one press of lg's Roll back button returns to the baseline and
+pauses refine for that agent (the observer says what a Roll back would
+do).
 
 ## 4. Turing PCs
 
