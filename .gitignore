@@ -4,5 +4,6 @@
 *.db-wal
 *.db-shm
 *.lock
+mud.toml
 !Cargo.lock
 /.claude/worktrees/
