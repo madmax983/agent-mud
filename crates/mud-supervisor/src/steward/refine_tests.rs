@@ -1000,6 +1000,127 @@ async fn a_human_rollback_while_a_clear_is_late_pauses_and_vetoes() {
 }
 
 #[tokio::test]
+async fn a_human_rollback_before_a_lost_clear_applies_pauses_and_vetoes() {
+    let mut r = refine_rig();
+    baseline_then_text(&r, &["brevity"]).await;
+    // The council drops brevity. A human presses Roll back (v3 -> v1)
+    // while the Clear waits in lg's queue; then the Clear runs (v1 -> v1)
+    // and its answer is lost. lg on v1 looks the same as the Clear alone.
+    r.advance(169 * HOUR);
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &[]);
+    r.d().activate_modes(&[ActivateMode::RollbackFirstSilently]);
+    r.pass().await;
+    assert_eq!(r.d().active(), Some(1));
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("unconfirmed"),
+        "{row:?}"
+    );
+    assert!(row.is_vetoed(overlay_digest(&text_of(&["brevity"]))));
+    assert!(row.overlay.active.is_none());
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert!(row.intent.is_none());
+    assert!(has_overlay(&r.steward_events(), "paused", "unconfirmed"));
+    // A week later nothing puts brevity back.
+    let acts = r.d().count("overlay_activate");
+    r.advance(169 * HOUR);
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.pass().await;
+    assert_eq!(r.d().count("overlay_activate"), acts);
+    assert_eq!(r.d().active(), Some(1));
+}
+
+#[tokio::test]
+async fn a_restart_after_a_clear_lg_shows_applied_pauses_and_vetoes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let fake = FakeDaemons::new(&["torin"], TOKEN);
+    let text = text_of(&["brevity"]);
+    {
+        let mut st = fake.of("torin").state.lock().unwrap();
+        st.refine = true;
+        st.store(super::refine::MUD_AUTHOR, "{}");
+        st.store(
+            super::refine::MUD_AUTHOR,
+            &serde_json::json!({ "guardrails": text }).to_string(),
+        );
+        st.activate(1);
+        st.activate(2);
+        // A human rolls v2 back to v1; then the Clear runs, v1 -> v1.
+        st.rollback();
+        st.activate(1);
+    }
+    // A row whose Clear was sent before a crash, never answered.
+    let mut row = StewardRow::default();
+    row.overlay.baseline = Some(1);
+    row.overlay.pointer = Some(2);
+    let baseline = super::state::Authored {
+        version: 1,
+        digest: overlay_digest(""),
+        source: OverlaySource::Baseline,
+        text: String::new(),
+    };
+    let brevity = super::state::Authored {
+        version: 2,
+        digest: overlay_digest(&text),
+        source: OverlaySource::Menu {
+            ids: vec!["brevity".into()],
+        },
+        text: text.clone(),
+    };
+    row.overlay.authored = vec![baseline, brevity.clone()];
+    row.overlay.active = Some(brevity);
+    row.overlay.last_refine_ms = Some(super::tests::T0);
+    row.open(
+        IntentAction::Activate {
+            version: 1,
+            expected_previous: Some(2),
+            purpose: super::state::Purpose::Clear,
+        },
+        super::tests::T0,
+    );
+    let r = rig(Opts {
+        db: Some(db.clone()),
+        fake: Some(Arc::clone(&fake)),
+        cfg: menu_cfg(),
+        ..Opts::default()
+    });
+    r.game
+        .act(&[mud_world::SideOp::Steward {
+            entity: torin(),
+            rev: 1,
+            schema: ROW_SCHEMA,
+            body: row.body(),
+        }])
+        .unwrap();
+    drop(r);
+    let r = rig(Opts {
+        db: Some(db),
+        fake: Some(fake),
+        cfg: menu_cfg(),
+        now: super::tests::T0 + MIN,
+        ..Opts::default()
+    });
+    r.d().clear_lines();
+    r.pass().await;
+    let row = r.row().await;
+    assert!(row.intent.is_none(), "{row:?}");
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("unconfirmed"),
+        "{row:?}"
+    );
+    assert!(row.is_vetoed(overlay_digest(&text)));
+    assert!(row.overlay.active.is_none());
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert_eq!(r.d().count("overlay_activate"), 0);
+    assert_eq!(r.d().active(), Some(1));
+}
+
+#[tokio::test]
 async fn refine_off_settles_an_open_overlay_intent() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("world.db");

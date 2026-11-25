@@ -64,6 +64,9 @@ pub enum ActivateMode {
     /// A human activates this version first, then ours runs: its
     /// `previous` is the human's version.
     HumanFirst(u64),
+    /// A human presses Roll back first, then ours applies and is never
+    /// answered.
+    RollbackFirstSilently,
 }
 
 /// What the daemon does with the next `refine_propose`.
@@ -273,6 +276,11 @@ impl FakeState {
                         (None, String::new())
                     }
                     ActivateMode::ApplySilently => {
+                        self.activate(version);
+                        (None, String::new())
+                    }
+                    ActivateMode::RollbackFirstSilently => {
+                        self.rollback();
                         self.activate(version);
                         (None, String::new())
                     }

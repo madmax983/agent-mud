@@ -177,9 +177,13 @@ move:
   nothing more may move. **An activate is never resent.** A lost answer
   is settled from lg's pointer: not applied, the version goes on the
   `late` list (if it applies later, the pointer check undoes it);
-  applied, a move to `{}` is adopted and a text is undone and refine
-  pauses (`unconfirmed`), since a human move in the window cannot be ruled
-  out; anything else is the human path. With `refine = "off"` nothing
+  applied, a move to `{}` is adopted when no text of the Steward's was
+  active, and otherwise taken as a human's Roll back off the text (paused
+  `unconfirmed`, the text vetoed), since a Roll back just before it leaves
+  lg on the same version; a text is undone and refine pauses
+  (`unconfirmed`), since a human move in the window cannot be ruled out;
+  anything else is the human path. The same rules settle an activate
+  intent left open by a restart. With `refine = "off"` nothing
   reads lg's pointer, so an open overlay intent is given up (`stuck
   refine_off`; an activate goes on the `late` list) and goals are decided
   again.

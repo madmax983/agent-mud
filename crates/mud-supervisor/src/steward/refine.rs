@@ -868,6 +868,14 @@ impl Steward {
         }
         if lg == Some(v) {
             return match purpose {
+                Purpose::Baseline | Purpose::Clear if run.row.overlay.active.is_some() => {
+                    // A move to `{}` off a text of the Steward's, applied:
+                    // a human's Roll back off that text, run just before
+                    // it, leaves lg on the same version. They look the
+                    // same, so it is taken as the human's veto.
+                    self.human_moved(e, run, lg, now, "unconfirmed");
+                    Activated::Not
+                }
                 Purpose::Baseline | Purpose::Clear => {
                     // Its `previous` is unknown: so is what Roll back does.
                     self.applied(e, run, v, None, &purpose);
