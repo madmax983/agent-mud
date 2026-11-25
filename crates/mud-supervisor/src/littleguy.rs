@@ -951,6 +951,62 @@ impl LittleguyMind {
     }
 }
 
+/// The Steward's seam (ADR 0015): the Steward owns these daemons through
+/// it, and never starts one.
+impl crate::steward::OwnedDaemons for LittleguyMind {
+    fn entities(&self) -> Vec<EntityId> {
+        let mut ids: Vec<EntityId> = self.personas.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    fn running_socket<'a>(&'a self, entity: &'a EntityId) -> BoxFuture<'a, Option<PathBuf>> {
+        Box::pin(Self::running_socket(self, entity))
+    }
+
+    fn start_key<'a>(&'a self, entity: &'a EntityId) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async move {
+            self.daemons.lock().await.get_mut(entity).and_then(|d| {
+                if matches!(d.child.try_wait(), Ok(None)) {
+                    d.child.id()
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    fn brief(&self, entity: &EntityId) -> Option<PersonaText> {
+        Self::brief(self, entity)
+    }
+
+    /// The ledger rows no wake charged yet (a heartbeat tick's), now
+    /// marked charged on the shared meter.
+    fn settle<'a>(&'a self, entity: &'a EntityId, now_ms: u64) -> BoxFuture<'a, Usage> {
+        Box::pin(async move {
+            Charge {
+                meter: self.meter(entity),
+                now_ms,
+                until_settled: None,
+            }
+            .settle(entity, Usage::default())
+            .await
+        })
+    }
+
+    fn set_quiet<'a>(
+        &'a self,
+        entity: &'a EntityId,
+        quiet: bool,
+    ) -> BoxFuture<'a, Result<(), MindError>> {
+        Box::pin(Self::set_quiet(self, entity, quiet))
+    }
+
+    fn is_quiet(&self, entity: &EntityId) -> bool {
+        Self::is_quiet(self, entity)
+    }
+}
+
 impl Mind for LittleguyMind {
     fn kind(&self) -> &'static str {
         "littleguy"

@@ -126,6 +126,8 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         login: false,
         wake_id: "wake-torin-0-1".into(),
         now_ms: 0,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
@@ -217,6 +219,8 @@ async fn an_ambient_harvest_mind_sees_no_wake_tools_or_habit() {
         login: false,
         wake_id: "wake-guard_01-0-1".into(),
         now_ms: 0,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     };
     let tools = MudTools::new(Arc::clone(&game), typing, hale.clone());
@@ -307,6 +311,8 @@ async fn a_timed_out_wake_is_charged_when_its_job_ends() {
         login: false,
         wake_id: id.into(),
         now_ms: 0,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
@@ -391,6 +397,8 @@ async fn a_timed_out_wake_settles_only_once_its_job_is_done() {
         login: false,
         wake_id: "wake-torin-0-1".into(),
         now_ms: 0,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     };
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
@@ -480,6 +488,8 @@ async fn harvest_db_history_is_bounded() {
             login: false,
             wake_id: format!("wake-{n}"),
             now_ms: n * 1_000,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: Vec::new(),
         };
         let r = mind.wake(ctx, tools.clone()).await.unwrap();
@@ -592,6 +602,8 @@ async fn the_worker_purges_sealed_runs_older_than_keep_days() {
             login: false,
             wake_id: format!("wake-{n}"),
             now_ms,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: Vec::new(),
         };
         mind.wake(ctx, tools.clone()).await.unwrap();

@@ -689,6 +689,8 @@ mod tests {
             login: false,
             wake_id: "w".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: Vec::new(),
         }
     }

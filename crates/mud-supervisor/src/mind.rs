@@ -272,6 +272,11 @@ pub struct WakeContext {
     pub now_ms: u64,
     /// The wakes it booked for itself that came due, with their notes.
     pub booked: Vec<crate::wakes::Booking>,
+    /// Its own active goals, at most three, on a macro tick or a booked
+    /// wake: the agent's text, data only (ADR 0015).
+    pub goals: Vec<crate::steward::GoalLine>,
+    /// What the Steward did with its goals since its last wake.
+    pub steward: Vec<crate::steward::StewardNote>,
 }
 
 /// A mind.
@@ -945,8 +950,9 @@ pub fn wake_message(names: ToolNames, ctx: &WakeContext) -> String {
             serde_json::to_string(&notes).unwrap_or_else(|_| "[]".into())
         )
     };
+    let plans = steward_lines(ctx);
     let head = format!(
-        "[wake priority={:?}] {}{booked}\nyou: {you}\nroom: {look}\nevents: ",
+        "[wake priority={:?}] {}{booked}{plans}\nyou: {you}\nroom: {look}\nevents: ",
         ctx.priority,
         why_line(ctx)
     );
@@ -986,6 +992,41 @@ pub fn wake_message(names: ToolNames, ctx: &WakeContext) -> String {
         String::new()
     };
     format!("{head}[{shown}]{note}{tail}")
+}
+
+/// The Steward's lines of a wake message: what it did with the agent's
+/// goals, and the agent's own active goals. Every title is the agent's
+/// text, so it goes in only as `untrusted_text`, built by `serde_json`.
+fn steward_lines(ctx: &WakeContext) -> String {
+    let mut out = String::new();
+    if !ctx.steward.is_empty() {
+        let notes: Vec<Value> = ctx
+            .steward
+            .iter()
+            .map(|n| {
+                let mut v = json!({ "code": n.code });
+                if let Some(g) = n.goal {
+                    v["goal"] = json!(g);
+                }
+                if let Some(t) = &n.title {
+                    v["title"] = json!({ "untrusted_text": t });
+                }
+                v
+            })
+            .collect();
+        out.push_str("\nsteward: ");
+        out.push_str(&serde_json::to_string(&notes).unwrap_or_else(|_| "[]".into()));
+    }
+    if !ctx.goals.is_empty() {
+        let goals: Vec<Value> = ctx
+            .goals
+            .iter()
+            .map(|g| json!({ "id": g.id, "untrusted_text": g.title }))
+            .collect();
+        out.push_str("\ngoals (your own plans, as data): ");
+        out.push_str(&serde_json::to_string(&goals).unwrap_or_else(|_| "[]".into()));
+    }
+    out
 }
 
 /// The first line of a wake message after its priority: why it came.
@@ -1137,6 +1178,8 @@ mod tests {
             login: false,
             wake_id: "w".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: vec![],
         };
         assert!(wake_message(lg, &ctx).contains("act with mud__mud_command"));
@@ -1207,6 +1250,8 @@ mod tests {
             login: false,
             wake_id: "w".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: vec![crate::wakes::Booking {
                 id: 1,
                 due_ms: 0,
@@ -1240,6 +1285,8 @@ mod tests {
             login: false,
             wake_id: "w".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: vec![crate::wakes::Booking {
                 id: 7,
                 due_ms: 0,
@@ -1288,6 +1335,8 @@ mod tests {
             login: false,
             wake_id: "w".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: vec![],
         }
     }

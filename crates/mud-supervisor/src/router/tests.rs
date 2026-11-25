@@ -1199,3 +1199,24 @@ fn a_booking_merges_into_a_pending_room_batch() {
         "nothing else waits for marta"
     );
 }
+
+#[test]
+fn a_claim_holds_only_an_idle_entity_and_starts_no_cooldown() {
+    let mut r = Router::new(RouterConfig::default());
+    let torin = id("torin");
+    assert!(r.claim(&torin), "idle: claimed");
+    assert!(r.is_busy(&torin));
+    assert!(!r.claim(&torin), "claimed already");
+    // A wake queued meanwhile waits for the release.
+    r.force(&torin, Priority::Immediate, "test", 10);
+    assert!(r.due_where(10, |_| true).is_empty(), "busy: nothing due");
+    r.release(&torin);
+    assert!(!r.is_busy(&torin));
+    assert!(!r.claim(&torin), "a waiting wake: not idle");
+    let due = r.due_where(10, |_| true);
+    assert_eq!(due.len(), 1, "no cooldown from the claim");
+    r.finish(&torin, 20);
+    assert!(r.claim(&torin));
+    r.release(&torin);
+    assert!(r.is_idle(&torin));
+}

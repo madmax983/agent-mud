@@ -311,6 +311,24 @@ impl Router {
             && !self.resumes.contains_key(entity)
     }
 
+    /// Marks an idle `entity` busy for a short owner task of the Steward
+    /// (a spend settle), so no wake starts meanwhile. Returns whether it
+    /// was idle and is now claimed; a claim never starts a cooldown.
+    pub fn claim(&mut self, entity: &EntityId) -> bool {
+        if self.is_idle(entity) {
+            self.busy.insert(entity.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ends a [`Router::claim`]: the entity is free, and no cooldown
+    /// starts, since no wake ran.
+    pub fn release(&mut self, entity: &EntityId) {
+        self.busy.remove(entity);
+    }
+
     /// Queues a plan resume for `entity`. It is delivered as a wake of its
     /// own as soon as the entity is free and online, ahead of any wake
     /// waiting ([`Router::resumes_due`]).

@@ -301,6 +301,8 @@ mod tests {
             login: false,
             wake_id: "w1".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: Vec::new(),
         };
         let r = mind
@@ -394,6 +396,8 @@ mod tests {
             login: false,
             wake_id: "w1".into(),
             now_ms: 0,
+            goals: Vec::new(),
+            steward: Vec::new(),
             booked: Vec::new(),
         };
         let tools = MudTools::new(Arc::clone(&game), typing, guard.clone());

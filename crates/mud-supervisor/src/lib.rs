@@ -22,5 +22,6 @@ pub mod replay;
 pub mod router;
 pub mod runtime;
 pub mod scripted;
+pub mod steward;
 pub mod turing;
 pub mod wakes;
