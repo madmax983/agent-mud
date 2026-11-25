@@ -124,6 +124,41 @@ fn information_is_local() {
 }
 
 #[test]
+fn a_roomless_event_keeps_where_its_parties_stood() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    ok(&mut w, &ada, "say evening");
+    ok(&mut w, &ada, "tell marta got a room?");
+    let evs = w.events_since(&id("marta"), Seq(0), 50);
+    let tell = evs.iter().find(|e| e.kind == EventKind::Tell).unwrap();
+    assert_eq!(
+        tell.party_rooms,
+        vec![
+            RoomId::from("rusty_flagon_taproom"),
+            RoomId::from("town_square")
+        ],
+        "sorted, the sender's and the recipient's rooms"
+    );
+    let said = w.events_since(&ada, Seq(0), 50);
+    let said = said.iter().find(|e| e.kind == EventKind::Speech).unwrap();
+    assert!(
+        said.party_rooms.is_empty(),
+        "an event with a room needs none"
+    );
+    // No entity view shows where the sender stands.
+    let view = tell.view_for(&id("marta"));
+    assert!(view.get("party_rooms").is_none(), "{view}");
+    assert!(!view.to_string().contains("town_square"), "{view}");
+    // A log written before the field existed still loads.
+    let mut old = serde_json::to_value(tell).unwrap();
+    old.as_object_mut().unwrap().remove("party_rooms");
+    let back: Event = serde_json::from_value(old).unwrap();
+    assert_eq!(back.party_rooms, Vec::<RoomId>::new());
+    let text = serde_json::to_string(said).unwrap();
+    assert!(!text.contains("party_rooms"), "{text}");
+}
+
+#[test]
 fn speech_is_quarantined_from_server_text() {
     let mut w = world();
     let ada = w.login("ada", 1).unwrap();

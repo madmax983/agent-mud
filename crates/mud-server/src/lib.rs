@@ -239,11 +239,18 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         cfg.world.seed,
         cfg.supervisor.typing_scale,
     );
+    // The open order (ADR 0002, ADR 0011): the world and its side rows
+    // first. Each agent's MCP token starts at its replay floor, the floor
+    // the supervisor replays above, so `mud_events` after a restart hands
+    // out nothing a committed wake consumed and skips nothing after it.
+    let restored = game.take_restored().unwrap_or_default();
+    let last = game.read(mud_world::World::last_seq);
     let tokens = Arc::new(TokenRegistry::new());
     let minds = minds::build(
         cfg,
         &pack,
         &tokens,
+        &|e| mud_supervisor::replay::boot_floor(&restored, e, last),
         scripts
             .as_ref()
             .map(|host| minds::MindScripts { host, game: &game }),
@@ -260,10 +267,8 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         catchup_spread_ms: s.catchup_spread_ms,
         ..SupervisorConfig::default()
     };
-    // The open order (ADR 0002, ADR 0011): the world and its side rows
-    // first, then the supervisor restores the rows (bookings, the macro
-    // schedule, rule counters, plans to resume).
-    let restored = game.take_restored().unwrap_or_default();
+    // Then the supervisor restores the rows (bookings, the macro schedule,
+    // rule counters, plans to resume) and derives the router.
     let sup = Supervisor::open(
         Arc::clone(&game),
         typing,
@@ -786,6 +791,43 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 2);
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_each_agent_token_starts_at_its_replay_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = MudConfig::default();
+        cfg.world.db = Some(dir.path().join("world.db"));
+        cfg.accounts.bcrypt_cost = 4;
+        cfg.minds.persistent = crate::config::Runtime::Littleguy;
+        cfg.littleguy.data_dir = dir.path().join("agents");
+        let torin = EntityId::from("torin");
+        let (tell, last) = {
+            let built = build(&cfg).await.unwrap();
+            let game = &built.mud.game;
+            let ada = game.login("ada").unwrap();
+            assert!(game.execute(&ada, "tell torin got ore").ok);
+            let tell = game.read(mud_world::World::last_seq);
+            assert!(game.execute(&ada, "say evening").ok);
+            // What torin's committed wake leaves: its consume.
+            assert_eq!(
+                game.persist(vec![mud_world::SideOp::SeenSeq {
+                    entity: torin.clone(),
+                    seq: tell.0,
+                }]),
+                mud_world::Durability::Durable
+            );
+            (tell, game.read(mud_world::World::last_seq))
+        };
+        let built = build(&cfg).await.unwrap();
+        assert_eq!(built.tokens.cursors_of(&torin), [tell]);
+        assert_eq!(built.mud.sup.seen_seq(&torin), Some(tell));
+        for e in ["marta", "vich"] {
+            let e = EntityId::from(e);
+            let floor = built.mud.sup.seen_seq(&e).unwrap();
+            assert_eq!(built.tokens.cursors_of(&e), [floor], "{e}");
+            assert!(floor <= last, "{e}: never past the world");
+        }
     }
 
     #[test]

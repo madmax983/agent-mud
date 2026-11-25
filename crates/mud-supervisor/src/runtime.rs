@@ -19,6 +19,12 @@
 //! kernels); at boot the stored tallies come back, and each ledger mind
 //! primes its meter, so a restart neither bills a ledger row twice nor
 //! forgets today's spend, and the breaker stands where it stood.
+//!
+//! What changes at event rate is derived, not stored (phase 4,
+//! [`crate::replay`]): at boot the router folds the reloaded event log into
+//! its chatter counters and queues an Immediate wake for each addressed
+//! event that no committed wake of its recipient consumed and that is at
+//! most `replay_max_age_ms` old.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mud_world::pack::Tier;
-use mud_world::side::{BookingRow, MacroRow, PlanRow, SideState, macro_consume, macro_queue};
+use mud_world::side::{
+    BookingRow, EntityRow, MacroRow, PlanRow, SideState, macro_consume, macro_queue,
+};
 use mud_world::{EntityId, Event, EventKind, Game, Seq, SideOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,6 +46,7 @@ use crate::gate::Gate;
 use crate::held::{assert_none_held, lock};
 use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
 use crate::persist::{DaySpend, macro_open, plan_resume, restore_macro, wake_id_key};
+use crate::replay::replay_floor;
 use crate::router::{EntityRuntime, Priority, Resume, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::{FallbackMind, PlanMind};
 use crate::turing::{Afk, in_session, mix, pick};
@@ -63,7 +72,8 @@ pub struct SupervisorConfig {
     /// The bound on one wake, in ms.
     pub wake_timeout_ms: u64,
     /// A reactive plan (one a wake made that carried no macro tick, booking
-    /// or login) older than this at boot is abandoned, not resumed. An
+    /// or login) older than this at boot is abandoned, not resumed, and an
+    /// addressed event older than this is not replayed (phase 4). An
     /// errand resumes however long the server was down.
     #[serde(default = "default_replay_max_age_ms")]
     pub replay_max_age_ms: u64,
@@ -196,7 +206,8 @@ struct EntityState {
     /// boot delivers it, under its number, without queuing another.
     owed_at_boot: bool,
     next_macro_ms: u64,
-    /// The last event seq a wake carried.
+    /// The replay floor at boot ([`replay_floor`]), then the last event
+    /// seq a wake of this process carried.
     seen_seq: u64,
     last_wake: Option<(Priority, String, u64)>,
     wakes: u64,
@@ -235,7 +246,7 @@ pub struct Supervisor {
     /// dice of a Rhai mind seeded by it, never depend on other entities'
     /// wakes or on which task the scheduler runs first.
     wake_n: Mutex<HashMap<EntityId, u64>>,
-    /// What the boot reconcile dropped or abandoned, kept for observers
+    /// What the boot reconcile dropped, abandoned or replayed, kept for observers
     /// that subscribe after [`Supervisor::open`] (see
     /// [`Supervisor::boot_report`]).
     boot_report: Mutex<Vec<Arc<ObserverEvent>>>,
@@ -434,7 +445,6 @@ impl Supervisor {
                 let Some(s) = st.get_mut(e) else { continue };
                 s.macro_row = row.macro_row;
                 s.owed_at_boot = row.macro_row.queued > row.macro_row.cleared;
-                s.seen_seq = row.seen_seq;
                 if let Some(next) = row.next_macro_ms {
                     let h = mix(
                         self.cfg.seed,
@@ -461,9 +471,73 @@ impl Supervisor {
         }
         self.reconcile_bookings(bookings.into_values(), next_booking_id, now, &mut ops);
         self.reconcile_plans(plans, now, &mut ops);
+        self.replay(&entities, now, &mut ops);
         if !ops.is_empty() {
             self.game.persist(ops);
         }
+    }
+
+    /// Derives the router from the reloaded event log (ADR 0011, phase 4):
+    /// the chatter counters, and an Immediate wake for each addressed event
+    /// no committed wake of its recipient consumed (after the recipient's
+    /// [`replay_floor`]) that is at most `replay_max_age_ms` old. The
+    /// decisions are published and kept in the boot report.
+    ///
+    /// An agent with no stored row gets one at the world's last seq, so
+    /// the floor its MCP token was issued at ([`crate::replay::boot_floor`])
+    /// stands at the next boot too. Nothing else raises a floor here: an
+    /// event left unreplayed is still handed out by `mud_events`.
+    fn replay(&self, entities: &BTreeMap<EntityId, EntityRow>, now: u64, ops: &mut Vec<SideOp>) {
+        let last = self.game.read(|w| w.last_seq().0);
+        let floors: HashMap<EntityId, u64> = self
+            .minds
+            .keys()
+            .map(|e| {
+                let row = entities.get(e);
+                let floor = replay_floor(row.is_some(), row.map_or(0, |r| r.seen_seq), last);
+                if row.is_none() {
+                    ops.push(SideOp::SeenSeq {
+                        entity: e.clone(),
+                        seq: floor,
+                    });
+                }
+                (e.clone(), floor)
+            })
+            .collect();
+        {
+            let mut st = lock(&self.state);
+            for (e, f) in &floors {
+                if let Some(s) = st.get_mut(e) {
+                    s.seen_seq = *f;
+                }
+            }
+        }
+        let rt = self.runtimes(now);
+        let max_age = self.cfg.replay_max_age_ms;
+        // An entity without a mind has nothing to wake: its floor is the
+        // last seq.
+        let notes = self.game.read(|w| {
+            lock(&self.router).replay(
+                w,
+                &rt,
+                now,
+                |e| floors.get(e).copied().unwrap_or(last),
+                max_age,
+            )
+        });
+        for n in notes {
+            if let RouteNote::Queued { entity, seq, .. } = &n {
+                tracing::info!(entity = %entity, seq = seq.0, "an addressed event was replayed at boot");
+            }
+            self.report(ObserverEvent::Route(n));
+        }
+    }
+
+    /// The seen seq of `entity`: its replay floor at boot (where its MCP
+    /// cursor started), then the last event a wake of this process carried.
+    #[must_use]
+    pub fn seen_seq(&self, entity: &EntityId) -> Option<Seq> {
+        lock(&self.state).get(entity).map(|s| Seq(s.seen_seq))
     }
 
     /// Restores the bookings: each waits, fires when its entity is ready,
@@ -594,8 +668,9 @@ impl Supervisor {
         self.observer.subscribe()
     }
 
-    /// What the boot reconcile dropped (bookings too late to fire) and
-    /// abandoned (reactive plans too old to resume), in order. It happened
+    /// What the boot reconcile dropped (bookings too late to fire),
+    /// abandoned (reactive plans too old to resume) and replayed (the
+    /// routing of addressed events, phase 4), in order. It happened
     /// inside [`Supervisor::open`], before anyone could subscribe, so an
     /// observer shows it ahead of the live feed.
     #[must_use]
@@ -1245,5 +1320,7 @@ fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>
 mod budget_tests;
 #[cfg(test)]
 mod persist_tests;
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod tests;

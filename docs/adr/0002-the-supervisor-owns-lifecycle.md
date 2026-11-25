@@ -99,7 +99,12 @@ sequenceDiagram
   its daemon's ledger once and marks every row seen, and the ledger tally
   rises to what the ledger holds of today; a harvest mind gets back the
   token count it was charged up to. Wake ids are `wake-{epoch:016x}-{boot}-{entity}-{n}`, so a
-  wake is never redelivered under an id littleguy has seen.
+  wake is never redelivered under an id littleguy has seen. The server
+  takes the side rows before it builds the minds (phase 4): each littleguy
+  agent's MCP token is issued at its replay floor
+  (`mud_supervisor::replay::boot_floor`), the same floor `Supervisor::open`
+  then replays above when it derives the router's waiting wakes and the
+  chatter counters from the event log (ADR 0003).
 - **Settle before close.** A wake's turn closes, and its entity is free
   for the next wake, only when the mind has really finished
   (`Mind::settled`): a littleguy op is read and charged or its grace ran

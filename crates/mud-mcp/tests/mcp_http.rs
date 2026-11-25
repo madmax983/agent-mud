@@ -311,6 +311,34 @@ mod http {
     }
 
     #[tokio::test]
+    async fn a_token_issued_at_a_cursor_reads_on_after_it() {
+        // After a restart the server issues an agent's token at its replay
+        // floor (ADR 0011): the last event a committed wake consumed.
+        let server = start(game(), direct).await;
+        let bob = server.game.login("bob").unwrap();
+        let ada = server.game.login("ada").unwrap();
+        let ada_client = server.client(&server.issue(&ada)).await;
+        call(&ada_client, "mud_command", json!({ "cmd": "say one" })).await;
+        let floor = server.game.events(&bob, mud_world::Seq(0), 100)["cursor"]
+            .as_u64()
+            .unwrap();
+        call(&ada_client, "mud_command", json!({ "cmd": "say two" })).await;
+        let token = server
+            .tokens
+            .issue_at(bob.clone(), mud_world::Seq(floor))
+            .unwrap();
+        let bob_client = server.client(&token).await;
+        let first = call(&bob_client, "mud_events", json!({})).await;
+        assert_eq!(texts(&first), ["two"], "nothing at or below the floor");
+        call(&ada_client, "mud_command", json!({ "cmd": "say three" })).await;
+        let next = call(&bob_client, "mud_events", json!({})).await;
+        assert_eq!(texts(&next), ["three"], "and nothing after it is skipped");
+        for c in [ada_client, bob_client] {
+            c.cancel().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn missing_wrong_and_revoked_tokens_get_401() {
         let server = start(game(), direct).await;
         let ada = server.game.login("ada").unwrap();

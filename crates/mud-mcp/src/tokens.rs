@@ -69,6 +69,18 @@ impl TokenRegistry {
     /// # Errors
     /// The operating system gives no randomness.
     pub fn issue(&self, entity: EntityId) -> Result<String, TokenError> {
+        self.issue_at(entity, Seq(0))
+    }
+
+    /// Issues a fresh token that acts as `entity`, whose `mud_events`
+    /// cursor starts after `cursor`. After a restart the server passes the
+    /// agent's replay floor (ADR 0011): the last event a committed wake of
+    /// it consumed, so the agent is handed nothing it consumed before the
+    /// restart and misses nothing after it.
+    ///
+    /// # Errors
+    /// The operating system gives no randomness.
+    pub fn issue_at(&self, entity: EntityId, cursor: Seq) -> Result<String, TokenError> {
         let mut bytes = [0_u8; TOKEN_BYTES];
         getrandom::fill(&mut bytes)?;
         let token: String = bytes
@@ -76,13 +88,7 @@ impl TokenRegistry {
             .flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 0xf)]])
             .map(char::from)
             .collect();
-        self.lock().insert(
-            token.clone(),
-            Grant {
-                entity,
-                cursor: Seq(0),
-            },
-        );
+        self.lock().insert(token.clone(), Grant { entity, cursor });
         Ok(token)
     }
 
@@ -103,6 +109,18 @@ impl TokenRegistry {
     #[must_use]
     pub fn resolve(&self, token: &str) -> Option<EntityId> {
         self.lock().get(token).map(|g| g.entity.clone())
+    }
+
+    /// Where `mud_events` resumes, for each live token of `entity`, when it
+    /// names no `since_seq`; in no particular order. The tokens themselves
+    /// stay hidden.
+    #[must_use]
+    pub fn cursors_of(&self, entity: &EntityId) -> Vec<Seq> {
+        self.lock()
+            .values()
+            .filter(|g| &g.entity == entity)
+            .map(|g| g.cursor)
+            .collect()
     }
 
     /// How many tokens are live.
@@ -193,6 +211,21 @@ mod tests {
         let other = EntityId::from("pc_kestrel");
         assert_eq!(reg.advance_cursor(&a, &other, |c| (c, c)), None);
         assert_eq!(reg.advance_cursor("nope", &ada, |c| (c, c)), None);
+    }
+
+    #[test]
+    fn a_token_issued_at_a_cursor_reads_on_from_it() {
+        let reg = TokenRegistry::new();
+        let ada = EntityId::from("ada");
+        let a = reg.issue_at(ada.clone(), Seq(42)).unwrap();
+        assert_eq!(reg.cursors_of(&ada), [Seq(42)]);
+        assert_eq!(reg.advance_cursor(&a, &ada, |c| (c, c)), Some(Seq(42)));
+        let b = reg.issue(ada.clone()).unwrap();
+        let mut both = reg.cursors_of(&ada);
+        both.sort();
+        assert_eq!(both, [Seq(0), Seq(42)]);
+        assert!(reg.revoke(&b));
+        assert_eq!(reg.cursors_of(&EntityId::from("nope")), Vec::<Seq>::new());
     }
 
     #[test]

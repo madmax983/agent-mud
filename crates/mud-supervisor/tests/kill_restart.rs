@@ -220,6 +220,23 @@ impl Mind for Stall {
     }
 }
 
+/// A mind that answers every wake aloud.
+#[derive(Debug)]
+struct Answer;
+
+impl Mind for Answer {
+    fn kind(&self) -> &'static str {
+        "answer"
+    }
+
+    fn wake(&self, _: WakeContext, tools: MudTools) -> BoxFuture<'_, Result<MindReply, MindError>> {
+        Box::pin(async move {
+            tools.command("say aye").await;
+            Ok(MindReply::default())
+        })
+    }
+}
+
 fn recording(dir: &Path, inner: Arc<dyn Mind>) -> Arc<dyn Mind> {
     Arc::new(Recording {
         inner,
@@ -239,7 +256,8 @@ async fn child(point: &str, dir: &Path) {
         .parse()
         .unwrap();
     let mind = match point {
-        "idle" => recording(dir, Arc::new(Stall(dir.to_path_buf()))),
+        "idle" | "tell-open" => recording(dir, Arc::new(Stall(dir.to_path_buf()))),
+        "tell-pending" | "tell-answered" => recording(dir, Arc::new(Answer)),
         _ => recording(dir, scripted()),
     };
     let mut p = open(dir, now, mind);
@@ -266,6 +284,7 @@ async fn child(point: &str, dir: &Path) {
             p.run_for(1_000, 500).await;
         }
         "retention" => retention_child(&p, dir),
+        "tell-pending" | "tell-open" | "tell-answered" => tell_child(point, &mut p, dir).await,
         "spend" => {
             // Past 80% of the default 400 000: soft. Stored at once.
             p.sup.record_spend(
@@ -296,6 +315,34 @@ async fn child(point: &str, dir: &Path) {
             p.run_for(5_000, 500).await;
         }
     }
+}
+
+/// A human tells torin something; the kill comes before torin's wake is
+/// taken (`tell-pending`), as it opens (`tell-open`), or once its answer
+/// committed (`tell-answered`). The marker is the tell's seq.
+async fn tell_child(point: &str, p: &mut Proc, dir: &Path) {
+    let ada = p.game.login("ada").unwrap();
+    assert!(p.game.execute(&ada, "tell torin got ore?").ok);
+    let tell = p.game.read(|w| w.last_seq().0);
+    match point {
+        "tell-pending" => {
+            mark(dir, &tell.to_string());
+            stop_here();
+        }
+        "tell-answered" => {
+            let at = dir.to_path_buf();
+            p.game
+                .set_commit_probe(Some(Arc::new(move |actor: &EntityId| {
+                    if *actor == torin() {
+                        mark(&at, &tell.to_string());
+                        stop_here();
+                    }
+                })));
+        }
+        _ => {}
+    }
+    // `tell-open`: the stall marks (its own text) as the wake opens.
+    p.run_for(5_000, 500).await;
 }
 
 /// How many events the retention child writes: past the newest
@@ -611,6 +658,60 @@ async fn kill_with_local_spend_flushed() {
     );
     assert_eq!((spend.local.calls, spend.local.cost_usd_micros), (3, 1_234));
     after_restart(dir.path(), &p, &[]);
+}
+
+/// What torin said aloud, from the stored events.
+fn ayes(p: &Proc) -> usize {
+    p.game.events(&torin(), mud_world::Seq(0), 1_000)["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["actor"]["id"] == "torin" && e["untrusted_text"] == "aye")
+        .count()
+}
+
+/// A tell killed at `point` is answered once after the restart, within
+/// the replay window, and a third process replays nothing.
+async fn kill_in_a_tell(point: &str, replayed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let marked = kill_at(point, dir.path(), T0, Duration::ZERO);
+    let mut p = open(dir.path(), T0 + 1_000, Arc::new(Answer));
+    let queued = p.sup.boot_report().iter().any(|e| {
+        matches!(&**e, ObserverEvent::Route(mud_supervisor::router::RouteNote::Queued { entity, .. }) if *entity == torin())
+    });
+    assert_eq!(queued, replayed, "{point}: {marked}");
+    p.run_for(5_000, 500).await;
+    assert_eq!(ayes(&p), 1, "{point}: answered once");
+    let started = p.started();
+    assert_eq!(started.len(), usize::from(replayed), "{point}: {started:?}");
+    if replayed {
+        assert!(started[0].1.starts_with("replayed tell"), "{started:?}");
+    }
+    let ids: Vec<String> = started.into_iter().map(|s| s.0).collect();
+    after_restart(dir.path(), &p, &ids);
+    drop(p);
+    let mut p = open(dir.path(), T0 + 8_000, Arc::new(Answer));
+    p.run_for(5_000, 500).await;
+    assert!(
+        p.started().is_empty(),
+        "{point}: a third boot replays nothing"
+    );
+    assert_eq!(ayes(&p), 1, "{point}");
+}
+
+#[tokio::test]
+async fn kill_before_a_tell_is_taken() {
+    kill_in_a_tell("tell-pending", true).await;
+}
+
+#[tokio::test]
+async fn kill_as_a_tell_wake_opens() {
+    kill_in_a_tell("tell-open", true).await;
+}
+
+#[tokio::test]
+async fn kill_after_a_tell_is_answered() {
+    kill_in_a_tell("tell-answered", false).await;
 }
 
 #[test]

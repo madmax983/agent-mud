@@ -2,20 +2,13 @@
 
 Planned work that a decision already shapes. Nothing here is built yet.
 
-## Runtime persistence, phase 4 (ADR 0011)
-
-Phases 1 (store v1), 2 (kernels and resumes) and 3 (budgets) are built:
-the versioned schema, epoch and boot, side ops, turns and lanes, the
-backlog of a failing store, events retention with an archive, `truncated`
-in `mud_events`; persisted bookings, macro schedule and count, wake ids
-from `(epoch, boot, n)`, settle before close, plans that resume at their
-cursor (an errand after any outage, a reactive plan within 120 s), rule
-counters by digest, the kill-and-restart test; the local and littleguy
-tallies joined by UTC day, ledger priming, `harvest_tokens_seen`, and
-HarvestMind's continue-as-new and `purge_with`. Next:
-
-- **Boot derivations.** Immediate-only replay of addressed events, the
-  chatter fold over the event tail, MCP cursors from `seen_seq`.
+Runtime persistence (ADR 0011) is built, all four phases: the versioned
+store, its side rows and turns, events retention with an archive; persisted
+bookings, the macro schedule and count, wake ids that never repeat, plans
+that resume at their cursor; budgets that survive a restart; and the boot
+derivations (Immediate-only replay of addressed events, the chatter fold
+over the event log, MCP cursors from each agent's replay floor). What
+follows builds on it.
 
 ## Admin rollback
 

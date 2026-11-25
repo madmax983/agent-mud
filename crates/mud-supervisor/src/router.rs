@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::BudgetLevel;
 use crate::chatter::{ChatterInput, MAX_AGENT_ONLY_TURNS, RoomChatter};
+use crate::replay::replay_due;
 use crate::turing::{Salience, has_keyword, mix, notices, pick};
 
 /// How urgent a wake is. Higher wins when wakes merge.
@@ -168,6 +169,32 @@ pub struct Router {
     busy: BTreeSet<EntityId>,
     /// Plans to resume, each delivered alone before the entity's next wake.
     resumes: BTreeMap<EntityId, Resume>,
+    /// The chatter count of a room the router has not seen yet: 0, or the
+    /// bound after a boot whose log does not reach the world's first event
+    /// (see [`Router::replay`]).
+    unseen_turns: u8,
+}
+
+/// Where the chatter counter reads whether a player saw an agent's event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    /// The world as it is now: a live event.
+    Live,
+    /// The event's recipients: a reloaded event, whose players may be gone.
+    Recipients,
+}
+
+/// Which recipients of a reloaded event [`Router::replay`] considers.
+type ReplayFilter<'a> = dyn Fn(&EntityId, &Event) -> bool + 'a;
+
+/// Why a wake was queued, for the observer.
+fn reason(ev: &Event, replayed: bool) -> String {
+    format!(
+        "{}{} by {}",
+        if replayed { "replayed " } else { "" },
+        ev.kind.name(),
+        ev.actor.as_ref().map_or("world", |a| a.name.as_str())
+    )
 }
 
 /// Whether `text` names the entity, as a whole word.
@@ -204,7 +231,9 @@ impl Router {
     /// The anti-chatter count of a room.
     #[must_use]
     pub fn agent_only_turns(&self, room: &RoomId) -> u8 {
-        self.rooms.get(room).map_or(0, |r| r.agent_only_turns)
+        self.rooms
+            .get(room)
+            .map_or(self.unseen_turns, |r| r.agent_only_turns)
     }
 
     /// The entities with a wake waiting.
@@ -273,18 +302,43 @@ impl Router {
         }
     }
 
-    /// Reads one event. Returns what was decided for each recipient.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one pass over the decision table reads best"
-    )]
-    pub fn observe(
-        &mut self,
-        ev: &Event,
-        world: &World,
-        rt: &HashMap<EntityId, EntityRuntime>,
-        now: u64,
-    ) -> Vec<RouteNote> {
+    /// The chatter counter of `room`. A room the router has not seen
+    /// starts at [`Router::replay`]'s guess for a history it cannot read:
+    /// 0 in a fresh world, held (the bound) otherwise.
+    fn room(&mut self, room: &RoomId) -> &mut RoomChatter {
+        let unseen = self.unseen_turns;
+        self.rooms.entry(room.clone()).or_insert(RoomChatter {
+            agent_only_turns: unseen,
+        })
+    }
+
+    /// Counts an agent event whose rooms are unknown (a reloaded tell from
+    /// a log that predates `Event::party_rooms`). An agent-alone one may
+    /// have counted in any room, so every room, seen or not, holds at the
+    /// bound until a human or a macro-tick resets it, and the event wakes
+    /// no other agent: the safe direction (`lemma_fold_holds_at_least`).
+    fn hold_everywhere(&mut self, input: ChatterInput) -> bool {
+        if input != ChatterInput::AgentAlone {
+            return true;
+        }
+        let max = self.cfg.max_agent_only_turns;
+        for room in self.rooms.values_mut() {
+            room.agent_only_turns = room.agent_only_turns.max(max);
+        }
+        self.unseen_turns = self.unseen_turns.max(max);
+        false
+    }
+
+    /// Steps the anti-chatter counters for `ev`. Returns whether its actor
+    /// is an agent-played NPC and whether it may wake other agents.
+    ///
+    /// Whether a player saw an agent's event is read from the world as it
+    /// is now (`Presence::Live`), or, for a reloaded event, from its
+    /// recipients (`Presence::Recipients`): at boot no human is online, so
+    /// the world would show no one. A player who was there but is not a
+    /// recipient makes the event count as an agent alone: more holding, the
+    /// safe direction (`lemma_fold_holds_at_least`).
+    fn chatter(&mut self, ev: &Event, world: &World, presence: Presence) -> (bool, bool) {
         let actor = ev.actor.as_ref().and_then(|a| world.entity(&a.id));
         // An agent here is an agent-played NPC. A player character counts
         // as a player whoever plays it, so an agent PC resets the room and
@@ -293,13 +347,25 @@ impl Router {
             && actor.is_some_and(|a| {
                 !a.human && matches!(a.tier, Tier::Ambient | Tier::Persistent | Tier::Turing)
             });
+        let player_saw = || {
+            ev.recipients
+                .iter()
+                .filter(|r| !ev.is_by(r))
+                .filter_map(|r| world.entity(r))
+                .any(|e| e.kind == EntityKind::Player)
+        };
+        let max = self.cfg.max_agent_only_turns;
         let allow_cross = if let Some(room) = &ev.room
             && ev.kind != EventKind::SelfControlNudge
         {
             let input = if ev.player_actor {
                 ChatterInput::Human
             } else if actor_is_agent {
-                if world.player_present(room) {
+                let here = match presence {
+                    Presence::Live => world.player_present(room),
+                    Presence::Recipients => player_saw(),
+                };
+                if here {
                     ChatterInput::AgentWithHuman
                 } else {
                     ChatterInput::AgentAlone
@@ -307,39 +373,139 @@ impl Router {
             } else {
                 ChatterInput::World
             };
-            self.rooms
-                .entry(room.clone())
-                .or_default()
-                .step(input, self.cfg.max_agent_only_turns)
+            self.room(room).step(input, max)
         } else if ev.room.is_none()
             && actor_is_agent
             && let Some(a) = actor
         {
-            // A roomless agent event (a tell) still counts, in the room of
-            // the actor and of each party it reaches: agent-only unless a
-            // human is with one of them.
-            let rooms: BTreeSet<&RoomId> = std::iter::once(&a.room)
-                .chain(
-                    ev.recipients
-                        .iter()
-                        .filter(|r| !ev.is_by(r))
-                        .filter_map(|r| world.entity(r))
-                        .map(|t| &t.room),
+            // A roomless agent event (a tell) still counts, in the rooms
+            // its parties stood in when it happened: agent-only unless a
+            // human is with one of them. The engine records those rooms on
+            // the event, so a boot counts it where the live counter did,
+            // however far the parties have walked since.
+            let rooms: Option<BTreeSet<RoomId>> = if !ev.party_rooms.is_empty() {
+                Some(ev.party_rooms.iter().cloned().collect())
+            } else if presence == Presence::Live {
+                Some(
+                    std::iter::once(&a.room)
+                        .chain(
+                            ev.recipients
+                                .iter()
+                                .filter(|r| !ev.is_by(r))
+                                .filter_map(|r| world.entity(r))
+                                .map(|t| &t.room),
+                        )
+                        .cloned()
+                        .collect(),
                 )
-                .collect();
-            let input = if rooms.iter().any(|room| world.player_present(room)) {
+            } else {
+                // A log written before the engine recorded the rooms: the
+                // positions now say nothing about where the parties were.
+                None
+            };
+            let here = match (presence, &rooms) {
+                (Presence::Live, Some(rooms)) => {
+                    rooms.iter().any(|room| world.player_present(room))
+                }
+                _ => player_saw(),
+            };
+            let input = if here {
                 ChatterInput::AgentWithHuman
             } else {
                 ChatterInput::AgentAlone
             };
-            let max = self.cfg.max_agent_only_turns;
-            rooms.into_iter().fold(true, |allow, room| {
-                let ok = self.rooms.entry(room.clone()).or_default().step(input, max);
-                allow && ok
-            })
+            match rooms {
+                Some(rooms) => rooms.iter().fold(true, |allow, room| {
+                    let ok = self.room(room).step(input, max);
+                    allow && ok
+                }),
+                None => self.hold_everywhere(input),
+            }
         } else {
             true
         };
+        (actor_is_agent, allow_cross)
+    }
+
+    /// Reads one event. Returns what was decided for each recipient.
+    pub fn observe(
+        &mut self,
+        ev: &Event,
+        world: &World,
+        rt: &HashMap<EntityId, EntityRuntime>,
+        now: u64,
+    ) -> Vec<RouteNote> {
+        let (actor_is_agent, allow_cross) = self.chatter(ev, world, Presence::Live);
+        self.route(ev, world, rt, now, actor_is_agent, allow_cross, None)
+    }
+
+    /// Derives the router at boot from the reloaded event log (ADR 0011,
+    /// phase 4).
+    ///
+    /// - **Chatter.** Every logged event is folded, oldest first, through
+    ///   the counters ([`crate::chatter::chatter_step`]), reading presence
+    ///   from its recipients. A macro-tick reset is not an event, so the
+    ///   fold can only hold more than the live counters did. A roomless
+    ///   event counts in the rooms recorded on it (`Event::party_rooms`),
+    ///   where the live counter counted it; one from an older log, which
+    ///   lacks them, holds every room. When the log does not reach back to
+    ///   the world's first event, a room's count before its first logged
+    ///   event is unknown and starts held (at the bound), and so does a
+    ///   room the log never shows: only a human or a macro-tick opens it
+    ///   again.
+    /// - **Replay.** For each logged event that [`crate::replay::replay_due`]
+    ///   accepts for a recipient (after `floor(recipient)`, at most
+    ///   `max_age_ms` old), the router queues the recipient's wake exactly
+    ///   as [`Router::observe`] would, but only an Immediate one (a tell,
+    ///   an attack on it, speech naming it); the anti-chatter rule drops
+    ///   what it would have dropped. No room batch and no ambient wake is
+    ///   replayed.
+    ///
+    /// Returns the routing decisions of the replay.
+    pub fn replay(
+        &mut self,
+        world: &World,
+        rt: &HashMap<EntityId, EntityRuntime>,
+        now: u64,
+        floor: impl Fn(&EntityId) -> u64,
+        max_age_ms: u64,
+    ) -> Vec<RouteNote> {
+        let whole = world
+            .oldest_logged()
+            .map_or_else(|| world.last_seq().0 == 0, |s| s.0 <= 1);
+        self.unseen_turns = if whole {
+            0
+        } else {
+            self.cfg.max_agent_only_turns
+        };
+        let due =
+            |r: &EntityId, ev: &Event| replay_due(ev.seq.0, ev.at_ms, floor(r), now, max_age_ms);
+        let mut notes = Vec::new();
+        for ev in world.logged() {
+            let (actor_is_agent, allow_cross) = self.chatter(ev, world, Presence::Recipients);
+            notes.extend(self.route(ev, world, rt, now, actor_is_agent, allow_cross, Some(&due)));
+        }
+        notes
+    }
+
+    /// Decides, for each recipient of `ev`, whether and when it wakes.
+    /// With `replay`, only the recipients it accepts are considered, and
+    /// only for an Immediate wake.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        reason = "one pass over the decision table reads best"
+    )]
+    fn route(
+        &mut self,
+        ev: &Event,
+        world: &World,
+        rt: &HashMap<EntityId, EntityRuntime>,
+        now: u64,
+        actor_is_agent: bool,
+        allow_cross: bool,
+        replay: Option<&ReplayFilter<'_>>,
+    ) -> Vec<RouteNote> {
         let haystack = format!(
             "{} {}",
             ev.untrusted_text.as_deref().unwrap_or(""),
@@ -358,9 +524,15 @@ impl Router {
             {
                 continue;
             }
+            if replay.is_some_and(|due| !due(r, ev)) {
+                continue;
+            }
             let Some(mut priority) = Self::priority_for(ev, who) else {
                 continue;
             };
+            if replay.is_some() && priority != Priority::Immediate {
+                continue;
+            }
             let drop = |why: &str| RouteNote::Dropped {
                 entity: r.clone(),
                 seq: ev.seq,
@@ -440,11 +612,7 @@ impl Router {
                 seqs: Vec::new(),
                 first_ms: now,
                 due_ms: due.max(floor),
-                reason: format!(
-                    "{} by {}",
-                    ev.kind.name(),
-                    ev.actor.as_ref().map_or("world", |a| a.name.as_str())
-                ),
+                reason: reason(ev, replay.is_some()),
                 macro_tick: false,
                 cooldown_ms: 0,
                 afk_until_ms: None,
@@ -458,11 +626,7 @@ impl Router {
             if priority > p.priority {
                 p.priority = priority;
                 p.due_ms = p.due_ms.min(due);
-                p.reason = format!(
-                    "{} by {}",
-                    ev.kind.name(),
-                    ev.actor.as_ref().map_or("world", |a| a.name.as_str())
-                );
+                p.reason = reason(ev, replay.is_some());
             } else if p.priority == Priority::RoomBatch && priority == Priority::RoomBatch {
                 // Rolling window: each new line pushes the wake back, up to the cap.
                 p.due_ms = due
@@ -500,10 +664,9 @@ impl Router {
                 why: "macro-tick deferred: a player is present".into(),
             };
         }
-        self.rooms
-            .entry(e.room.clone())
-            .or_default()
-            .step(ChatterInput::MacroTick, self.cfg.max_agent_only_turns);
+        let max = self.cfg.max_agent_only_turns;
+        let room = e.room.clone();
+        self.room(&room).step(ChatterInput::MacroTick, max);
         let p = self
             .pending
             .entry(entity.clone())

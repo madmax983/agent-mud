@@ -23,6 +23,7 @@ use mud_accounts::{Accounts, AccountsConfig, Peer, Secret};
 use mud_script::ScriptHost;
 use mud_supervisor::gate::Gate;
 use mud_supervisor::mind::Mind;
+use mud_supervisor::router::RouteNote;
 use mud_supervisor::runtime::{ObserverEvent, Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::{FallbackMind, ScriptedMind};
 use mud_world::hooks::WorldHooks;
@@ -359,6 +360,7 @@ async fn restart_drill() -> anyhow::Result<Vec<String>> {
         home.as_deref() == Some("smithy"),
         "torin did not walk home after the resume: {home:?}"
     );
+    let replayed = tell_drill(&db, &game, rig, DRILL_T0 + 5_000).await?;
     Ok(vec![
         "restart drill: killed after torin's `move e` committed".to_owned(),
         format!(
@@ -371,7 +373,47 @@ async fn restart_drill() -> anyhow::Result<Vec<String>> {
             "restart drill: torin's budget stood at {level:?} with {} tokens",
             spend.local.tokens
         ),
+        replayed,
     ])
+}
+
+/// The tell drill (ADR 0011, phase 4): a human tells torin, and the
+/// process stops before torin's wake runs. The next process, a few seconds
+/// later, replays the tell as an Immediate wake, which consumes it; the
+/// process after that replays nothing.
+async fn tell_drill(db: &Path, game: &Arc<Game>, rig: Rig, at: u64) -> anyhow::Result<String> {
+    let torin = EntityId::from("torin");
+    let ada = game.login("ada").context("ada could not log in")?;
+    let r = game.execute(&ada, "tell torin evening");
+    ensure!(r.ok, "the tell failed: {}", r.narrative);
+    let tell = game.read(World::last_seq);
+    drop(rig);
+    let (game, mut rig) = drill_open(db, at)?;
+    let queued = |sup: &Supervisor| {
+        sup.boot_report().iter().any(|e| {
+            matches!(&**e, ObserverEvent::Route(RouteNote::Queued { entity, seq, .. })
+                if *entity == torin && *seq == tell)
+        })
+    };
+    ensure!(
+        queued(&rig.sup),
+        "the tell was not replayed after the restart"
+    );
+    rig.run_for(2_000).await?;
+    ensure!(
+        rig.sup.seen_seq(&torin) >= Some(tell),
+        "the replayed wake did not run"
+    );
+    drop((game, rig));
+    let (_, rig) = drill_open(db, at + 3_000)?;
+    ensure!(
+        !queued(&rig.sup),
+        "the tell was replayed again after its wake consumed it"
+    );
+    Ok(format!(
+        "restart drill: a tell left unanswered by a stop was replayed once (seq {})",
+        tell.0
+    ))
 }
 
 /// What the drill's first process spends for torin before the kill: past

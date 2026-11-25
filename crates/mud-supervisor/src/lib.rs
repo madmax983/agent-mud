@@ -17,6 +17,7 @@ pub mod ledger;
 pub mod littleguy;
 pub mod mind;
 pub mod persist;
+pub mod replay;
 pub mod router;
 pub mod runtime;
 pub mod scripted;

@@ -66,17 +66,39 @@ stateDiagram-v2
   Hard --> Normal: UTC midnight
 ```
 
-## Amended by ADR 0011: after a restart (phase 4, not built yet)
+## Amended by ADR 0011: after a restart (phase 4)
 
-- **No storm at boot.** Addressed events (a tell, an attack, a mention by
-  name) newer than `[supervisor] replay_max_age_ms` (120 s) that a
-  recipient has not been woken for (`seq > seen_seq`) are replayed as
-  Immediate wakes only; ambient and room-batch wakes are never replayed,
-  and older events are skipped (their recipients' `seen_seq` is raised).
-- **The chatter fold.** The per-room anti-chatter counters are rebuilt by
-  folding the reloaded event tail through the proved `chatter_step`. A
-  macro-tick reset is not an event, so the fold can only overcount: more
-  holding, the safe direction.
+The router's waiting wakes and the chatter counters are not stored. The
+boot derives them from the reloaded event log (`Router::replay`, called by
+`Supervisor::open`):
+
+- **No storm at boot.** Each agent has a replay floor: the last event a
+  committed wake of it consumed (`seen_seq`, which commits with the wake's
+  first effectful command or its close), or the world's last seq when it
+  has no stored row yet. An addressed event (a tell, an attack on it,
+  speech naming it) after the floor and at most `[supervisor]
+  replay_max_age_ms` (120 s) old is replayed as an Immediate wake, through
+  the same rules as a live event (the anti-chatter hold included). Room
+  batches and ambient wakes are never replayed, and an older event is not
+  replayed at all. So a tell that arrived just before a crash is answered
+  once: not twice (its answer committed the floor past it), and not never
+  (a crash before the answer committed leaves it above the floor). The
+  replayed routing decisions are in the observer's boot report, and a
+  replayed wake's reason reads `replayed tell by …`.
+- **The chatter fold.** The per-room counters are rebuilt by folding the
+  whole log, oldest first, through the proved `chatter_step`. A reloaded
+  event reads whether a player saw it from its recipients, since no human
+  is online at boot. A macro-tick reset is not an event, and a player who
+  was in the room but did not perceive the event is not counted, so the
+  fold can only hold more than the live counters did: the safe direction
+  (`lemma_fold_holds_at_least`, ADR 0006). A tell has no room: it counts
+  in the rooms its sender and recipient stood in when it was sent, which
+  the engine records on the event (`party_rooms`), so the fold counts it
+  in the same rooms as the live counter after they move. A tell from an
+  older log, without those rooms, holds every room. When the log does not reach
+  back to the world's first event, a room's count before its first logged
+  event is unknown; such a room, and every room the log never shows,
+  starts held at the bound until a human or a macro-tick resets it.
 - Deterministic errands (a macro-tick, booking or login plan) are not
   replays: they resume at their cursor after any outage (ADR 0011).
 

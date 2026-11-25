@@ -25,7 +25,7 @@ pub(super) fn torin() -> EntityId {
     EntityId::from("torin")
 }
 
-fn marta() -> EntityId {
+pub(super) fn marta() -> EntityId {
     EntityId::from("marta")
 }
 
@@ -187,7 +187,7 @@ impl Run {
     }
 
     /// What `who` said aloud, from the stored events (the durable record).
-    fn said(&self, who: &EntityId) -> Vec<String> {
+    pub(super) fn said(&self, who: &EntityId) -> Vec<String> {
         self.game.events(who, Seq(0), 1_000)["events"]
             .as_array()
             .unwrap()
@@ -201,7 +201,7 @@ impl Run {
 /// From the `n`th effectful command of `who` on (0: at once), the store
 /// refuses every write: the files hold what a process killed at that point
 /// left behind.
-fn crash_after(game: &Arc<Game>, who: &EntityId, n: usize) {
+pub(super) fn crash_after(game: &Arc<Game>, who: &EntityId, n: usize) {
     if n == 0 {
         game.refuse_store_writes(true).unwrap();
         return;

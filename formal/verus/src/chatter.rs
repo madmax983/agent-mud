@@ -101,6 +101,117 @@ pub proof fn lemma_run_allows_at_most_max(inputs: Seq<ChatterInput>, max: u8)
     }
 }
 
+/// How much an input counts toward holding a room: a reset (human,
+/// macro-tick) least, then the inputs that keep the count (an agent with a
+/// human present, the world), then an agent alone.
+pub open spec fn rank(input: ChatterInput) -> int {
+    match input {
+        ChatterInput::Human | ChatterInput::MacroTick => 0,
+        ChatterInput::AgentWithHuman | ChatterInput::World => 1,
+        ChatterInput::AgentAlone => 2,
+    }
+}
+
+/// The count after `inputs`, from a counter at `turns`.
+pub open spec fn count_from(turns: u8, inputs: Seq<ChatterInput>, max: u8) -> u8
+    decreases inputs.len(),
+{
+    if inputs.len() == 0 {
+        turns
+    } else {
+        spec_step(count_from(turns, inputs.drop_last(), max), inputs.last(), max).0
+    }
+}
+
+/// Whether input `i` of `inputs` may wake other agents, from a counter at
+/// `turns`.
+pub open spec fn allowed_at(turns: u8, inputs: Seq<ChatterInput>, max: u8, i: int) -> bool {
+    spec_step(count_from(turns, inputs.take(i), max), inputs[i], max).1
+}
+
+pub open spec fn min8(a: u8, b: u8) -> u8 {
+    if a <= b { a } else { b }
+}
+
+/// One step keeps "holds at least as much" (the count clamped at `max`)
+/// when the second input counts at least as much as the first, and the
+/// second counter allows only what the first allows.
+pub proof fn lemma_step_holds_at_least(a: u8, b: u8, x: ChatterInput, y: ChatterInput, max: u8)
+    requires
+        min8(a, max) <= min8(b, max),
+        rank(x) <= rank(y),
+    ensures
+        min8(spec_step(a, x, max).0, max) <= min8(spec_step(b, y, max).0, max),
+        spec_step(b, y, max).1 ==> spec_step(a, x, max).1,
+{
+}
+
+/// The boot fold can only hold more (ADR 0011, phase 4). The live counter
+/// saw the inputs `live`; the boot folds `boot` over the reloaded event
+/// tail, where each input counts at least as much: a macro-tick reset,
+/// which is not an event, reads as the world (no change), and an agent
+/// event whose recipients show no player reads as an agent alone. From a
+/// start that holds at least as much (`max`, a history the tail does not
+/// reach back to the start of; 0 from the world's first event), the fold
+/// ends holding at least as much, and every event it lets wake other agents
+/// the live counter let through too.
+pub proof fn lemma_fold_holds_at_least(
+    live: Seq<ChatterInput>,
+    boot: Seq<ChatterInput>,
+    live_turns: u8,
+    boot_turns: u8,
+    max: u8,
+)
+    requires
+        live.len() == boot.len(),
+        min8(live_turns, max) <= min8(boot_turns, max),
+        forall|i: int| 0 <= i < live.len() ==> rank(#[trigger] live[i]) <= rank(boot[i]),
+    ensures
+        min8(count_from(live_turns, live, max), max) <= min8(count_from(boot_turns, boot, max), max),
+        forall|i: int|
+            0 <= i < live.len() ==> (#[trigger] allowed_at(boot_turns, boot, max, i) ==> allowed_at(
+                live_turns,
+                live,
+                max,
+                i,
+            )),
+    decreases live.len(),
+{
+    if live.len() > 0 {
+        let (lp, bp) = (live.drop_last(), boot.drop_last());
+        assert forall|i: int| 0 <= i < lp.len() implies rank(#[trigger] lp[i]) <= rank(bp[i]) by {
+            assert(lp[i] == live[i] && bp[i] == boot[i]);
+        }
+        lemma_fold_holds_at_least(lp, bp, live_turns, boot_turns, max);
+        let last = live.len() - 1;
+        assert(rank(live[last]) <= rank(boot[last]));
+        lemma_step_holds_at_least(
+            count_from(live_turns, lp, max),
+            count_from(boot_turns, bp, max),
+            live.last(),
+            boot.last(),
+            max,
+        );
+        assert forall|i: int|
+            0 <= i < live.len() && #[trigger] allowed_at(boot_turns, boot, max, i) implies allowed_at(
+                live_turns,
+                live,
+                max,
+                i,
+            ) by {
+            if i < last {
+                assert(live.take(i) =~= lp.take(i));
+                assert(boot.take(i) =~= bp.take(i));
+                assert(live[i] == lp[i] && boot[i] == bp[i]);
+                assert(allowed_at(boot_turns, bp, max, i) ==> allowed_at(live_turns, lp, max, i));
+            } else {
+                assert(live.take(i) =~= lp);
+                assert(boot.take(i) =~= bp);
+            }
+        }
+    }
+}
+
 /// The executable steps agree with [`run`]: stepping a fresh counter
 /// through `inputs` with [`chatter_step`] ends at `run(inputs, max).0`.
 pub fn run_exec(inputs: &Vec<ChatterInput>, max: u8) -> (r: u8)
