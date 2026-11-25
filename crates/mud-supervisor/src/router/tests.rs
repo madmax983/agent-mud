@@ -785,3 +785,214 @@ fn a_tell_from_an_older_log_holds_every_room() {
     assert_eq!(r.agent_only_turns(&RoomId::from("dark_alley")), 0);
     assert!(w.entity(&ada).is_some());
 }
+
+// ------------------------------------------------------------ downed
+
+/// `w` with `who` out cold at `hp` in its room.
+fn knocked_out(w: &World, who: &str, hp: i32) -> World {
+    let mut s = w.snapshot();
+    if let Some(e) = s.entities.get_mut(&id(who)) {
+        e.pools.hp = hp;
+        e.unconscious = true;
+    }
+    let recent: Vec<Event> = w.logged().cloned().collect();
+    let mut out = World::from_state(Arc::clone(w.pack()), s, recent);
+    // A reload takes humans offline; bring them back.
+    for h in w.state().entities.values().filter(|e| e.human && e.online) {
+        out.bring_online(&h.id, 0);
+    }
+    out.drain_fresh();
+    out
+}
+
+/// Takes and finishes every wake waiting.
+fn clear(r: &mut Router) {
+    for wake in r.due(u64::MAX) {
+        r.finish(&wake.entity, 0);
+    }
+}
+
+/// One recovery step a minute until someone comes to; their report.
+fn tick_until_came_to(w: &mut World, from: u64) -> (u64, Vec<(EntityId, Seq)>) {
+    (1..=20)
+        .map(|m| from + m * 60_000)
+        .find_map(|t| {
+            let out = w.tick(t);
+            (!out.came_to.is_empty()).then_some((t, out.came_to))
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_tell_to_an_entity_out_cold_is_held_and_rides_on_its_come_to_wake() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    w.drain_fresh();
+    let mut w = knocked_out(&w, "marta", -3);
+    let n = run(&mut w, &mut r, &rt, &ada, "tell marta you there?", 1_000);
+    assert_eq!(
+        queued_for(&n, "marta").map(|q| q.0),
+        Some(Priority::Immediate)
+    );
+    let out_cold = |e: &EntityId| e != &id("marta");
+    assert!(
+        r.due_where(10_000, out_cold).is_empty(),
+        "held while out cold"
+    );
+    assert_eq!(r.pending().len(), 1, "kept, not dropped");
+    let (t, came) = tick_until_came_to(&mut w, 1_000);
+    let notes: Vec<RouteNote> = came.iter().map(|(e, s)| r.came_to(e, *s, t)).collect();
+    assert!(matches!(
+        notes[..],
+        [RouteNote::Queued {
+            priority: Priority::Immediate,
+            ..
+        }]
+    ));
+    // The line itself comes through the event feed too: no second wake.
+    let n = feed(&mut w, &mut r, &rt, t);
+    assert!(
+        dropped_for(&n, "marta").is_some_and(|why| why.contains("already woken")),
+        "{n:?}"
+    );
+    let wakes = r.due_where(t, |_| true);
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert_eq!(wakes[0].reason, CAME_TO);
+    assert_eq!(wakes[0].priority, Priority::Immediate);
+    let tell = seqs_of(&w, EventKind::Tell)[0];
+    assert_eq!(
+        wakes[0].seqs,
+        [tell, came[0].1],
+        "the tell and the come-to line"
+    );
+    assert!(r.due(u64::MAX).is_empty(), "once");
+}
+
+#[test]
+fn a_come_to_line_seen_first_wakes_the_entity_once() {
+    // A heal in a command: the router learns of it from the line alone.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    clear(&mut r);
+    let mut w = knocked_out(&w, "marta", 0);
+    let (t, came) = tick_until_came_to(&mut w, 0);
+    let n = feed(&mut w, &mut r, &rt, t);
+    assert_eq!(
+        queued_for(&n, "marta").map(|q| q.0),
+        Some(Priority::Immediate)
+    );
+    assert!(matches!(
+        r.came_to(&came[0].0, came[0].1, t),
+        RouteNote::Dropped { .. }
+    ));
+    let wakes = r.due(t);
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(
+        (wakes[0].reason.as_str(), &wakes[0].seqs[..]),
+        (CAME_TO, &[came[0].1][..])
+    );
+}
+
+#[test]
+fn bystanders_notice_someone_stir_and_a_heal_on_an_agent_wakes_it() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    clear(&mut r);
+    // Torin lies out cold in the Flagon, where Marta can see him stir.
+    let mut snap = w.snapshot();
+    let torin = snap.entities.get_mut(&id("torin")).unwrap();
+    torin.room = RoomId::from("rusty_flagon_taproom");
+    torin.pools.hp = 0;
+    torin.unconscious = true;
+    let bandage = snap.new_item(&mud_world::ProtoId::from("bandage"), w.pack());
+    snap.attach(
+        bandage,
+        &mud_world::state::Holder::Entity {
+            entity: id("torin"),
+        },
+    );
+    let mut w = World::from_state(Arc::clone(w.pack()), snap, Vec::new());
+    w.bring_online(&ada, 0);
+    w.drain_fresh();
+    let (t, _) = tick_until_came_to(&mut w, 0);
+    let n = feed(&mut w, &mut r, &rt, t);
+    assert_eq!(
+        queued_for(&n, "marta").map(|q| q.0),
+        Some(Priority::Ambient)
+    );
+    assert_eq!(
+        queued_for(&n, "torin").map(|q| q.0),
+        Some(Priority::Immediate)
+    );
+    clear(&mut r);
+    // An agent's bandage on Marta (a Gear event that targets her) is a
+    // room batch for her, not nothing.
+    let n = run(
+        &mut w,
+        &mut r,
+        &rt,
+        &id("torin"),
+        "use bandage on marta",
+        t + 1_000,
+    );
+    assert_eq!(
+        queued_for(&n, "marta").map(|q| q.0),
+        Some(Priority::RoomBatch)
+    );
+}
+
+#[test]
+fn a_held_wake_given_back_merges_with_what_came_meanwhile() {
+    let mut r = Router::new(RouterConfig::default());
+    let marta = id("marta");
+    r.force(&marta, Priority::Booked, "booked wake", 0);
+    let mut taken = r.due(0);
+    assert!(r.is_busy(&marta));
+    taken[0].seqs = vec![Seq(4)];
+    taken[0].macro_tick = true;
+    r.force(&marta, Priority::Immediate, "combat by giant rat", 1);
+    r.hold(taken.remove(0));
+    assert!(!r.is_busy(&marta));
+    let w = r.due(2);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].priority, Priority::Immediate);
+    assert_eq!(w[0].reason, "combat by giant rat");
+    assert!(w[0].macro_tick);
+    assert_eq!(w[0].seqs, [Seq(4)]);
+    // A resume given back waits as a resume.
+    r.finish(&marta, 3);
+    r.resume(
+        &marta,
+        Resume {
+            wake_id: "w".into(),
+            lines: vec!["say hi".into()],
+            cursor: 0,
+        },
+    );
+    let mut res = r.resumes_due(|_| true);
+    r.hold(res.remove(0));
+    assert_eq!(r.resumes_due(|_| true).len(), 1);
+}
+
+#[test]
+fn replay_waives_the_age_limit_for_an_entity_held_out_cold() {
+    let mut w = world();
+    let mut live = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut live, &rt, &ada, "tell marta old news", 1_000);
+    run(&mut w, &mut live, &rt, &ada, "tell torin old news", 1_000);
+    let w = knocked_out(&reloaded(&w, 0), "marta", -5);
+    let mut r = Router::new(RouterConfig::default());
+    let notes = r.replay(&w, &rt, 10 * 60_000, |_| 0, 120_000);
+    assert!(queued_for(&notes, "marta").is_some(), "held: still owed");
+    assert!(queued_for(&notes, "torin").is_none(), "awake and too old");
+}

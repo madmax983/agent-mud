@@ -35,6 +35,7 @@ use mud_world::pack::Tier;
 use mud_world::side::{
     BookingRow, EntityRow, MacroRow, PlanRow, SideState, macro_consume, macro_queue,
 };
+use mud_world::state::Entity;
 use mud_world::{EntityId, Event, EventKind, Game, Seq, SideOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -645,16 +646,30 @@ impl Supervisor {
         })
     }
 
+    /// The agents that cannot act now: unconscious or dead. Their wakes
+    /// are held ([`crate::admit`]). Read from the world; nothing of it
+    /// reaches any view.
+    fn held(&self) -> HashSet<EntityId> {
+        self.game.read(|w| {
+            self.minds
+                .keys()
+                .filter(|id| w.entity(id).is_some_and(Entity::incapacitated))
+                .cloned()
+                .collect()
+        })
+    }
+
     /// Queues each booked wake that came due, for an agent that is ready:
-    /// in the world and not stopped by its budget. One that is not (a
-    /// Turing PC between sessions, an agent at its hard cap) keeps its
-    /// booking until it is ready.
-    fn booked_wakes(&self, now: u64, online: &HashSet<EntityId>) {
+    /// in the world, able to act, and not stopped by its budget. One that
+    /// is not (a Turing PC between sessions, an agent out cold, an agent
+    /// at its hard cap) keeps its booking, stored, until it is ready: an
+    /// agent out cold gets it with the wake it has when it comes to.
+    fn booked_wakes(&self, now: u64, online: &HashSet<EntityId>, held: &HashSet<EntityId>) {
         let stopped: HashSet<EntityId> = lock(&self.state)
             .iter_mut()
             .filter_map(|(id, s)| (s.budget.level(now) == BudgetLevel::Hard).then(|| id.clone()))
             .collect();
-        let ready = |e: &EntityId| online.contains(e) && !stopped.contains(e);
+        let ready = |e: &EntityId| online.contains(e) && !held.contains(e) && !stopped.contains(e);
         for (entity, bookings) in self.wakes.take_due(now, ready) {
             let note = lock(&self.router).deliver_booked(&entity, bookings, now);
             self.publish(ObserverEvent::Route(note));
@@ -856,22 +871,42 @@ impl Supervisor {
         }
     }
 
+    /// Wakes the mind of each agent that came to in a world tick: one
+    /// Immediate "came to" wake, which carries everything held while it
+    /// was out ([`Router::came_to`]).
+    fn came_to(&self, came_to: Vec<(EntityId, Seq)>, now: u64) {
+        for (id, seq) in came_to {
+            if !self.minds.contains_key(&id) {
+                continue;
+            }
+            let note = lock(&self.router).came_to(&id, seq, now);
+            self.publish(ObserverEvent::Route(note));
+        }
+    }
+
     /// One pass of the clock. Returns the wake tasks it started.
+    ///
+    /// The order matters for an agent that comes to: the world tick
+    /// brings it to and the router queues its "came to" wake; the bookings
+    /// that fell due while it was out merge in; then the wake is taken,
+    /// once, with all of it.
     pub fn step(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         let now = self.game.now_ms();
         if now.saturating_sub(self.last_world_tick.load(Ordering::Relaxed))
             >= self.cfg.world_tick_ms
         {
             self.last_world_tick.store(now, Ordering::Relaxed);
-            self.game.tick();
+            let out = self.game.tick();
+            self.came_to(out.came_to, now);
         }
         self.charge_late_spend(now);
         self.turing_sessions(now);
         self.macro_ticks(now);
         let online = self.online();
-        self.booked_wakes(now, &online);
-        let mut wakes = lock(&self.router).resumes_due(|e| online.contains(e));
-        wakes.extend(lock(&self.router).due(now));
+        let held = self.held();
+        self.booked_wakes(now, &online, &held);
+        let mut wakes = lock(&self.router).resumes_due(|e| online.contains(e) && !held.contains(e));
+        wakes.extend(lock(&self.router).due_where(now, |e| !held.contains(e)));
         let mut tasks: Vec<JoinHandle<()>> = wakes
             .into_iter()
             .map(|w| {
@@ -909,6 +944,7 @@ impl Supervisor {
                 event_views: events.iter().map(|ev| ev.view_for(&wake.entity)).collect(),
                 events,
                 look: w.look_view(&wake.entity),
+                you: crate::mind::you_view(&w.sheet_view(&wake.entity)),
                 macro_tick: wake.macro_tick,
                 macro_ticks,
                 login: wake.reason == "login",
@@ -973,6 +1009,22 @@ impl Supervisor {
             .collect();
         drop(st);
         ops
+    }
+
+    /// `wake`, unless its entity is out cold: one that collapsed between
+    /// the router taking the wake and the wake starting. Then the whole
+    /// wake goes back to the router, held until the entity comes to.
+    /// Nothing is lost, and no model is called.
+    fn unless_out_cold(&self, wake: Wake) -> Option<Wake> {
+        let out_cold = self.game.read(|w| {
+            w.entity(&wake.entity)
+                .is_some_and(|e| e.online && e.incapacitated())
+        });
+        if out_cold {
+            lock(&self.router).hold(wake);
+            return None;
+        }
+        Some(wake)
     }
 
     /// The mind that runs `wake`, and the bookings it sees: none for a
@@ -1072,6 +1124,9 @@ impl Supervisor {
     /// turn still has staged and ends its plan.
     pub async fn run_wake(self: Arc<Self>, wake: Wake) {
         let start = self.game.now_ms();
+        let Some(wake) = self.unless_out_cold(wake) else {
+            return;
+        };
         let Some((mind, booked)) = self.choose_mind(&wake, start) else {
             lock(&self.router).finish(&wake.entity, start);
             return;
@@ -1318,6 +1373,8 @@ fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>
 
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod downed_tests;
 #[cfg(test)]
 mod persist_tests;
 #[cfg(test)]

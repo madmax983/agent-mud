@@ -659,6 +659,7 @@ mod tests {
             events,
             event_views: Vec::new(),
             look: Value::Null,
+            you: serde_json::Value::Null,
             macro_tick: priority == Priority::MacroTick,
             macro_ticks: 1,
             login: false,
