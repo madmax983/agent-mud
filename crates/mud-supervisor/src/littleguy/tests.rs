@@ -237,6 +237,7 @@ fn no_ledger(dir: &tempfile::TempDir) -> Charge {
     Charge {
         meter: Arc::new(LedgerMeter::new(dir.path().join("no-ledger.db"))),
         now_ms: NOW,
+        until_settled: None,
     }
 }
 
@@ -249,6 +250,7 @@ fn ledger_with(dir: &tempfile::TempDir, tokens: &[i64]) -> Charge {
     Charge {
         meter: Arc::new(LedgerMeter::new(path)),
         now_ms: NOW,
+        until_settled: None,
     }
 }
 
@@ -412,6 +414,80 @@ async fn a_recycled_pid_that_is_not_our_daemon_is_left_alone() {
         "an unrelated process keeps running"
     );
     stranger.kill().await.unwrap();
+}
+
+/// A wake that times out does not settle until its op is read: the
+/// entity stays busy, so a late command lands in its own turn.
+#[tokio::test]
+async fn a_timed_out_wake_settles_only_once_its_op_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let cfg = LittleguyConfig {
+        bin: dir.path().join("no-such-lg"),
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    // A daemon that answers only when told, behind a running stand-in.
+    let sock = dir.path().join("fake.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut req = String::new();
+        reader.read_line(&mut req).await.unwrap();
+        go_rx.await.unwrap();
+        let _ = reader
+            .into_inner()
+            .write_all(b"{\"kind\":\"reply\",\"text\":\"late\"}\n")
+            .await;
+    });
+    mind.daemons.lock().await.insert(
+        torin.clone(),
+        Daemon {
+            child: stand_in(&sock),
+            socket: sock.clone(),
+        },
+    );
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 1),
+        None,
+        Arc::new(ManualClock::new(NOW)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let ctx = WakeContext {
+        entity: torin.clone(),
+        name: "Torin".into(),
+        priority: Priority::Booked,
+        reason: "test".into(),
+        events: Vec::new(),
+        event_views: Vec::new(),
+        look: serde_json::Value::Null,
+        macro_tick: false,
+        macro_ticks: 0,
+        login: false,
+        wake_id: "wake-torin-1".into(),
+        now_ms: NOW,
+        booked: Vec::new(),
+    };
+    let tools = MudTools::new(game, typing, torin.clone());
+    let cut = tokio::time::timeout(Duration::from_millis(200), mind.wake(ctx, tools)).await;
+    assert!(cut.is_err(), "the wake timed out");
+    let mut settled = mind.settled(&torin);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut settled)
+            .await
+            .is_err(),
+        "the op is still out: not settled"
+    );
+    go_tx.send(()).unwrap();
+    server.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), settled)
+        .await
+        .expect("settled once the op was read");
+    mind.shutdown().await;
 }
 
 /// Runs a real `lg serve` when `LG_BIN` names one (the CI job that builds

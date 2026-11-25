@@ -49,7 +49,8 @@ cargo run -p mud-server --bin mud -- smoke
 #15   [notice_market] kestrel studies the notice board.
 #22   [rusty_flagon_taproom] wanderer arrives from the west.
 #25   [rusty_flagon_taproom] kestrel says something. "yo wanderer you going down the cellar? need a 2nd blade for the ossuary, split 50/50"
-smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered)
+restart drill: reopened at boot 2, resumed at line 2 of 5, 1 BOUNTY on the board
+smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty across a restart)
 ```
 
 ## Persistence
@@ -62,6 +63,20 @@ newer file. Each open mints the file's epoch once and bumps its boot
 number, the basis of wake ids that never repeat. A failing disk keeps
 unsaved changes in a bounded backlog and retries them with the next
 command.
+
+The supervisor's own state lives there too, so a restart loses nothing
+that matters: booked wakes (with their ids and notes), each agent's macro
+schedule and count, the scripted rule counters, and the plan of a scripted
+wake with its cursor. A wake's obligations commit with the mind's first
+effectful command, and each line of a scripted plan commits with its own
+cursor, so after a crash torin's BOUNTY is posted once, not twice, and a
+booking fires once. A plan made by a macro tick, a booking or a login
+resumes at its cursor however long the server was down; a reactive plan
+older than `[supervisor] replay_max_age_ms` (120 s) is dropped. A missed
+macro tick fires once within `catchup_spread_ms` of boot, and a booking
+overdue by more than `booking_max_late_ms` (a day) is dropped. `cargo test
+-p mud-supervisor --test kill_restart` kills a real process at each of
+these points and checks it.
 
 Old events are never deleted outright. Every hour (`[world]
 retention_every_ms`) events older than `events_keep_days` (7) are appended

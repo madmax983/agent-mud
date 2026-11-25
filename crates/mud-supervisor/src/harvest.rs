@@ -23,8 +23,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::mind::{
-    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, WakeContext, system_prompt, tool_specs,
-    wake_message,
+    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, Usage, WakeContext,
+    system_prompt, tool_specs, wake_message,
 };
 
 /// The agent kind of every MUD entity in harvest.
@@ -45,6 +45,7 @@ type Job = (
     String,
     String,
     oneshot::Sender<Result<MindReply, MindError>>,
+    InFlightGuard,
 );
 
 /// Durable in-process agents.
@@ -54,6 +55,9 @@ pub struct HarvestMind {
     window: u32,
     personas: HashMap<EntityId, HarvestPersona>,
     workers: Mutex<HashMap<EntityId, mpsc::Sender<Job>>>,
+    /// Jobs queued or running, per entity: a wake settles when its job is
+    /// done, even after the wake gave up on it.
+    in_flight: InFlight,
 }
 
 impl std::fmt::Debug for HarvestMind {
@@ -110,6 +114,7 @@ impl HarvestMind {
             window: 30,
             personas,
             workers: Mutex::new(HashMap::new()),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -164,7 +169,7 @@ impl HarvestMind {
             // from the start of this one, so a job whose wake was abandoned
             // (or failed) is still paid for.
             let mut last_seen = tokens_used(&rt, &id).await.unwrap_or(0);
-            while let Some((text, wake_id, reply)) = rx.recv().await {
+            while let Some((text, wake_id, reply, _job)) = rx.recv().await {
                 let op = AgentOp::message_with_id(text, wake_id.clone());
                 let out = match sqlite::send(&mut rt, &id, &op, Some(&wake_id)) {
                     Err(e) => Err(MindError::Failed(e.to_string())),
@@ -211,6 +216,11 @@ impl Mind for HarvestMind {
         "harvest"
     }
 
+    /// Resolves once the entity's jobs are done.
+    fn settled(&self, entity: &EntityId) -> BoxFuture<'_, ()> {
+        self.in_flight.settled(entity)
+    }
+
     fn wake(
         &self,
         ctx: WakeContext,
@@ -219,7 +229,8 @@ impl Mind for HarvestMind {
         Box::pin(async move {
             let tx = self.worker(&ctx.entity, &tools).await?;
             let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send((wake_message(&ctx), ctx.wake_id.clone(), reply_tx))
+            let job = self.in_flight.start(&ctx.entity);
+            tx.send((wake_message(&ctx), ctx.wake_id.clone(), reply_tx, job))
                 .await
                 .map_err(|_| MindError::Unavailable("the agent task stopped".into()))?;
             reply_rx

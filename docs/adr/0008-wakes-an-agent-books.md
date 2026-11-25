@@ -33,9 +33,9 @@ far too late for "back in 25 minutes".
   `mud_wake_me` to come back to something, and that no other reminder tool
   can act in the world.
 - **The observer shows each agent's bookings** (notes escaped by maud).
-- **Bookings persist (ADR 0011).** The `sup_booking` table and its
-  `BookingInsert` / `BookingDelete` ops exist since store v1; from phase 2
-  the supervisor writes through them. `mud_wake_me` answers ok only after
+- **Bookings persist (ADR 0011, phase 2).** The wake book writes
+  through the `sup_booking` table and its `BookingInsert` /
+  `BookingDelete` ops. `mud_wake_me` answers ok only after
   its row is written with `synchronous = FULL` (`Game::act`); a failing
   store answers `{"ok":false,"error_code":"store"}` and keeps nothing.
   Booking ids are `max(next_booking_id, max id) + 1` after a restart, so
@@ -43,8 +43,12 @@ far too late for "back in 25 minutes".
   command of the wake that carried it (or at that wake's close), in the
   same transaction: a crash before that leaves the booking, and it fires
   again as a new wake with a fresh id. A booking overdue past
-  `booking_max_late_ms` at boot is dropped with an event. Until phase 2
-  ships, bookings still live in memory and a restart drops them.
+  `booking_max_late_ms` at boot is dropped with a `booking_dropped`
+  observer event (the note stays out of the feed). A due booking is taken
+  *in flight*, not deleted: a wake that never runs (its agent went
+  offline) or runs the budget fallback gives it back, and an agent at its
+  hard cap is not ready, so its bookings wait for the next UTC day. After
+  a restart the observer lists the bookings read back from `world.db`.
 
 ```mermaid
 sequenceDiagram

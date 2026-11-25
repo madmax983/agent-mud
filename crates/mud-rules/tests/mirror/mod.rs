@@ -159,7 +159,7 @@ pub fn mirrors(source: &str, proof: &str) -> TestResult {
 }
 
 /// Each Verus module and the Rust file it mirrors.
-pub const PAIRS: [(&str, &str); 14] = [
+pub const PAIRS: [(&str, &str); 15] = [
     ("classify", "crates/mud-rules/src/roll.rs"),
     ("injury", "crates/mud-rules/src/damage.rs"),
     ("wounds", "crates/mud-rules/src/stats.rs"),
@@ -174,6 +174,7 @@ pub const PAIRS: [(&str, &str); 14] = [
     ("rewards", "crates/mud-world/src/rewards.rs"),
     ("side", "crates/mud-world/src/side.rs"),
     ("durability", "crates/mud-world/src/durability.rs"),
+    ("persist", "crates/mud-supervisor/src/persist.rs"),
 ];
 
 /// The Verus file of a module named in [`PAIRS`].

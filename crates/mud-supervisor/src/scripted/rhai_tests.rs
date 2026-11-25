@@ -55,6 +55,13 @@ impl Rig {
         }
     }
 
+    /// A rig whose wake book writes through the world's store.
+    fn on_disk(game: Arc<Game>) -> Self {
+        let mut rig = Self::on(game);
+        rig.wakes = Arc::new(WakeBook::persisted(Arc::clone(&rig.game)));
+        rig
+    }
+
     fn tools(&self, who: &str) -> MudTools {
         MudTools::new(
             Arc::clone(&self.game),
@@ -159,6 +166,55 @@ async fn a_rhai_mind_leaves_toml_counters_alone() {
         ["rhai", "rhai", "first time only"],
         "the TOML fallback still fires its nth = 1 rule"
     );
+}
+
+#[tokio::test]
+async fn rhai_decides_leaves_nth_counters_unpersisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let clock = Arc::new(ManualClock::new(12 * 3_600_000));
+    let rig = Rig::on(Game::open(pack(), Some(&db), 1, clock).unwrap());
+    let body = "let n = if \"n\" in ctx.memory { ctx.memory.n } else { 0 };\n\
+                if n >= 2 { let x = ctx.nope; }\n\
+                #{ lines: [\"say rhai\"], memory: #{ n: n + 1 } }";
+    let pack = pack();
+    let mut hale: CastDef = pack.cast[&EntityId::from("guard_01")].clone();
+    hale.script =
+        vec![toml::from_str("on = \"enter\"\nnth = 1\ndo = [\"say first time only\"]").unwrap()];
+    let id = EntityId::from("guard_01");
+    let m =
+        ScriptedMind::from_cast([(&id, &hale)]).with_scripts(host(body), Arc::clone(&rig.game), 7);
+    let counts = || -> Vec<i64> {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut q = conn
+            .prepare("SELECT count FROM sup_rule_count WHERE entity = 'guard_01'")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let mut seen = Vec::new();
+    for (i, who) in ["ada", "bo", "cy"].iter().enumerate() {
+        let wake = format!("w{i}");
+        rig.game.open_turn(&id, &wake, Vec::new());
+        let evs = rig.events_of(|g| {
+            g.login(who).unwrap();
+        });
+        m.wake(ctx(evs, &wake), rig.tools("guard_01"))
+            .await
+            .unwrap();
+        let done = SideOp::PlanDone {
+            entity: id.clone(),
+            wake_id: wake.clone(),
+        };
+        rig.game.close_turn(&id, &wake, vec![done]).unwrap();
+        seen.push(counts());
+    }
+    // Rhai decided twice: no count moved. The third wake faulted and ran
+    // the TOML plan, whose nth = 1 rule fired and persisted its count.
+    assert_eq!(seen, [vec![], vec![], vec![1]]);
+    assert_eq!(rig.game.plan_of(&id), None, "each plan ended at close");
 }
 
 #[tokio::test]
@@ -441,4 +497,110 @@ async fn hale_counts_one_visit_per_wake() {
         r.text.as_deref().unwrap_or("").starts_with("rhai: 1 lines"),
         "{r:?}"
     );
+}
+
+/// Hale's script for the kill tests: one line, a memory flag and a booked
+/// reminder, decided once.
+const ONCE: &str = "if \"done\" in ctx.memory { #{ lines: [] } } else { \
+                    #{ lines: [\"say the gate is shut\"], memory: #{ done: true }, \
+                    wake_me: #{ minutes: 30, note: \"check\" } } }";
+
+fn bookings(db: &std::path::Path) -> Vec<i64> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut q = conn
+        .prepare("SELECT id FROM sup_booking WHERE entity = 'guard_01'")
+        .unwrap();
+    q.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_kill_between_decide_and_the_first_line_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let clock = Arc::new(ManualClock::new(12 * 3_600_000));
+    let hale = EntityId::from("guard_01");
+    {
+        let rig = Rig::on_disk(Game::open(pack(), Some(&db), 1, clock.clone()).unwrap());
+        let m = mind(&rig, &host(ONCE));
+        rig.game.open_turn(&hale, "w1", Vec::new());
+        let s = m.scripts.as_ref().unwrap();
+        let d = s
+            .decide(&ctx(Vec::new(), "w1"), &[], &rig.tools("guard_01"))
+            .await;
+        assert!(matches!(d, Decision::Lines(..)));
+        // Killed here: the plan's first line never ran.
+    }
+    assert!(bookings(&db).is_empty(), "the booking went with the turn");
+    let rig = Rig::on_disk(Game::open(pack(), Some(&db), 1, clock).unwrap());
+    assert_eq!(
+        rig.game.script_memory(&hale, 1),
+        json!({}),
+        "so did the memory"
+    );
+    let m = mind(&rig, &host(ONCE));
+    rig.game.open_turn(&hale, "w2", Vec::new());
+    m.wake(ctx(Vec::new(), "w2"), rig.tools("guard_01"))
+        .await
+        .unwrap();
+    rig.game.close_turn(&hale, "w2", Vec::new()).unwrap();
+    assert_eq!(
+        rig.hale_said(),
+        ["the gate is shut"],
+        "decided again, said once"
+    );
+    assert_eq!(bookings(&db).len(), 1, "booked once");
+    assert_eq!(rig.wakes.pending(&hale).len(), 1);
+    drop(rig);
+    let again = Game::open(pack(), Some(&db), 1, Arc::new(ManualClock::new(0))).unwrap();
+    assert_eq!(again.script_memory(&hale, 1), json!({ "done": true }));
+}
+
+#[tokio::test]
+async fn the_memory_and_booking_of_a_decision_commit_with_its_first_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let clock = Arc::new(ManualClock::new(12 * 3_600_000));
+    let hale = EntityId::from("guard_01");
+    let rig = Rig::on_disk(Game::open(pack(), Some(&db), 1, clock).unwrap());
+    let m = mind(&rig, &host(ONCE));
+    rig.game.open_turn(&hale, "w1", Vec::new());
+    m.wake(ctx(Vec::new(), "w1"), rig.tools("guard_01"))
+        .await
+        .unwrap();
+    // The say committed; the turn is still open (no close yet).
+    assert_eq!(bookings(&db).len(), 1, "with the say");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let body: String = conn
+        .query_row(
+            "SELECT body FROM script_memory WHERE entity = 'guard_01'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(body.contains("done"), "{body}");
+}
+
+#[tokio::test]
+async fn a_reset_during_the_wake_wins_over_its_staged_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let clock = Arc::new(ManualClock::new(12 * 3_600_000));
+    let hale = EntityId::from("guard_01");
+    {
+        let rig = Rig::on_disk(Game::open(pack(), Some(&db), 1, clock.clone()).unwrap());
+        let m = mind(&rig, &host("#{ lines: [], memory: #{ seen: 1 } }"));
+        rig.game.open_turn(&hale, "w1", Vec::new());
+        m.wake(ctx(Vec::new(), "w1"), rig.tools("guard_01"))
+            .await
+            .unwrap();
+        // An operator resets the mind before the turn closes.
+        rig.game.reset_script_memory(&hale);
+        rig.game.close_turn(&hale, "w1", Vec::new()).unwrap();
+        assert_eq!(rig.game.script_memory(&hale, 1), json!({}));
+    }
+    let again = Game::open(pack(), Some(&db), 1, clock).unwrap();
+    assert_eq!(again.script_memory(&hale, 1), json!({}), "the reset stands");
 }

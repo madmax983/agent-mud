@@ -132,7 +132,11 @@ Persistence (ADR 0011): `world.db` carries a schema version, an epoch and a
 boot number; supervisor state (bookings, macro counters, plans, spend)
 lives in its side tables and commits with the world command that consumed
 it; old events are archived to `archive/events-YYYY-MM-<epoch>.jsonl`
-before they are trimmed.
+before they are trimmed. After a restart, bookings, the macro schedule and
+the scripted rule counters come back, and a scripted plan resumes at its
+cursor (an errand after any outage, a reactive plan within 120 s), so each
+of its effectful lines takes effect once: torin posts one BOUNTY however
+the server dies.
 
 ## 7. Starter world: `worlds/crypt-v01/`
 

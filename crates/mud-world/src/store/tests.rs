@@ -858,3 +858,53 @@ fn a_restored_backup_that_reuses_archived_seqs_refuses_to_trim() {
     assert_eq!(stored(&s), vec![1, 2, 3, 4, 5], "nothing was deleted");
     assert_eq!(archive::seqs(&arch).unwrap(), vec![1, 2, 3, 4, 5]);
 }
+
+#[test]
+fn dropped_rule_counts_and_script_memory_match_the_model() {
+    let mut s = Store::open_in_memory(1, 0).unwrap();
+    let row = |digest, dup| RuleCountRow {
+        digest,
+        dup,
+        count: 2,
+    };
+    let ops = [
+        SideOp::RuleCounts {
+            entity: ada(),
+            rows: vec![row(u64::MAX, 0), row(7, 0), row(7, 1)],
+        },
+        SideOp::RuleCountsDrop {
+            entity: ada(),
+            keys: vec![(u64::MAX, 0), (7, 1), (9, 0)],
+        },
+        SideOp::ScriptMemory {
+            entity: ada(),
+            schema: 2,
+            body: serde_json::json!({ "seen": 3 }),
+        },
+    ];
+    s.apply_side(&ops, 5, Fsync::Normal).unwrap();
+    let side = s.load_side().unwrap();
+    let mut model = SideState {
+        epoch: side.epoch,
+        boot: side.boot,
+        ..SideState::default()
+    };
+    for op in &ops {
+        model.apply(op, 5);
+    }
+    assert_eq!(side, model);
+    assert_eq!(side.rule_counts[&ada()], [row(7, 0)]);
+    let memory = s.load_script_memory().unwrap();
+    assert_eq!(memory[&ada()], (2, serde_json::json!({ "seen": 3 })));
+    // Dropping the last key forgets the entity's counts.
+    s.apply_side(
+        &[SideOp::RuleCountsDrop {
+            entity: ada(),
+            keys: vec![(7, 0)],
+        }],
+        6,
+        Fsync::Normal,
+    )
+    .unwrap();
+    assert!(s.load_side().unwrap().rule_counts.is_empty());
+}

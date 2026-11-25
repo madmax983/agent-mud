@@ -203,6 +203,7 @@ pub async fn open_accounts(cfg: &MudConfig, game: &Game) -> anyhow::Result<Accou
 /// cannot be built, or the proxy setup would merge every player.
 pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     cfg.check_proxy()?;
+    cfg.supervisor.check_restart()?;
     for w in cfg.plaintext_warnings() {
         tracing::warn!("{w}");
     }
@@ -253,14 +254,22 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         budgets: budgets(&pack, &s.budgets)?,
         macro_tick_scale: s.macro_tick_scale,
         first_macro_tick_secs: s.first_macro_tick_secs,
+        replay_max_age_ms: s.replay_max_age_ms,
+        booking_max_late_ms: s.booking_max_late_ms,
+        catchup_spread_ms: s.catchup_spread_ms,
         ..SupervisorConfig::default()
     };
-    let sup = Supervisor::new(
+    // The open order (ADR 0002, ADR 0011): the world and its side rows
+    // first, then the supervisor restores the rows (bookings, the macro
+    // schedule, rule counters, plans to resume).
+    let restored = game.take_restored().unwrap_or_default();
+    let sup = Supervisor::open(
         Arc::clone(&game),
         typing,
         minds.by_entity,
         Arc::new(FallbackMind::from_cast(&pack.cast)),
         sup_cfg,
+        restored,
     );
     let (admin_token, admin_token_generated) =
         admin_token(std::env::var(&cfg.server.admin_token_env).ok())?;

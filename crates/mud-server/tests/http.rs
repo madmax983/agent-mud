@@ -818,6 +818,47 @@ async fn the_observer_counts_logins_with_the_token_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_booked_wake_survives_a_restart_and_the_observer_shows_it_escaped() {
+    use mud_mcp::WakeBooker as _;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let torin = mud_world::EntityId::from("torin");
+    let note = "<b>is the ore in?</b>";
+    let first = {
+        let db = db.clone();
+        let (_, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+        let wakes = mud_server::SupervisorWakes(Arc::clone(&built.mud.sup));
+        let r = wakes.wake_me(&torin, 30, note);
+        assert_eq!(r["ok"], true, "{r}");
+        r["booked"]["id"].as_u64().unwrap()
+    };
+    // A second server on the same file: the booking came back from it.
+    let (addr, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+    let pending = built.mud.sup.wakes().pending(&torin);
+    assert_eq!(pending.len(), 1);
+    assert_eq!((pending[0].id, pending[0].note.as_str()), (first, note));
+    let token = built.mud.admin_token.clone();
+    let page = http()
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("booked: &lt;b&gt;is the ore in?&lt;/b&gt;"),
+        "the note shows, escaped: {page}"
+    );
+    assert!(!page.contains(note), "never as markup");
+    let next = mud_server::SupervisorWakes(Arc::clone(&built.mud.sup)).wake_me(&torin, 5, "x");
+    assert!(
+        next["booked"]["id"].as_u64().unwrap() > first,
+        "ids never repeat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_stay_signed_in_box_follows_remember_days() {
     for (days, shown) in [(30, true), (0, false)] {
         let (addr, _) = boot_cfg(None, |c| c.accounts.remember_days = days).await;
@@ -876,4 +917,43 @@ async fn a_signed_out_or_locked_browser_is_closed_at_revalidation() {
         assert_eq!(bye["kind"], "system");
         assert_eq!(close_code(c).await, Some(1008));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_feed_opens_with_what_the_boot_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let torin = mud_world::EntityId::from("torin");
+    let note = "zq-private reminder";
+    {
+        let db = db.clone();
+        let (_, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+        // Booked three days ago for a minute later: far too late now.
+        let then = built.mud.game.now_ms() - 3 * 86_400_000;
+        built.mud.sup.wakes().book(&torin, then, 1, note).unwrap();
+    }
+    let (addr, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+    assert!(built.mud.sup.wakes().pending(&torin).is_empty(), "dropped");
+    let token = built.mud.admin_token.clone();
+    let mut resp = http()
+        .get(format!("http://{addr}/observer/feed?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !seen.contains("booking_dropped") {
+        let chunk = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .expect("the boot report never came")
+            .unwrap()
+            .unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.contains("\"entity\":\"torin\""), "{seen}");
+    assert!(
+        !seen.contains("zq-private"),
+        "the note stays out of the feed"
+    );
 }

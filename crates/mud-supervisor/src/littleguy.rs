@@ -27,8 +27,8 @@ use tokio::sync::{Mutex, oneshot};
 
 use crate::ledger::LedgerMeter;
 use crate::mind::{
-    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, UsageSink, WakeContext, system_prompt,
-    wake_message,
+    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, Usage, UsageSink,
+    WakeContext, system_prompt, wake_message,
 };
 
 /// How long a daemon's reply is still read after its wake was given up.
@@ -263,6 +263,9 @@ pub(crate) struct Charge {
     pub meter: Arc<LedgerMeter>,
     /// The wake's start, which fixes the budget day.
     pub now_ms: u64,
+    /// Held until the op is read and charged: the entity's wake settles
+    /// only then ([`Mind::settled`]).
+    pub until_settled: Option<Arc<InFlightGuard>>,
 }
 
 impl Charge {
@@ -318,6 +321,8 @@ pub(crate) async fn chat_charged(
             }
             Err(_) => sink.add(&entity, charge.settle(&entity, Usage::default()).await),
         }
+        // The op is read and charged: the wake may settle.
+        drop(charge.until_settled);
     });
     rx.await
         .map_err(|_| MindError::Unavailable("the daemon did not answer in time".into()))?
@@ -428,6 +433,8 @@ pub struct LittleguyMind {
     meters: std::sync::Mutex<HashMap<EntityId, Arc<LedgerMeter>>>,
     /// Set by [`LittleguyMind::shutdown`]: no daemon starts after it.
     closed: std::sync::atomic::AtomicBool,
+    /// Ops still read after their wake (see [`chat_charged`]).
+    in_flight: InFlight,
 }
 
 impl LittleguyMind {
@@ -440,6 +447,7 @@ impl LittleguyMind {
             daemons: Mutex::new(HashMap::new()),
             meters: std::sync::Mutex::new(HashMap::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -617,6 +625,12 @@ impl Mind for LittleguyMind {
         "littleguy"
     }
 
+    /// Resolves once every op of the entity was read and charged, or its
+    /// grace ([`LATE_REPLY_GRACE`]) ran out.
+    fn settled(&self, entity: &EntityId) -> BoxFuture<'_, ()> {
+        self.in_flight.settled(entity)
+    }
+
     fn wake(
         &self,
         ctx: WakeContext,
@@ -626,6 +640,7 @@ impl Mind for LittleguyMind {
             let charge = Charge {
                 meter: self.meter(&ctx.entity),
                 now_ms: ctx.now_ms,
+                until_settled: Some(Arc::new(self.in_flight.start(&ctx.entity))),
             };
             // Spend since the last wake (a heartbeat, an op that outlived
             // its wake) is owed before this wake adds its own.

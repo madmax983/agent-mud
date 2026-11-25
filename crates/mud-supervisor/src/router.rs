@@ -99,6 +99,21 @@ pub struct Wake {
     /// it left itself.
     #[serde(default)]
     pub booked: Vec<crate::wakes::Booking>,
+    /// A plan this wake resumes after a restart. Such a wake carries
+    /// nothing else: no events, no macro tick, no booking.
+    #[serde(default)]
+    pub resume: Option<Resume>,
+}
+
+/// A deterministic plan to finish: its lines, from its durable cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// The wake that made the plan: the key of its cursor.
+    pub wake_id: String,
+    /// Every line of the plan.
+    pub lines: Vec<String>,
+    /// The first line to run.
+    pub cursor: u32,
 }
 
 /// A routing decision, for the observer.
@@ -151,6 +166,8 @@ pub struct Router {
     pending: BTreeMap<EntityId, Pending>,
     last_wake_end: HashMap<EntityId, u64>,
     busy: BTreeSet<EntityId>,
+    /// Plans to resume, each delivered alone before the entity's next wake.
+    resumes: BTreeMap<EntityId, Resume>,
 }
 
 /// Whether `text` names the entity, as a whole word.
@@ -202,7 +219,16 @@ impl Router {
     /// Whether `entity` has no wake in flight and none waiting.
     #[must_use]
     pub fn is_idle(&self, entity: &EntityId) -> bool {
-        !self.busy.contains(entity) && !self.pending.contains_key(entity)
+        !self.busy.contains(entity)
+            && !self.pending.contains_key(entity)
+            && !self.resumes.contains_key(entity)
+    }
+
+    /// Queues a plan resume for `entity`. It is delivered as a wake of its
+    /// own as soon as the entity is free and online, ahead of any wake
+    /// waiting ([`Router::resumes_due`]).
+    pub fn resume(&mut self, entity: &EntityId, plan: Resume) {
+        self.resumes.insert(entity.clone(), plan);
     }
 
     fn jitter(&self, range: [u64; 2], entity: &EntityId, seq: Seq, salt: &[u8]) -> u64 {
@@ -542,12 +568,43 @@ impl Router {
         }
     }
 
-    /// Takes the wakes that are due, skipping entities with one in flight.
+    /// Takes the plan resumes of the entities that `ready` accepts (online)
+    /// and that have no wake in flight. A resume waits for its entity:
+    /// it runs before any other wake of that entity.
+    pub fn resumes_due(&mut self, ready: impl Fn(&EntityId) -> bool) -> Vec<Wake> {
+        let resuming: Vec<EntityId> = self
+            .resumes
+            .keys()
+            .filter(|e| !self.busy.contains(*e) && ready(e))
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for e in resuming {
+            if let Some(plan) = self.resumes.remove(&e) {
+                self.busy.insert(e.clone());
+                out.push(Wake {
+                    entity: e,
+                    priority: Priority::Booked,
+                    seqs: Vec::new(),
+                    reason: format!("resume plan at line {}", plan.cursor.saturating_add(1)),
+                    macro_tick: false,
+                    booked: Vec::new(),
+                    resume: Some(plan),
+                });
+            }
+        }
+        out
+    }
+
+    /// Takes the wakes that are due, skipping entities with one in flight
+    /// or a plan resume waiting (see [`Router::resumes_due`]).
     pub fn due(&mut self, now: u64) -> Vec<Wake> {
         let ready: Vec<EntityId> = self
             .pending
             .iter()
-            .filter(|(e, p)| p.due_ms <= now && !self.busy.contains(*e))
+            .filter(|(e, p)| {
+                p.due_ms <= now && !self.busy.contains(*e) && !self.resumes.contains_key(*e)
+            })
             .map(|(e, _)| e.clone())
             .collect();
         let mut out = Vec::new();
@@ -561,6 +618,7 @@ impl Router {
                     reason: p.reason,
                     macro_tick: p.macro_tick,
                     booked: p.booked,
+                    resume: None,
                 });
             }
         }
@@ -581,9 +639,14 @@ impl Router {
         }
     }
 
-    /// Forgets every waiting wake of an entity (it logged out).
-    pub fn forget(&mut self, entity: &EntityId) {
-        self.pending.remove(entity);
+    /// Forgets every waiting wake of an entity (it logged out). Returns
+    /// the ids of the booked wakes it carried, for the wake book to give
+    /// back: they come due again when the entity returns.
+    pub fn forget(&mut self, entity: &EntityId) -> Vec<u64> {
+        self.pending
+            .remove(entity)
+            .map(|p| p.booked.iter().map(|b| b.id).collect())
+            .unwrap_or_default()
     }
 }
 

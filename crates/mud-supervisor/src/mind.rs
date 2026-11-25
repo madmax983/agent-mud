@@ -10,10 +10,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use mud_world::{CommandResult, EntityId, Event, Game, Seq};
+use mud_world::side::RuleCountRow;
+use mud_world::{CommandResult, EntityId, Event, Game, Seq, SideError, SideOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::gate::Gate;
 use crate::router::Priority;
@@ -231,6 +233,75 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
         ctx: WakeContext,
         tools: MudTools,
     ) -> BoxFuture<'_, Result<MindReply, MindError>>;
+
+    /// Resolves once `entity`'s mind has really finished its last wake:
+    /// work that outlives the wake's future (a littleguy op read after a
+    /// timeout, a harvest job) is done. The supervisor closes the wake's
+    /// turn and frees the entity only then, so a late command lands in its
+    /// own turn and never consumes the next wake's obligations. Most minds
+    /// finish with their future: the default resolves at once.
+    fn settled(&self, entity: &EntityId) -> BoxFuture<'_, ()> {
+        let _ = entity;
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Restores the counters the mind persisted for `entity` (the scripted
+    /// mind's rule counts), at boot, and returns the stale ones: counts of
+    /// rules the mind no longer has (edited or removed), for the caller to
+    /// drop from the store. The default keeps none and calls none stale.
+    fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) -> Vec<RuleCountRow> {
+        let _ = (entity, counts);
+        Vec::new()
+    }
+}
+
+/// Work of a mind that outlives its wake, per entity: a wake starts it
+/// with [`InFlight::start`], the guard ends it when dropped, and
+/// [`InFlight::settled`] waits until none is left.
+#[derive(Debug, Default)]
+pub struct InFlight {
+    by_entity: Mutex<HashMap<EntityId, watch::Sender<u32>>>,
+}
+
+/// One unit of in-flight work; dropping it ends it.
+#[derive(Debug)]
+pub struct InFlightGuard(watch::Sender<u32>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+impl InFlight {
+    /// Starts one unit of work for `entity`.
+    #[must_use]
+    pub fn start(&self, entity: &EntityId) -> InFlightGuard {
+        let tx = self
+            .by_entity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(entity.clone())
+            .or_insert_with(|| watch::channel(0).0)
+            .clone();
+        tx.send_modify(|n| *n = n.saturating_add(1));
+        InFlightGuard(tx)
+    }
+
+    /// Resolves once `entity` has no work in flight.
+    pub fn settled(&self, entity: &EntityId) -> BoxFuture<'static, ()> {
+        let rx = self
+            .by_entity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(entity)
+            .map(watch::Sender::subscribe);
+        Box::pin(async move {
+            if let Some(mut rx) = rx {
+                let _ = rx.wait_for(|n| *n == 0).await;
+            }
+        })
+    }
 }
 
 /// The four MUD tools, in process, scoped to one entity.
@@ -281,10 +352,33 @@ impl MudTools {
         book_wake(&self.wakes, &self.entity, self.game.now_ms(), minutes, note)
     }
 
+    /// `mud_wake_me` for a deterministic mind's decision: the booking rides
+    /// on the open turn of `wake_id` ([`WakeBook::book_on_turn`]), so it
+    /// is in the store with the decision's first effect, or at the close,
+    /// and never without it.
+    #[must_use]
+    pub fn wake_me_on_turn(&self, wake_id: &str, minutes: u32, note: &str) -> Value {
+        let now = self.game.now_ms();
+        let booked = self
+            .wakes
+            .book_on_turn(&self.entity, wake_id, now, minutes, note);
+        book_answer(&self.wakes, &self.entity, now, minutes, booked)
+    }
+
     /// `mud_cancel_wake`.
     #[must_use]
     pub fn cancel_wake(&self, id: u64) -> Value {
         cancel_wake(&self.wakes, &self.entity, id)
+    }
+
+    /// Stages side ops on the entity's open turn of `wake_id` (a plan, its
+    /// cursor, rule counts): they commit with the entity's next effectful
+    /// command, or at the turn's close.
+    ///
+    /// # Errors
+    /// The entity has no open turn of that wake; nothing is staged.
+    pub fn stage(&self, wake_id: &str, ops: Vec<SideOp>) -> Result<(), SideError> {
+        self.game.stage(&self.entity, wake_id, ops)
     }
 
     /// The entity.
@@ -362,14 +456,31 @@ pub fn book_wake(
     minutes: u32,
     note: &str,
 ) -> Value {
-    match book.book(entity, now_ms, minutes, note) {
+    book_answer(
+        book,
+        entity,
+        now_ms,
+        minutes,
+        book.book(entity, now_ms, minutes, note),
+    )
+}
+
+/// The answer of `mud_wake_me` to a booking's outcome.
+fn book_answer(
+    book: &WakeBook,
+    entity: &EntityId,
+    now_ms: u64,
+    minutes: u32,
+    booked: Result<crate::wakes::Booking, crate::wakes::BookError>,
+) -> Value {
+    match booked {
         Ok(b) => json!({
             "ok": true,
             "booked": { "id": b.id, "in_minutes": minutes, "note": b.note },
             "pending": pending_view(book, entity, now_ms),
         }),
         Err(e) => {
-            json!({ "ok": false, "error": e.to_string(), "pending": pending_view(book, entity, now_ms) })
+            json!({ "ok": false, "error": e.to_string(), "error_code": e.code(), "pending": pending_view(book, entity, now_ms) })
         }
     }
 }
@@ -377,8 +488,11 @@ pub fn book_wake(
 /// Cancels a booking and answers as `mud_cancel_wake` does.
 #[must_use]
 pub fn cancel_wake(book: &WakeBook, entity: &EntityId, id: u64) -> Value {
-    let ok = book.cancel(entity, id);
-    json!({ "ok": ok, "error": (!ok).then_some("no such booked wake") })
+    match book.cancel(entity, id) {
+        Ok(true) => json!({ "ok": true, "error": null }),
+        Ok(false) => json!({ "ok": false, "error": "no such booked wake" }),
+        Err(e) => json!({ "ok": false, "error": e.to_string(), "error_code": e.code() }),
+    }
 }
 
 fn pending_view(book: &WakeBook, entity: &EntityId, now_ms: u64) -> Value {

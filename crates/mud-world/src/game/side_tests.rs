@@ -365,11 +365,12 @@ fn act_fails_while_the_store_fails() {
         Err(SideError::Store(_))
     ));
     r.game.refuse_store_writes(false).unwrap();
-    // The refused act keeps nothing, now or later.
+    // The refused act keeps nothing, now or later; the failed close
+    // promised nothing, and its ops go with the next commit.
     r.game.tick();
     let side = r.side_on_disk();
     assert!(side.bookings.is_empty(), "the agent was told no");
-    assert_eq!(seen_seq(&side, &ada), 0);
+    assert_eq!(seen_seq(&side, &ada), 4, "the close went with the tick");
     // While a backlog waits, a working act writes it with its own ops.
     r.game.refuse_store_writes(true).unwrap();
     assert!(r.game.execute(&ada, "say y").ok);
@@ -613,4 +614,78 @@ fn a_gap_inside_the_stored_tail_is_reported_after_a_reload() {
     assert_eq!(game.events(&ada, Seq(1), 10)["truncated"], true);
     assert_eq!(game.events(&ada, Seq(7), 10)["truncated"], false);
     assert_eq!(game.read(World::oldest_logged), Some(Seq(8)));
+}
+
+#[test]
+fn a_failed_close_waits_in_the_backlog_for_the_next_write() {
+    let r = Rig::new();
+    let ada = r.game.login("ada").unwrap();
+    r.game.open_turn(&ada, "w1", vec![seen(&ada, 6)]);
+    r.game.refuse_store_writes(true).unwrap();
+    assert!(r.game.close_turn(&ada, "w1", vec![seen(&ada, 7)]).is_err());
+    assert_eq!(r.game.open_turn_of(&ada), None, "the turn is gone");
+    r.game.refuse_store_writes(false).unwrap();
+    // Only ops wait: a persist writes them without a snapshot.
+    assert_eq!(r.game.persist(vec![seen(&ada, 1)]), Durability::Durable);
+    assert_eq!(seen_seq(&r.side_on_disk(), &ada), 7);
+}
+
+#[test]
+fn script_memory_rides_on_the_turn_and_a_reset_drops_it() {
+    let mut r = Rig::new();
+    let hale = EntityId::from("guard_01");
+    let (resets, before) = r.game.script_memory_at(&hale, 1);
+    assert_eq!(before, serde_json::json!({}));
+    r.game.open_turn(&hale, "w1", Vec::new());
+    assert!(
+        r.game
+            .stage_script_memory_if(&hale, "w1", 1, resets, serde_json::json!({ "n": 1 }))
+    );
+    assert_eq!(
+        r.game.script_memory(&hale, 1),
+        serde_json::json!({ "n": 1 })
+    );
+    r.restart();
+    assert_eq!(
+        r.game.script_memory(&hale, 1),
+        serde_json::json!({}),
+        "staged, not written"
+    );
+    r.game.open_turn(&hale, "w2", Vec::new());
+    assert!(
+        r.game
+            .stage_script_memory_if(&hale, "w2", 1, 0, serde_json::json!({ "n": 2 }))
+    );
+    assert!(r.game.execute(&hale, "say hi").ok);
+    r.restart();
+    assert_eq!(
+        r.game.script_memory(&hale, 1),
+        serde_json::json!({ "n": 2 }),
+        "written with the say"
+    );
+    // A reset drops a staged save, and a stale read cannot save after it.
+    r.game.open_turn(&hale, "w3", Vec::new());
+    let (resets, _) = r.game.script_memory_at(&hale, 1);
+    assert!(
+        r.game
+            .stage_script_memory_if(&hale, "w3", 1, resets, serde_json::json!({ "n": 3 }))
+    );
+    r.game.reset_script_memory(&hale);
+    assert!(
+        !r.game
+            .stage_script_memory_if(&hale, "w3", 1, resets, serde_json::json!({ "n": 4 }))
+    );
+    r.game.close_turn(&hale, "w3", Vec::new()).unwrap();
+    r.restart();
+    assert_eq!(r.game.script_memory(&hale, 1), serde_json::json!({}));
+    // With no turn of that wake, the save is written at once.
+    assert!(
+        r.game
+            .stage_script_memory_if(&hale, "none", 1, 0, serde_json::json!({ "n": 5 }))
+    );
+    r.restart();
+    assert_eq!(
+        r.game.script_memory(&hale, 1),
+        serde_json::json!({ "n": 5 })
+    );
 }
