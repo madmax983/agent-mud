@@ -8,9 +8,17 @@
 //!
 //! What a restart must not lose lives in the world store (ADR 0011): the
 //! bookings, the macro schedule and count, the plan of a scripted wake with
-//! its cursor, and the scripted rule counters. A wake's obligations are
-//! staged on its turn and commit with the mind's first effectful command,
-//! or at the turn's close; [`Supervisor::open`] restores the rows at boot.
+//! its cursor, the scripted rule counters, and each day's spend. A wake's
+//! obligations are staged on its turn and commit with the mind's first
+//! effectful command, or at the turn's close; [`Supervisor::open`] restores
+//! the rows at boot.
+//!
+//! The spend is split by source (phase 3): what the supervisor metered and
+//! what littleguy's ledger reported. The close of each wake stores the
+//! day's tallies (`Spend`, joined by the proved [`crate::persist`]
+//! kernels); at boot the stored tallies come back, and each ledger mind
+//! primes its meter, so a restart neither bills a ledger row twice nor
+//! forgets today's spend, and the breaker stands where it stood.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,11 +33,11 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::budget::{Budget, BudgetLevel};
+use crate::budget::{Budget, BudgetLevel, DAY_MS, SpendSource};
 use crate::gate::Gate;
 use crate::held::{assert_none_held, lock};
 use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
-use crate::persist::{macro_open, plan_resume, restore_macro, wake_id_key};
+use crate::persist::{DaySpend, macro_open, plan_resume, restore_macro, wake_id_key};
 use crate::router::{EntityRuntime, Priority, Resume, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::{FallbackMind, PlanMind};
 use crate::turing::{Afk, in_session, mix, pick};
@@ -375,8 +383,53 @@ impl Supervisor {
             }
         }
         let spans = self.macro_spans();
+        // Each ledger meter is read before the state lock: a file read.
+        let primed: Vec<(EntityId, Usage)> = self
+            .minds
+            .iter()
+            .filter_map(|(e, m)| m.prime(e, now).map(|u| (e.clone(), u)))
+            .collect();
+        for (e, row) in &entities {
+            if let (Some(m), Some(seen)) = (self.minds.get(e), row.harvest_tokens_seen) {
+                m.restore_tokens_seen(e, seen);
+            }
+        }
         {
             let mut st = lock(&self.state);
+            for (e, s) in st.iter_mut() {
+                s.budget.roll(now);
+                if let Some(row) = entities.get(e) {
+                    let stored = DaySpend {
+                        day: row.budget_day,
+                        local: row.local,
+                        lg: row.lg,
+                    };
+                    if s.budget.restore(stored, now) {
+                        tracing::warn!(
+                            entity = %e,
+                            stored_day = row.budget_day,
+                            today = now / DAY_MS,
+                            "a budget stored more than a day ahead of the clock was reset"
+                        );
+                        // The store is reset too: its stale day would drop
+                        // today's spend and come back on that day.
+                        ops.push(SideOp::SpendReset {
+                            entity: e.clone(),
+                            day: s.budget.spend.day,
+                            local: s.budget.spend.local,
+                            lg: s.budget.spend.lg,
+                        });
+                    }
+                }
+            }
+            for (e, u) in &primed {
+                if let Some(s) = st.get_mut(e) {
+                    s.budget.prime(now, u.tally());
+                    // The ledger may drop the rows it was primed from (a
+                    // littleguy purge): the stored tally keeps the floor.
+                    ops.push(spend_op(e, &s.budget, None));
+                }
+            }
             for (e, row) in &entities {
                 let Some(s) = st.get_mut(e) else { continue };
                 s.macro_row = row.macro_row;
@@ -791,19 +844,60 @@ impl Supervisor {
         })
     }
 
-    /// Charges spend that came in after its wake ended (a model that kept
-    /// going after a timeout).
+    /// Charges spend that came in after its wake closed (a model that
+    /// kept going, ambient chatter).
+    ///
+    /// The spend of an entity whose wake is still open stays in the sink
+    /// for that wake's close. A harvest job raises its token mark before
+    /// it hands its spend over, and only the close stores the mark: a
+    /// tally stored here, ahead of its mark, would be charged again after
+    /// a kill before the close (ADR 0011). Once the close is done no job
+    /// of the entity runs, so the stored mark already covers what is
+    /// left.
+    ///
+    /// The new tallies are stored through [`Game::persist`]: a lost late
+    /// `Spend` is a bounded under-charge, and the next close stores the
+    /// day again.
     fn charge_late_spend(&self, now: u64) {
-        let late = self.usage.take_all();
+        let late = {
+            let router = lock(&self.router);
+            self.usage.take_where(|e| !router.is_busy(e))
+        };
         if late.is_empty() {
             return;
         }
-        let mut st = lock(&self.state);
-        for (id, u) in late {
-            if let Some(s) = st.get_mut(&id) {
-                s.budget.spend(now, u.tokens(), u.cost_usd_micros, u.calls);
-            }
+        let ops = self.charge(now, late);
+        if !ops.is_empty() {
+            self.game.persist(ops);
         }
+    }
+
+    /// Where `entity`'s spend is metered: its own mind's source (the
+    /// fallback and the plan runner spend nothing).
+    fn source(&self, entity: &EntityId) -> SpendSource {
+        self.minds
+            .get(entity)
+            .map_or(SpendSource::Local, |m| m.spend_source())
+    }
+
+    /// Charges each spend to its entity's budget and returns the `Spend`
+    /// ops that store the new tallies. They carry no harvest mark: only a
+    /// wake's close, after its mind settled, knows the mark matches what
+    /// was charged.
+    fn charge(&self, now: u64, spends: Vec<(EntityId, Usage)>) -> Vec<SideOp> {
+        let sources: Vec<SpendSource> = spends.iter().map(|(e, _)| self.source(e)).collect();
+        let mut st = lock(&self.state);
+        let ops = spends
+            .into_iter()
+            .zip(sources)
+            .filter_map(|((id, u), source)| {
+                let s = st.get_mut(&id)?;
+                s.budget.spend(now, source, u.tally());
+                Some(spend_op(&id, &s.budget, None))
+            })
+            .collect();
+        drop(st);
+        ops
     }
 
     /// The mind that runs `wake`, and the bookings it sees: none for a
@@ -956,11 +1050,11 @@ impl Supervisor {
         // The reply's spend, plus what the mind could not put in a reply: a
         // failed wake, or one dropped by the timeout above.
         let usage = reply.usage.plus(self.usage.take(&wake.entity));
+        let source = self.source(&wake.entity);
         let budget = {
             let mut st = lock(&self.state);
             st.get_mut(&wake.entity).map_or(BudgetLevel::Normal, |s| {
-                s.budget
-                    .spend(end, usage.tokens(), usage.cost_usd_micros, usage.calls);
+                s.budget.spend(end, source, usage.tally());
                 s.last_wake = Some((wake.priority, wake.reason.clone(), start));
                 s.wakes += 1;
                 s.budget.level(end)
@@ -975,15 +1069,26 @@ impl Supervisor {
             took_ms: end.saturating_sub(start),
         });
         mind.settled(&wake.entity).await;
+        // What the mind spent after the timeout (a job or an op read late)
+        // is in the sink by now: charge it, so the close stores the day's
+        // tallies and the harvest mark together, and they agree.
+        let late = self.usage.take(&wake.entity);
+        let mark = self
+            .minds
+            .get(&wake.entity)
+            .and_then(|m| m.tokens_seen(&wake.entity));
+        let now = self.game.now_ms();
+        self.charge(now, vec![(wake.entity.clone(), late)]);
+        let spend = lock(&self.state)
+            .get(&wake.entity)
+            .map(|s| spend_op(&wake.entity, &s.budget, mark));
         assert_none_held("closing a turn");
-        let closed = self.game.close_turn(
-            &wake.entity,
-            &turn,
-            vec![SideOp::PlanDone {
-                entity: wake.entity.clone(),
-                wake_id: turn.clone(),
-            }],
-        );
+        let mut ops: Vec<SideOp> = spend.into_iter().collect();
+        ops.push(SideOp::PlanDone {
+            entity: wake.entity.clone(),
+            wake_id: turn.clone(),
+        });
+        let closed = self.game.close_turn(&wake.entity, &turn, ops);
         if let Err(e) = closed {
             // The store logged and counted it; the close's ops wait in its
             // backlog for the next commit.
@@ -1067,13 +1172,16 @@ impl Supervisor {
             .filter_map(|(id, mut v)| {
                 let s = st.get_mut(id)?;
                 let level = s.budget.level(now);
+                let (local, lg) = (s.budget.spend.local, s.budget.spend.lg);
                 let extra = json!({
                     "budget": {
                         "level": level,
-                        "tokens": s.budget.tokens,
+                        "tokens": s.budget.tokens(),
                         "limit": s.budget.limit,
-                        "cost_usd_micros": s.budget.cost_usd_micros,
-                        "calls": s.budget.calls,
+                        "cost_usd_micros": s.budget.cost_usd_micros(),
+                        "calls": s.budget.calls(),
+                        "local": { "tokens": local.tokens, "cost_usd_micros": local.cost_usd_micros, "calls": local.calls },
+                        "lg": { "tokens": lg.tokens, "cost_usd_micros": lg.cost_usd_micros, "calls": lg.calls },
                     },
                     "wakes": s.wakes,
                     "last_wake": s.last_wake.as_ref().map(|(p, r, at)| json!({ "priority": p, "reason": r, "at_ms": at })),
@@ -1090,22 +1198,51 @@ impl Supervisor {
                 Some(v)
             })
             .collect();
-        let tokens: u64 = st.values().map(|s| s.budget.tokens).sum();
-        let cost: u64 = st.values().map(|s| s.budget.cost_usd_micros).sum();
+        let tokens: u64 = st.values().map(|s| s.budget.tokens()).sum();
+        let cost: u64 = st.values().map(|s| s.budget.cost_usd_micros()).sum();
         drop(st);
         json!({ "now_ms": now, "entities": entities, "tokens_today": tokens, "cost_usd_micros_today": cost })
     }
 
-    /// Records spend from outside a wake (tests, external minds).
+    /// Records spend from outside a wake (tests, external minds), metered
+    /// by the supervisor, and stores the day's tallies.
     pub fn record_spend(&self, entity: &EntityId, usage: Usage) {
         let now = self.game.now_ms();
-        if let Some(s) = lock(&self.state).get_mut(entity) {
-            s.budget
-                .spend(now, usage.tokens(), usage.cost_usd_micros, usage.calls);
+        let op = lock(&self.state).get_mut(entity).map(|s| {
+            s.budget.spend(now, SpendSource::Local, usage.tally());
+            spend_op(entity, &s.budget, None)
+        });
+        if let Some(op) = op {
+            self.game.persist(vec![op]);
         }
+    }
+
+    /// The day's budget of `entity`: its level and the tallies by source
+    /// (tests and the admin page).
+    #[must_use]
+    pub fn budget_of(&self, entity: &EntityId) -> Option<(BudgetLevel, DaySpend)> {
+        let now = self.game.now_ms();
+        lock(&self.state)
+            .get_mut(entity)
+            .map(|s| (s.budget.level(now), s.budget.spend))
     }
 }
 
+/// The `Spend` op that stores `budget`'s day: absolute tallies, joined in
+/// the store by the proved [`crate::persist::budget_join`], so a retried,
+/// reordered or lost op never stores more than memory holds.
+fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>) -> SideOp {
+    SideOp::Spend {
+        entity: entity.clone(),
+        day: budget.spend.day,
+        local: budget.spend.local,
+        lg: budget.spend.lg,
+        harvest_tokens_seen,
+    }
+}
+
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod persist_tests;
 #[cfg(test)]

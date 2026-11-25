@@ -47,6 +47,15 @@ until midnight the deterministic fallback answers direct interactions
 with canned flavor ("Torin grunts and keeps hammering.") and no model is
 called. `budget_level` is proved in Verus.
 
+**Budgets survive a restart (ADR 0011, phase 3).** The day's spend is two
+tallies, what the supervisor metered and what littleguy's ledger
+reported, and the breaker counts both. The day rolls only forward, so a
+clock set back never resets a spent budget. Each wake's close stores the
+tallies with its turn, and the boot restores them and primes each
+littleguy meter from its ledger: a restart neither bills a ledger row
+twice nor forgets today's spend, and an agent at its hard stop is still
+stopped after a restart. The kernels are proved (ADR 0006).
+
 ```mermaid
 stateDiagram-v2
   [*] --> Normal

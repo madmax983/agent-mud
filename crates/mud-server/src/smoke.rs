@@ -283,7 +283,8 @@ fn bounties(game: &Game) -> usize {
 /// moment torin's `move e` commits, that thread stops for good, holding
 /// the world, as a killed process would. A second process opens the same
 /// file: the macro tick is consumed, the plan's cursor is 1, and the
-/// resume runs the other four lines. One BOUNTY, and torin is home.
+/// resume runs the other four lines. One BOUNTY, and torin is home. The
+/// spend the first process recorded comes back with the same budget level.
 async fn restart_drill() -> anyhow::Result<Vec<String>> {
     let dir = DrillDir::new()?;
     let db = dir.0.join("world.db");
@@ -315,6 +316,7 @@ async fn restart_drill() -> anyhow::Result<Vec<String>> {
                     std::thread::park();
                 }
             })));
+            rig.sup.record_spend(&EntityId::from("torin"), DRILL_SPEND);
             rig.sup.fire_macro_tick(&EntityId::from("torin"));
             let _ = rig.run_for(5_000).await;
         });
@@ -332,6 +334,15 @@ async fn restart_drill() -> anyhow::Result<Vec<String>> {
     ensure!(
         bounties(&game) == 0,
         "the bounty was posted before the kill"
+    );
+    let (level, spend) = rig
+        .sup
+        .budget_of(&torin)
+        .context("torin has no budget after the restart")?;
+    ensure!(
+        level == mud_supervisor::budget::BudgetLevel::Soft
+            && spend.local.tokens == DRILL_SPEND.tokens(),
+        "the spend did not survive the restart: {level:?} {spend:?}"
     );
     rig.run_for(2_000).await?;
     let posts = bounties(&game);
@@ -356,8 +367,21 @@ async fn restart_drill() -> anyhow::Result<Vec<String>> {
             plan.cursor + 1,
             plan.lines.len()
         ),
+        format!(
+            "restart drill: torin's budget stood at {level:?} with {} tokens",
+            spend.local.tokens
+        ),
     ])
 }
+
+/// What the drill's first process spends for torin before the kill: past
+/// 80% of the default 400 000 tokens, so the budget is soft.
+const DRILL_SPEND: mud_supervisor::mind::Usage = mud_supervisor::mind::Usage {
+    calls: 2,
+    input_tokens: 320_000,
+    output_tokens: 10_000,
+    cost_usd_micros: 500,
+};
 
 /// Plays the v0.1 done criteria, the accounts' turn, then the scripts'.
 async fn play(game: &Arc<Game>, accounts: &Arc<Accounts>, rig: &mut Rig) -> anyhow::Result<()> {

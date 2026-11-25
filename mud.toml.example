@@ -44,6 +44,14 @@ persistent = "littleguy"
 turing = "littleguy"
 ambient = "plugin-agent"
 
+# Harvest agents keep their own history bounded (ADR 0011): each continues
+# as new after ops_per_run wakes, and sealed runs older than keep_days (by
+# harvest's own clock) are purged, at most once per purge_every_ms.
+[minds.harvest]
+ops_per_run = 32
+keep_days = 3                    # 0 keeps every run
+purge_every_ms = 3600000
+
 # Model aliases named by `mind.model` in cast.toml.
 [models.flash]
 base_url = "https://openrouter.ai/api/v1"

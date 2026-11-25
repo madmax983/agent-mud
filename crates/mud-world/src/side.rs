@@ -114,8 +114,9 @@ pub const fn dated_max(a_day: u64, a: u64, b_day: u64, b: u64) -> u64 {
 }
 // mirror-end dated_max
 
-/// One UTC day's spend through one channel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// mirror-begin tally
+/// One UTC day's spend through one channel.
 pub struct Tally {
     /// Tokens.
     pub tokens: u64,
@@ -124,6 +125,7 @@ pub struct Tally {
     /// Model calls.
     pub calls: u64,
 }
+// mirror-end tally
 
 impl Tally {
     /// Joins two dated tallies field by field with [`dated_max`]: the
@@ -328,6 +330,22 @@ pub enum SideOp {
         /// The harvest agent's lifetime tokens charged so far.
         harvest_tokens_seen: Option<u64>,
     },
+    /// Sets a day's spend outright and leaves the harvest mark alone.
+    ///
+    /// It is for the boot only, while no wake runs: a row stored more than
+    /// a day ahead of the clock is reset, and [`SideOp::Spend`] never moves
+    /// a day back, so without it the stale day would drop every later
+    /// `Spend` and come back at the next boot.
+    SpendReset {
+        /// Whose.
+        entity: EntityId,
+        /// The UTC day.
+        day: u64,
+        /// Metered spend.
+        local: Tally,
+        /// littleguy ledger spend.
+        lg: Tally,
+    },
     /// Stores a booking (a second insert of the same id is ignored).
     BookingInsert {
         /// The booking.
@@ -531,6 +549,17 @@ impl SideState {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (a, b) => a.or(b),
                 };
+            }
+            SideOp::SpendReset {
+                entity,
+                day,
+                local,
+                lg,
+            } => {
+                let row = self.entity_mut(entity, now_ms);
+                row.budget_day = *day;
+                row.local = *local;
+                row.lg = *lg;
             }
             SideOp::BookingInsert { row } => {
                 self.bookings.entry(row.id).or_insert_with(|| row.clone());
@@ -740,6 +769,30 @@ pub(crate) fn apply_sql(tx: &Transaction<'_>, op: &SideOp, now_ms: u64) -> Resul
                 int(lg.cost_usd_micros),
                 int(lg.calls),
                 harvest_tokens_seen.map(int)
+            ])?;
+        }
+        SideOp::SpendReset {
+            entity,
+            day,
+            local,
+            lg,
+        } => {
+            touch(tx, entity, now_ms)?;
+            tx.prepare_cached(
+                "UPDATE sup_entity SET budget_day = ?2,
+                    local_tokens = ?3, local_cost = ?4, local_calls = ?5,
+                    lg_tokens = ?6, lg_cost = ?7, lg_calls = ?8
+                 WHERE entity = ?1",
+            )?
+            .execute(params![
+                entity.as_str(),
+                int(*day),
+                int(local.tokens),
+                int(local.cost_usd_micros),
+                int(local.calls),
+                int(lg.tokens),
+                int(lg.cost_usd_micros),
+                int(lg.calls)
             ])?;
         }
         SideOp::BookingInsert { row } => {

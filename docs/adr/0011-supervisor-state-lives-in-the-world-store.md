@@ -10,8 +10,11 @@ retention with an archive, and `truncated` in `mud_events`. **Phase 2
 and count, wake ids from `(epoch, boot, n)`, settle before close, plans
 that resume at their cursor, rule counters by digest, the boot reconcile,
 the proved kernels in `crates/mud-supervisor/src/persist.rs`, and the
-kill-and-restart test. Phases 3 (budgets) and 4 (boot derivations) are
-not built yet.
+kill-and-restart test. **Phase 3 (budgets) is built:** the day's spend
+split into `local` and `lg` tallies and stored with every close, a
+forward-only roll, littleguy meters primed from the ledger at boot, the
+harvest token mark, HarvestMind continue-as-new and retention, and their
+proved kernels. Phase 4 (boot derivations) is not built yet.
 
 ## Context
 
@@ -103,6 +106,7 @@ rows never enter `WorldState`: they are not physics, and no view shows them.
 | `RuleCountsDrop` | deletes the counts of rules that are gone, by `(digest, dup)` |
 | `ScriptMemory` | a Rhai mind's memory, last writer wins (it rides on the wake's turn; not a side row) |
 | `Spend`, `Booked` | the dated join: the later UTC day wins; the same day takes the larger value; `harvest_tokens_seen = max` |
+| `SpendReset` | boot only: sets the day and both tallies outright (a row stored more than a day ahead of the clock); the harvest mark stays |
 | `BookingInsert` / `BookingDelete` | insert once by id / delete |
 | `MetaMax` | raises `next_booking_id` (never `epoch` or `boot`) |
 | `SeenSeq` | `max` |
@@ -143,7 +147,9 @@ turns (`entity → { wake_id, staged ops }`) and the backlog of a failed save.
    change waits, else it defers behind the backlog (`Durability::Deferred`).
    Only ops whose loss is a safe regression use it: a macro schedule, a
    late spend, boot-time cleanups. Nothing that precedes an external effect
-   uses it.
+   uses it. The boot-time cleanups (`DropEntity`, `RuleCountsDrop`,
+   `SpendReset`) are the only ops that are not monotone; they are written
+   while no wake can run.
 
 **A failing store.** A failed save keeps its events, ledger rows and ops in
 the backlog, and the next commit (or `act`) retries them all, with a fresh
@@ -253,11 +259,43 @@ fresh ids through the normal, ready-gated paths.
   errand resumes after any outage) supersedes the design draft, which
   bounded every resumed plan by `replay_max_age_ms`; only reactive plans
   keep that window.
-- **Phase 3.** Budgets split into `local` and `lg` tallies joined by UTC
-  day; `roll` becomes forward-only; littleguy meters are primed from the
-  ledger (`lg = max(persisted, ledger today)`); HarvestMind's
-  `harvest_tokens_seen` re-charges tokens unflushed at a crash once, to the
-  boot day.
+- **Phase 3 (built).** A budget is `{ limit, spend: DaySpend { day,
+  local, lg } }`: `local` is what the supervisor metered (a reply's usage,
+  a harvest job, `record_spend`), `lg` what a littleguy ledger reported;
+  a mind says which with `Mind::spend_source`. The breaker counts both.
+  Every change is a proved kernel (`budget_spend`, `roll_day`,
+  `budget_join`; ADR 0006): the roll only moves forward, so a clock that
+  goes back keeps the later day's counters (they still apply on the real
+  next day and roll the day after: a documented over-restriction). Each
+  close stores the day's absolute tallies (`Spend`) with its turn; late
+  spend and `record_spend` store theirs through `persist` (a lost one is a
+  bounded under-charge). Late spend is the spend of an entity whose wake
+  is closed: the clock step leaves the sink entry of an entity with an
+  open wake (the router still has it busy) to that wake's close, which
+  stores it with the harvest mark that covers it. At boot
+  `Supervisor::open` restores each row with `restore_budget` (the same day
+  and one day ahead stand, an earlier day is zeroed, more than one day
+  ahead is reset with a warning). The join never moves a day back, so the
+  boot also stores a reset with `SpendReset`: otherwise the stale later
+  day would drop every `Spend` of the real day, a later restart would
+  hand out a fresh allowance, and on that later day the stale counters
+  would come back. Then the boot asks every
+  mind to `prime`: a littleguy mind reads its daemon's ledger once, marks
+  every row of the window seen and returns today's, and the supervisor
+  raises the ledger tally to the componentwise max (`prime_budget`,
+  `restore_lg`) and stores it, so the ledger rows a restart finds are
+  neither billed again nor forgotten, and a littleguy purge of its ledger
+  keeps the stored floor. The prime is a synchronous file read at boot,
+  before any wake (as `Store::open` is), not a `spawn_blocking` task:
+  `Supervisor::open` is not async, and boot is the one moment no wake can
+  race it. An unreadable ledger primes nothing (logged); its rows are then
+  charged by the first wake on top of the stored tally, an over-count, the
+  safe direction. HarvestMind keeps the lifetime token count it charged up
+  to (`Mind::tokens_seen`), raised before each job's spend is handed over;
+  the close (after the mind settled, and after charging what reached the
+  sink late) stores it with the tallies, and `restore_tokens_seen` hands it
+  back at boot, so the first job after a crash charges the tokens the store
+  missed, once, to the boot day.
 - **Phase 4.** Addressed events (a tell, an attack, a mention by name)
   newer than `replay_max_age_ms` and after the recipient's `seen_seq` are
   replayed as Immediate wakes only; older ones are skipped. The chatter
@@ -315,10 +353,18 @@ fresh ids through the normal, ready-gated paths.
   failed save) sits below the log and is reported as `truncated`. The
   backlog cap (`Audit::StoreBacklog`) keeps `EVENT_LOG_CAP` events after
   the gap it makes, so its gap is never inside the reloaded log either.
-- **HarvestMind's `harvest.db` (phase 3)** continues as new every
-  `ops_per_run` wakes (32) and purges sealed runs older than `keep_days`
-  (3) with the public `purge_with`, on harvest's real clock (this
-  exception applies only to the minds' own files).
+- **HarvestMind's `harvest.db` (phase 3, built)** continues as new every
+  `ops_per_run` wakes (32): `AgentProfile::max_ops_per_run` carries the
+  agent state, its `tokens_used` included, into a new run. After a job, at
+  most once per `purge_every_ms` of game time, the worker calls the public
+  `SqliteRuntime::purge_with(&PurgePolicy::new().override_age("agent",
+  keep_days).batch_limit(4))`; `keep_days` is 3, and 0 keeps every run.
+  The window counts on harvest's real clock (`closed_at`): this exception
+  applies only to the minds' own files. A RUNNING run is never purged. In
+  a debug build a wake costs about 20 ms at the start of a run and about
+  140 ms by its 32nd op (replay grows within a run), about 126 ms on
+  average over 300 wakes, and drops back at each continue-as-new; the test
+  (`harvest_db_history_is_bounded`) keeps that shape at 8 ops per run.
 - **Any future harvest workflow** (a Steward saga) must continue as new
   every 100 signals or fewer, purge, and drive on the game clock.
 
@@ -329,10 +375,23 @@ fresh ids through the normal, ready-gated paths.
 `retention_batch` (5000), `archive_dir` (unset: `archive/` beside `db`).
 `[supervisor]` (phase 2): `replay_max_age_ms` (120000; 0 to one day),
 `booking_max_late_ms` (86400000; 0 to 30 days), `catchup_spread_ms`
-(120000; 0 to one hour). Phase 3 adds `[minds.harvest] ops_per_run`,
-`keep_days`, `purge_every_ms`. Every section denies unknown keys and checks its bounds.
+(120000; 0 to one hour). `[minds.harvest]` (phase 3): `ops_per_run` (32;
+1 to 10000), `keep_days` (3; 0 keeps every run, at most 36500),
+`purge_every_ms` (3600000; one second to a week). Every section denies
+unknown keys and checks its bounds.
 
 ## Guarantees and crash model
+
+**Budgets (phase 3).** The stored tallies never pass the ones in memory
+(`lemma_stored_never_passes_memory`), and a restart restores them, so the
+breaker stands where it stood: a hard stop survives a restart. What a
+crash can lose is the spend after the last stored close (an LLM mind's
+turn in flight): a littleguy mind gets it back from its ledger at boot,
+and a harvest mind from its token mark; other minds under-charge by at
+most that turn. No stored tally counts harvest tokens past the stored
+mark: only a close stores a harvest entity's spend while its job can run,
+and it stores the mark with it, so a kill at any point charges each token
+once.
 
 **Deterministic plans (Scripted runtime, Rhai minds; phase 2).** Every
 effectful line commits with `PlanCursor` past it, in the same transaction.
@@ -367,7 +426,8 @@ next tick is number 2 and posts nothing; the dice match a run that was
 never killed); and in the middle of retention (the table and the archive
 are contiguous, with no line twice, and a re-run finishes). Each case
 also checks `user_version = 1`, a bumped boot and that no wake id of the
-child is used again. The budget case waits for phase 3.
+child is used again. The budget case (phase 3): a spend stored before the
+kill comes back with the same tallies and the same breaker level.
 
 **OS crash.** With WAL and `synchronous = NORMAL` the last world commits
 may be lost, and their `Consume` and `PlanCursor` ops with them: durable

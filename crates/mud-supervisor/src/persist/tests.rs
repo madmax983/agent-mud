@@ -174,3 +174,129 @@ proptest! {
         prop_assert_eq!(WakeKey::parse(&ka.id(&e)), Some((ka, e)));
     }
 }
+
+// ---- budgets (phase 3) ----
+
+const fn t(tokens: u64, cost_usd_micros: u64, calls: u64) -> Tally {
+    Tally {
+        tokens,
+        cost_usd_micros,
+        calls,
+    }
+}
+
+const fn ds(day: u64, local: Tally, lg: Tally) -> DaySpend {
+    DaySpend { day, local, lg }
+}
+
+/// The dated order of the proofs.
+fn le(a: DaySpend, b: DaySpend) -> bool {
+    let tle = |x: Tally, y: Tally| {
+        x.tokens <= y.tokens && x.cost_usd_micros <= y.cost_usd_micros && x.calls <= y.calls
+    };
+    a.day < b.day || (a.day == b.day && tle(a.local, b.local) && tle(a.lg, b.lg))
+}
+
+#[test]
+fn a_spend_lands_in_its_tally_and_a_later_day_rolls_both() {
+    let s = budget_spend(DaySpend::default(), 7, false, t(10, 2, 1));
+    let s = budget_spend(s, 7, true, t(5, 1, 1));
+    assert_eq!(s, ds(7, t(10, 2, 1), t(5, 1, 1)));
+    assert_eq!(budget_used(s), 15);
+    let next = budget_spend(s, 8, true, t(1, 0, 1));
+    assert_eq!(
+        next,
+        ds(8, tally_zero(), t(1, 0, 1)),
+        "a new day starts at 0"
+    );
+    let back = budget_spend(next, 7, false, t(3, 0, 1));
+    assert_eq!(back.day, 8, "the day never rolls back");
+    assert_eq!(back.local, t(3, 0, 1));
+    assert_eq!(
+        budget_used(ds(0, t(u64::MAX, 0, 0), t(1, 0, 0))),
+        u64::MAX,
+        "saturating"
+    );
+    assert_eq!(
+        tally_add(t(u64::MAX, u64::MAX, u64::MAX), t(1, 1, 1)),
+        t(u64::MAX, u64::MAX, u64::MAX)
+    );
+}
+
+#[test]
+fn a_restore_keeps_today_and_tomorrow_and_zeroes_the_rest() {
+    let row = ds(10, t(5, 1, 1), t(7, 2, 1));
+    assert_eq!(restore_budget(row, 10), row, "the same day stands");
+    assert_eq!(restore_budget(row, 9), row, "one day ahead stands");
+    assert_eq!(restore_budget(row, 11), ds(11, tally_zero(), tally_zero()));
+    assert_eq!(restore_budget(row, 8), ds(8, tally_zero(), tally_zero()));
+    let primed = prime_budget(row, 10, t(9, 1, 3));
+    assert_eq!(primed, ds(10, t(5, 1, 1), t(9, 2, 3)), "each field rises");
+    assert_eq!(prime_budget(row, 9, t(99, 9, 9)), row, "another day: kept");
+    assert_eq!(restore_lg(t(4, 0, 2), t(3, 5, 1)), t(4, 5, 2));
+}
+
+fn tally() -> impl Strategy<Value = Tally> {
+    (0u64..50, 0u64..50, 0u64..5).prop_map(|(a, b, c)| t(a, b, c))
+}
+
+fn day_spend() -> impl Strategy<Value = DaySpend> {
+    (0u64..4, tally(), tally()).prop_map(|(d, l, g)| ds(d, l, g))
+}
+
+proptest! {
+    #[test]
+    fn the_budget_join_is_a_semilattice(a in day_spend(), b in day_spend(), c in day_spend()) {
+        prop_assert_eq!(budget_join(a, b), budget_join(b, a));
+        prop_assert_eq!(budget_join(budget_join(a, b), c), budget_join(a, budget_join(b, c)));
+        prop_assert_eq!(budget_join(a, a), a);
+        prop_assert!(le(a, budget_join(a, b)) && le(b, budget_join(a, b)));
+    }
+
+    /// The store's `Spend` merge, folded in memory, is the kernel's join.
+    #[test]
+    fn the_store_merge_is_the_kernel_join(rows in proptest::collection::vec(day_spend(), 1..6)) {
+        let e = EntityId::from("torin");
+        let mut side = mud_world::side::SideState::default();
+        let mut want = DaySpend::default();
+        for r in &rows {
+            side.apply(
+                &mud_world::SideOp::Spend {
+                    entity: e.clone(),
+                    day: r.day,
+                    local: r.local,
+                    lg: r.lg,
+                    harvest_tokens_seen: None,
+                },
+                0,
+            );
+            want = budget_join(want, *r);
+        }
+        let got = &side.entities[&e];
+        prop_assert_eq!(ds(got.budget_day, got.local, got.lg), want);
+    }
+
+    /// Writes of memory snapshots, in any order, never pass memory.
+    #[test]
+    fn the_stored_budget_never_passes_memory(
+        spends in proptest::collection::vec((0u64..3, any::<bool>(), tally()), 1..12),
+        order in proptest::collection::vec(any::<prop::sample::Index>(), 0..12),
+    ) {
+        let mut mem = DaySpend::default();
+        let mut hist = vec![mem];
+        for (day, ledger, add) in spends {
+            let next = budget_spend(mem, day, ledger, add);
+            prop_assert!(le(mem, next), "a spend never goes down");
+            mem = next;
+            hist.push(mem);
+        }
+        let mut stored = DaySpend::default();
+        for i in order {
+            stored = budget_join(stored, *i.get(&hist));
+        }
+        prop_assert!(le(stored, mem));
+        if stored.day == mem.day {
+            prop_assert!(budget_used(stored) <= budget_used(mem));
+        }
+    }
+}

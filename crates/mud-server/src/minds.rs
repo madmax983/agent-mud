@@ -184,11 +184,10 @@ pub fn build(
                         )
                     })
                     .collect();
-                Arc::new(HarvestMind::new(
-                    client,
-                    Some(cfg.littleguy.data_dir.clone()),
-                    personas,
-                ))
+                Arc::new(
+                    HarvestMind::new(client, Some(cfg.littleguy.data_dir.clone()), personas)
+                        .with_history(cfg.minds.harvest.history()?),
+                )
             }
             Runtime::PluginAgent => {
                 let m = model(cfg, &alias)?;

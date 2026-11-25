@@ -27,8 +27,8 @@ use tokio::sync::{Mutex, oneshot};
 
 use crate::ledger::LedgerMeter;
 use crate::mind::{
-    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, Usage, UsageSink,
-    WakeContext, system_prompt, wake_message,
+    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, SpendSource, Usage,
+    UsageSink, WakeContext, system_prompt, wake_message,
 };
 
 /// How long a daemon's reply is still read after its wake was given up.
@@ -623,6 +623,25 @@ impl LittleguyMind {
 impl Mind for LittleguyMind {
     fn kind(&self) -> &'static str {
         "littleguy"
+    }
+
+    /// littleguy's ledger is the one complete record of its spend.
+    fn spend_source(&self) -> SpendSource {
+        SpendSource::Ledger
+    }
+
+    /// Reads the daemon's ledger at boot: today's rows, now marked seen.
+    /// An unreadable ledger primes nothing (logged): its rows are then
+    /// charged by the first wake on top of the stored tally, which
+    /// over-counts, the safe direction for a budget.
+    fn prime(&self, entity: &EntityId, now_ms: u64) -> Option<Usage> {
+        match self.meter(entity).prime(now_ms) {
+            Ok(primed) => primed,
+            Err(e) => {
+                tracing::warn!(%entity, error = %e, "littleguy ledger unreadable at boot; not primed");
+                None
+            }
+        }
     }
 
     /// Resolves once every op of the entity was read and charged, or its

@@ -162,6 +162,19 @@ pub const fn dated_max(a_day: u64, a: u64, b_day: u64, b: u64) -> (r: u64)
 }
 // mirror-end dated_max
 
+#[derive(Clone, Copy)]
+// mirror-begin tally
+/// One UTC day's spend through one channel.
+pub struct Tally {
+    /// Tokens.
+    pub tokens: u64,
+    /// Cost, in millionths of a dollar.
+    pub cost_usd_micros: u64,
+    /// Model calls.
+    pub calls: u64,
+}
+// mirror-end tally
+
 pub open spec fn spec_dated(a_day: u64, a: u64, b_day: u64, b: u64) -> u64 {
     if a_day > b_day {
         a

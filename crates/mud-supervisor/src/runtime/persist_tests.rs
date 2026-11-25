@@ -18,10 +18,10 @@ use crate::mind::{BoxFuture, InFlight, MindError};
 use crate::scripted::ScriptedMind;
 
 /// 20:00 on day 0 of the game clock.
-const T0: u64 = 20 * 3_600_000;
-const DAY: u64 = 86_400_000;
+pub(super) const T0: u64 = 20 * 3_600_000;
+pub(super) const DAY: u64 = 86_400_000;
 
-fn torin() -> EntityId {
+pub(super) fn torin() -> EntityId {
     EntityId::from("torin")
 }
 
@@ -30,13 +30,13 @@ fn marta() -> EntityId {
 }
 
 /// A world.db in a temporary folder, opened again at each restart.
-struct Disk {
-    dir: tempfile::TempDir,
-    pack: Arc<WorldPack>,
+pub(super) struct Disk {
+    pub(super) dir: tempfile::TempDir,
+    pub(super) pack: Arc<WorldPack>,
 }
 
 impl Disk {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with(WorldPack::crypt_v01().unwrap())
     }
 
@@ -47,17 +47,21 @@ impl Disk {
         }
     }
 
-    fn db(&self) -> PathBuf {
+    pub(super) fn db(&self) -> PathBuf {
         self.dir.path().join("world.db")
     }
 
-    fn game(&self, now: u64) -> (Arc<Game>, Arc<ManualClock>) {
+    pub(super) fn game(&self, now: u64) -> (Arc<Game>, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(now));
         let game = Game::open(Arc::clone(&self.pack), Some(&self.db()), 5, clock.clone()).unwrap();
         (game, clock)
     }
 
-    fn sql<T>(&self, q: &str, f: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>) -> Vec<T> {
+    pub(super) fn sql<T>(
+        &self,
+        q: &str,
+        f: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Vec<T> {
         let conn = rusqlite::Connection::open(self.db()).unwrap();
         let mut st = conn.prepare(q).unwrap();
         st.query_map([], |r| f(r))
@@ -74,17 +78,17 @@ impl Disk {
 }
 
 /// One process's run: a supervisor over the disk's world.
-struct Run {
-    sup: Arc<Supervisor>,
-    game: Arc<Game>,
-    clock: Arc<ManualClock>,
+pub(super) struct Run {
+    pub(super) sup: Arc<Supervisor>,
+    pub(super) game: Arc<Game>,
+    pub(super) clock: Arc<ManualClock>,
     rx: broadcast::Receiver<Arc<Event>>,
     obs: broadcast::Receiver<Arc<ObserverEvent>>,
     /// The boot report, ahead of the feed, as the observer page shows it.
     boot: Vec<Arc<ObserverEvent>>,
 }
 
-fn quiet() -> SupervisorConfig {
+pub(super) fn quiet() -> SupervisorConfig {
     SupervisorConfig {
         first_macro_tick_secs: [3_600, 3_600],
         ..SupervisorConfig::default()
@@ -94,7 +98,7 @@ fn quiet() -> SupervisorConfig {
 /// Starts a process at `now` as the server does: opens the world, opens
 /// the supervisor on what the world restored, and only then subscribes to
 /// its feed.
-fn start(
+pub(super) fn start(
     disk: &Disk,
     now: u64,
     cfg: SupervisorConfig,
@@ -105,7 +109,7 @@ fn start(
 }
 
 /// [`start`] on a world the caller opened (a mind needs its game first).
-fn start_on(
+pub(super) fn start_on(
     disk: &Disk,
     game: Arc<Game>,
     clock: Arc<ManualClock>,
@@ -130,7 +134,7 @@ fn start_on(
 }
 
 impl Run {
-    async fn run_for(&mut self, total_ms: u64, step_ms: u64) {
+    pub(super) async fn run_for(&mut self, total_ms: u64, step_ms: u64) {
         let mut t = 0;
         while t <= total_ms {
             while let Ok(ev) = self.rx.try_recv() {
@@ -148,7 +152,7 @@ impl Run {
     }
 
     /// Every feed entry so far: the boot report first.
-    fn feed(&mut self) -> Vec<Arc<ObserverEvent>> {
+    pub(super) fn feed(&mut self) -> Vec<Arc<ObserverEvent>> {
         let mut out = std::mem::take(&mut self.boot);
         while let Ok(e) = self.obs.try_recv() {
             out.push(e);

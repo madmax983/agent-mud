@@ -216,6 +216,13 @@ impl Router {
             .collect()
     }
 
+    /// Whether `entity` has a wake in flight: from the moment it is taken
+    /// as due until [`Router::finish`], after its close.
+    #[must_use]
+    pub fn is_busy(&self, entity: &EntityId) -> bool {
+        self.busy.contains(entity)
+    }
+
     /// Whether `entity` has no wake in flight and none waiting.
     #[must_use]
     pub fn is_idle(&self, entity: &EntityId) -> bool {

@@ -5,7 +5,12 @@
 //! a deterministic fallback answers direct interactions with canned
 //! flavor, and no model is called.
 
+use mud_world::side::Tally;
 use serde::{Deserialize, Serialize};
+
+use crate::persist::{
+    DaySpend, budget_spend, budget_used, prime_budget, restore_budget, roll_day, tally_zero,
+};
 
 /// How much of its budget an entity may still spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -38,19 +43,30 @@ pub const fn budget_level(used: u64, limit: u64) -> BudgetLevel {
 /// Milliseconds in a day.
 pub const DAY_MS: u64 = 86_400_000;
 
+/// Where a spend was metered, which says which tally of the day it joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpendSource {
+    /// The supervisor metered it: a reply's usage, a harvest agent's
+    /// token count, a plugin-agent client.
+    Local,
+    /// littleguy's own cost ledger reported it.
+    Ledger,
+}
+
 /// The spend of one entity on one UTC day.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// It is split by source (ADR 0011): what the supervisor metered itself
+/// (`local`) and what littleguy's ledger reported (`lg`). The breaker
+/// counts both. The day only moves forward, and every change is a
+/// [`crate::persist`] kernel, so the row the store keeps is never above
+/// this one and a restart restores it exactly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Budget {
     /// The daily token limit. `None` means no limit.
     pub limit: Option<u64>,
-    /// The UTC day the counters belong to (days since the epoch).
-    pub day: u64,
-    /// Tokens spent today.
-    pub tokens: u64,
-    /// Cost spent today, in millionths of a dollar.
-    pub cost_usd_micros: u64,
-    /// Model calls today.
-    pub calls: u64,
+    /// Today's spend, by source.
+    pub spend: DaySpend,
 }
 
 impl Budget {
@@ -59,30 +75,49 @@ impl Budget {
     pub const fn new(limit: Option<u64>) -> Self {
         Self {
             limit,
-            day: 0,
-            tokens: 0,
-            cost_usd_micros: 0,
-            calls: 0,
+            spend: DaySpend {
+                day: 0,
+                local: tally_zero(),
+                lg: tally_zero(),
+            },
         }
     }
 
-    /// Rolls over at UTC midnight.
+    /// Rolls over at UTC midnight. Only forward: a clock that went back
+    /// keeps the later day's counters, which roll the day after it.
     pub const fn roll(&mut self, now_ms: u64) {
-        let day = now_ms / DAY_MS;
-        if day != self.day {
-            self.day = day;
-            self.tokens = 0;
-            self.cost_usd_micros = 0;
-            self.calls = 0;
-        }
+        self.spend = roll_day(self.spend, now_ms / DAY_MS);
     }
 
-    /// Records a spend.
-    pub const fn spend(&mut self, now_ms: u64, tokens: u64, cost_usd_micros: u64, calls: u64) {
-        self.roll(now_ms);
-        self.tokens = self.tokens.saturating_add(tokens);
-        self.cost_usd_micros = self.cost_usd_micros.saturating_add(cost_usd_micros);
-        self.calls = self.calls.saturating_add(calls);
+    /// Records a spend from `source`.
+    pub const fn spend(&mut self, now_ms: u64, source: SpendSource, add: Tally) {
+        self.spend = budget_spend(
+            self.spend,
+            now_ms / DAY_MS,
+            matches!(source, SpendSource::Ledger),
+            add,
+        );
+    }
+
+    /// Tokens spent today, both sources.
+    #[must_use]
+    pub const fn tokens(&self) -> u64 {
+        budget_used(self.spend)
+    }
+
+    /// Cost spent today, in millionths of a dollar, both sources.
+    #[must_use]
+    pub const fn cost_usd_micros(&self) -> u64 {
+        self.spend
+            .local
+            .cost_usd_micros
+            .saturating_add(self.spend.lg.cost_usd_micros)
+    }
+
+    /// Model calls today, both sources.
+    #[must_use]
+    pub const fn calls(&self) -> u64 {
+        self.spend.local.calls.saturating_add(self.spend.lg.calls)
     }
 
     /// The current level.
@@ -90,7 +125,22 @@ impl Budget {
     pub fn level(&mut self, now_ms: u64) -> BudgetLevel {
         self.roll(now_ms);
         self.limit
-            .map_or(BudgetLevel::Normal, |l| budget_level(self.tokens, l))
+            .map_or(BudgetLevel::Normal, |l| budget_level(self.tokens(), l))
+    }
+
+    /// Restores the stored row at boot ([`restore_budget`]). Returns
+    /// whether a row more than a day ahead of the clock was reset (the
+    /// caller warns).
+    pub const fn restore(&mut self, row: DaySpend, now_ms: u64) -> bool {
+        let today = now_ms / DAY_MS;
+        self.spend = restore_budget(row, today);
+        row.day > today && self.spend.day != row.day
+    }
+
+    /// Raises the ledger tally to what the ledger holds of today
+    /// ([`prime_budget`]), at boot.
+    pub const fn prime(&mut self, now_ms: u64, ledger: Tally) {
+        self.spend = prime_budget(self.spend, now_ms / DAY_MS, ledger);
     }
 }
 
@@ -109,16 +159,57 @@ mod tests {
         assert_eq!(budget_level(5, 0), BudgetLevel::Hard);
     }
 
+    const fn tally(tokens: u64, cost_usd_micros: u64, calls: u64) -> Tally {
+        Tally {
+            tokens,
+            cost_usd_micros,
+            calls,
+        }
+    }
+
     #[test]
     fn the_day_rolls_over_at_midnight() {
         let mut b = Budget::new(Some(100));
-        b.spend(DAY_MS + 5, 100, 7, 1);
-        assert_eq!(b.level(DAY_MS + 6), BudgetLevel::Hard);
+        b.spend(DAY_MS + 5, SpendSource::Local, tally(60, 7, 1));
+        b.spend(DAY_MS + 5, SpendSource::Ledger, tally(40, 3, 2));
+        assert_eq!((b.tokens(), b.cost_usd_micros(), b.calls()), (100, 10, 3));
+        assert_eq!(b.level(DAY_MS + 6), BudgetLevel::Hard, "both sources count");
         assert_eq!(b.level(2 * DAY_MS), BudgetLevel::Normal);
-        assert_eq!(b.tokens, 0);
+        assert_eq!(b.tokens(), 0);
         let mut open = Budget::new(None);
-        open.spend(0, u64::MAX, 0, 1);
+        open.spend(0, SpendSource::Local, tally(u64::MAX, 0, 1));
         assert_eq!(open.level(1), BudgetLevel::Normal);
+    }
+
+    #[test]
+    fn a_clock_that_goes_back_keeps_the_later_day() {
+        let mut b = Budget::new(Some(100));
+        b.spend(2 * DAY_MS + 5, SpendSource::Local, tally(100, 0, 1));
+        assert_eq!(b.level(DAY_MS + 5), BudgetLevel::Hard, "not reset");
+        assert_eq!(b.level(2 * DAY_MS + 9), BudgetLevel::Hard);
+        assert_eq!(
+            b.level(3 * DAY_MS),
+            BudgetLevel::Normal,
+            "rolls on the day after"
+        );
+    }
+
+    #[test]
+    fn a_restore_far_ahead_is_reported_and_reset() {
+        let row = DaySpend {
+            day: 10,
+            local: tally(5, 0, 1),
+            lg: tally_zero(),
+        };
+        let mut b = Budget::new(Some(10));
+        assert!(!b.restore(row, 10 * DAY_MS), "the same day");
+        assert_eq!(b.spend, row);
+        assert!(!b.restore(row, 9 * DAY_MS), "one day ahead stands");
+        assert!(b.restore(row, 8 * DAY_MS), "two days ahead resets");
+        assert_eq!(b.tokens(), 0);
+        assert!(!b.restore(row, 11 * DAY_MS), "an earlier day is just over");
+        b.prime(11 * DAY_MS, tally(7, 1, 1));
+        assert_eq!(b.spend.lg, tally(7, 1, 1));
     }
 
     proptest! {

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use mud_supervisor::gate::Gate;
-use mud_supervisor::mind::{BoxFuture, Mind, MindError, MindReply, MudTools, WakeContext};
+use mud_supervisor::mind::{BoxFuture, Mind, MindError, MindReply, MudTools, Usage, WakeContext};
 use mud_supervisor::runtime::{ObserverEvent, Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::{FallbackMind, ScriptedMind};
 use mud_world::{EntityId, Event, Game, ManualClock, RoomId, WorldPack};
@@ -266,6 +266,21 @@ async fn child(point: &str, dir: &Path) {
             p.run_for(1_000, 500).await;
         }
         "retention" => retention_child(&p, dir),
+        "spend" => {
+            // Past 80% of the default 400 000: soft. Stored at once.
+            p.sup.record_spend(
+                &torin(),
+                Usage {
+                    calls: 3,
+                    input_tokens: 300_000,
+                    output_tokens: 30_000,
+                    cost_usd_micros: 1_234,
+                },
+            );
+            let (level, spend) = p.sup.budget_of(&torin()).unwrap();
+            mark(dir, &format!("{level:?} {}", spend.local.tokens));
+            stop_here();
+        }
         lines => {
             let n: usize = lines.trim_start_matches("line").parse().unwrap();
             let seen = AtomicUsize::new(0);
@@ -579,6 +594,22 @@ async fn kill_during_retention() {
         .query_row("SELECT MIN(seq) FROM events", [], |r| r.get(0))
         .unwrap();
     assert_eq!(u64::try_from(lo).unwrap(), archived.last().unwrap() + 1);
+    after_restart(dir.path(), &p, &[]);
+}
+
+#[tokio::test]
+async fn kill_with_local_spend_flushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let marked = kill_at("spend", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "Soft 330000");
+    let p = open(dir.path(), T0 + 1_000, scripted());
+    let (level, spend) = p.sup.budget_of(&torin()).unwrap();
+    assert_eq!(
+        format!("{level:?} {}", spend.local.tokens),
+        marked,
+        "the budget level is unchanged by the kill"
+    );
+    assert_eq!((spend.local.calls, spend.local.cost_usd_micros), (3, 1_234));
     after_restart(dir.path(), &p, &[]);
 }
 
