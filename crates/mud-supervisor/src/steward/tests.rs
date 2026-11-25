@@ -18,21 +18,21 @@ use crate::runtime::SupervisorConfig;
 use crate::scripted::FallbackMind;
 
 /// 08:00 on day 10 of the game clock.
-const T0: u64 = 10 * DAY_MS + 8 * 3_600_000;
-const MIN: u64 = 60_000;
-const HOUR: u64 = 3_600_000;
-const TOKEN: &str = "tok-SECRET-9f3";
+pub(super) const T0: u64 = 10 * DAY_MS + 8 * 3_600_000;
+pub(super) const MIN: u64 = 60_000;
+pub(super) const HOUR: u64 = 3_600_000;
+pub(super) const TOKEN: &str = "tok-SECRET-9f3";
 
-fn torin() -> EntityId {
+pub(super) fn torin() -> EntityId {
     EntityId::from("torin")
 }
 
 /// A mind that records each wake and, when asked, holds it open.
 #[derive(Debug, Default)]
-struct Noop {
-    seen: Mutex<Vec<WakeContext>>,
-    hold: Mutex<Option<Arc<Notify>>>,
-    usage: Usage,
+pub(super) struct Noop {
+    pub(super) seen: Mutex<Vec<WakeContext>>,
+    pub(super) hold: Mutex<Option<Arc<Notify>>>,
+    pub(super) usage: Usage,
 }
 
 impl Mind for Noop {
@@ -60,26 +60,26 @@ impl Mind for Noop {
     }
 }
 
-struct Rig {
-    game: Arc<Game>,
-    clock: Arc<ManualClock>,
-    sup: Arc<Supervisor>,
-    mind: Arc<Noop>,
-    fake: Arc<FakeDaemons>,
-    judge: Arc<ScriptedJudge>,
-    steward: Arc<Steward>,
-    obs: broadcast::Receiver<Arc<ObserverEvent>>,
-    events: broadcast::Receiver<Arc<Event>>,
+pub(super) struct Rig {
+    pub(super) game: Arc<Game>,
+    pub(super) clock: Arc<ManualClock>,
+    pub(super) sup: Arc<Supervisor>,
+    pub(super) mind: Arc<Noop>,
+    pub(super) fake: Arc<FakeDaemons>,
+    pub(super) judge: Arc<ScriptedJudge>,
+    pub(super) steward: Arc<Steward>,
+    pub(super) obs: broadcast::Receiver<Arc<ObserverEvent>>,
+    pub(super) events: broadcast::Receiver<Arc<Event>>,
 }
 
-struct Opts {
-    cfg: StewardConfig,
-    judge: bool,
-    db: Option<std::path::PathBuf>,
-    now: u64,
-    mind: Noop,
-    fake: Option<Arc<FakeDaemons>>,
-    judge_of: Option<Arc<ScriptedJudge>>,
+pub(super) struct Opts {
+    pub(super) cfg: StewardConfig,
+    pub(super) judge: bool,
+    pub(super) db: Option<std::path::PathBuf>,
+    pub(super) now: u64,
+    pub(super) mind: Noop,
+    pub(super) fake: Option<Arc<FakeDaemons>>,
+    pub(super) judge_of: Option<Arc<ScriptedJudge>>,
 }
 
 impl Default for Opts {
@@ -96,7 +96,7 @@ impl Default for Opts {
     }
 }
 
-fn rig(o: Opts) -> Rig {
+pub(super) fn rig(o: Opts) -> Rig {
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
     let clock = Arc::new(ManualClock::new(o.now));
     let game = o.db.as_ref().map_or_else(
@@ -135,6 +135,12 @@ fn rig(o: Opts) -> Rig {
         game.boot(),
     );
     steward.set_owner_timeout(Duration::from_millis(300));
+    steward.set_refine_waits(
+        Duration::from_millis(300),
+        Duration::from_millis(400),
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+    );
     Rig {
         game,
         clock,
@@ -149,20 +155,20 @@ fn rig(o: Opts) -> Rig {
 }
 
 impl Rig {
-    fn d(&self) -> &Arc<fake::FakeDaemon> {
+    pub(super) fn d(&self) -> &Arc<fake::FakeDaemon> {
         self.fake.of("torin")
     }
 
-    async fn pass(&self) {
+    pub(super) async fn pass(&self) {
         self.steward.pass().await;
     }
 
-    fn advance(&self, ms: u64) {
+    pub(super) fn advance(&self, ms: u64) {
         self.clock.advance(ms);
     }
 
     /// The Steward lines of the feed since the last call.
-    fn steward_events(&mut self) -> Vec<StewardEvent> {
+    pub(super) fn steward_events(&mut self) -> Vec<StewardEvent> {
         let mut out = Vec::new();
         while let Ok(e) = self.obs.try_recv() {
             if let ObserverEvent::Steward(s) = &*e {
@@ -174,7 +180,7 @@ impl Rig {
 
     /// Feeds the world's events to the supervisor and runs its due wakes
     /// to the end.
-    async fn step(&mut self) {
+    pub(super) async fn step(&mut self) {
         while let Ok(ev) = self.events.try_recv() {
             self.sup.observe(&ev);
         }
@@ -184,25 +190,25 @@ impl Rig {
     }
 
     /// A macro-tick wake of torin, run to the end; its context.
-    async fn macro_wake(&mut self) -> WakeContext {
+    pub(super) async fn macro_wake(&mut self) -> WakeContext {
         self.sup.fire_macro_tick(&torin());
         self.step().await;
         self.mind.seen.lock().unwrap().last().cloned().unwrap()
     }
 
-    async fn row(&self) -> StewardRow {
+    pub(super) async fn row(&self) -> StewardRow {
         self.steward.row(&torin()).await.unwrap_or_default()
     }
 }
 
-fn actions(events: &[StewardEvent]) -> Vec<(Option<i64>, String, String)> {
+pub(super) fn actions(events: &[StewardEvent]) -> Vec<(Option<i64>, String, String)> {
     events
         .iter()
         .map(|e| (e.id, e.action.clone(), e.code.clone()))
         .collect()
 }
 
-fn has(events: &[StewardEvent], id: i64, action: &str, code: &str) -> bool {
+pub(super) fn has(events: &[StewardEvent], id: i64, action: &str, code: &str) -> bool {
     events
         .iter()
         .any(|e| e.id == Some(id) && e.action == action && e.code == code)
@@ -1151,7 +1157,7 @@ async fn state_survives_a_restart() {
     assert_eq!(before.ballots.count, 2);
     assert_eq!(before.declined.len(), 2);
     assert!(matches!(
-        before.intent.map(|i| i.action),
+        before.intent.clone().map(|i| i.action),
         Some(IntentAction::Decline { goal: 3 })
     ));
     assert_eq!(before.goals.len(), 2, "goal 1 active, goal 3 proposed");

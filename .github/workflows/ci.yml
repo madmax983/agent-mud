@@ -74,9 +74,15 @@ jobs:
           workspaces: |
             . -> target
             littleguy -> target
+      # The features the MUD uses. `refine` lets the Steward run lg's
+      # proposer and own the overlays (ADR 0015). The rest stay out:
+      # `skills` and `council` wait for an owner the MUD never is (skill
+      # drafts; lg's council never votes on a tainted proposal), and
+      # `followups`, `sandbox`, `auto-approve`, `scripts` and `research`
+      # would give an agent tools or approvals outside the game.
       - name: Build lg (the features the MUD uses)
         working-directory: littleguy
-        run: cargo build --release -p littleguy --no-default-features --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction"
+        run: cargo build --release -p littleguy --no-default-features --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction,refine"
       - name: lg serve accepts the generated config and plays over MCP
         env:
           LG_BIN: ${{ github.workspace }}/littleguy/target/release/lg

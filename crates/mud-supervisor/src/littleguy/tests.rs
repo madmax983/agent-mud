@@ -242,12 +242,44 @@ fn the_config_asks_for_no_owner_gated_feature() {
             "hooks",
             "followups",
             "allow_actions",
-            "refine",
         ] {
             assert!(!v.contains_key(key), "[{key}] is never written");
         }
         assert!(!v["tools"].as_table().unwrap().contains_key("allow_actions"));
     }
+}
+
+#[test]
+fn refine_is_written_only_when_asked() {
+    let render = |refine| -> toml::Table {
+        let cfg = LittleguyConfig {
+            refine,
+            ..LittleguyConfig::default()
+        };
+        toml::from_str(&render_config(&cfg, &persona().text(), 4123, false)).unwrap()
+    };
+    assert!(!render(RefineMode::Off).contains_key("refine"));
+    for mode in [RefineMode::Menu, RefineMode::Free] {
+        let v = render(mode);
+        assert_eq!(v["refine"]["messages"].as_integer(), Some(30), "{mode:?}");
+        assert_eq!(v["refine"]["dimension"].as_str(), Some("inv"), "{mode:?}");
+        assert_eq!(v["refine"].as_table().unwrap().len(), 2, "{mode:?}");
+    }
+    assert_eq!(
+        LittleguyConfig::default().refine,
+        RefineMode::Menu,
+        "the code default"
+    );
+    // A quiet config keeps it: quiet only stops ticks and memory.
+    let quiet: toml::Table = toml::from_str(&render_config(
+        &LittleguyConfig::default(),
+        &persona().text(),
+        4123,
+        true,
+    ))
+    .unwrap();
+    assert!(quiet.contains_key("refine"));
+    assert!(!RefineMode::Off.is_on() && RefineMode::Menu.is_on() && RefineMode::Free.is_on());
 }
 
 #[tokio::test]
@@ -1494,4 +1526,108 @@ fn a_littleguy_mind_primes_from_its_daemons_ledger_at_boot() {
     std::fs::create_dir_all(&broken).unwrap();
     std::fs::write(broken.join("lg.db"), b"not a database").unwrap();
     assert_eq!(mind.prime(&other, day + 20), None);
+}
+
+/// One raw owner line, for a request the owner client never sends (the
+/// human's `overlay_rollback`).
+async fn raw_owner_line(socket: &Path, line: &str) -> serde_json::Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    stream.write_all(line.as_bytes()).await.unwrap();
+    stream.write_all(b"\n").await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    reader.read_line(&mut buf).await.unwrap();
+    serde_json::from_str(buf.trim()).unwrap()
+}
+
+#[tokio::test]
+async fn a_real_lg_with_refine_takes_overlay_requests() {
+    use owner::{OwnerRequest as Req, OwnerResponse as Resp, request};
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real littleguy overlay check");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LittleguyConfig {
+        bin: PathBuf::from(bin),
+        data_dir: dir.path().to_path_buf(),
+        mcp_url: "http://127.0.0.1:9/mcp".into(),
+        refine: RefineMode::Menu,
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    let log = || std::fs::read_to_string(dir.path().join("torin/lg.log")).unwrap_or_default();
+    let sock = match mind.ensure(&torin).await {
+        Ok(sock) => sock,
+        Err(e) => {
+            let text = format!("{e}\n{}", log());
+            if text.contains("needs the `refine` feature") {
+                eprintln!("this lg has no refine feature: skipping the overlay check\n{text}");
+                return;
+            }
+            panic!("{text}");
+        }
+    };
+    let t = Duration::from_secs(30);
+    let ask = |r: Req| {
+        let sock = sock.clone();
+        async move { request(&sock, &r, t).await.unwrap() }
+    };
+    let listed = ask(Req::Overlays).await;
+    assert!(
+        matches!(&listed, Resp::Overlays { active: None, .. }),
+        "{listed:?}\n{}",
+        log()
+    );
+    let put = |text: &str| Req::OverlayPut {
+        overlay: crate::steward::vet::overlay_json(text),
+    };
+    let Resp::OverlayStored { version: baseline } = ask(put("")).await else {
+        panic!("{}", log());
+    };
+    let on = ask(Req::OverlayActivate { version: baseline }).await;
+    assert_eq!(
+        on,
+        Resp::OverlayActive {
+            version: baseline,
+            previous: None
+        }
+    );
+    let menu = crate::steward::vet::default_menu();
+    let text = crate::steward::vet::render_guardrails(&menu, &["brevity".to_owned()]);
+    let Resp::OverlayStored { version: a } = ask(put(&text)).await else {
+        panic!("{}", log());
+    };
+    let shown = ask(Req::OverlayShow { version: a }).await;
+    let Resp::Overlay { overlay, entry } = &shown else {
+        panic!("{shown:?}");
+    };
+    assert!(
+        crate::steward::vet::overlay_matches(overlay, &text),
+        "{overlay}"
+    );
+    assert_eq!(entry.author, "operator:mud");
+    let on = ask(Req::OverlayActivate { version: a }).await;
+    assert_eq!(
+        on,
+        Resp::OverlayActive {
+            version: a,
+            previous: Some(baseline)
+        }
+    );
+    // The human's Roll back, sent by the test (never by the Steward).
+    let back = raw_owner_line(&sock, r#"{"kind":"overlay_rollback"}"#).await;
+    assert_eq!(back["kind"], "overlay_active", "{back}");
+    assert_eq!(
+        back["version"], baseline,
+        "one Roll back lands on the baseline"
+    );
+    let listed = ask(Req::Overlays).await;
+    assert!(
+        matches!(&listed, Resp::Overlays { active: Some(v), .. } if *v == baseline),
+        "{listed:?}"
+    );
+    mind.shutdown().await;
 }

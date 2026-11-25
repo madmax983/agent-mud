@@ -349,11 +349,17 @@ pub(crate) fn steward(
         .iter()
         .map(|m| Arc::clone(m) as Arc<dyn OwnedDaemons>)
         .collect();
+    // The refine mode is `[littleguy] refine`, which also writes lg's
+    // `[refine]`; the Steward gets a copy.
+    let steward_cfg = mud_supervisor::steward::StewardConfig {
+        refine: cfg.littleguy.refine,
+        ..s.clone()
+    };
     Ok(Some(Steward::new(
         Arc::clone(sup),
         daemons,
         council_judge(cfg)?,
-        s.clone(),
+        steward_cfg,
         rows,
         boot,
     )))

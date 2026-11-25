@@ -1263,3 +1263,56 @@ async fn the_autonomy_panel_escapes_goal_titles() {
     assert!(html.contains("quiet (hard budget)") && html.contains("sending: accept"));
     assert!(html.contains("2 ideas"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_autonomy_panel_shows_the_overlay_chain_escaped() {
+    let (addr, built) = boot().await;
+    let token = built.mud.admin_token.clone();
+    let torin = mud_world::EntityId::from("torin");
+    built.mud.sup.set_autonomy(
+        &torin,
+        mud_supervisor::steward::AutonomyView {
+            overlay: Some(mud_supervisor::steward::OverlayView {
+                mode: "menu".into(),
+                pointer: Some(1),
+                baseline: Some(1),
+                source: None,
+                paused: Some("rolled_back".into()),
+                chain: vec![
+                    mud_supervisor::steward::ChainEntry {
+                        version: 3,
+                        label: "brevity".into(),
+                        text: "- <b>Keep</b> it short.".into(),
+                        active: false,
+                    },
+                    mud_supervisor::steward::ChainEntry {
+                        version: 1,
+                        label: "baseline".into(),
+                        text: String::new(),
+                        active: true,
+                    },
+                ],
+            }),
+            ..Default::default()
+        },
+    );
+    let html = http()
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("refine (menu): lg runs v1"), "{html}");
+    assert!(html.contains("refine paused: rolled_back"));
+    assert!(
+        html.contains("Roll back on the littleguy page returns to the empty baseline (version 1).")
+    );
+    assert!(
+        html.contains("v3 brevity: - &lt;b&gt;Keep&lt;/b&gt; it short."),
+        "{html}"
+    );
+    assert!(html.contains("v1 baseline:  (active)"));
+    assert!(!html.contains("<b>Keep"));
+}

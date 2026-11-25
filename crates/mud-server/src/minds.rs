@@ -75,6 +75,7 @@ fn littleguy_mind(
         compaction: lg.compaction(),
         max_request_bytes: lg.max_request_bytes,
         window: lg.window,
+        refine: lg.refine,
         ..LittleguyConfig::default()
     };
     let mut personas = HashMap::new();
