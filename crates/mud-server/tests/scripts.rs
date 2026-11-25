@@ -40,8 +40,9 @@ async fn boot(tweak: impl FnOnce(&mut MudConfig)) -> (SocketAddr, Arc<Built>) {
     let mut cfg = MudConfig::default();
     cfg.world.db = None;
     cfg.supervisor.typing_scale = 0.0;
+    cfg.accounts.bcrypt_cost = 4;
     tweak(&mut cfg);
-    let built = Arc::new(build(&cfg).unwrap());
+    let built = Arc::new(build(&cfg).await.unwrap());
     let mud = Arc::clone(&built.mud);
     let router = TestApp::new()
         .config(settings(&cfg).unwrap())
@@ -384,8 +385,8 @@ fn check_reports_scripts_and_lists_every_problem() {
     assert!(err.contains("\"look\" shadows a built-in verb"), "{err}");
 }
 
-#[test]
-fn serve_refuses_a_broken_script() {
+#[tokio::test]
+async fn serve_refuses_a_broken_script() {
     let dir = pack_copy();
     let hale = dir.path().join("scripts/minds/hale.rhai");
     let text = std::fs::read_to_string(&hale).unwrap();
@@ -397,13 +398,13 @@ fn serve_refuses_a_broken_script() {
     let mut cfg = MudConfig::default();
     cfg.world.db = None;
     cfg.world.pack = Some(dir.path().to_path_buf());
-    let err = build(&cfg).unwrap_err().to_string();
+    let err = build(&cfg).await.unwrap_err().to_string();
     assert!(err.contains("dry run minds.guard_01.on_wake"), "{err}");
     assert!(err.contains("night_start"), "{err}");
 }
 
-#[test]
-fn runtime_rhai_changes_no_view() {
+#[tokio::test]
+async fn runtime_rhai_changes_no_view() {
     // Hale is the only ambient NPC. On littleguy (which needs no key to
     // build), the `runtime = "rhai"` override is the only reason he runs
     // his Rhai mind in `on`; in `off` he runs on littleguy.
@@ -412,7 +413,9 @@ fn runtime_rhai_changes_no_view() {
     on.minds.ambient = Runtime::Littleguy;
     let mut off = on.clone();
     off.scripts.allow_runtime_override = false;
-    let (with_rhai, without) = (build(&on).unwrap(), build(&off).unwrap());
+    on.accounts.bcrypt_cost = 4;
+    off.accounts.bcrypt_cost = 4;
+    let (with_rhai, without) = (build(&on).await.unwrap(), build(&off).await.unwrap());
     let hale = EntityId::from("guard_01");
     assert!(!with_rhai.littleguy.iter().any(|m| m.serves(&hale)));
     assert!(without.littleguy.iter().any(|m| m.serves(&hale)));

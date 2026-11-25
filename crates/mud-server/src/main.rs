@@ -38,16 +38,49 @@ enum Command {
         #[arg(default_value = "worlds/crypt-v01")]
         pack: PathBuf,
     },
+    /// Manage player accounts in accounts.db (works while the server runs).
+    Account {
+        /// The config file; defaults apply when it does not exist.
+        #[arg(long, env = "MUD_CONFIG", default_value = "mud.toml", global = true)]
+        config: PathBuf,
+        #[command(subcommand)]
+        op: AccountCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountCmd {
+    /// List every account: origin, dates, browsers, lock.
+    List,
+    /// Print a temporary password, once; it must be changed at the next login.
+    Reset {
+        /// The character.
+        name: String,
+    },
+    /// Refuse logins; live sessions end within `revalidate_secs`.
+    Lock {
+        /// The character.
+        name: String,
+    },
+    /// Allow logins again.
+    Unlock {
+        /// The character.
+        name: String,
+    },
+    /// Forget every remembered browser and end live sessions.
+    Signout {
+        /// The character.
+        name: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("MUD_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    // Wire frames carry passwords and tokens: `logging` never lets them
+    // through, whatever MUD_LOG says.
+    let spec = std::env::var("MUD_LOG").unwrap_or_else(|_| "info".to_owned());
+    mud_server::logging::subscriber(&spec, std::io::stdout).init();
     match Cli::parse().command {
         Command::Serve { config, bind, db } => {
             let mut cfg = mud_server::load_config(&config)?;
@@ -69,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {w}");
             }
             println!(
-                "\nsmoke: PASS (bounty posted, board read, human recruited, the alley answered)"
+                "\nsmoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered)"
             );
             Ok(())
         }
@@ -77,6 +110,20 @@ async fn main() -> anyhow::Result<()> {
             for line in mud_server::check_pack(&pack)? {
                 println!("{line}");
             }
+            Ok(())
+        }
+        Command::Account { config, op } => {
+            use mud_server::account_cli::{AccountOp, run};
+            let cfg = mud_server::load_config(&config)?;
+            let op = match op {
+                AccountCmd::List => AccountOp::List,
+                AccountCmd::Reset { name } => AccountOp::Reset(name),
+                AccountCmd::Lock { name } => AccountOp::Lock(name),
+                AccountCmd::Unlock { name } => AccountOp::Unlock(name),
+                AccountCmd::Signout { name } => AccountOp::Signout(name),
+            };
+            let now = mud_world::Clock::now_ms(&mud_world::SystemClock);
+            println!("{}", run(&cfg, op, now).await?);
             Ok(())
         }
     }

@@ -25,7 +25,7 @@ use crate::hooks::{WorldDice, WorldHooks};
 use crate::ids::{EntityId, ItemId, ProtoId, RoomId, Seq, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WorldPack};
 use crate::parser::{Command, MAX_TEXT_CHARS, ParseError, forbidden_in_text, parse_with};
-use crate::state::{Entity, Holder, WorldState};
+use crate::state::{Entity, Holder, NameOwner, WorldState};
 
 /// How many events the world keeps in memory for `mud_events`.
 pub const EVENT_LOG_CAP: usize = 10_000;
@@ -988,41 +988,29 @@ impl World {
 
     // ------------------------------------------------------- sessions
 
-    /// Logs a human in by name, making the character on first use.
+    /// Who holds the login name `name`; see [`WorldState::name_owner`].
     ///
     /// # Errors
-    /// The name is invalid or belongs to another entity.
+    /// The name is invalid or reserved.
+    pub fn name_owner(&self, name: &str) -> Result<NameOwner, LoginError> {
+        self.state.name_owner(name)
+    }
+
+    /// Logs a human in by name, making the character on first use. The
+    /// server calls it only once the login has proved its password.
+    ///
+    /// # Errors
+    /// The name is invalid, reserved, or belongs to another entity.
     pub fn login(&mut self, name: &str, now: u64) -> Result<EntityId, LoginError> {
-        let name = name.trim();
-        let valid = (2..=16).contains(&name.chars().count())
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid {
-            return Err(LoginError::Invalid);
-        }
-        // `find_here` reads these as the viewer, so nobody could target
-        // a player with one of them as a name.
-        let id = EntityId::new(format!("pc_{}", name.to_ascii_lowercase()));
-        // A save from before the name was reserved may still hold such a
-        // player; it may come back, but nobody new may take the name.
-        let saved_human = self.state.entities.get(&id).is_some_and(|e| e.human);
-        if !saved_human && SELF_WORDS.iter().any(|w| name.eq_ignore_ascii_case(w)) {
-            return Err(LoginError::Reserved);
-        }
-        let taken =
-            self.state.entities.values().any(|e| {
-                e.id != id && (e.matches(name) || e.id.as_str() == name.to_ascii_lowercase())
-            });
-        if taken {
-            return Err(LoginError::Taken);
-        }
-        if let Some(e) = self.state.entities.get(&id) {
-            if !e.human {
-                return Err(LoginError::Taken);
+        let id = match self.state.name_owner(name)? {
+            NameOwner::Free(id) => {
+                let start = self.pack.world.start_room.clone();
+                self.state.new_player(&id, name.trim(), start, &self.pack);
+                id
             }
-        } else {
-            let start = self.pack.world.start_room.clone();
-            self.state.new_player(&id, name, start, &self.pack);
-        }
+            NameOwner::Human(id) => id,
+            NameOwner::OtherPlayer | NameOwner::NonPlayer => return Err(LoginError::Taken),
+        };
         self.bring_online(&id, now);
         Ok(id)
     }

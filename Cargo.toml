@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/mud-rules",
+    "crates/mud-accounts",
     "crates/mud-world",
     "crates/mud-mcp",
     "crates/mud-script",
@@ -20,6 +21,7 @@ repository = "https://github.com/madmax983/agent-mud"
 mud-rules = { version = "0.1.0", path = "crates/mud-rules" }
 mud-world = { version = "0.1.0", path = "crates/mud-world" }
 mud-mcp = { version = "0.1.0", path = "crates/mud-mcp" }
+mud-accounts = { version = "0.1.0", path = "crates/mud-accounts" }
 mud-script = { version = "0.1.0", path = "crates/mud-script" }
 mud-supervisor = { version = "0.1.0", path = "crates/mud-supervisor" }
 anyhow = "1"

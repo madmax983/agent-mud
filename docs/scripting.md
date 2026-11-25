@@ -58,7 +58,9 @@ config = { modifier = -2 }
 Rules the loader checks, all reported at once: known cast ids, rooms and
 items; a binding declares at least one hook; `on_use` only for items that
 are not a key, container, coin pouch, healing item or gear; a verb never
-shadows a built-in verb or alias, is declared once and names known rooms;
+shadows a built-in verb or alias, never takes a session word (`password`,
+`logout`, `quit`: the server reads those before the engine, ADR 0009), is
+declared once and names known rooms;
 files are relative paths of `[a-z0-9_/-]` ending in `.rhai`, inside the
 `scripts/` folder (no symlinks), at most 64 KiB each, 512 KiB and 64 files
 in all; `config` holds no floats or dates; every hook function exists and

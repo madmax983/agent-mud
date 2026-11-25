@@ -12,7 +12,9 @@ pub mod classify;
 pub mod connections;
 pub mod hooks;
 pub mod injury;
+pub mod login_route;
 pub mod schedule;
+pub mod throttle;
 pub mod typing;
 pub mod wounds;
 

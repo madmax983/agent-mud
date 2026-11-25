@@ -2184,6 +2184,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mud-accounts"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "bcrypt",
+ "getrandom 0.4.3",
+ "mud-world",
+ "proptest",
+ "rusqlite",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
 name = "mud-mcp"
 version = "0.1.0"
 dependencies = [
@@ -2239,6 +2259,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "maud",
+ "mud-accounts",
  "mud-mcp",
  "mud-script",
  "mud-supervisor",
@@ -2256,6 +2277,7 @@ dependencies = [
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

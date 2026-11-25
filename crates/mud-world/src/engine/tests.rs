@@ -743,6 +743,71 @@ fn selling_and_buying_back_never_makes_money() {
 }
 
 #[test]
+fn name_owner_classifies_every_holder() {
+    let mut w = world();
+    assert_eq!(w.name_owner("ada"), Ok(NameOwner::Free(id("pc_ada"))));
+    let ada = w.login("ada", 1).unwrap();
+    assert_eq!(w.name_owner("ada"), Ok(NameOwner::Human(ada.clone())));
+    assert_eq!(w.name_owner(" ADA "), Ok(NameOwner::Human(ada)));
+    for name in ["kestrel", "Kestrel"] {
+        assert_eq!(w.name_owner(name), Ok(NameOwner::OtherPlayer), "{name}");
+    }
+    for name in ["marta", "hale", "guard_01"] {
+        assert_eq!(w.name_owner(name), Ok(NameOwner::NonPlayer), "{name}");
+    }
+    assert_eq!(w.name_owner("me"), Err(LoginError::Reserved));
+    assert_eq!(w.name_owner("a"), Err(LoginError::Invalid));
+}
+
+#[test]
+fn name_owner_reserves_the_pc_prefix_for_new_names() {
+    let mut w = world();
+    for name in ["pc_ada", "PC_kestrel", "pc_x"] {
+        assert_eq!(w.name_owner(name), Err(LoginError::Reserved), "{name}");
+        assert_eq!(w.login(name, 1), Err(LoginError::Reserved), "{name}");
+    }
+    // A save from before the rule may hold one; it still comes back.
+    let old = id("pc_pc_x");
+    let start = w.pack.world.start_room.clone();
+    let pack = Arc::clone(&w.pack);
+    w.state.new_player(&old, "pc_x", start, &pack);
+    assert_eq!(w.name_owner("pc_x"), Ok(NameOwner::Human(old.clone())));
+    assert_eq!(w.login("pc_x", 1), Ok(old));
+}
+
+#[test]
+fn login_refuses_exactly_what_name_owner_refuses() {
+    let names = [
+        "ada", "Ada", "kestrel", "marta", "hale", "guard_01", "me", "pc_ada", "a", "bad name",
+        "torin", "zed_9",
+    ];
+    for name in names {
+        let mut w = world();
+        let owner = w.name_owner(name);
+        let login = w.login(name, 1);
+        match owner {
+            Err(e) => assert_eq!(login, Err(e), "{name}"),
+            Ok(NameOwner::Free(id) | NameOwner::Human(id)) => assert_eq!(login, Ok(id), "{name}"),
+            Ok(NameOwner::OtherPlayer | NameOwner::NonPlayer) => {
+                assert_eq!(login, Err(LoginError::Taken), "{name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn human_ids_lists_humans_not_agent_pcs() {
+    let mut w = world();
+    assert_eq!(w.state.human_ids(), Vec::<EntityId>::new());
+    let ada = w.login("ada", 1).unwrap();
+    let bo = w.login("bo", 1).unwrap();
+    w.bring_online(&id("pc_kestrel"), 1);
+    let mut got = w.state.human_ids();
+    got.sort();
+    assert_eq!(got, vec![ada, bo]);
+}
+
+#[test]
 fn the_self_words_are_not_player_names() {
     let mut w = world();
     for name in ["me", "Self", "MYSELF"] {

@@ -1,0 +1,32 @@
+[package]
+name = "mud-accounts"
+description = "Player accounts of the littleguy MUD: passwords, web resume tokens and login throttles, kept outside the world in their own SQLite file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mud-world.workspace = true
+# The password policy and the remember-token helpers; `auth` is not
+# feature-gated.
+autumn-web = { version = "0.11.0", default-features = false }
+bcrypt = "0.19"
+sha2 = "0.10"
+getrandom = "0.4"
+zeroize = "1"
+# The same SQLite build as autumn-harvest: two libsqlite3-sys copies cannot link.
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

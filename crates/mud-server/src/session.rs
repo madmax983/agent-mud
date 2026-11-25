@@ -1,13 +1,38 @@
 //! One player connection, transport-agnostic: the web terminal and telnet
-//! both drive a [`Session`].
+//! both drive a [`Session`] once the login dialogue ([`crate::login`]) has
+//! proved who it is.
+//!
+//! The session words (`password`, `logout`, `quit`) are read here, before
+//! the engine: `World::execute` never sees them, so a password never
+//! reaches the world, the command log or a script.
 
 use std::sync::Arc;
 
+use mud_accounts::{Accounts, AuthError, Authenticated, IssuedToken, Peer, Secret};
 use mud_world::{EntityId, Event, Game};
 
+/// Which answer a secret prompt wants, for the browser's password manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Secretness {
+    /// The current password.
+    Current,
+    /// A new password.
+    New,
+}
+
+impl Secretness {
+    /// The `autocomplete` word the terminal uses.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current-password",
+            Self::New => "new-password",
+        }
+    }
+}
+
 /// What a client sees, line by line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     /// The answer to the player's own command.
     Narrative,
@@ -17,10 +42,14 @@ pub enum LineKind {
     Error,
     /// A server notice.
     System,
+    /// A question whose answer may echo.
+    Prompt,
+    /// A question whose answer must not echo.
+    Secret(Secretness),
 }
 
 /// One line for a client.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     /// The kind.
     pub kind: LineKind,
@@ -30,11 +59,73 @@ pub struct Line {
 }
 
 impl Line {
-    fn new(kind: LineKind, text: impl Into<String>) -> Self {
+    /// A line.
+    pub fn new(kind: LineKind, text: impl Into<String>) -> Self {
         Self {
             kind,
             text: text.into(),
         }
+    }
+}
+
+/// Which connection a session or a login runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The browser terminal.
+    Web,
+    /// Telnet and plain-text clients.
+    Telnet,
+}
+
+/// A message to the client that is not a line.
+#[derive(Debug)]
+pub enum Control {
+    /// The login is done.
+    Authed {
+        /// The character's name.
+        name: String,
+    },
+    /// Keep this resume token.
+    Remember(IssuedToken),
+    /// Forget any resume token.
+    Forget,
+}
+
+/// How a connection ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseKind {
+    /// The player left, or a timeout: WebSocket 1000.
+    Normal,
+    /// The server refused to go on: WebSocket 1008.
+    Policy,
+}
+
+/// What one input produced.
+#[derive(Debug, Default)]
+pub struct Output {
+    /// Lines to show.
+    pub lines: Vec<Line>,
+    /// Controls (web only).
+    pub controls: Vec<Control>,
+    /// Close after sending, if set.
+    pub close: Option<CloseKind>,
+}
+
+impl Output {
+    fn lines(lines: Vec<Line>) -> Self {
+        Self {
+            lines,
+            ..Self::default()
+        }
+    }
+
+    fn one(kind: LineKind, text: impl Into<String>) -> Self {
+        Self::lines(vec![Line::new(kind, text)])
+    }
+
+    const fn closing(mut self, kind: CloseKind) -> Self {
+        self.close = Some(kind);
+        self
     }
 }
 
@@ -80,13 +171,23 @@ impl Presence {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Logs `name` in and counts one more connection for it.
+    /// Brings a proved login into the world and counts one more
+    /// connection for it. Only an [`Authenticated`] opens a character: the
+    /// world sees the name alone, never a secret.
     ///
     /// # Errors
-    /// The name is invalid or taken.
-    pub fn login(&self, game: &Game, name: &str) -> Result<EntityId, mud_world::LoginError> {
+    /// The name changed hands since the login was proved.
+    pub fn login(
+        &self,
+        game: &Game,
+        auth: &Authenticated,
+    ) -> Result<EntityId, mud_world::LoginError> {
         let mut open = self.lock();
-        let id = game.login(name)?;
+        let id = game.login(auth.name())?;
+        if &id != auth.entity() {
+            drop(open);
+            return Err(mud_world::LoginError::Taken);
+        }
         *open.entry(id.clone()).or_default() += 1;
         drop(open);
         Ok(id)
@@ -108,25 +209,58 @@ impl Presence {
     }
 }
 
+/// A password change in progress.
+enum Change {
+    Current,
+    New { current: Secret },
+    Repeat { current: Secret, new: Secret },
+}
+
+impl std::fmt::Debug for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Current => "Change::Current",
+            Self::New { .. } => "Change::New",
+            Self::Repeat { .. } => "Change::Repeat",
+        })
+    }
+}
+
+/// The answer to a line over the transport's limit.
+pub const TOO_LONG: &str = "That line is too long; nothing was done.";
+
+/// The help line for the session words.
+pub const ACCOUNT_HELP: &str =
+    "Account: password (change it) · logout (forget this browser) · quit";
+
 /// A logged-in player.
 #[derive(Debug)]
 pub struct Session {
     game: Arc<Game>,
     presence: Arc<Presence>,
+    accounts: Arc<Accounts>,
+    auth: Authenticated,
+    peer: Peer,
+    transport: Transport,
     entity: EntityId,
+    pending: Option<Change>,
+    wrong: u32,
 }
 
 impl Session {
-    /// Logs in `name`. Returns the session and its greeting.
+    /// Opens a session for a proved login. Returns it and its greeting.
     ///
     /// # Errors
-    /// The name is invalid or taken.
+    /// The name changed hands since the login was proved.
     pub fn login(
         game: Arc<Game>,
         presence: Arc<Presence>,
-        name: &str,
+        accounts: Arc<Accounts>,
+        auth: Authenticated,
+        peer: Peer,
+        transport: Transport,
     ) -> Result<(Self, Vec<Line>), mud_world::LoginError> {
-        let entity = presence.login(&game, name)?;
+        let entity = presence.login(&game, &auth)?;
         let motd = game.read(|w| w.pack().world.motd.clone());
         let mut lines = vec![Line::new(LineKind::System, motd)];
         let look = game.execute(&entity, "look");
@@ -135,7 +269,13 @@ impl Session {
             Self {
                 game,
                 presence,
+                accounts,
+                auth,
+                peer,
+                transport,
                 entity,
+                pending: None,
+                wrong: 0,
             },
             lines,
         ))
@@ -147,7 +287,13 @@ impl Session {
         &self.entity
     }
 
-    /// Runs one typed line.
+    /// The proved login behind the session.
+    #[must_use]
+    pub const fn auth(&self) -> &Authenticated {
+        &self.auth
+    }
+
+    /// Runs one typed line through the engine.
     #[must_use]
     pub fn command(&self, line: &str) -> Vec<Line> {
         if line.trim().is_empty() {
@@ -167,6 +313,160 @@ impl Session {
         vec![Line::new(kind, text)]
     }
 
+    fn min_chars(&self) -> usize {
+        self.accounts.config().min_password_chars
+    }
+
+    /// Takes one line from the player: the answer to a pending password
+    /// question, a session word, or a command for the engine.
+    pub async fn input(&mut self, line: Secret) -> Output {
+        if let Some(change) = self.pending.take() {
+            return self.answer_change(change, line).await;
+        }
+        let text = line.expose();
+        let mut words = text.split_whitespace();
+        let first = words.next().unwrap_or("").to_ascii_lowercase();
+        let alone = words.next().is_none();
+        match first.as_str() {
+            "password" if !alone => Output::one(
+                LineKind::Error,
+                "Type password alone; you will be asked for it privately.",
+            ),
+            "password" => {
+                self.pending = Some(Change::Current);
+                Output::one(LineKind::Secret(Secretness::Current), "Current password:")
+            }
+            "logout" if self.transport == Transport::Web => {
+                if let Some(s) = self.auth.series()
+                    && let Err(e) = self.accounts.forget(s).await
+                {
+                    tracing::warn!(target: "mud::auth", error = %e, "forgetting a browser failed");
+                }
+                Output {
+                    lines: vec![Line::new(
+                        LineKind::System,
+                        "Farewell. This browser will ask for your password next time.",
+                    )],
+                    controls: vec![Control::Forget],
+                    close: Some(CloseKind::Normal),
+                }
+            }
+            "quit" | "logout" => {
+                Output::one(LineKind::System, "Farewell.").closing(CloseKind::Normal)
+            }
+            "help" => {
+                let mut lines = self.command(text);
+                lines.push(Line::new(LineKind::System, ACCOUNT_HELP));
+                Output::lines(lines)
+            }
+            _ => Output::lines(self.command(text)),
+        }
+    }
+
+    /// A line over the transport's limit, which never runs. A pending
+    /// password change is cancelled with it, so no secret prompt is left
+    /// waiting while the client echoes again.
+    pub fn too_long(&mut self) -> Output {
+        let mut lines = vec![Line::new(LineKind::Error, TOO_LONG)];
+        if self.pending.take().is_some() {
+            lines.push(Line::new(LineKind::System, "Password change cancelled."));
+        }
+        Output::lines(lines)
+    }
+
+    fn new_prompt(&self) -> Line {
+        Line::new(
+            LineKind::Secret(Secretness::New),
+            format!("New password ({} or more characters):", self.min_chars()),
+        )
+    }
+
+    async fn answer_change(&mut self, change: Change, answer: Secret) -> Output {
+        if answer.is_empty() {
+            return Output::one(LineKind::System, "Password change cancelled.");
+        }
+        match change {
+            Change::Current => {
+                self.pending = Some(Change::New { current: answer });
+                Output::lines(vec![self.new_prompt()])
+            }
+            Change::New { current } => {
+                if let Err(r) = self
+                    .accounts
+                    .check_new_password(&answer, self.auth.name())
+                    .await
+                {
+                    self.pending = Some(Change::New { current });
+                    return Output::lines(vec![
+                        Line::new(LineKind::Error, r.to_string()),
+                        self.new_prompt(),
+                    ]);
+                }
+                self.pending = Some(Change::Repeat {
+                    current,
+                    new: answer,
+                });
+                Output::one(LineKind::Secret(Secretness::New), "Type it again:")
+            }
+            Change::Repeat { current, new } => {
+                if !autumn_web::auth::constant_time_eq(
+                    new.expose().as_bytes(),
+                    answer.expose().as_bytes(),
+                ) {
+                    self.pending = Some(Change::New { current });
+                    return Output::lines(vec![
+                        Line::new(LineKind::Error, "The passwords did not match."),
+                        self.new_prompt(),
+                    ]);
+                }
+                self.change(&current, &new).await
+            }
+        }
+    }
+
+    async fn change(&mut self, current: &Secret, new: &Secret) -> Output {
+        let now = self.game.now_ms();
+        match self
+            .accounts
+            .change_password(&mut self.auth, current, new, self.peer, now)
+            .await
+        {
+            Ok(()) => Output::one(
+                LineKind::System,
+                "Password changed. Your other sessions and remembered browsers are signed out.",
+            ),
+            Err(AuthError::WrongPassword) => {
+                self.wrong += 1;
+                if self.wrong >= self.accounts.config().max_password_attempts {
+                    Output::one(LineKind::Error, "Wrong password. Farewell.")
+                        .closing(CloseKind::Policy)
+                } else {
+                    Output::one(LineKind::Error, "Wrong password.")
+                }
+            }
+            Err(e @ AuthError::Locked) => {
+                Output::one(LineKind::Error, e.to_string()).closing(CloseKind::Policy)
+            }
+            Err(e) => {
+                if let AuthError::Unavailable(source) = &e {
+                    tracing::error!(target: "mud::auth", error = %source, "a password change failed");
+                }
+                Output::one(LineKind::Error, e.to_string())
+            }
+        }
+    }
+
+    /// Whether the account still allows this session: not locked, and no
+    /// password change, reset or sign-out since it began.
+    ///
+    /// # Errors
+    /// The account store failed.
+    pub async fn revalidate(&self) -> Result<bool, mud_accounts::AccountError> {
+        self.accounts
+            .revalidate(&self.auth, self.game.now_ms())
+            .await
+    }
+
     /// The line an event shows this player, if it reaches them and is not
     /// their own doing (their own command already answered).
     #[must_use]
@@ -184,101 +484,4 @@ impl Drop for Session {
 }
 
 #[cfg(test)]
-mod tests {
-    use mud_world::{ManualClock, World, WorldPack};
-
-    use super::*;
-
-    fn game() -> Arc<Game> {
-        Game::new(
-            World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1),
-            None,
-            Arc::new(ManualClock::new(1)),
-        )
-    }
-
-    #[test]
-    fn two_players_hear_each_other_and_logout_needs_the_last_tab() {
-        let g = game();
-        let p = Arc::new(Presence::default());
-        let (ada, greet) = Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
-        assert!(greet[1].text.contains("Town Square"));
-        let (bo, _) = Session::login(Arc::clone(&g), Arc::clone(&p), "bo").unwrap();
-        let mut rx = g.subscribe();
-        let out = ada.command("say hi bo");
-        assert_eq!(out[0].text, "You say, \"hi bo\"");
-        let ev = rx.try_recv().unwrap();
-        assert_eq!(bo.render(&ev).unwrap().text, "ada says, \"hi bo\"");
-        assert!(ada.render(&ev).is_none(), "no echo of your own line");
-        assert_eq!(ada.command("dance")[0].kind, LineKind::Error);
-        let (ada2, _) = Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
-        drop(ada);
-        assert!(
-            g.read(|w| w.entity(&EntityId::from("pc_ada")).unwrap().online),
-            "a tab is still open"
-        );
-        drop(ada2);
-        assert!(!g.read(|w| w.entity(&EntityId::from("pc_ada")).unwrap().online));
-        assert!(Session::login(g, p, "kestrel").is_err());
-    }
-
-    #[test]
-    fn board_posts_are_rendered_from_the_resolution_once() {
-        let posts = serde_json::json!({ "posts": [
-            { "author": { "id": "pc_ada", "name": "ada" }, "untrusted_text": "ore wanted" },
-            { "author": { "id": "torin", "name": "Torin" }, "untrusted_text": "<b>15s</b>" },
-        ]});
-        let want = "The notice board:\n  [1] ada: ore wanted\n  [2] Torin: <b>15s</b>";
-        assert_eq!(with_board_posts("The notice board:", &posts), want);
-        assert_eq!(with_board_posts(want, &posts), want, "no duplicates");
-        assert_eq!(
-            with_board_posts("The notice board: bare wood.", &serde_json::json!({})),
-            "The notice board: bare wood."
-        );
-    }
-
-    #[test]
-    fn a_player_reads_the_board_through_a_session() {
-        let g = game();
-        let p = Arc::new(Presence::default());
-        let (ada, _) = Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
-        let _ = ada.command("n");
-        assert_eq!(
-            ada.command("board post ore wanted")[0].kind,
-            LineKind::Narrative
-        );
-        let out = ada.command("board read");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].text.matches("  [1] ada: ore wanted").count(), 1);
-    }
-
-    /// A tab closing while another tab of the same player logs in must
-    /// never leave the new session attached to an offline entity.
-    #[test]
-    fn a_login_racing_the_last_logout_stays_online() {
-        let g = game();
-        let p = Arc::new(Presence::default());
-        let id = EntityId::from("pc_ada");
-        let stale = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..4 {
-                s.spawn(|| {
-                    for _ in 0..2_000 {
-                        let (sess, _) =
-                            Session::login(Arc::clone(&g), Arc::clone(&p), "ada").unwrap();
-                        if !g.read(|w| w.entity(&id).unwrap().online) {
-                            stale.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        drop(sess);
-                    }
-                });
-            }
-        });
-        assert_eq!(
-            stale.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a live session saw its entity offline"
-        );
-        assert!(!g.read(|w| w.entity(&id).unwrap().online));
-    }
-}
+pub(crate) mod tests;

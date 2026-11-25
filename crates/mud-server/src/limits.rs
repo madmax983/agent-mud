@@ -89,6 +89,38 @@ pub fn client_addr(resolved: Option<IpAddr>, peer: Option<SocketAddr>) -> Option
     resolved.or_else(|| peer.map(|p| p.ip()))
 }
 
+/// What the login throttles key a web client by: the address the
+/// trusted-proxy layer resolved, else the TCP peer, bucketed; with
+/// neither, [`Peer::Shared`].
+///
+/// A client's own `X-Forwarded-For`, `Forwarded` or `X-Real-IP` never
+/// changes the key: with no trusted proxy the layer resolves the TCP peer,
+/// so a spoofed header lands in the sender's own buckets. A request that
+/// carries such a header while no proxy is trusted logs one warning,
+/// because behind a real proxy every player then shares its address
+/// (stricter limits, never looser ones; an https `public_url` without
+/// `trusted_proxies` is refused at start).
+///
+/// [`Peer::Shared`]: mud_accounts::Peer::Shared
+#[must_use]
+pub fn account_peer(
+    resolved: Option<IpAddr>,
+    peer: Option<SocketAddr>,
+    forwarded: bool,
+    trusted: bool,
+) -> mud_accounts::Peer {
+    use mud_accounts::Peer;
+    if forwarded && !trusted {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "a web client sent a forwarding header, but [server] trusted_proxies is empty; login limits key it by its TCP peer"
+            );
+        });
+    }
+    bucket(client_addr(resolved, peer)).map_or(Peer::Shared, Peer::Addr)
+}
+
 #[derive(Debug, Default)]
 struct Counts {
     total: u32,
@@ -259,6 +291,37 @@ mod tests {
         assert_eq!(client_addr(Some(real), Some(peer)), Some(real));
         assert_eq!(client_addr(None, Some(peer)), Some(peer.ip()));
         assert_eq!(client_addr(None, None), None);
+    }
+
+    #[test]
+    fn account_peer_cases() {
+        use mud_accounts::Peer;
+        let real: IpAddr = "203.0.113.7".parse().unwrap();
+        let proxy: SocketAddr = "10.0.0.2:5555".parse().unwrap();
+        assert_eq!(
+            account_peer(Some(real), Some(proxy), true, true),
+            Peer::Addr(real)
+        );
+        // Untrusted: a client's own header never lowers its key; the TCP
+        // peer (the proxy, when one is in front) is the key.
+        assert_eq!(
+            account_peer(None, Some(proxy), true, false),
+            Peer::Addr(proxy.ip())
+        );
+        assert_eq!(
+            account_peer(Some(proxy.ip()), Some(proxy), true, false),
+            Peer::Addr(proxy.ip()),
+        );
+        assert_eq!(
+            account_peer(None, Some(proxy), false, false),
+            Peer::Addr(proxy.ip())
+        );
+        let v6: SocketAddr = "[2001:db8:1:2:3:4:5:6]:1".parse().unwrap();
+        assert_eq!(
+            account_peer(None, Some(v6), false, false),
+            Peer::Addr("2001:db8:1:2::".parse().unwrap())
+        );
+        assert_eq!(account_peer(None, None, false, false), Peer::Shared);
     }
 
     #[test]

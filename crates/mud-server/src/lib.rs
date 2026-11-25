@@ -6,12 +6,17 @@
 //! use to play. The supervisor runs alongside and decides when each mind
 //! thinks.
 
+pub mod account_cli;
 pub mod config;
 pub mod limits;
+pub mod logging;
+pub mod login;
 pub mod minds;
 pub mod session;
 pub mod smoke;
 pub mod telnet;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod web;
 
 use std::collections::{BTreeMap, HashMap};
@@ -25,6 +30,7 @@ use anyhow::Context as _;
 use autumn_web::app::AppBuilder;
 use autumn_web::config::{AutumnConfig, ConfigError, ConfigLoader, LogConfig, TelemetryConfig};
 use autumn_web::telemetry::{TelemetryGuard, TelemetryInitError, TelemetryProvider};
+use mud_accounts::Accounts;
 use mud_mcp::{CommandGate, TokenRegistry};
 use mud_script::{ScriptError, ScriptHost, ScriptSources};
 use mud_supervisor::gate::Gate;
@@ -147,12 +153,59 @@ pub fn load_scripts(cfg: &MudConfig, pack: &Arc<WorldPack>) -> anyhow::Result<Sc
     Ok(host)
 }
 
+/// Opens the accounts beside the world.
+///
+/// It logs what an operator should know: a low bcrypt cost, the legacy
+/// characters, and a new `accounts.db` next to a world that already has
+/// humans (a lost `accounts.db` makes every human claimable again).
+///
+/// # Errors
+/// The config is out of bounds, or `accounts.db` cannot be opened.
+pub async fn open_accounts(cfg: &MudConfig, game: &Game) -> anyhow::Result<Accounts> {
+    let (path, acfg) = cfg.accounts.to_config(cfg.world.db.as_deref())?;
+    if acfg.bcrypt_cost < 10 {
+        tracing::warn!(
+            "[accounts] bcrypt_cost = {} is for tests; use 10 or more on a real server",
+            acfg.bcrypt_cost
+        );
+    }
+    let mode = acfg.legacy;
+    let accounts = Accounts::open(path.as_deref(), acfg, 1_000, game.now_ms())
+        .await
+        .context("opening the accounts")?;
+    let humans = game.human_ids();
+    let legacy = accounts.legacy_count(&humans).await?;
+    tracing::info!(
+        "{legacy} characters have no password yet; [accounts] legacy = {}",
+        mode.as_str()
+    );
+    if accounts.created_new() && !humans.is_empty() {
+        let until = accounts
+            .legacy_closes_ms()
+            .map_or_else(|| "the window closes (never)".to_owned(), account_cli::utc);
+        let until = if accounts.legacy_open(game.now_ms()) {
+            until
+        } else {
+            "nobody: legacy is sealed".to_owned()
+        };
+        tracing::warn!(
+            "accounts.db is new and the world has {} human characters; they are claimable until {until}. If accounts.db was lost, set [accounts] legacy = \"sealed\". Back up world.db and accounts.db together.",
+            humans.len()
+        );
+    }
+    Ok(accounts)
+}
+
 /// Loads the world and builds the supervisor and its minds.
 ///
 /// # Errors
-/// The pack, its scripts or the store fail to open, or a mind cannot be
-/// built.
-pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
+/// The pack, its scripts, the store or the accounts fail to open, a mind
+/// cannot be built, or the proxy setup would merge every player.
+pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
+    cfg.check_proxy()?;
+    for w in cfg.plaintext_warnings() {
+        tracing::warn!("{w}");
+    }
     let pack = Arc::new(match &cfg.world.pack {
         Some(dir) => WorldPack::load(dir)?,
         None => WorldPack::crypt_v01()?,
@@ -206,6 +259,7 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     );
     let (admin_token, admin_token_generated) =
         admin_token(std::env::var(&cfg.server.admin_token_env).ok())?;
+    let accounts = Arc::new(open_accounts(cfg, &game).await?);
     Ok(Built {
         mud: Arc::new(Mud {
             game,
@@ -220,6 +274,9 @@ pub fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             shutdown: tokio_util::sync::CancellationToken::new(),
             littleguy: minds.littleguy.clone(),
             scripts,
+            accounts,
+            public_url: cfg.server.public_url.clone(),
+            trusted_proxies: !cfg.server.trusted_proxies.is_empty(),
         }),
         admin_token_generated,
         tokens,
@@ -487,7 +544,7 @@ pub async fn stop_on(
 /// # Errors
 /// The world, a mind, or a listener fails to start.
 pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
-    let built = build(&cfg)?;
+    let built = build(&cfg).await?;
     let settings = settings(&cfg)?;
     tracing::info!(
         terminal = %format!("http://{}/", cfg.server.bind),
@@ -504,10 +561,13 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
         tracing::info!(%addr, "telnet is up");
         tasks.push(tokio::spawn(telnet::serve_limited(
             Arc::clone(&built.mud.limiter),
-            cfg.server.timeouts(),
             listener,
-            Arc::clone(&built.mud.game),
-            Arc::clone(&built.mud.presence),
+            telnet::Shared {
+                game: Arc::clone(&built.mud.game),
+                presence: Arc::clone(&built.mud.presence),
+                accounts: Arc::clone(&built.mud.accounts),
+                timeouts: cfg.server.timeouts(),
+            },
         )));
     }
     let stopper = tokio::spawn(stop_on(
@@ -589,7 +649,7 @@ mod tests {
         use mud_mcp::WakeBooker as _;
         let mut cfg = MudConfig::default();
         cfg.world.db = None;
-        let built = build(&cfg).unwrap();
+        let built = build(&cfg).await.unwrap();
         let torin = EntityId::from("torin");
         let wakes = SupervisorWakes(Arc::clone(&built.mud.sup));
         let before = built.mud.game.now_ms();
@@ -639,6 +699,37 @@ mod tests {
             .unwrap();
         assert!(lg.is_closed());
         assert!(forever.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_new_accounts_db_beside_a_world_with_humans_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = MudConfig::default();
+        cfg.world.db = Some(dir.path().join("world.db"));
+        cfg.accounts.bcrypt_cost = 4;
+        let game = Game::open(
+            Arc::new(WorldPack::crypt_v01().unwrap()),
+            cfg.world.db.as_deref(),
+            1,
+            Arc::new(mud_world::ManualClock::new(1_800_000_000_000)),
+        )
+        .unwrap();
+        game.login("old").unwrap();
+        let a = open_accounts(&cfg, &game).await.unwrap();
+        assert!(a.created_new());
+        assert!(dir.path().join("accounts.db").exists());
+        assert_eq!(a.legacy_count(&game.human_ids()).await.unwrap(), 1);
+        drop(a);
+        let again = open_accounts(&cfg, &game).await.unwrap();
+        assert!(!again.created_new());
+        cfg.server.public_url = Some("https://mud.example".into());
+        assert!(
+            build(&cfg)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trusted_proxies is empty")
+        );
     }
 
     #[test]

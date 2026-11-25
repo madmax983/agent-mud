@@ -12,6 +12,10 @@ use mud_server::{Built, TypingGate, build, settings, web};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+/// The password every test character gets.
+const PW: &str = "lantern-and-jerkin";
 
 async fn boot() -> (SocketAddr, Arc<Built>) {
     boot_with(None).await
@@ -41,8 +45,9 @@ async fn boot_full(
     let mut cfg = MudConfig::default();
     cfg.world.db = None;
     cfg.supervisor.typing_scale = 0.0;
+    cfg.accounts.bcrypt_cost = 4;
     tweak(&mut cfg);
-    let mut built = build(&cfg).unwrap();
+    let mut built = build(&cfg).await.unwrap();
     if let Some(t) = admin_token {
         built.mud = Arc::new(web::Mud {
             admin_token: t.to_owned(),
@@ -94,6 +99,85 @@ async fn ws(addr: SocketAddr) -> Ws {
         .await
         .unwrap()
         .0
+}
+
+/// A socket whose upgrade request carries `headers`.
+async fn ws_with(addr: SocketAddr, headers: &[(&'static str, &str)]) -> Ws {
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    for (k, v) in headers {
+        req.headers_mut().insert(*k, v.parse().unwrap());
+    }
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
+
+/// The next JSON message, or fails after 3 s.
+async fn next_json(ws: &mut Ws) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for a message"))
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = msg {
+            return serde_json::from_str(&t).unwrap();
+        }
+    }
+}
+
+/// Reads messages until one has `kind`; returns it.
+async fn until_kind(ws: &mut Ws, kind: &str) -> Value {
+    loop {
+        let v = next_json(ws).await;
+        if v["kind"] == kind {
+            return v;
+        }
+    }
+}
+
+/// Makes `name` a character over `ws` and waits for the room. Returns
+/// the resume token the server issued, if any.
+async fn register(ws: &mut Ws, name: &str, remember: bool) -> Option<String> {
+    send(ws, json!({ "line": name })).await;
+    until(ws, "Choose a password").await;
+    send(ws, json!({ "line": PW, "remember": remember })).await;
+    until(ws, "Type it again").await;
+    send(ws, json!({ "line": PW, "remember": remember })).await;
+    let mut token = None;
+    loop {
+        let v = next_json(ws).await;
+        if v["kind"] == "remember" {
+            token = v["token"].as_str().map(str::to_owned);
+        }
+        if v["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("Town Square"))
+        {
+            return token;
+        }
+    }
+}
+
+/// Logs `name` in with the test password over `ws`.
+async fn sign_in(ws: &mut Ws, name: &str) {
+    send(ws, json!({ "line": name })).await;
+    until(ws, "Password:").await;
+    send(ws, json!({ "line": PW })).await;
+    until(ws, "Town Square").await;
+}
+
+/// The close code the server sends, waiting up to 3 s.
+async fn close_code(ws: &mut Ws) -> Option<u16> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if let Message::Close(frame) = msg {
+                return frame.map(|f| u16::from(f.code));
+            }
+        }
+        None
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the server never closed the socket"))
 }
 
 async fn send(ws: &mut Ws, v: Value) {
@@ -164,15 +248,16 @@ async fn the_terminal_page_serves() {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_players_share_a_room_over_websockets() {
     let (addr, _) = boot().await;
-    let mut ada = ws(addr).await;
-    send(&mut ada, json!({ "login": "kestrel" })).await;
-    let refused = until(&mut ada, "taken").await;
+    let mut probe = ws(addr).await;
+    send(&mut probe, json!({ "login": "kestrel" })).await;
+    until(&mut probe, "Password:").await;
+    send(&mut probe, json!({ "cmd": PW })).await;
+    let refused = until(&mut probe, "Wrong password.").await;
     assert_eq!(refused["kind"], "error");
-    send(&mut ada, json!({ "login": "ada" })).await;
-    until(&mut ada, "Town Square").await;
+    let mut ada = ws(addr).await;
+    register(&mut ada, "ada", false).await;
     let mut bo = ws(addr).await;
-    send(&mut bo, json!({ "login": "bo" })).await;
-    until(&mut bo, "Town Square").await;
+    register(&mut bo, "bo", false).await;
     until(&mut ada, "bo arrives").await;
     send(&mut ada, json!({ "cmd": "say <b>hello</b> bo" })).await;
     let mine = until(&mut ada, "You say").await;
@@ -211,19 +296,18 @@ async fn a_terminal_that_gives_no_name_is_closed() {
     .await;
     let mut ws = ws(addr).await;
     assert_eq!(until(&mut ws, "Too slow").await["kind"], "error");
-    closed(&mut ws).await;
+    assert_eq!(close_code(&mut ws).await, Some(1000));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_address_gets_its_share_of_terminals() {
     let (addr, built) = boot_cfg(None, |c| c.server.max_connections_per_address = 1).await;
     let mut first = ws(addr).await;
-    send(&mut first, json!({ "login": "ada" })).await;
-    until(&mut first, "Town Square").await;
+    register(&mut first, "ada", false).await;
     let mut second = ws(addr).await;
     let refused = until(&mut second, "Too many connections from your address").await;
     assert_eq!(refused["kind"], "error");
-    closed(&mut second).await;
+    assert_eq!(close_code(&mut second).await, Some(1008));
     assert_eq!(built.mud.limiter.open(), 1);
     drop(first);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -235,8 +319,7 @@ async fn one_address_gets_its_share_of_terminals() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let mut third = ws(addr).await;
-    send(&mut third, json!({ "login": "bo" })).await;
-    until(&mut third, "Town Square").await;
+    register(&mut third, "bo", false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -247,8 +330,7 @@ async fn an_idle_terminal_is_closed_after_login() {
     })
     .await;
     let mut ws = ws(addr).await;
-    send(&mut ws, json!({ "login": "ada" })).await;
-    until(&mut ws, "Town Square").await;
+    register(&mut ws, "ada", false).await;
     until(&mut ws, "Idle too long").await;
     closed(&mut ws).await;
     let ada = mud_world::EntityId::new("pc_ada");
@@ -267,8 +349,7 @@ async fn an_idle_terminal_is_closed_after_login() {
 async fn an_oversized_terminal_message_closes_the_socket() {
     let (addr, built) = boot().await;
     let mut ws = ws(addr).await;
-    send(&mut ws, json!({ "login": "ada" })).await;
-    until(&mut ws, "Town Square").await;
+    register(&mut ws, "ada", false).await;
     let huge = "x".repeat(mud_server::MAX_WS_MESSAGE_BYTES * 4);
     let _ = ws
         .send(Message::Text(
@@ -491,4 +572,308 @@ async fn mcp_is_mounted_behind_bearer_tokens() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_null_resume_gets_the_name_prompt() {
+    let (addr, _) = boot().await;
+    let mut c = ws(addr).await;
+    send(&mut c, json!({ "resume": null })).await;
+    assert_eq!(
+        next_json(&mut c).await,
+        json!({ "kind": "prompt", "text": "What is your name?" })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remembered_browser_resumes_without_a_password() {
+    let (addr, _) = boot().await;
+    let mut first = ws(addr).await;
+    let token = register(&mut first, "ada", true).await.unwrap();
+    drop(first);
+    for _ in 0..2 {
+        let mut again = ws(addr).await;
+        send(&mut again, json!({ "resume": token })).await;
+        assert_eq!(until_kind(&mut again, "authed").await["name"], "ada");
+        until(&mut again, "Town Square").await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remembered_browser_resumes_while_its_address_is_held() {
+    let (addr, _) = boot_cfg(None, |c| {
+        c.accounts.throttle.address.free = 0;
+        c.accounts.throttle.name.free = 0;
+    })
+    .await;
+    let mut first = ws(addr).await;
+    let token = register(&mut first, "ada", true).await.unwrap();
+    drop(first);
+    let mut probe = ws(addr).await;
+    send(&mut probe, json!({ "line": "kestrel" })).await;
+    until(&mut probe, "Password:").await;
+    send(&mut probe, json!({ "line": "wrong-pass-123" })).await;
+    until(&mut probe, "Wrong password.").await;
+    let mut held = ws(addr).await;
+    send(&mut held, json!({ "line": "bo" })).await;
+    until(&mut held, "Too many failed logins from your address").await;
+    let mut back = ws(addr).await;
+    send(&mut back, json!({ "resume": token })).await;
+    until(&mut back, "Town Square").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_token_is_forgotten_by_the_client() {
+    let (addr, _) = boot().await;
+    let mut c = ws(addr).await;
+    send(&mut c, json!({ "resume": "no-such-series:no-such-token" })).await;
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(next_json(&mut c).await);
+    }
+    assert!(seen.contains(&json!({ "kind": "forget" })), "{seen:?}");
+    assert!(seen.contains(&json!({ "kind": "error", "text": "Your saved login has expired." })));
+    assert!(seen.contains(&json!({ "kind": "prompt", "text": "What is your name?" })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_prompts_are_marked_secret() {
+    let (addr, _) = boot().await;
+    let mut c = ws(addr).await;
+    send(&mut c, json!({ "line": "ada" })).await;
+    assert_eq!(
+        next_json(&mut c).await,
+        json!({ "kind": "prompt", "secret": "new-password",
+                "text": "Nobody here is called ada. Choose a password to make a new character (8 or more characters):" })
+    );
+    let mut k = ws(addr).await;
+    send(&mut k, json!({ "line": "kestrel" })).await;
+    assert_eq!(
+        next_json(&mut k).await,
+        json!({ "kind": "prompt", "text": "Password:", "secret": "current-password" })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_sent_as_cmd_is_never_executed() {
+    let (addr, built) = boot().await;
+    let mut first = ws(addr).await;
+    register(&mut first, "ada", false).await;
+    drop(first);
+    let mut audit = built.mud.game.subscribe_audit();
+    let mut old = ws(addr).await;
+    send(&mut old, json!({ "login": "ada" })).await;
+    until(&mut old, "Password:").await;
+    send(&mut old, json!({ "cmd": "say hunter2" })).await;
+    until(&mut old, "Wrong password.").await;
+    let heard = built
+        .mud
+        .game
+        .events(&mud_world::EntityId::from("pc_ada"), mud_world::Seq(0), 100)
+        .to_string();
+    assert!(!heard.contains("hunter2"), "{heard}");
+    while let Ok(a) = audit.try_recv() {
+        assert!(!serde_json::to_string(&*a).unwrap().contains("hunter2"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deliberate_close_is_code_1000_and_a_refusal_is_1008() {
+    let (addr, _) = boot_cfg(None, |c| c.server.max_connections_per_address = 1).await;
+    let mut c = ws(addr).await;
+    register(&mut c, "ada", false).await;
+    let mut refused = ws(addr).await;
+    assert_eq!(close_code(&mut refused).await, Some(1008), "the limiter");
+    send(&mut c, json!({ "line": "quit" })).await;
+    until(&mut c, "Farewell.").await;
+    assert_eq!(close_code(&mut c).await, Some(1000));
+    let mut wrong = ws(addr).await;
+    send(&mut wrong, json!({ "line": "kestrel" })).await;
+    for _ in 0..3 {
+        send(&mut wrong, json!({ "line": "wrong-pass-123" })).await;
+    }
+    until(&mut wrong, "Wrong password. Farewell.").await;
+    assert_eq!(close_code(&mut wrong).await, Some(1008));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cross_site_origin_is_refused() {
+    let (addr, _) = boot().await;
+    let mut evil = ws_with(addr, &[("origin", "https://evil.example")]).await;
+    assert_eq!(
+        next_json(&mut evil).await,
+        json!({ "kind": "error", "text": "This terminal only accepts connections from its own page." })
+    );
+    assert_eq!(close_code(&mut evil).await, Some(1008));
+    let own = format!("http://{addr}");
+    let mut ok = ws_with(addr, &[("origin", own.as_str())]).await;
+    send(&mut ok, json!({})).await;
+    until(&mut ok, "What is your name?").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accounts_persist_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let (addr, built) = boot_cfg(None, |c| c.world.db = Some(db.clone())).await;
+    let mut c = ws(addr).await;
+    register(&mut c, "ada", false).await;
+    drop(c);
+    drop(built);
+    assert!(dir.path().join("accounts.db").exists());
+    let (addr, _) = boot_cfg(None, |c| c.world.db = Some(db.clone())).await;
+    let mut back = ws(addr).await;
+    sign_in(&mut back, "ada").await;
+    let mut wrong = ws(addr).await;
+    send(&mut wrong, json!({ "line": "ada" })).await;
+    until(&mut wrong, "Password:").await;
+    send(&mut wrong, json!({ "line": "not-the-password" })).await;
+    until(&mut wrong, "Wrong password.").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_passwords_from_one_address_are_held() {
+    let (addr, _) = boot().await;
+    for _ in 0..2 {
+        let mut c = ws(addr).await;
+        send(&mut c, json!({ "line": "kestrel" })).await;
+        for _ in 0..3 {
+            send(&mut c, json!({ "line": "wrong-pass-123" })).await;
+        }
+        until(&mut c, "Wrong password. Farewell.").await;
+    }
+    let mut c = ws(addr).await;
+    send(&mut c, json!({ "line": "kestrel" })).await;
+    let held = until(&mut c, "Too many failed logins for that name").await;
+    assert_eq!(held["kind"], "error");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_header_never_lifts_the_limits_of_a_direct_client() {
+    // No trusted proxies: a client-supplied header names nobody, so the
+    // TCP peer is the key whatever the header says.
+    let (addr, _) = boot_cfg(None, |c| c.accounts.new_characters_per_address_per_day = 1).await;
+    let mut first = ws_with(addr, &[("x-forwarded-for", "203.0.113.9")]).await;
+    register(&mut first, "ada", false).await;
+    for fwd in [
+        ("x-forwarded-for", "198.51.100.1"),
+        ("forwarded", "for=198.51.100.2"),
+        ("x-real-ip", "198.51.100.3"),
+    ] {
+        let mut c = ws_with(addr, &[fwd]).await;
+        send(&mut c, json!({ "line": "bo" })).await;
+        until(&mut c, "Too many new characters from your address today").await;
+    }
+    let mut direct = ws(addr).await;
+    send(&mut direct, json!({ "line": "cy" })).await;
+    until(
+        &mut direct,
+        "Too many new characters from your address today",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_header_never_lifts_the_address_hold() {
+    let (addr, _) = boot_cfg(None, |c| {
+        c.accounts.throttle.address.free = 0;
+    })
+    .await;
+    let fwd = [("x-forwarded-for", "203.0.113.9")];
+    let mut c = ws_with(addr, &fwd).await;
+    send(&mut c, json!({ "line": "kestrel" })).await;
+    until(&mut c, "Password:").await;
+    send(&mut c, json!({ "line": "wrong-pass-123" })).await;
+    until(&mut c, "Wrong password.").await;
+    let mut again = ws_with(addr, &[("x-forwarded-for", "198.51.100.7")]).await;
+    send(&mut again, json!({ "line": "nobody" })).await;
+    until(&mut again, "Too many failed logins from your address").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_observer_counts_logins_with_the_token_only() {
+    let (addr, built) = boot().await;
+    let mut c = ws(addr).await;
+    register(&mut c, "ada", false).await;
+    let token = built.mud.admin_token.clone();
+    let page = http()
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("Logins: 1 ok · 0 failed · 0 held · 1 new · 0 resumed"),
+        "{page}"
+    );
+    assert!(!page.contains("127.0.0.1"));
+    let denied = http()
+        .get(format!("http://{addr}/observer/entities"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stay_signed_in_box_follows_remember_days() {
+    for (days, shown) in [(30, true), (0, false)] {
+        let (addr, _) = boot_cfg(None, |c| c.accounts.remember_days = days).await;
+        let page = http()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(
+            page.contains("stay signed in on this browser"),
+            shown,
+            "{days}"
+        );
+        assert!(page.contains("Type logout to make this browser forget you."));
+    }
+}
+
+/// Waits up to `secs` for a message whose text holds `needle`.
+async fn until_within(ws: &mut Ws, needle: &str, secs: u64) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}"))
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["text"].as_str().is_some_and(|s| s.contains(needle)) {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_out_or_locked_browser_is_closed_at_revalidation() {
+    let (addr, built) = boot_cfg(None, |c| c.accounts.revalidate_secs = 5).await;
+    let accounts = &built.mud.accounts;
+    let mut ada = ws(addr).await;
+    register(&mut ada, "ada", false).await;
+    let mut bo = ws(addr).await;
+    register(&mut bo, "bo", false).await;
+    let now = built.mud.game.now_ms();
+    let key = |n| mud_accounts::NameKey::parse(n).unwrap();
+    accounts.admin_signout(&key("ada"), now + 1).await.unwrap();
+    accounts
+        .admin_set_locked(&key("bo"), true, now + 1)
+        .await
+        .unwrap();
+    for c in [&mut ada, &mut bo] {
+        let bye = until_within(c, "Your account changed elsewhere. Farewell.", 8).await;
+        assert_eq!(bye["kind"], "system");
+        assert_eq!(close_code(c).await, Some(1008));
+    }
 }

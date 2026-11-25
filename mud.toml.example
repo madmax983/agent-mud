@@ -7,10 +7,14 @@
 
 [server]
 bind = "127.0.0.1:3000"          # terminal at /, observer at /observer, MCP at /mcp
+# telnet and plain http carry passwords in clear text; on a public server bind
+# telnet to loopback or leave it unset, and put a TLS proxy in front with
+# public_url = "https://…" and trusted_proxies set.
 telnet = "127.0.0.1:4000"        # optional plain-text clients
-# public_url = "http://127.0.0.1:3000"   # what agents use to reach /mcp
+# public_url = "http://127.0.0.1:3000"   # what agents use to reach /mcp; once it is
+#                                        # https, trusted_proxies must be set too
 admin_token_env = "MUD_ADMIN_TOKEN"     # unset: a token is made at start and logged
-login_timeout_ms = 60000         # a client that gives no name in time is closed (0: never)
+login_timeout_ms = 300000        # the whole login, name to last password (0: never)
 idle_timeout_ms = 3600000        # a player silent this long is closed (0: never)
 max_connections = 512            # terminal + telnet connections at once (0: no cap)
 max_connections_per_address = 8  # from one address; an IPv6 /64 counts as one (0: no cap)
@@ -63,3 +67,50 @@ enabled = true
 # A mind binding with runtime = "rhai" (Hale in crypt-v01) runs on its Rhai
 # script whatever [minds] says; false keeps every entity on its tier's runtime.
 allow_runtime_override = true
+
+# Player accounts (ADR 0009). Passwords, hashes and tokens live in their own
+# file, never in the world. Back up world.db and accounts.db together: a lost
+# accounts.db makes every human character claimable again.
+[accounts]
+# db = "data/accounts.db"        # unset: accounts.db beside [world] db; in memory when the world is
+bcrypt_cost = 12                 # 4..=16; each step doubles the work; below 10 is for tests (warned)
+min_password_chars = 8           # 8..=64; passwords are at most 72 bytes
+reject_common_passwords = true   # autumn-web's 10k weak-password list
+allow_new = true                 # false: only existing characters may log in
+new_characters_per_address_per_day = 5   # an IPv6 /48 counts as one address; 0: no limit
+new_characters_per_day = 0       # across every address; 0: no limit (a warning is logged every 50)
+# Characters saved before accounts: "claim" lets the first confirmed password
+# take one (a takeover, recorded as origin = claimed); "sealed" keeps them
+# closed until `mud account reset <name>`. Use "sealed" on a public server,
+# and for strict Turing runs: while claims are open, a probe that types a
+# password learns whether a name is an unclaimed human, so the hidden PC can
+# stand out by elimination.
+legacy = "claim"
+legacy_claim_days = 30           # after this, "claim" acts as "sealed"; 0: never closes
+remember_days = 30               # web "stay signed in on this browser"; 0 turns it off (0..=365)
+reconnect_minutes = 15           # a tab's token after its last activity, for reloads and restarts; 0 off (0..=1440)
+max_remembered = 10              # remembered browsers per character (1..=50)
+known_addresses = 5              # recent login addresses per character that skip the shared limits (0..=20)
+max_password_attempts = 3        # wrong passwords per connection before it closes (1..=10)
+hash_concurrency = 2             # bcrypt checks at once (1..=64)
+revalidate_secs = 30             # live sessions re-check locks and password changes (5..=3600)
+[accounts.throttle.name_address] # one name from one address: always applies
+free = 5
+base_ms = 1000
+max_ms = 900000
+forget_ms = 86400000
+[accounts.throttle.name]         # one name from addresses it never logged in from
+free = 10
+base_ms = 1000
+max_ms = 300000
+forget_ms = 86400000
+[accounts.throttle.address]      # one address over names it never logged in as
+free = 20
+base_ms = 1000
+max_ms = 900000
+forget_ms = 3600000
+[accounts.throttle.work]         # bcrypt checks from one address, pass or fail
+free = 60
+base_ms = 1000
+max_ms = 60000
+forget_ms = 600000
