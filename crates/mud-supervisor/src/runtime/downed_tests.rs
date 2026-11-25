@@ -67,7 +67,7 @@ impl Mind for Recorder {
                 seqs: ctx.events.iter().map(|e| e.seq).collect(),
                 booked: ctx.booked.iter().map(|b| b.note.clone()).collect(),
                 you: ctx.you.clone(),
-                message: crate::mind::wake_message(&ctx),
+                message: crate::mind::wake_message(crate::mind::ToolNames::BARE, &ctx),
             });
             let crash = self.crash.lock().unwrap().take();
             if let Some(game) = crash {

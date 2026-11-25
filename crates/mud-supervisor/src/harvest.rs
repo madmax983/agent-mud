@@ -40,8 +40,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::mind::{
-    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, Usage, WakeContext,
-    persistent_habits, system_prompt, tool_specs, wake_message, wake_tool_specs,
+    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, ToolNames, Usage,
+    WakeContext, persistent_habits, system_prompt, tool_specs, wake_message, wake_tool_specs,
 };
 
 /// The agent kind of every MUD entity in harvest.
@@ -168,13 +168,14 @@ fn tokens_used(
 /// wake habit for an entity that books its own wakes.
 fn harvest_system(persona: &HarvestPersona) -> String {
     let mut system = system_prompt(
+        ToolNames::BARE,
         &persona.name,
         &persona.persona,
         &persona.goal,
         &persona.body,
     );
     if persona.wakes {
-        system.push_str(&persistent_habits());
+        system.push_str(&persistent_habits(ToolNames::BARE));
     }
     system
 }
@@ -399,7 +400,7 @@ impl Mind for HarvestMind {
             let (reply_tx, reply_rx) = oneshot::channel();
             let job = self.in_flight.start(&ctx.entity);
             tx.send(Job {
-                text: wake_message(&ctx),
+                text: wake_message(ToolNames::BARE, &ctx),
                 wake_id: ctx.wake_id.clone(),
                 now_ms: ctx.now_ms,
                 reply: reply_tx,

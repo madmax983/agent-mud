@@ -23,7 +23,7 @@ fn persona() -> Persona {
 #[test]
 fn the_config_points_littleguy_at_the_mud() {
     let cfg = LittleguyConfig::default();
-    let text = render_config(&cfg, &persona(), 4123);
+    let text = render_config(&cfg, &persona().text(), 4123, false);
     let v: toml::Table = toml::from_str(&text).unwrap();
     assert_eq!(v["owner"].as_str(), Some("mud"));
     assert!(v["system"].as_str().unwrap().contains("Get ore."));
@@ -39,10 +39,10 @@ fn the_config_points_littleguy_at_the_mud() {
         v["system"]
             .as_str()
             .unwrap()
-            .ends_with(&persistent_habits()),
+            .ends_with(&littleguy_habits(ToolNames::LITTLEGUY)),
         "the wake habit"
     );
-    assert!(v["system"].as_str().unwrap().contains("mud_wake_me"));
+    assert!(v["system"].as_str().unwrap().contains("world__mud_wake_me"));
     let server = &v["mcp"]["server"][0];
     assert_eq!(server["url"].as_str(), Some("http://127.0.0.1:3000/mcp"));
     assert_eq!(server["bearer_env"].as_str(), Some(TOKEN_ENV));
@@ -67,8 +67,351 @@ fn zero_max_steps_leaves_a_wake_unbounded() {
         max_steps: 0,
         ..LittleguyConfig::default()
     };
-    let v: toml::Table = toml::from_str(&render_config(&cfg, &persona(), 4123)).unwrap();
+    let v: toml::Table =
+        toml::from_str(&render_config(&cfg, &persona().text(), 4123, false)).unwrap();
     assert!(!v.contains_key("max_steps"));
+}
+
+/// The default config of torin, parsed.
+fn torin_config(quiet: bool) -> toml::Table {
+    let text = render_config(&LittleguyConfig::default(), &persona().text(), 4123, quiet);
+    toml::from_str(&text).unwrap()
+}
+
+#[test]
+fn the_config_turns_on_notes_compaction_and_research() {
+    let v = torin_config(false);
+    assert_eq!(v["tools"]["files"].as_bool(), Some(true), "notes");
+    assert_eq!(v["tools"]["plans"].as_bool(), Some(true));
+    assert_eq!(v["tools"]["runs"].as_bool(), Some(false));
+    assert_eq!(v["tools"]["web_search"].as_bool(), Some(false));
+    assert_eq!(v["memory"]["enabled"].as_bool(), Some(true));
+    assert_eq!(v["memory"]["reflect"].as_bool(), Some(true));
+    assert_eq!(v["window"].as_integer(), Some(30));
+    assert_eq!(v["max_request_bytes"].as_integer(), Some(240_000));
+    assert_eq!(v["compaction"]["at_percent"].as_integer(), Some(80));
+    assert_eq!(v["compaction"]["max_resets"].as_integer(), Some(3));
+    assert_eq!(v["heartbeat"]["research"].as_bool(), Some(true));
+    assert_eq!(v["heartbeat"]["every_minutes"].as_integer(), Some(240));
+    assert_eq!(
+        v["heartbeat"]["prompt"].as_str(),
+        Some(heartbeat_prompt(ToolNames::LITTLEGUY).as_str())
+    );
+    assert_eq!(v["flow"]["rule_of_two"].as_bool(), Some(true));
+    // Each switch is the operator's.
+    let off = LittleguyConfig {
+        notes: false,
+        research: false,
+        compaction: None,
+        max_request_bytes: 0,
+        window: 12,
+        ..LittleguyConfig::default()
+    };
+    let v: toml::Table =
+        toml::from_str(&render_config(&off, &persona().text(), 4123, false)).unwrap();
+    assert_eq!(v["tools"]["files"].as_bool(), Some(false));
+    assert_eq!(v["heartbeat"]["research"].as_bool(), Some(false));
+    assert!(!v.contains_key("compaction") && !v.contains_key("max_request_bytes"));
+    assert_eq!(v["window"].as_integer(), Some(12));
+}
+
+#[test]
+fn the_mud_server_is_split_by_effect() {
+    let v = torin_config(false);
+    let servers = v["mcp"]["server"].as_array().unwrap();
+    assert_eq!(servers.len(), 2);
+    let tools = |s: &toml::Value| -> Vec<String> {
+        s["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (world, mud) = (&servers[0], &servers[1]);
+    assert_eq!(world["id"].as_str(), Some("world"));
+    assert_eq!(world["effect"].as_str(), Some("internal"));
+    assert_eq!(
+        tools(world),
+        ["mud_look", "mud_sheet", "mud_wake_me", "mud_cancel_wake"]
+    );
+    assert_eq!(mud["id"].as_str(), Some("mud"));
+    assert_eq!(mud["effect"].as_str(), Some("write"));
+    assert_eq!(tools(mud), ["mud_events", "mud_command"]);
+    for s in servers {
+        assert_eq!(s["url"].as_str(), Some("http://127.0.0.1:3000/mcp"));
+        assert_eq!(s["bearer_env"].as_str(), Some(TOKEN_ENV));
+        assert_eq!(s["labels"][0].as_str(), Some("untrusted_input"));
+    }
+    let text = render_config(&LittleguyConfig::default(), &persona().text(), 4123, false);
+    assert!(
+        !text.contains("secret-token"),
+        "the token never goes in a file"
+    );
+}
+
+/// The `<server>__<tool>` names in `text`.
+fn served_names(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+        .filter(|w| w.contains("__"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn every_tool_named_in_the_prompts_exists_under_that_name() {
+    let v = torin_config(false);
+    let mut served = Vec::new();
+    for s in v["mcp"]["server"].as_array().unwrap() {
+        let id = s["id"].as_str().unwrap();
+        for t in s["tools"].as_array().unwrap() {
+            served.push(format!("{id}__{}", t.as_str().unwrap()));
+        }
+    }
+    let system = v["system"].as_str().unwrap();
+    let tick = v["heartbeat"]["prompt"].as_str().unwrap();
+    let mut named = served_names(system);
+    named.extend(served_names(tick));
+    assert_ne!(named.len(), 0);
+    for n in &named {
+        assert!(
+            served.contains(n),
+            "{n} is named but not served: {served:?}"
+        );
+    }
+    for n in ToolNames::LITTLEGUY.all() {
+        assert!(named.iter().any(|m| m == n), "{n} is never named");
+        assert!(served.iter().any(|m| m == n), "{n} is not served");
+    }
+    for text in [system, tick] {
+        let rest = text.replace("mud__mud_command", "");
+        assert!(!rest.contains("mud_command"), "a bare mud_command: {text}");
+    }
+}
+
+#[test]
+fn the_config_asks_for_no_owner_gated_feature() {
+    for quiet in [false, true] {
+        let v = torin_config(quiet);
+        for key in [
+            "council",
+            "skills",
+            "sandbox",
+            "approvals",
+            "scripts",
+            "patches",
+            "research",
+            "hooks",
+            "followups",
+            "allow_actions",
+            "refine",
+        ] {
+            assert!(!v.contains_key(key), "[{key}] is never written");
+        }
+        assert!(!v["tools"].as_table().unwrap().contains_key("allow_actions"));
+    }
+}
+
+#[tokio::test]
+async fn a_quiet_config_drops_the_heartbeat_and_memory_and_keeps_the_port() {
+    let quiet = torin_config(true);
+    assert!(!quiet.contains_key("heartbeat"), "no tick while quiet");
+    assert_eq!(quiet["memory"]["enabled"].as_bool(), Some(false));
+    let loud = torin_config(false);
+    for key in [
+        "system",
+        "tools",
+        "mcp",
+        "ui",
+        "compaction",
+        "flow",
+        "window",
+    ] {
+        assert_eq!(quiet[key], loud[key], "{key} stays");
+    }
+    // On a mind, a rewrite keeps the daemon's pages port.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LittleguyConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    assert!(!mind.is_quiet(&torin));
+    // Before any start, the flag waits for the first render.
+    mind.set_quiet(&torin, true).await.unwrap();
+    assert!(mind.is_quiet(&torin));
+    assert!(
+        !mind.config_path(&torin).exists(),
+        "nothing runs: nothing written"
+    );
+    std::fs::create_dir_all(mind.entity_dir(&torin)).unwrap();
+    let sock = dir.path().join("fake.sock");
+    mind.daemons.lock().await.insert(
+        torin.clone(),
+        Daemon {
+            child: stand_in(&sock),
+            socket: sock.clone(),
+            ui_port: 4999,
+        },
+    );
+    let read = || -> toml::Table {
+        toml::from_str(&std::fs::read_to_string(mind.config_path(&torin)).unwrap()).unwrap()
+    };
+    mind.set_quiet(&torin, true).await.unwrap();
+    let v = read();
+    assert!(!v.contains_key("heartbeat"));
+    assert_eq!(v["ui"]["bind"].as_str(), Some("127.0.0.1:4999"));
+    mind.set_quiet(&torin, false).await.unwrap();
+    let v = read();
+    assert!(v.contains_key("heartbeat"));
+    assert_eq!(v["memory"]["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        v["ui"]["bind"].as_str(),
+        Some("127.0.0.1:4999"),
+        "the port stays"
+    );
+    assert!(!mind.is_quiet(&torin));
+    assert!(
+        mind.set_quiet(&EntityId::from("nobody"), true)
+            .await
+            .is_err()
+    );
+    assert_eq!(mind.brief(&torin).unwrap().goal, "Get ore.");
+    assert!(mind.brief(&EntityId::from("nobody")).is_none());
+    mind.shutdown().await;
+}
+
+#[test]
+fn config_writes_are_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lg.toml");
+    let loud = render_config(&LittleguyConfig::default(), &persona().text(), 4123, false);
+    let quiet = render_config(&LittleguyConfig::default(), &persona().text(), 4123, true);
+    write_config(&path, &loud).unwrap();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (path, done) = (path.clone(), Arc::clone(&done));
+        let (loud, quiet) = (loud.clone(), quiet.clone());
+        std::thread::spawn(move || {
+            let mut reads = 0_u32;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    text == loud || text == quiet,
+                    "a partial file: {} bytes",
+                    text.len()
+                );
+                toml::from_str::<toml::Table>(&text).unwrap();
+                reads += 1;
+            }
+            reads
+        })
+    };
+    for i in 0..200 {
+        write_config(&path, if i % 2 == 0 { &quiet } else { &loud }).unwrap();
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(reader.join().unwrap() > 0);
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["lg.toml"], "no temp file stays");
+}
+
+#[test]
+fn a_long_wake_line_stays_under_lgs_cap() {
+    let quotes = "\"".repeat(500);
+    let views: Vec<Value> = (0..300_u64)
+        .map(|seq| json!({ "seq": seq, "kind": "say", "who": "Ada", "untrusted_text": quotes }))
+        .collect();
+    let ctx = WakeContext {
+        entity: EntityId::from("torin"),
+        name: "Torin".into(),
+        priority: Priority::Booked,
+        reason: "booked wake".into(),
+        events: Vec::new(),
+        event_views: views,
+        look: json!({ "title": "The Forge" }),
+        you: serde_json::Value::Null,
+        macro_tick: false,
+        macro_ticks: 0,
+        login: false,
+        wake_id: "w".repeat(200),
+        now_ms: NOW,
+        booked: (1..=5)
+            .map(|id| crate::wakes::Booking {
+                id,
+                due_ms: NOW,
+                note: "\"".repeat(280),
+            })
+            .collect(),
+    };
+    let text = wake_message(ToolNames::LITTLEGUY, &ctx);
+    let mut line =
+        serde_json::to_string(&json!({ "kind": "chat", "message_id": ctx.wake_id, "text": text }))
+            .unwrap();
+    line.push('\n');
+    assert!(line.len() < 65_536, "{} bytes on the wire", line.len());
+    assert!(line.len() <= LG_MAX_LINE_BYTES);
+    assert!(serde_json::to_string(&text).unwrap().len() <= crate::mind::WAKE_TEXT_WIRE_BYTES);
+    let events_line = text.lines().find(|l| l.starts_with("events: ")).unwrap();
+    let shown: Vec<Value> =
+        serde_json::from_str(&events_line["events: ".len()..]).expect("every event shown is whole");
+    assert!(!shown.is_empty() && shown.len() < 300, "{}", shown.len());
+    let seqs: Vec<u64> = shown.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    let first = 300 - u64::try_from(shown.len()).unwrap();
+    assert_eq!(
+        seqs,
+        (first..300).collect::<Vec<_>>(),
+        "the newest, in order"
+    );
+    for e in &shown {
+        assert_eq!(
+            e["untrusted_text"].as_str().unwrap().len(),
+            500,
+            "none is cut"
+        );
+    }
+    let omitted = 300 - shown.len();
+    assert!(
+        text.contains(&format!(
+            "\n{omitted} older events are not shown; read them with mud__mud_events.\n"
+        )),
+        "{}",
+        &text[text.len() - 300..]
+    );
+    assert!(text.contains("booked: [{\"id\":1,"), "the notes stay");
+    // A short wake shows everything and no omission line.
+    let mut short = ctx;
+    short.event_views.truncate(3);
+    let m = wake_message(ToolNames::LITTLEGUY, &short);
+    assert!(!m.contains("not shown"), "{m}");
+}
+
+#[tokio::test]
+async fn chat_refuses_an_oversized_line_before_sending() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    // 33 000 quotes take 66 000 bytes once escaped.
+    let text = "\"".repeat(33_000);
+    let e = chat(&sock, "wake-torin-1", &text).await.unwrap_err();
+    assert!(e.to_string().contains("longer than lg accepts"), "{e}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "no connection, so no byte"
+    );
+    // Just under the cap goes out.
+    let sock = dir.path().join("lg2.sock");
+    let server = fake_daemon(&sock, r#"{"kind":"reply","text":"ok"}"#);
+    let fits = "x".repeat(LG_MAX_LINE_BYTES - 100);
+    assert!(chat(&sock, "w", &fits).await.is_ok());
+    let req = server.await.unwrap();
+    assert!(req.len() <= LG_MAX_LINE_BYTES);
 }
 
 fn fake_daemon(path: &Path, answer: &'static str) -> tokio::task::JoinHandle<String> {
@@ -526,6 +869,7 @@ async fn a_timed_out_wake_settles_only_once_its_op_is_read() {
         Daemon {
             child: stand_in(&sock),
             socket: sock.clone(),
+            ui_port: 4123,
         },
     );
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
@@ -631,6 +975,7 @@ async fn no_second_chat_starts_while_an_op_is_live() {
         Daemon {
             child: stand_in(&sock),
             socket: sock.clone(),
+            ui_port: 4123,
         },
     );
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
@@ -786,6 +1131,91 @@ async fn a_real_lg_serve_answers_a_wake() {
             "lg serve {pid} is gone"
         );
     }
+}
+
+/// The supervisor is a real daemon's owner on its socket: reads, a
+/// decision, and a quiet reload that lg applies live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_lg_serve_takes_owner_requests() {
+    use owner::{OwnerRequest as Req, OwnerResponse as Resp, PlanDecision, request};
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real littleguy owner check");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LittleguyConfig {
+        bin: PathBuf::from(bin),
+        data_dir: dir.path().to_path_buf(),
+        mcp_url: "http://127.0.0.1:9/mcp".into(),
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    let started = mind.ensure(&torin).await;
+    let log = || std::fs::read_to_string(dir.path().join("torin/lg.log")).unwrap_or_default();
+    let sock = started.unwrap_or_else(|e| panic!("{e}\n--- lg.log ---\n{}", log()));
+    assert_eq!(mind.running_socket(&torin).await.as_ref(), Some(&sock));
+    let t = Duration::from_secs(30);
+    let ask = |r: Req| {
+        let sock = sock.clone();
+        async move { request(&sock, &r, t).await.unwrap() }
+    };
+    assert!(
+        matches!(ask(Req::Plans).await, Resp::Plans { .. }),
+        "{}",
+        log()
+    );
+    assert!(
+        matches!(ask(Req::Notes).await, Resp::Notes { .. }),
+        "{}",
+        log()
+    );
+    assert!(matches!(ask(Req::Approvals).await, Resp::Off { .. }));
+    let decided = ask(Req::Decide {
+        decision: PlanDecision::Accept,
+        id: 99,
+    })
+    .await;
+    assert!(
+        matches!(&decided, Resp::Error { message } if message.contains("not a proposed goal")),
+        "{decided:?}"
+    );
+    let overlays = ask(Req::Overlays).await;
+    assert!(
+        matches!(overlays, Resp::Off { .. } | Resp::Overlays { .. }),
+        "{overlays:?}"
+    );
+    let port = |text: String| -> toml::Table { toml::from_str(&text).unwrap() };
+    let before = port(std::fs::read_to_string(mind.config_path(&torin)).unwrap());
+    mind.set_quiet(&torin, true).await.unwrap();
+    let quiet = ask(Req::Reload).await;
+    let Resp::Reloaded {
+        applied, restart, ..
+    } = &quiet
+    else {
+        panic!("{quiet:?}\n{}", log());
+    };
+    assert!(
+        applied.iter().any(|a| a == "memory") && applied.iter().any(|a| a == "heartbeat"),
+        "{quiet:?}"
+    );
+    assert!(restart.is_empty(), "{quiet:?}");
+    let after = port(std::fs::read_to_string(mind.config_path(&torin)).unwrap());
+    assert_eq!(before["ui"], after["ui"], "the pages keep their port");
+    mind.set_quiet(&torin, false).await.unwrap();
+    let loud = ask(Req::Reload).await;
+    assert!(
+        matches!(&loud, Resp::Reloaded { restart, .. } if restart.is_empty()),
+        "{loud:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        matches!(ask(Req::Plans).await, Resp::Plans { .. }),
+        "still answers after the reloads:\n{}",
+        log()
+    );
+    mind.shutdown().await;
+    assert!(mind.running_socket(&torin).await.is_none());
 }
 
 #[test]

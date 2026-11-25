@@ -206,6 +206,7 @@ pub async fn open_accounts(cfg: &MudConfig, game: &Game) -> anyhow::Result<Accou
 pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     cfg.check_proxy()?;
     cfg.supervisor.check_restart()?;
+    cfg.littleguy.check()?;
     cfg.minds.harvest.history()?;
     for w in cfg.plaintext_warnings() {
         tracing::warn!("{w}");

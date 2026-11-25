@@ -63,6 +63,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: autumn-foundation/littleguy
+          # The commit whose protocol and config this repository is tested
+          # against; bump it on purpose, with the real-lg tests.
+          ref: aefce058ca0b18bdf58cd68f012288b6fb4ef099
           path: littleguy
       - name: Toolchain
         run: rustup show
