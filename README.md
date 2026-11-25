@@ -65,8 +65,10 @@ command.
 
 Old events are never deleted outright. Every hour (`[world]
 retention_every_ms`) events older than `events_keep_days` (7) are appended
-to `archive/events-YYYY-MM.jsonl` beside `world.db`, synced, and only then
-trimmed from the table; the newest 10000 always stay, and `mud_events`
+to `archive/events-YYYY-MM-<epoch>.jsonl` beside `world.db` (one file per
+month and world, so a reset world never mixes with the old one), synced,
+and only then trimmed from the table, oldest seq first; the newest 10000
+always stay, and `mud_events`
 answers `truncated: true` when a reader asks for events older than the
 in-memory log. Back up `world.db`, `accounts.db` and `archive/` together.
 Restoring a point and replaying the archive is on the
@@ -185,7 +187,7 @@ flowchart LR
 | Untrusted speech is data | `untrusted_text` never enters narratives or cues; policy codes such as `POLICY_TRADE_REQUIRED` |
 | Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops, cast and scripts are pack data |
 | Secrets stay out of the world | passwords, hashes and tokens live in `mud-accounts`; tests check no event, `Audit`, snapshot, view or trace log holds one; every name gets the same `Password:` prompt and one bcrypt verify (proved route kernel, ADR 0009) |
-| History is archived, never deleted | events leave `world.db` only after they are appended to the archive and synced, and a re-run after a crash writes none twice (proved, ADR 0011) |
+| History is archived, never deleted | events leave `world.db` only after the archive holds each one's exact line, synced; a trim batch is a seq prefix even when the clock steps back, a re-run after a crash writes none twice, and another history under the same seqs refuses the trim (proved, ADR 0011) |
 | Supervisor rows merge monotonically | side ops are idempotent upserts whose merges commute (proved); a mind's staged ops commit only in the transaction of its first effectful command, or at its close (ADR 0011) |
 | Scripts are data in, data out | hooks return effects that a proved admission kernel and `check_effects` gate; no script holds the world; player text reaches scripts only as `Untrusted` (ADR 0010) |
 

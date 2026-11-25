@@ -199,23 +199,52 @@ fresh ids through the normal, ready-gated paths.
 - **`world.db` events (phase 1): archive before trim.** Retention never
   deletes history outright. Every `retention_every_ms` of game time the
   supervisor's step runs `Game::retain` off the async workers. Each batch is
-  one transaction under the cell lock only: it selects at most
-  `retention_batch` rows stamped before `now - events_keep_days` and below
-  the newest `events_keep_min` rows (never fewer than `EVENT_LOG_CAP`),
-  appends them in seq order to `<archive_dir>/events-YYYY-MM.jsonl` (the
-  UTC month of each event's own `at_ms`, one JSON line per event, the
-  stored event as it is), fsyncs each file it touched (and the directory,
-  when it made a file), and only then deletes them and commits. A row
-  joins a file only above the file's last line (`archive_admits`), and a
-  torn last line is cut off first, so a crash between the append and the
-  delete, then a re-run, writes nothing twice (`lemma_crash_rerun_is_idempotent`,
-  proved). If the archive cannot be written, nothing is deleted.
+  one transaction under the cell lock only: it takes at most
+  `retention_batch` rows below the newest `events_keep_min` rows (never
+  fewer than `EVENT_LOG_CAP`), oldest seq first, and stops before the
+  first row stamped at or after `now - events_keep_days`. So a batch is
+  always a seq prefix of the table, even when the wall clock stepped back
+  and `at_ms` does not rise with seq: a row too young to go holds back
+  every row after it until it ages (`lemma_prefix_leaves_only_higher_rows`).
+  A row stamped ahead by a clock that later stepped back holds retention
+  until its stamp ages; the table grows meanwhile, and nothing is lost.
+  It appends the batch in seq order to
+  `<archive_dir>/events-YYYY-MM-<epoch>.jsonl` (the UTC month of each
+  event's own `at_ms` and the `world.db` epoch in 16 hex digits, one JSON
+  line per event, the stored event as it is), fsyncs each file it
+  touched, the directory and its parent (every batch, so a file or
+  directory an earlier crashed run made is durable too), and only then
+  deletes exactly those rows and commits.
+  Each row gets an `archive_verdict`: above its file's last line it is
+  written; at or below it, the file must already hold the row's exact
+  line (a re-run after a crash between the append and the delete) or the
+  whole batch is refused and nothing is deleted. A torn last line is cut
+  off first. So no event is written twice
+  (`lemma_crash_rerun_is_idempotent`), and every deleted row is in the
+  archive, the exact line, not merely at or below a file's last seq
+  (`lemma_every_trimmed_row_is_archived`), proved. The epoch in the file
+  name keeps worlds apart: deleting `world.db` (a world reset) mints a new
+  epoch, so the new world's seqs, which start again at 1, go to new files
+  beside the old world's. A restored backup keeps its epoch; once it
+  reuses a seq the archive holds with other text, retention refuses
+  (`StoreError::Archive`, counted in `store_errors`) until the operator
+  moves the file aside or gives the file a new epoch. The owner's decision
+  named the files `events-YYYY-MM.jsonl`; the epoch suffix is the
+  smallest change that keeps a reset or restored world from losing
+  history to the old world's lines. If the archive cannot be written or
+  refuses the batch, nothing is deleted.
   `events_keep_days = 0` keeps every event in the table. Freed pages are
   reused; there is no runtime `VACUUM`.
 - **`mud_events` (phase 1)** reads the in-memory log, not the table, so
   retention does not touch it. It now answers `truncated: true` when some
   event after `since_seq` has left the in-memory log (`events_truncated`,
-  proved exact); that loss happened before and was not reported.
+  proved exact); that loss happened before and was not reported. The
+  proof needs the log to hold `oldest..=last` with no hole. A reload keeps
+  only the run of stored rows that ends at the snapshot's last seq without
+  a hole, so a gap in the table (events a version 0 store lost with a
+  failed save) sits below the log and is reported as `truncated`. The
+  backlog cap (`Audit::StoreBacklog`) keeps `EVENT_LOG_CAP` events after
+  the gap it makes, so its gap is never inside the reloaded log either.
 - **HarvestMind's `harvest.db` (phase 3)** continues as new every
   `ops_per_run` wakes (32) and purges sealed runs older than `keep_days`
   (3) with the public `purge_with`, on harvest's real clock (this

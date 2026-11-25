@@ -27,7 +27,8 @@ Restore `world.db` to a point, then replay the events archive.
 
 - **Why it is possible.** Retention never deletes history outright: every
   trimmed event is first appended, in seq order, to
-  `<archive_dir>/events-YYYY-MM.jsonl` and synced (ADR 0011). With a backup
+  `<archive_dir>/events-YYYY-MM-<epoch>.jsonl` and synced (ADR 0011). The
+  epoch names the `world.db` the events came from. With a backup
   of `world.db` (the snapshot, the ledger and the side rows at a point) and
   the archive, an operator has every event since that point, in order,
   whether it is still in the table or not.
@@ -42,7 +43,11 @@ Restore `world.db` to a point, then replay the events archive.
      event names its actor's line), and checks each step's seq and
      resulting events against the archive. A divergence stops the replay
      at the last matching seq.
-  5. Mint a new epoch for the restored file, so no wake id repeats.
+  5. Mint a new epoch for the restored file, so no wake id repeats and
+     its events after `S`, which reuse seqs the archive already holds
+     under the old epoch, go to new archive files. Without a new epoch,
+     retention refuses to trim at the first reused seq whose line differs
+     (ADR 0011); it never deletes such an event unarchived.
 - **Open questions.** Events would need the command line (or enough of the
   state change) to replay deterministically; today they carry the
   outcome, its recipients and the actor. The ledger (`mints`) must roll

@@ -10,13 +10,19 @@
 //! - `retention_cutoff`: `keep_days == 0` trims nothing; an event younger
 //!   than `keep_days` is never below the cutoff; the cutoff never passes
 //!   `now` and never moves back as `now` grows.
-//! - `archive_admits`: a row joins an archive file only above its last
-//!   line. Over any sequence of batches, crashes and re-runs the file stays
-//!   strictly ascending, so no event is written twice
-//!   (`lemma_append_keeps_ascending`); a batch leaves every one of its rows
-//!   covered (`lemma_append_covers`); and re-running a batch after a crash
-//!   at any point of an earlier run of it gives the same file as one clean
-//!   run (`lemma_crash_rerun_is_idempotent`).
+//! - `archive_verdict`: a row is written only above its file's last line;
+//!   at or below it, the file must already hold the row's exact line
+//!   (skipped), or the batch is refused and nothing is trimmed. Over any
+//!   sequence of batches, crashes and re-runs the file stays strictly
+//!   ascending, so no event is written twice
+//!   (`lemma_append_keeps_ascending`); an accepted batch leaves every one
+//!   of its rows in the file, the exact line, so the delete removes only
+//!   archived rows (`lemma_every_trimmed_row_is_archived`); re-running a
+//!   batch after a crash at any point of an earlier run of it gives the
+//!   same file as one clean run (`lemma_crash_rerun_is_idempotent`); and a
+//!   seq-prefix batch above the file is written whole
+//!   (`lemma_prefix_leaves_only_higher_rows`,
+//!   `lemma_fresh_batch_appends_all`).
 //! - `pending_overflow`: dropping that many oldest events leaves at most
 //!   `cap`, and nothing is dropped within the cap.
 //! - `events_truncated`: true exactly when some event after `since_seq`
@@ -118,150 +124,247 @@ pub open spec fn spec_cutoff(now_ms: u64, keep_days: u64) -> int {
     }
 }
 
-// mirror-begin archive_admits
-/// Whether a row with `seq` joins an archive file whose last line holds
-/// `last` (`None`: the file is empty or new).
+// mirror-begin archive_verdict_enum
+/// What the archive does with one row of a trim batch.
+pub enum ArchiveVerdict {
+    /// The row is above the file's last line: write it.
+    Append,
+    /// The file already holds this exact line (a re-run after a crash
+    /// between the append and the delete): skip it.
+    Present,
+    /// The file has a line at or above this seq, and not this row's line:
+    /// another history under the same epoch (a restored backup). Refuse
+    /// the batch; nothing is trimmed.
+    Conflict,
+}
+// mirror-end archive_verdict_enum
+
+// mirror-begin archive_verdict
+/// The verdict for a row with `seq` against an archive file.
+///
+/// `last` is the seq of the file's last line (`None`: the file is empty or
+/// new). `present` says whether the file holds this row's exact line; it
+/// counts only at or below `last`.
 #[must_use]
-pub const fn archive_admits(last: Option<u64>, seq: u64) -> (r: bool)
+pub const fn archive_verdict(last: Option<u64>, seq: u64, present: bool) -> (r: ArchiveVerdict)
     ensures
-        r == spec_admits(last, seq),
+        r == spec_verdict(last, seq, present),
 {
     match last {
-        Some(l) => seq > l,
-        None => true,
+        Some(l) => {
+            if seq > l {
+                ArchiveVerdict::Append
+            } else if present {
+                ArchiveVerdict::Present
+            } else {
+                ArchiveVerdict::Conflict
+            }
+        }
+        None => ArchiveVerdict::Append,
     }
 }
-// mirror-end archive_admits
+// mirror-end archive_verdict
 
-pub open spec fn spec_admits(last: Option<u64>, seq: u64) -> bool {
+pub open spec fn spec_verdict(last: Option<u64>, seq: u64, present: bool) -> ArchiveVerdict {
     match last {
-        Some(l) => seq > l,
-        None => true,
+        Some(l) => {
+            if seq > l {
+                ArchiveVerdict::Append
+            } else if present {
+                ArchiveVerdict::Present
+            } else {
+                ArchiveVerdict::Conflict
+            }
+        }
+        None => ArchiveVerdict::Append,
     }
 }
 
-/// The last line of a file.
-pub open spec fn last_of(f: Seq<u64>) -> Option<u64> {
-    if f.len() == 0 { None } else { Some(f.last()) }
+/// A row of `events`, and a line of an archive file: its seq and its
+/// text (abstracted to a number).
+pub type Row = (u64, u64);
+
+/// The seq of the last line of a file.
+pub open spec fn last_of(f: Seq<Row>) -> Option<u64> {
+    if f.len() == 0 {
+        None
+    } else {
+        Some(f.last().0)
+    }
 }
 
-/// Appending one row.
-pub open spec fn step(f: Seq<u64>, seq: u64) -> Seq<u64> {
-    if spec_admits(last_of(f), seq) { f.push(seq) } else { f }
+/// The file holds this exact line.
+pub open spec fn holds(f: Seq<Row>, row: Row) -> bool {
+    exists|i: int| 0 <= i < f.len() && #[trigger] f[i] == row
 }
 
-/// Appending a batch, row by row.
-pub open spec fn append(f: Seq<u64>, b: Seq<u64>) -> Seq<u64>
+/// One row: `None` when the archive refuses the batch.
+pub open spec fn step(f: Seq<Row>, row: Row) -> Option<Seq<Row>> {
+    match spec_verdict(last_of(f), row.0, holds(f, row)) {
+        ArchiveVerdict::Append => Some(f.push(row)),
+        ArchiveVerdict::Present => Some(f),
+        ArchiveVerdict::Conflict => None,
+    }
+}
+
+/// A batch, row by row; `None` when any row is refused (then nothing is
+/// trimmed).
+pub open spec fn append(f: Seq<Row>, b: Seq<Row>) -> Option<Seq<Row>>
     decreases b.len(),
 {
     if b.len() == 0 {
-        f
+        Some(f)
     } else {
-        step(append(f, b.drop_last()), b.last())
+        match append(f, b.drop_last()) {
+            Some(g) => step(g, b.last()),
+            None => None,
+        }
     }
 }
 
-/// A file with no repeated and no out-of-order line.
-pub open spec fn ascending(f: Seq<u64>) -> bool {
-    forall|i: int, j: int| 0 <= i < j < f.len() ==> f[i] < f[j]
+/// Appending after a possible refusal.
+pub open spec fn then(o: Option<Seq<Row>>, b: Seq<Row>) -> Option<Seq<Row>> {
+    match o {
+        Some(g) => append(g, b),
+        None => None,
+    }
 }
 
-/// `seq` is at or below the last line: the file already holds it, or
-/// skipping it can lose nothing the run would write.
-pub open spec fn covers(f: Seq<u64>, seq: u64) -> bool {
-    f.len() > 0 && seq <= f.last()
+/// Strictly ascending seqs: no line twice, none out of order. A table
+/// (by its primary key) and every archive file are.
+pub open spec fn ascending(f: Seq<Row>) -> bool {
+    forall|i: int, j: int| #![trigger f[i], f[j]] 0 <= i < j < f.len() ==> f[i].0 < f[j].0
 }
 
-pub proof fn lemma_step_keeps_ascending(f: Seq<u64>, seq: u64)
+pub proof fn lemma_step_keeps_ascending(f: Seq<Row>, row: Row)
     requires
         ascending(f),
+        step(f, row) is Some,
     ensures
-        ascending(step(f, seq)),
+        ascending(step(f, row).unwrap()),
 {
-}
-
-/// The archive never holds a row twice, whatever runs, crashes and
-/// re-runs built it.
-pub proof fn lemma_append_keeps_ascending(f: Seq<u64>, b: Seq<u64>)
-    requires
-        ascending(f),
-    ensures
-        ascending(append(f, b)),
-    decreases b.len(),
-{
-    if b.len() > 0 {
-        lemma_append_keeps_ascending(f, b.drop_last());
-        lemma_step_keeps_ascending(append(f, b.drop_last()), b.last());
-    }
-}
-
-/// One row never lowers the last line.
-pub proof fn lemma_step_keeps_coverage(f: Seq<u64>, x: u64, seq: u64)
-    requires
-        covers(f, seq),
-    ensures
-        covers(step(f, x), seq),
-{
-}
-
-/// The last line never goes down.
-pub proof fn lemma_append_keeps_coverage(f: Seq<u64>, b: Seq<u64>, seq: u64)
-    requires
-        covers(f, seq),
-    ensures
-        covers(append(f, b), seq),
-    decreases b.len(),
-{
-    if b.len() > 0 {
-        lemma_append_keeps_coverage(f, b.drop_last(), seq);
-    }
-}
-
-/// After a batch, every row of it is covered.
-pub proof fn lemma_append_covers(f: Seq<u64>, b: Seq<u64>)
-    ensures
-        forall|k: int| 0 <= k < b.len() ==> covers(append(f, b), #[trigger] b[k]),
-    decreases b.len(),
-{
-    if b.len() > 0 {
-        let p = b.drop_last();
-        lemma_append_covers(f, p);
-        assert forall|k: int| 0 <= k < b.len() implies covers(append(f, b), #[trigger] b[k]) by {
-            if k < b.len() - 1 {
-                assert(b[k] == p[k]);
-                assert(covers(append(f, p), p[k]));
-                lemma_step_keeps_coverage(append(f, p), b.last(), b[k]);
+    if spec_verdict(last_of(f), row.0, holds(f, row)) is Append {
+        let g = f.push(row);
+        assert forall|i: int, j: int| #![trigger g[i], g[j]] 0 <= i < j < g.len() implies g[i].0 < g[j].0 by {
+            if j == f.len() {
+                if i < f.len() - 1 {
+                    assert(f[i].0 < f[f.len() - 1].0);
+                }
             }
         }
     }
 }
 
-/// A batch whose every row is covered appends nothing.
-pub proof fn lemma_covered_batch_appends_nothing(f: Seq<u64>, b: Seq<u64>)
+/// The archive never holds a row twice, nor out of order, whatever runs,
+/// crashes and re-runs built it.
+pub proof fn lemma_append_keeps_ascending(f: Seq<Row>, b: Seq<Row>)
     requires
-        forall|k: int| 0 <= k < b.len() ==> covers(f, #[trigger] b[k]),
+        ascending(f),
+        append(f, b) is Some,
     ensures
-        append(f, b) == f,
+        ascending(append(f, b).unwrap()),
+    decreases b.len(),
+{
+    if b.len() > 0 {
+        lemma_append_keeps_ascending(f, b.drop_last());
+        lemma_step_keeps_ascending(append(f, b.drop_last()).unwrap(), b.last());
+    }
+}
+
+/// A line once held stays held.
+pub proof fn lemma_step_keeps_holds(f: Seq<Row>, row: Row, x: Row)
+    requires
+        holds(f, x),
+        step(f, row) is Some,
+    ensures
+        holds(step(f, row).unwrap(), x),
+{
+    let i = choose|i: int| 0 <= i < f.len() && #[trigger] f[i] == x;
+    let g = step(f, row).unwrap();
+    assert(g[i] == x);
+}
+
+pub proof fn lemma_append_keeps_holds(f: Seq<Row>, b: Seq<Row>, x: Row)
+    requires
+        holds(f, x),
+        append(f, b) is Some,
+    ensures
+        holds(append(f, b).unwrap(), x),
+    decreases b.len(),
+{
+    if b.len() > 0 {
+        lemma_append_keeps_holds(f, b.drop_last(), x);
+        lemma_step_keeps_holds(append(f, b.drop_last()).unwrap(), b.last(), x);
+    }
+}
+
+/// No row is lost: after a batch the archive accepted, the file holds
+/// every row of it, so the delete that follows removes only archived
+/// rows. Not merely "at or below the last line": the exact line.
+pub proof fn lemma_every_trimmed_row_is_archived(f: Seq<Row>, b: Seq<Row>)
+    requires
+        append(f, b) is Some,
+    ensures
+        forall|k: int| 0 <= k < b.len() ==> holds(append(f, b).unwrap(), #[trigger] b[k]),
     decreases b.len(),
 {
     if b.len() > 0 {
         let p = b.drop_last();
-        assert forall|k: int| 0 <= k < p.len() implies covers(f, #[trigger] p[k]) by {
+        let g = append(f, p).unwrap();
+        let h = append(f, b).unwrap();
+        lemma_every_trimmed_row_is_archived(f, p);
+        // The new row itself.
+        if spec_verdict(last_of(g), b.last().0, holds(g, b.last())) is Append {
+            assert(h[g.len() as int] == b.last());
+        }
+        assert forall|k: int| 0 <= k < b.len() implies holds(h, #[trigger] b[k]) by {
+            if k < b.len() - 1 {
+                assert(b[k] == p[k]);
+                assert(holds(g, p[k]));
+                lemma_step_keeps_holds(g, b.last(), b[k]);
+            }
+        }
+    }
+}
+
+/// A batch whose every row the file already holds appends nothing and
+/// is not refused.
+pub proof fn lemma_held_batch_appends_nothing(f: Seq<Row>, b: Seq<Row>)
+    requires
+        ascending(f),
+        forall|k: int| 0 <= k < b.len() ==> holds(f, #[trigger] b[k]),
+    ensures
+        append(f, b) == Some(f),
+    decreases b.len(),
+{
+    if b.len() > 0 {
+        let p = b.drop_last();
+        assert forall|k: int| 0 <= k < p.len() implies holds(f, #[trigger] p[k]) by {
             assert(p[k] == b[k]);
         }
-        lemma_covered_batch_appends_nothing(f, p);
-        assert(covers(f, b[b.len() - 1]));
+        lemma_held_batch_appends_nothing(f, p);
+        let x = b.last();
+        assert(holds(f, b[b.len() - 1]));
+        let i = choose|i: int| 0 <= i < f.len() && #[trigger] f[i] == x;
+        if i < f.len() - 1 {
+            assert(f[i].0 < f[f.len() - 1].0);
+        }
+        assert(x.0 <= f.last().0);
     }
 }
 
 /// Appending `a + b` is appending `a`, then `b`.
-pub proof fn lemma_append_concat(f: Seq<u64>, a: Seq<u64>, b: Seq<u64>)
+pub proof fn lemma_append_concat(f: Seq<Row>, a: Seq<Row>, b: Seq<Row>)
     ensures
-        append(f, a + b) == append(append(f, a), b),
+        append(f, a + b) == then(append(f, a), b),
     decreases b.len(),
 {
     if b.len() == 0 {
         assert(a + b =~= a);
+        match append(f, a) {
+            Some(g) => {},
+            None => {},
+        }
     } else {
         assert((a + b).drop_last() =~= a + b.drop_last());
         assert((a + b).last() == b.last());
@@ -269,23 +372,78 @@ pub proof fn lemma_append_concat(f: Seq<u64>, a: Seq<u64>, b: Seq<u64>)
     }
 }
 
-/// A crash after the first `k` rows of a batch were written (and fsynced),
-/// before the trim committed, then a re-run of the whole batch: the file is
-/// the one a single clean run writes. The trim then deletes the batch once.
-pub proof fn lemma_crash_rerun_is_idempotent(f: Seq<u64>, b: Seq<u64>, k: int)
+/// A crash after the first `k` rows of a batch were written (and synced),
+/// before the trim committed, then a re-run of the whole batch: the file
+/// is the one a single clean run writes, and the re-run is not refused.
+/// The trim then deletes the batch once.
+pub proof fn lemma_crash_rerun_is_idempotent(f: Seq<Row>, b: Seq<Row>, k: int)
     requires
         0 <= k <= b.len(),
+        ascending(f),
+        append(f, b) is Some,
     ensures
-        append(append(f, b.subrange(0, k)), b) == append(f, b),
+        append(f, b.subrange(0, k)) is Some,
+        append(append(f, b.subrange(0, k)).unwrap(), b) == append(f, b),
 {
     let head = b.subrange(0, k);
     let tail = b.subrange(k, b.len() as int);
-    let g = append(f, head);
     assert(b =~= head + tail);
-    lemma_append_concat(g, head, tail);
-    lemma_append_covers(f, head);
-    lemma_covered_batch_appends_nothing(g, head);
     lemma_append_concat(f, head, tail);
+    let g = append(f, head).unwrap();
+    lemma_append_keeps_ascending(f, head);
+    lemma_every_trimmed_row_is_archived(f, head);
+    lemma_held_batch_appends_nothing(g, head);
+    lemma_append_concat(g, head, tail);
+}
+
+/// A batch of ascending rows all above the file's last line is written
+/// whole: never refused, nothing skipped.
+pub proof fn lemma_fresh_batch_appends_all(f: Seq<Row>, b: Seq<Row>)
+    requires
+        ascending(b),
+        forall|k: int| 0 <= k < b.len() ==> spec_verdict(last_of(f), #[trigger] b[k].0, false) is Append,
+    ensures
+        append(f, b) == Some(f + b),
+    decreases b.len(),
+{
+    if b.len() == 0 {
+        assert(f + b =~= f);
+    } else {
+        let p = b.drop_last();
+        assert forall|i: int, j: int| #![trigger p[i], p[j]] 0 <= i < j < p.len() implies p[i].0 < p[j].0 by {
+            assert(p[i] == b[i] && p[j] == b[j]);
+        }
+        assert forall|k: int| 0 <= k < p.len() implies spec_verdict(last_of(f), #[trigger] p[k].0, false) is Append by {
+            assert(p[k] == b[k]);
+        }
+        lemma_fresh_batch_appends_all(f, p);
+        let x = b.last();
+        assert(spec_verdict(last_of(f), b[b.len() - 1].0, false) is Append);
+        if p.len() > 0 {
+            assert((f + p).last() == p.last());
+            assert(p.last() == b[b.len() - 2]);
+        } else {
+            assert(f + p =~= f);
+        }
+        assert((f + p).push(x) =~= f + b);
+    }
+}
+
+/// The trim batch is a seq prefix of the table: the rows from the oldest
+/// on, stopping before the first row too young to go. Every row left in
+/// the table is then above every row of the batch, so (with
+/// `lemma_fresh_batch_appends_all`) the next batch is above each file's
+/// last line and is written whole: a row is never skipped as "already
+/// archived" when it is not, and a row that missed one cutoff never
+/// meets a file that moved past it.
+pub proof fn lemma_prefix_leaves_only_higher_rows(t: Seq<Row>, n: int)
+    requires
+        ascending(t),
+        0 <= n <= t.len(),
+    ensures
+        forall|i: int, j: int| #![trigger t[i], t[j]] 0 <= i < n <= j < t.len() ==> t[i].0 < t[j].0,
+        ascending(t.subrange(n, t.len() as int)),
+{
 }
 
 // mirror-begin pending_overflow

@@ -507,6 +507,23 @@ pub(crate) struct Ctx {
 
 type Done = Result<(String, Value), Fail>;
 
+/// The longest suffix of `recent` (oldest first) whose seqs run without a
+/// hole up to `last`; empty when the newest event is not `last`.
+fn contiguous_tail(recent: Vec<Event>, last: u64) -> VecDeque<Event> {
+    let mut want = last;
+    let keep = recent
+        .iter()
+        .rev()
+        .take_while(|e| {
+            let ok = e.seq.0 == want && want > 0;
+            want = want.saturating_sub(1);
+            ok
+        })
+        .count();
+    let skip = recent.len() - keep;
+    recent.into_iter().skip(skip).collect()
+}
+
 /// A running world: the pack, the state, the dice and the recent events.
 #[derive(Debug, Clone)]
 pub struct World {
@@ -531,6 +548,12 @@ impl World {
 
     /// A world resumed from a stored state and its recent events.
     ///
+    /// The log keeps only the run of `recent` that ends at the state's last
+    /// seq with no hole: an older event across a hole (a version 0 store
+    /// lost a failed save's events) is left out, so the log always holds
+    /// `oldest..=last` and `mud_events` reports `truncated` for any
+    /// `since_seq` below the hole.
+    ///
     /// Every human starts offline: no session is connected yet, and a
     /// state saved before a crash may still say otherwise. A human comes
     /// back when their session logs in. Agent PCs and NPCs are left to
@@ -544,11 +567,12 @@ impl World {
             e.hidden = false;
         }
         let dice = WorldDice::seeded(state.dice_state);
+        let log = contiguous_tail(recent, state.next_seq.saturating_sub(1));
         Self {
             pack,
             state,
             dice,
-            log: recent.into_iter().collect(),
+            log,
             fresh: Vec::new(),
             audit: Vec::new(),
             mints: Vec::new(),

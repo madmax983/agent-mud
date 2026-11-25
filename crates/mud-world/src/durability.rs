@@ -1,6 +1,8 @@
-//! The durability rules of the world store: the schema verdict, the
-//! events retention cutoff, the archive's append rule, the cap on events
-//! waiting for a failed store, and the `truncated` flag of `mud_events`.
+//! The durability rules of the world store.
+//!
+//! They are the schema verdict, the events retention cutoff, the archive's
+//! verdict on each row, the cap on events waiting for a failed store, and
+//! the `truncated` flag of `mud_events`.
 //!
 //! Each kernel here is mirrored in `formal/verus/src/durability.rs`, which
 //! proves it (see that file and ADR 0006). Edit both in one commit; the
@@ -54,17 +56,44 @@ pub const fn retention_cutoff(now_ms: u64, keep_days: u64) -> u64 {
 }
 // mirror-end retention_cutoff
 
-// mirror-begin archive_admits
-/// Whether a row with `seq` joins an archive file whose last line holds
-/// `last` (`None`: the file is empty or new).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// mirror-begin archive_verdict_enum
+/// What the archive does with one row of a trim batch.
+pub enum ArchiveVerdict {
+    /// The row is above the file's last line: write it.
+    Append,
+    /// The file already holds this exact line (a re-run after a crash
+    /// between the append and the delete): skip it.
+    Present,
+    /// The file has a line at or above this seq, and not this row's line:
+    /// another history under the same epoch (a restored backup). Refuse
+    /// the batch; nothing is trimmed.
+    Conflict,
+}
+// mirror-end archive_verdict_enum
+
+// mirror-begin archive_verdict
+/// The verdict for a row with `seq` against an archive file.
+///
+/// `last` is the seq of the file's last line (`None`: the file is empty or
+/// new). `present` says whether the file holds this row's exact line; it
+/// counts only at or below `last`.
 #[must_use]
-pub const fn archive_admits(last: Option<u64>, seq: u64) -> bool {
+pub const fn archive_verdict(last: Option<u64>, seq: u64, present: bool) -> ArchiveVerdict {
     match last {
-        Some(l) => seq > l,
-        None => true,
+        Some(l) => {
+            if seq > l {
+                ArchiveVerdict::Append
+            } else if present {
+                ArchiveVerdict::Present
+            } else {
+                ArchiveVerdict::Conflict
+            }
+        }
+        None => ArchiveVerdict::Append,
     }
 }
-// mirror-end archive_admits
+// mirror-end archive_verdict
 
 // mirror-begin pending_overflow
 /// How many of the oldest pending events to drop so that at most `cap`
@@ -110,11 +139,15 @@ mod tests {
     }
 
     #[test]
-    fn the_archive_takes_only_rows_above_its_last_line() {
-        assert!(archive_admits(None, 0));
-        assert!(archive_admits(Some(4), 5));
-        assert!(!archive_admits(Some(5), 5));
-        assert!(!archive_admits(Some(9), 5));
+    fn the_archive_writes_above_its_last_line_and_skips_only_held_lines() {
+        use ArchiveVerdict::{Append, Conflict, Present};
+        assert_eq!(archive_verdict(None, 0, false), Append);
+        assert_eq!(archive_verdict(None, 3, true), Append);
+        assert_eq!(archive_verdict(Some(4), 5, false), Append);
+        assert_eq!(archive_verdict(Some(5), 5, true), Present);
+        assert_eq!(archive_verdict(Some(9), 5, true), Present);
+        assert_eq!(archive_verdict(Some(5), 5, false), Conflict);
+        assert_eq!(archive_verdict(Some(9), 5, false), Conflict);
     }
 
     #[test]

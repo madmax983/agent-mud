@@ -560,3 +560,57 @@ fn retention_archives_then_trims_and_reports() {
     assert!(r.game.retain(later + 5 * crate::rewards::DAY_MS).is_err());
     assert_eq!(r.game.store_errors(), 1);
 }
+
+#[test]
+fn a_capped_backlog_never_leaves_a_gap_inside_the_reloaded_log() {
+    // Review finding 7, the backlog path: the cap keeps EVENT_LOG_CAP
+    // events after the gap it makes, and the reload reads RELOAD_EVENTS ==
+    // EVENT_LOG_CAP rows, so the reloaded log starts after the gap.
+    let mut r = Rig::new();
+    let ada = r.game.login("ada").unwrap();
+    r.game.refuse_store_writes(true).unwrap();
+    r.game.write(|w, now| {
+        for i in 0..EVENT_LOG_CAP + 25 {
+            assert!(w.execute(&ada, &format!("say {i}"), now).ok);
+        }
+    });
+    r.game.refuse_store_writes(false).unwrap();
+    r.game.tick();
+    r.restart();
+    let last = r.game.read(World::last_seq).0;
+    let oldest = r.game.read(World::oldest_logged).unwrap().0;
+    assert_eq!(oldest, last - EVENT_LOG_CAP as u64 + 1);
+    assert!(oldest > 2, "the gap is below the log");
+    // Since the login's event: events 2.. are gone, and it says so.
+    assert_eq!(r.game.events(&ada, Seq(1), 10)["truncated"], true);
+    assert_eq!(r.game.events(&ada, Seq(oldest - 1), 10)["truncated"], false);
+}
+
+#[test]
+fn a_gap_inside_the_stored_tail_is_reported_after_a_reload() {
+    // Review finding 7: a file whose last rows have a hole (a version 0
+    // store dropped the events of a failed save). The reloaded log keeps
+    // only the run that ends at the last seq, so `truncated` stays exact.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let mut w = World::new(pack(), 7);
+    let ada = w.login("ada", 1_000).unwrap();
+    for i in 2..=10 {
+        assert!(w.execute(&ada, &format!("say {i}"), 1_000 + i).ok);
+    }
+    let kept: Vec<Event> = w
+        .drain_fresh()
+        .into_iter()
+        .filter(|e| e.seq.0 != 6 && e.seq.0 != 7)
+        .collect();
+    let mut s = Store::open(&db, 7, 0).unwrap();
+    s.save("crypt-v01", &w.snapshot(), &kept, &[], 1_000)
+        .unwrap();
+    drop(s);
+    let game = Game::open(pack(), Some(&db), 7, Arc::new(ManualClock::new(2_000))).unwrap();
+    assert_eq!(game.read(World::last_seq).0, 10);
+    assert_eq!(game.events(&ada, Seq(5), 10)["truncated"], true);
+    assert_eq!(game.events(&ada, Seq(1), 10)["truncated"], true);
+    assert_eq!(game.events(&ada, Seq(7), 10)["truncated"], false);
+    assert_eq!(game.read(World::oldest_logged), Some(Seq(8)));
+}

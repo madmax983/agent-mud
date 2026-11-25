@@ -479,13 +479,19 @@ impl Store {
     }
 
     /// Archives, then deletes, one batch of old events: at most `batch`
-    /// rows, oldest seq first, stamped before `cutoff` and below the newest
-    /// `keep_min` rows, which are never touched. The rows are appended to
-    /// the archive in `archive_dir` and synced before the delete commits;
-    /// if the archive fails, nothing is deleted.
+    /// rows, oldest seq first, below the newest `keep_min` rows (never
+    /// touched), and stopping before the first row stamped at or after
+    /// `cutoff`. So a batch is always a seq prefix of the table, even when
+    /// the clock stepped back and `at_ms` does not rise with seq: a row
+    /// too young to go holds back every row after it until it ages.
+    ///
+    /// The rows go to the archive in `archive_dir`, under this file's
+    /// epoch, and are synced before the delete commits; the delete removes
+    /// exactly those rows. If the archive fails or refuses a row (another
+    /// history under this epoch already holds its seq), nothing is deleted.
     ///
     /// # Errors
-    /// SQLite fails, or the archive cannot be written.
+    /// SQLite fails, or the archive cannot be written or refuses the batch.
     pub fn trim_events(
         &mut self,
         cutoff: u64,
@@ -510,12 +516,11 @@ impl Store {
         let Some(bound) = bound else {
             return Ok(Trimmed::default());
         };
-        let rows: Vec<ArchiveRow> = {
+        let mut rows: Vec<ArchiveRow> = {
             let mut q = tx.prepare(
-                "SELECT seq, at_ms, body FROM events WHERE seq <= ?1 AND at_ms < ?2
-                 ORDER BY seq LIMIT ?3",
+                "SELECT seq, at_ms, body FROM events WHERE seq <= ?1 ORDER BY seq LIMIT ?2",
             )?;
-            let rows = q.query_map(params![bound, int(cutoff), i64::from(batch)], |r| {
+            let rows = q.query_map(params![bound, i64::from(batch)], |r| {
                 Ok(ArchiveRow {
                     seq: uint(r.get(0)?),
                     at_ms: uint(r.get(1)?),
@@ -524,15 +529,15 @@ impl Store {
             })?;
             rows.collect::<Result<_, _>>()?
         };
+        // The prefix: stop at the first row too young to go.
+        let old = rows.iter().take_while(|r| r.at_ms < cutoff).count();
+        rows.truncate(old);
         let Some(last) = rows.last().map(|r| r.seq) else {
             return Ok(Trimmed::default());
         };
-        let archived = archive::append(archive_dir, &rows)?;
-        // Exactly the rows selected: the first `batch` by seq that match.
-        tx.execute(
-            "DELETE FROM events WHERE seq <= ?1 AND at_ms < ?2",
-            params![int(last), int(cutoff)],
-        )?;
+        let archived = archive::append(archive_dir, self.epoch, &rows)?;
+        // Exactly the rows selected: every row up to `last`, all archived.
+        tx.execute("DELETE FROM events WHERE seq <= ?1", params![int(last)])?;
         tx.commit()?;
         Ok(Trimmed {
             rows: rows.len(),

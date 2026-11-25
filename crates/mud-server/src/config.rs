@@ -439,7 +439,8 @@ pub struct WorldConfig {
     pub retention_every_ms: u64,
     /// Events per retention transaction (1 to 100000).
     pub retention_batch: u32,
-    /// Where `events-YYYY-MM.jsonl` go. Unset: `archive/` beside `db`.
+    /// Where `events-YYYY-MM-<epoch>.jsonl` go. Unset: `archive/` beside
+    /// `db`.
     pub archive_dir: Option<PathBuf>,
 }
 

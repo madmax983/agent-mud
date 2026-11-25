@@ -28,7 +28,7 @@ pub struct Retention {
     pub every_ms: u64,
     /// Rows per transaction.
     pub batch: u32,
-    /// Where `events-YYYY-MM.jsonl` go.
+    /// Where `events-YYYY-MM-<epoch>.jsonl` go.
     pub archive_dir: PathBuf,
 }
 

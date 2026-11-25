@@ -695,7 +695,7 @@ fn a_crash_between_archive_and_delete_archives_each_event_once() {
         .collect::<Result<_, _>>()
         .unwrap()
     };
-    archive::append(&arch, &rows).unwrap();
+    archive::append(&arch, s.epoch(), &rows).unwrap();
     assert_eq!(s.event_count().unwrap(), 10);
     let t = s.trim_events(cutoff, 0, 100, &arch).unwrap();
     assert_eq!(t.rows, 8, "days 1..=8 are older than the cutoff");
@@ -732,4 +732,129 @@ fn a_store_that_refuses_writes_fails_until_it_is_let_through() {
     s.refuse_writes(false).unwrap();
     s.apply_side(&[op], 1, Fsync::Full).unwrap();
     assert_eq!(s.load_side().unwrap().entities.len(), 1);
+}
+
+/// A store at `db` (made at the first stamp, which picks its epoch) whose
+/// events are stamped at `days` (in days), in seq order: a login, then one
+/// `say` each.
+fn stamped(db: &Path, days: &[u64]) -> Store {
+    let day = crate::rewards::DAY_MS;
+    let mut s = Store::open(db, 1, days[0] * day).unwrap();
+    let mut w = World::new(pack(), 3);
+    let ada = w.login("ada", days[0] * day).unwrap();
+    for (i, d) in days.iter().enumerate().skip(1) {
+        assert!(w.execute(&ada, &format!("say {i}"), d * day).ok);
+    }
+    let fresh = w.drain_fresh();
+    let got: Vec<(u64, u64)> = fresh.iter().map(|e| (e.seq.0, e.at_ms / day)).collect();
+    let want: Vec<(u64, u64)> = (1..).zip(days.iter().copied()).collect();
+    assert_eq!(got, want, "one event per stamp");
+    s.save("crypt-v01", &w.snapshot(), &fresh, &[], 0).unwrap();
+    s
+}
+
+/// Every seq still in the table.
+fn stored(s: &Store) -> Vec<u64> {
+    s.events_after(0, usize::MAX)
+        .unwrap()
+        .iter()
+        .map(|e| e.seq.0)
+        .collect()
+}
+
+fn trim_all(s: &mut Store, cutoff_day: u64, arch: &Path) {
+    let cutoff = cutoff_day * crate::rewards::DAY_MS;
+    while s.trim_events(cutoff, 0, 100, arch).unwrap().rows > 0 {}
+}
+
+#[test]
+fn a_clock_that_steps_back_never_loses_an_event_to_retention() {
+    // Review findings 1, 4 and 6: the clock steps back between seq 2 and
+    // seq 3, so at_ms does not rise with seq.
+    let dir = tempfile::tempdir().unwrap();
+    let arch = dir.path().join("archive");
+    let mut s = stamped(&dir.path().join("world.db"), &[10, 10, 5, 20]);
+    // Seq 3 is old enough, but seq 1 and 2 are not: retention trims only a
+    // seq prefix, so it waits.
+    trim_all(&mut s, 8, &arch);
+    // Later the cutoff passes days 10.
+    trim_all(&mut s, 15, &arch);
+    let mut all = archive::seqs(&arch).unwrap();
+    all.extend(stored(&s));
+    assert_eq!(
+        all,
+        vec![1, 2, 3, 4],
+        "each event is archived or stored, once"
+    );
+    assert_eq!(stored(&s), vec![4]);
+    // The other shape: a later seq is younger than an earlier one.
+    let dir = tempfile::tempdir().unwrap();
+    let arch = dir.path().join("archive");
+    let mut s = stamped(&dir.path().join("world.db"), &[1, 5, 3, 20]);
+    trim_all(&mut s, 4, &arch);
+    assert_eq!(
+        stored(&s),
+        vec![2, 3, 4],
+        "seq 2 is young: nothing past it goes"
+    );
+    trim_all(&mut s, 6, &arch);
+    let mut all = archive::seqs(&arch).unwrap();
+    all.extend(stored(&s));
+    assert_eq!(all, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn a_world_reset_keeps_the_new_worlds_history_in_the_kept_archive() {
+    // Review findings 2 and 5: world.db is deleted, the archive is kept,
+    // and the new world's seqs start again at 1 in the same month.
+    let dir = tempfile::tempdir().unwrap();
+    let arch = dir.path().join("archive");
+    let db = dir.path().join("world.db");
+    let mut s = stamped(&db, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    trim_all(&mut s, 20, &arch);
+    assert_eq!(stored(&s), Vec::<u64>::new());
+    drop(s);
+    std::fs::remove_file(&db).unwrap();
+    let mut s = stamped(&db, &[11, 12, 13, 14, 15]);
+    trim_all(&mut s, 20, &arch);
+    let seqs = archive::seqs(&arch).unwrap();
+    assert_eq!(seqs.len() + stored(&s).len(), 15, "archive {seqs:?}");
+}
+
+#[test]
+fn a_restored_backup_that_reuses_archived_seqs_refuses_to_trim() {
+    // The same epoch (a copy of world.db) with other events under seqs the
+    // archive already holds: retention refuses rather than deleting them.
+    let day = crate::rewards::DAY_MS;
+    let dir = tempfile::tempdir().unwrap();
+    let arch = dir.path().join("archive");
+    let db = dir.path().join("world.db");
+    let backup = dir.path().join("backup.db");
+    drop(stamped(&db, &[1, 2, 3]));
+    std::fs::copy(&db, &backup).unwrap();
+    let go_on = |s: &mut Store, words: &str| {
+        let mut w = World::from_state(pack(), s.load(0).unwrap().unwrap().state, Vec::new());
+        let ada = w.login("ada", 4 * day).unwrap();
+        assert!(w.execute(&ada, &format!("say {words}"), 5 * day).ok);
+        let fresh = w.drain_fresh();
+        s.save("crypt-v01", &w.snapshot(), &fresh, &[], 0).unwrap();
+    };
+    // The live world goes on, then archives through seq 5.
+    let mut s = Store::open(&db, 1, 9 * day).unwrap();
+    go_on(&mut s, "live");
+    trim_all(&mut s, 20, &arch);
+    assert_eq!(archive::seqs(&arch).unwrap(), vec![1, 2, 3, 4, 5]);
+    drop(s);
+    // The operator restores the backup (seqs 1..=3, the same epoch) and
+    // the world goes on: seq 4 (the same login at the same time) is the
+    // same line, seq 5 is another.
+    std::fs::copy(&backup, &db).unwrap();
+    let mut s = Store::open(&db, 1, 9 * day).unwrap();
+    go_on(&mut s, "other");
+    assert_eq!(stored(&s), vec![1, 2, 3, 4, 5]);
+    let err = s.trim_events(20 * day, 0, 100, &arch).unwrap_err();
+    assert!(matches!(err, StoreError::Archive(_)), "{err:?}");
+    assert!(err.to_string().contains("seq 5"), "{err}");
+    assert_eq!(stored(&s), vec![1, 2, 3, 4, 5], "nothing was deleted");
+    assert_eq!(archive::seqs(&arch).unwrap(), vec![1, 2, 3, 4, 5]);
 }

@@ -131,8 +131,8 @@ structured `error_code` such as `POLICY_TRADE_REQUIRED`).
 Persistence (ADR 0011): `world.db` carries a schema version, an epoch and a
 boot number; supervisor state (bookings, macro counters, plans, spend)
 lives in its side tables and commits with the world command that consumed
-it; old events are archived to `archive/events-YYYY-MM.jsonl` before they
-are trimmed.
+it; old events are archived to `archive/events-YYYY-MM-<epoch>.jsonl`
+before they are trimmed.
 
 ## 7. Starter world: `worlds/crypt-v01/`
 
