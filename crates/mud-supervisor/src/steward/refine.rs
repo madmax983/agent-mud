@@ -14,7 +14,10 @@
 //! [`vet::FREE_MIN_MEMBERS`] activates it ([`vet::overlay_verdict`]). The
 //! Steward puts `{"guardrails": preamble + lines}` and nothing else. An
 //! active free text that comes to name an entity (a player registers a
-//! matching name) is revoked on the next pass.
+//! matching name) is revoked on the next pass, even at a hard budget: a
+//! Clear costs no tokens. When free text is no longer the mode for an
+//! entity (the operator set `menu`, or it is Turing-tier), the next pass
+//! withdraws its free text the same way, with no ballot and no veto.
 //!
 //! lg's `overlay_activate` takes no expected version, so the Steward keeps
 //! its own view of lg's active version (`pointer`) and checks every move:
@@ -200,10 +203,16 @@ impl Steward {
             Next::Baseline | Next::Undo { .. } => return,
         }
         let ov = &run.row.overlay;
-        if !can_act || ov.paused.is_some() || ov.baseline.is_none() || ov.pointer.is_none() {
+        // A Clear costs no tokens: the Steward withdraws its own text even
+        // at a hard budget. It never moves a paused pointer.
+        let can_clear = run.row.intent.is_none() && run.row.stuck_until_ms.is_none();
+        if !can_clear || ov.paused.is_some() || ov.baseline.is_none() || ov.pointer.is_none() {
             return;
         }
-        if self.revoke_if_named(e, socket, run, now).await {
+        if self.revoke_if_named(e, socket, run, now).await
+            || self.withdraw_if_not_free(e, socket, run, now).await
+            || !can_act
+        {
             return;
         }
         if let Some(pending) = run.row.overlay.pending.take() {
@@ -577,6 +586,63 @@ impl Steward {
             self.note_plain(e, "overlay_off");
         }
         true
+    }
+
+    /// Whether free text is the mode for `e`: `refine = "free"`, and `e`
+    /// is not Turing-tier.
+    fn free_mode(&self, e: &EntityId) -> bool {
+        self.cfg.refine == RefineMode::Free && !self.is_turing(e)
+    }
+
+    /// Withdraws a free text of the Steward's when free text is no longer
+    /// the mode for `e` (the operator set `refine = "menu"`, or `e` is
+    /// Turing-tier): a pending one is dropped, an active one is cleared
+    /// back to the baseline at once, with no ballot. Neither is vetoed: the
+    /// text was not refused, the mode changed. Returns whether it moved.
+    async fn withdraw_if_not_free(
+        &self,
+        e: &EntityId,
+        socket: &Path,
+        run: &mut Run,
+        now: u64,
+    ) -> bool {
+        let is_free = |a: &Authored| a.source.free_lines().is_some();
+        let ov = &run.row.overlay;
+        if !(ov.active.as_ref().is_some_and(is_free) || ov.pending.as_ref().is_some_and(is_free))
+            || self.free_mode(e)
+        {
+            return false;
+        }
+        if let Some(p) = run.row.overlay.pending.take_if(|p| is_free(p)) {
+            run.dirty = true;
+            self.withdrawn_event(e, &p);
+        }
+        let Some(a) = run.row.overlay.active.clone().filter(is_free) else {
+            return false;
+        };
+        let Some(b) = run.row.overlay.baseline else {
+            return false;
+        };
+        self.withdrawn_event(e, &a);
+        let pointer = run.row.overlay.pointer;
+        if self.clear(e, socket, run, b, pointer, now).await {
+            self.note_plain(e, "overlay_off");
+        }
+        true
+    }
+
+    fn withdrawn_event(&self, e: &EntityId, a: &Authored) {
+        tracing::info!(entity = %e, version = a.version, "free text is not the refine mode now; the Steward withdraws its text");
+        self.publish_full(StewardEvent {
+            entity: e.clone(),
+            item: "overlay".into(),
+            id: as_id(a.version),
+            action: "withdrawn".into(),
+            code: "mode_menu".into(),
+            votes: None,
+            text: Some(a.text.clone()),
+            reasons: Vec::new(),
+        });
     }
 
     fn revoked_event(&self, e: &EntityId, a: &Authored) {
@@ -1260,7 +1326,7 @@ impl Steward {
                 run.row.overlay.see(version);
                 // A Turing-tier entity always uses the menu: a habit such
                 // as "say you are not a real person" would leak its tier.
-                let free = self.cfg.refine == RefineMode::Free && !self.is_turing(e);
+                let free = self.free_mode(e);
                 let mode = if free { "free" } else { "menu" };
                 self.publish(e, "overlay", as_id(version), "proposed", mode, None, None);
                 if free {

@@ -54,28 +54,39 @@ Each control has a test.
      Cyrillic letters, "ｓｙｓｔｅｍ") fails before any word check, and no
      markup, heading, JSON, URL or tool syntax passes. A pack in another
      language gets no free text; its operator uses `menu`.
-   - Tokens: each line split on space and `, ; : ! ? ( ) -`, with `.` and
-     `'` deleted inside a token, in lowercase ("A.I." is `ai`). A token in
-     `DENY_WORDS`, or one that starts with a `DENY_STEMS` entry
-     ("obeying", "instructed", "commands"), fails. Two one-letter tokens
-     in a row ("a i", "l l m") fail.
+   - Tokens, read two ways: each line split on space and `, ; : ! ? ( )
+     -` with `.` and `'` deleted inside a token ("A.I." is `ai`), and
+     each line split on `.` and `'` as well ("a.bot" is `a` and `bot`);
+     both in lowercase. A token in `DENY_WORDS`, or one that starts with
+     a `DENY_STEMS` entry ("obeying", "instructed", "commands"), fails.
+     So does a join of two to four adjacent words that is a denied word
+     ("hu-man", "pe.op.le", "a i"), or a denied stem followed by nothing,
+     `s`, `ed`, `ing`, `er` or `ers` ("ob ey", "to-ols"). Two one-letter
+     tokens in a row ("d o r e") fail.
    - The squashed line (lowercase letters and digits only) fails when it
-     holds a denied phrase or a stem of five letters or more ("in struct
-     ions", "over-ride").
+     holds a denied phrase, built in or configured (`deny_phrases`, which
+     guards goals too), or a stem of five letters or more ("over-ride",
+     "ig nore").
    - The built-in lists cover every word the council's rules forbid and
      the tier vocabulary (`ai`, `bot`, `npc`, `pc`, `tier`, `turing`,
      `human`, `person`, `people`, `real`, ...). Config adds words and stems
      (`refine_deny_words`, `refine_deny_stems`); it can never remove one.
-   - No entity name: a token equal to the name or an alias of any entity
+   - No entity name: words equal to the name or an alias of any entity
      in the world, players included, or, for a name of five letters or
-     more, the squashed line containing it.
+     more, the squashed line containing it. Names are read in ASCII:
+     accents are dropped and letters such as `ø`, `æ` and `ß` are written
+     `o`, `ae` and `ss`, so "Jose" names "José" and "Bjorn" names "Bjørn".
    - No repeat of a text the council declined or a human vetoed.
 
    Tests: `the_free_text_guard_rejects_injection`,
    `a_tier_word_never_reaches_the_judge`,
-   `config_cannot_remove_the_builtin_deny_lists`, and the proptests
-   `free_text_ok_never_passes_markup_or_non_ascii` and
-   `free_text_ok_never_passes_a_denied_word_or_stem`.
+   `config_cannot_remove_the_builtin_deny_lists`,
+   `a_denied_word_joined_or_split_by_punctuation_fails`,
+   `a_configured_phrase_guards_free_text_too`,
+   `a_name_with_letters_outside_ascii_is_matched_in_ascii`, and the
+   proptests `free_text_ok_never_passes_markup_or_non_ascii`,
+   `free_text_ok_never_passes_a_denied_word_or_stem` and
+   `free_text_ok_never_passes_a_denied_word_or_stem_split_by_punctuation`.
 3. **A unanimous council of at least three** votes on the exact lines
    (`council::OVERLAY_SYSTEM`; the lines and the active lines go in only
    as `untrusted_text`). The proved kernel `overlay_verdict(text_ok, yes,
@@ -136,10 +147,21 @@ Each control has a test.
    activated): a hit activates the baseline, vetoes the text and publishes
    `revoked` (`names_entity`); the agent hears `overlay_off`. This is the
    Steward withdrawing its own text, not a pause; refine goes on at its
-   next due time. It does not move the pointer while refine is paused: a
-   human's choice stands. Tests:
+   next due time. A Clear costs no tokens, so revocation runs at a hard
+   budget too; it waits only while an intent is open or the daemon is
+   stuck. It does not move the pointer while refine is paused: a human's
+   choice stands. Tests:
    `a_habit_that_comes_to_name_a_player_is_revoked`,
-   `a_pending_text_that_names_a_player_is_never_activated`.
+   `a_pending_text_that_names_a_player_is_never_activated`,
+   `a_habit_is_revoked_at_a_hard_budget`.
+
+   The same pass withdraws a free text when free text is no longer the
+   mode for the entity: the operator set `refine = "menu"`, or the entity
+   is Turing-tier. A pending text is dropped, an active one is cleared
+   back to the baseline at once, with no ballot, and the observer shows
+   `withdrawn` (`mode_menu`) with the full text. It is no veto: the text
+   was not refused. Test:
+   `switching_to_menu_withdraws_an_active_free_text_at_once`.
 10. **Free text is never a code default.** The code default is `menu`;
     `free` is one explicit `mud.toml` line. `mud.toml.example` sets it,
     with a comment that points here.
@@ -163,7 +185,9 @@ default, so the vote is not independent review.
 - The test `no_byte_outside_the_approved_lines_reaches_overlay_put` holds
   the exception to its scope.
 - An operator who wants no model text in any agent's instructions sets
-  `refine = "menu"` (or `off`).
+  `refine = "menu"` (or `off`). With `menu`, the first Steward pass after
+  the restart clears an active free text back to the baseline (control
+  9); with `off`, lg has no overlay store, so no overlay applies.
 
 ## Alternatives rejected
 

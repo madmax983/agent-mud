@@ -802,6 +802,61 @@ mod tests {
     }
 
     #[test]
+    fn a_free_text_row_round_trips() {
+        let free = OverlaySource::Free {
+            lines: vec!["Keep trades short.".into(), "Count coins.".into()],
+        };
+        let text = Authored {
+            version: 3,
+            digest: 11,
+            source: free.clone(),
+            text: "habits\n- Keep trades short.\n- Count coins.".into(),
+        };
+        let mut row = StewardRow::default();
+        row.overlay.baseline = Some(1);
+        row.overlay.pointer = Some(3);
+        row.overlay.authored = vec![text.clone()];
+        row.overlay.active = Some(text.clone());
+        row.overlay.pending = Some(Authored {
+            version: 4,
+            ..text.clone()
+        });
+        row.decline_overlay(12);
+        row.decline(12);
+        row.veto(13);
+        row.open(
+            IntentAction::Activate {
+                version: 4,
+                expected_previous: Some(1),
+                purpose: Purpose::Text {
+                    digest: 11,
+                    source: free.clone(),
+                    text: text.text,
+                },
+            },
+            5,
+        );
+        let body = row.body();
+        assert_eq!(body["overlay"]["active"]["source"]["kind"], "free");
+        assert_eq!(
+            body["overlay"]["active"]["source"]["lines"][1],
+            "Count coins."
+        );
+        let back = StewardRow::from_body(ROW_SCHEMA, &body).unwrap();
+        assert_eq!(back, row);
+        assert!(back.overlay_declined(12) && back.was_declined(12));
+        assert_eq!(back.declined.len(), 2, "both kinds come back");
+        row.open(
+            IntentAction::Put {
+                digest: 11,
+                source: free,
+            },
+            6,
+        );
+        assert_eq!(StewardRow::from_body(ROW_SCHEMA, &row.body()), Some(row));
+    }
+
+    #[test]
     fn a_body_round_trips_and_another_schema_is_refused() {
         let mut row = StewardRow::default();
         row.open(IntentAction::Accept { goal: 4 }, 9);

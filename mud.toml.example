@@ -94,7 +94,8 @@ window = 30                      # turns of transcript the agent sees
 # the habit lines lg's proposer wrote from the agent's play, which holds what
 # players said, go into the agent's instructions after a deterministic guard
 # and a unanimous council of at least three. A Turing-tier agent still uses
-# the menu. Use "menu" to keep model text out of every agent's instructions.
+# the menu. Use "menu" to keep model text out of every agent's instructions:
+# the first Steward pass after the restart clears an active free text.
 refine = "free"
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
@@ -123,7 +124,7 @@ proposal_ttl_hours = 48          # a goal still waiting then is declined
 goal_stale_days = 7              # an active goal with no new note this long is dropped
 title_chars = 120
 why_chars = 800
-deny_phrases = []                # added to the built-in phrases, never replacing them
+deny_phrases = []                # added to the built-in phrases, never replacing them; goals and free text
 quiet_on_hard = true             # at the hard cap: no heartbeat, no memory, no tick spend
 # The next three are 1 to 86400 (a day).
 activate_wait_secs = 600         # one overlay_activate answer is awaited this long, never resent

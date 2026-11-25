@@ -133,7 +133,8 @@ pub struct StewardConfig {
     pub title_chars: usize,
     /// The longest goal reason, in characters.
     pub why_chars: usize,
-    /// Phrases refused in a goal, added to [`vet::DENY_PHRASES`].
+    /// Phrases refused in a goal and in a free text, added to
+    /// [`vet::DENY_PHRASES`].
     pub deny_phrases: Vec<String>,
     /// Whether a daemon goes quiet at the hard budget cap.
     pub quiet_on_hard: bool,
@@ -250,6 +251,7 @@ impl StewardConfig {
             max_chars: self.refine_max_chars,
             extra_words: self.refine_deny_words.clone(),
             extra_stems: self.refine_deny_stems.clone(),
+            extra_phrases: self.deny_phrases.clone(),
         }
     }
 
