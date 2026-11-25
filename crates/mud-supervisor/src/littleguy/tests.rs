@@ -579,3 +579,29 @@ async fn a_real_lg_serve_answers_a_wake() {
         );
     }
 }
+
+#[test]
+fn a_littleguy_mind_primes_from_its_daemons_ledger_at_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let cfg = LittleguyConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    assert_eq!(mind.spend_source(), SpendSource::Ledger);
+    assert_eq!(mind.prime(&torin, 1_000), None, "no daemon database yet");
+    let entity_dir = mind.entity_dir(&torin);
+    std::fs::create_dir_all(&entity_dir).unwrap();
+    let (_, conn) = crate::ledger::fake::ledger(&entity_dir);
+    let day = 20_000 * 86_400_000;
+    crate::ledger::fake::call(&conn, 1, 70, 30, Some(4), day + 10);
+    let primed = mind.prime(&torin, day + 20).unwrap();
+    assert_eq!((primed.tokens(), primed.calls), (100, 1));
+    // A broken file primes nothing; the boot goes on.
+    let other = EntityId::from("marta");
+    let broken = mind.entity_dir(&other);
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("lg.db"), b"not a database").unwrap();
+    assert_eq!(mind.prime(&other, day + 20), None);
+}

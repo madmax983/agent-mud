@@ -50,7 +50,7 @@ cargo run -p mud-server --bin mud -- smoke
 #22   [rusty_flagon_taproom] wanderer arrives from the west.
 #25   [rusty_flagon_taproom] kestrel says something. "yo wanderer you going down the cellar? need a 2nd blade for the ossuary, split 50/50"
 restart drill: reopened at boot 2, resumed at line 2 of 5, 1 BOUNTY on the board
-smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty across a restart)
+smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty and one budget across a restart)
 ```
 
 ## Persistence
@@ -77,6 +77,15 @@ macro tick fires once within `catchup_spread_ms` of boot, and a booking
 overdue by more than `booking_max_late_ms` (a day) is dropped. `cargo test
 -p mud-supervisor --test kill_restart` kills a real process at each of
 these points and checks it.
+
+Budgets survive a restart too. Each wake's close stores the day's spend,
+split into what the supervisor metered and what littleguy's ledger
+reported; the boot restores it and reads each littleguy ledger once, so
+no ledger row is billed twice and none is forgotten, and an agent at its
+hard stop stays stopped. A clock set back never resets a spent day. A
+harvest agent continues as new every `[minds.harvest] ops_per_run` (32)
+wakes and purges its sealed runs older than `keep_days` (3), so its
+`harvest.db` stays bounded.
 
 Old events are never deleted outright. Every hour (`[world]
 retention_every_ms`) events older than `events_keep_days` (7) are appended
@@ -204,6 +213,7 @@ flowchart LR
 | Secrets stay out of the world | passwords, hashes and tokens live in `mud-accounts`; tests check no event, `Audit`, snapshot, view or trace log holds one; every name gets the same `Password:` prompt and one bcrypt verify (proved route kernel, ADR 0009) |
 | History is archived, never deleted | events leave `world.db` only after the archive holds each one's exact line, synced; a trim batch is a seq prefix even when the clock steps back, a re-run after a crash writes none twice, and another history under the same seqs refuses the trim (proved, ADR 0011) |
 | Supervisor rows merge monotonically | side ops are idempotent upserts whose merges commute (proved); a mind's staged ops commit only in the transaction of its first effectful command, or at its close (ADR 0011) |
+| Budgets hold across a restart | the stored day's spend never passes the one in memory, and the ledger tally restores to the componentwise max of the stored and the ledger's own (proved, ADR 0011) |
 | Scripts are data in, data out | hooks return effects that a proved admission kernel and `check_effects` gate; no script holds the world; player text reaches scripts only as `Untrusted` (ADR 0010) |
 
 ## Development

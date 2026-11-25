@@ -10,13 +10,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use mud_world::side::RuleCountRow;
+use mud_world::side::{RuleCountRow, Tally};
 use mud_world::{CommandResult, EntityId, Event, Game, Seq, SideError, SideOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::watch;
 
+pub use crate::budget::SpendSource;
 use crate::gate::Gate;
 use crate::router::Priority;
 use crate::wakes::WakeBook;
@@ -52,6 +53,16 @@ impl Usage {
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             output_tokens: self.output_tokens.saturating_add(other.output_tokens),
             cost_usd_micros: self.cost_usd_micros.saturating_add(other.cost_usd_micros),
+        }
+    }
+
+    /// The spend as a budget tally: tokens in and out together.
+    #[must_use]
+    pub const fn tally(&self) -> Tally {
+        Tally {
+            tokens: self.tokens(),
+            cost_usd_micros: self.cost_usd_micros,
+            calls: self.calls,
         }
     }
 
@@ -252,6 +263,41 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
     fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) -> Vec<RuleCountRow> {
         let _ = (entity, counts);
         Vec::new()
+    }
+
+    /// Where this mind's spend is metered: the tally of the budget it
+    /// joins. The default is the supervisor's own meter.
+    fn spend_source(&self) -> SpendSource {
+        SpendSource::Local
+    }
+
+    /// At boot, before any wake: what the mind's own meter already holds of
+    /// `entity`'s spend on the UTC day of `now_ms`, with every row read
+    /// marked charged, so no later wake bills it again. `None` when there
+    /// is nothing to read (the default; a littleguy daemon with no
+    /// database yet). The supervisor raises the stored ledger tally to it
+    /// (ADR 0011). It runs once per entity at boot and may block on a
+    /// file read.
+    fn prime(&self, entity: &EntityId, now_ms: u64) -> Option<Usage> {
+        let _ = (entity, now_ms);
+        None
+    }
+
+    /// At boot: the lifetime token count of `entity`'s agent that its
+    /// budget was last charged up to (`harvest_tokens_seen`). A mind that
+    /// counts lifetime tokens charges from there, so tokens spent before a
+    /// crash, and not yet charged, are charged once. The default ignores
+    /// it.
+    fn restore_tokens_seen(&self, entity: &EntityId, seen: u64) {
+        let _ = (entity, seen);
+    }
+
+    /// The lifetime token count of `entity`'s agent that the spend handed
+    /// to the supervisor so far covers, for the store; `None` for a mind
+    /// that counts no lifetime tokens (the default).
+    fn tokens_seen(&self, entity: &EntityId) -> Option<u64> {
+        let _ = entity;
+        None
     }
 }
 

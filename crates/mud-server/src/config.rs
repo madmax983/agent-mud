@@ -533,6 +533,8 @@ pub struct MindsConfig {
     pub turing: Runtime,
     /// Ambient NPCs.
     pub ambient: Runtime,
+    /// How a harvest agent's own history stays bounded.
+    pub harvest: HarvestSection,
 }
 
 impl Default for MindsConfig {
@@ -541,7 +543,63 @@ impl Default for MindsConfig {
             persistent: Runtime::Scripted,
             turing: Runtime::Scripted,
             ambient: Runtime::Scripted,
+            harvest: HarvestSection::default(),
         }
+    }
+}
+
+/// `[minds.harvest]`: continue-as-new and retention of each harvest
+/// agent's `harvest.db` (ADR 0011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HarvestSection {
+    /// Wakes per run before the agent continues as new (1 to 10000).
+    pub ops_per_run: u64,
+    /// Sealed runs older than this many days are purged, by harvest's own
+    /// clock; 0 keeps them all (0 to 36500).
+    pub keep_days: u64,
+    /// The least game time between two purges, in ms (1000 to 604800000).
+    pub purge_every_ms: u64,
+}
+
+impl Default for HarvestSection {
+    fn default() -> Self {
+        let d = mud_supervisor::harvest::HarvestHistory::default();
+        Self {
+            ops_per_run: d.ops_per_run,
+            keep_days: d.keep_days,
+            purge_every_ms: d.purge_every_ms,
+        }
+    }
+}
+
+impl HarvestSection {
+    /// The checked history bounds.
+    ///
+    /// # Errors
+    /// A value is out of bounds; the message names it.
+    pub fn history(&self) -> anyhow::Result<mud_supervisor::harvest::HarvestHistory> {
+        use anyhow::ensure;
+        ensure!(
+            (1..=10_000).contains(&self.ops_per_run),
+            "[minds.harvest] ops_per_run must be 1 to 10000, not {}",
+            self.ops_per_run
+        );
+        ensure!(
+            self.keep_days <= mud_world::durability::MAX_KEEP_DAYS,
+            "[minds.harvest] keep_days must be 0 to 36500, not {}",
+            self.keep_days
+        );
+        ensure!(
+            (1_000..=604_800_000).contains(&self.purge_every_ms),
+            "[minds.harvest] purge_every_ms must be 1000 to 604800000, not {}",
+            self.purge_every_ms
+        );
+        Ok(mud_supervisor::harvest::HarvestHistory {
+            ops_per_run: self.ops_per_run,
+            keep_days: self.keep_days,
+            purge_every_ms: self.purge_every_ms,
+        })
     }
 }
 
@@ -952,6 +1010,41 @@ mod tests {
             bad(&|s| s.booking_max_late_ms = 30 * 86_400_000 + 1).contains("booking_max_late_ms")
         );
         assert!(bad(&|s| s.catchup_spread_ms = 3_600_001).contains("catchup_spread_ms"));
+    }
+
+    #[test]
+    fn harvest_history_defaults_and_bounds() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        assert_eq!(ex.minds.harvest, HarvestSection::default());
+        let h = ex.minds.harvest.history().unwrap();
+        assert_eq!(
+            (h.ops_per_run, h.keep_days, h.purge_every_ms),
+            (32, 3, 3_600_000)
+        );
+        let own: MudConfig = toml::from_str(
+            "[minds.harvest]
+ops_per_run = 5
+keep_days = 0",
+        )
+        .unwrap();
+        let h = own.minds.harvest.history().unwrap();
+        assert_eq!((h.ops_per_run, h.keep_days), (5, 0));
+        let bad = |edit: &dyn Fn(&mut HarvestSection)| {
+            let mut s = HarvestSection::default();
+            edit(&mut s);
+            s.history().unwrap_err().to_string()
+        };
+        assert!(bad(&|s| s.ops_per_run = 0).contains("ops_per_run"));
+        assert!(bad(&|s| s.ops_per_run = 10_001).contains("ops_per_run"));
+        assert!(bad(&|s| s.keep_days = 36_501).contains("keep_days"));
+        assert!(bad(&|s| s.purge_every_ms = 999).contains("purge_every_ms"));
+        assert!(
+            toml::from_str::<MudConfig>(
+                "[minds.harvest]
+keep = 1"
+            )
+            .is_err()
+        );
     }
 
     #[test]

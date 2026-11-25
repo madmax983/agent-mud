@@ -91,7 +91,11 @@ until reset.
 
 **Budget breakers.** Soft cap (80% of the daily budget): double cooldowns,
 no ambient wakes. Hard cap (100%): deterministic fallback until UTC
-midnight, with canned flavor ("Torin grunts and keeps hammering.").
+midnight, with canned flavor ("Torin grunts and keeps hammering."). The
+day's spend lives in `world.db` (ADR 0011): what the supervisor metered and
+what littleguy's ledger reported, stored with every wake's close and
+restored at boot, with each littleguy meter primed from its ledger, so a
+restart keeps the breaker where it was.
 
 ## 4. Turing PCs
 

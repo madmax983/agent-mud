@@ -17,9 +17,18 @@
 //!   never repeats an effect and never skips a line.
 //! - [`wake_id_key`]: the parts of a wake id, unique across restarts and
 //!   world resets.
+//! - [`budget_join`], [`roll_day`], [`budget_spend`] (phase 3): a day's
+//!   spend, split into what the supervisor metered and what littleguy's
+//!   ledger reported. The join is a join-semilattice, a spend never lowers
+//!   it, and the day never rolls back, so `Spend` upserts in any order
+//!   converge and the stored budget never passes the one in memory.
+//! - [`restore_budget`], [`restore_lg`], [`prime_budget`] (phase 3): the
+//!   budget at boot. The ledger tally rises to what the ledger holds of
+//!   today, each field to the larger value, so a restart neither bills a
+//!   ledger row twice nor forgets one.
 
 use mud_world::EntityId;
-use mud_world::side::MacroRow;
+use mud_world::side::{MacroRow, Tally};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 // mirror-begin macro_open_struct
@@ -196,6 +205,194 @@ impl WakeKey {
         ))
     }
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// mirror-begin day_spend
+/// One entity's spend on one UTC day, by where it was metered.
+pub struct DaySpend {
+    /// The UTC day (days since the epoch).
+    pub day: u64,
+    /// Spend the supervisor metered itself.
+    pub local: Tally,
+    /// Spend read from littleguy's ledger.
+    pub lg: Tally,
+}
+// mirror-end day_spend
+
+// mirror-begin tally_kernels
+/// No spend.
+#[must_use]
+pub const fn tally_zero() -> Tally {
+    Tally {
+        tokens: 0,
+        cost_usd_micros: 0,
+        calls: 0,
+    }
+}
+
+/// Each field's larger value: the join of two tallies of one day.
+#[must_use]
+pub const fn tally_max(a: Tally, b: Tally) -> Tally {
+    Tally {
+        tokens: if a.tokens > b.tokens {
+            a.tokens
+        } else {
+            b.tokens
+        },
+        cost_usd_micros: if a.cost_usd_micros > b.cost_usd_micros {
+            a.cost_usd_micros
+        } else {
+            b.cost_usd_micros
+        },
+        calls: if a.calls > b.calls { a.calls } else { b.calls },
+    }
+}
+
+/// A tally with the spend `add` added, each field saturating.
+#[must_use]
+pub const fn tally_add(t: Tally, add: Tally) -> Tally {
+    Tally {
+        tokens: if add.tokens <= u64::MAX - t.tokens {
+            t.tokens + add.tokens
+        } else {
+            u64::MAX
+        },
+        cost_usd_micros: if add.cost_usd_micros <= u64::MAX - t.cost_usd_micros {
+            t.cost_usd_micros + add.cost_usd_micros
+        } else {
+            u64::MAX
+        },
+        calls: if add.calls <= u64::MAX - t.calls {
+            t.calls + add.calls
+        } else {
+            u64::MAX
+        },
+    }
+}
+// mirror-end tally_kernels
+
+// mirror-begin budget_join
+/// The join of two dated spends: the later day wins whole; on the same
+/// day, each field of each tally takes the larger value. A `Spend` upsert
+/// merges this way.
+#[must_use]
+pub const fn budget_join(a: DaySpend, b: DaySpend) -> DaySpend {
+    if a.day > b.day {
+        a
+    } else if b.day > a.day {
+        b
+    } else {
+        DaySpend {
+            day: a.day,
+            local: tally_max(a.local, b.local),
+            lg: tally_max(a.lg, b.lg),
+        }
+    }
+}
+// mirror-end budget_join
+
+// mirror-begin roll_day
+/// The spend as of UTC day `day`: zeroed on a later day, else unchanged.
+/// It never rolls back: after the clock went back, the later day stays.
+#[must_use]
+pub const fn roll_day(s: DaySpend, day: u64) -> DaySpend {
+    if day > s.day {
+        DaySpend {
+            day,
+            local: tally_zero(),
+            lg: tally_zero(),
+        }
+    } else {
+        s
+    }
+}
+// mirror-end roll_day
+
+// mirror-begin budget_spend
+/// Records the spend `add` on UTC day `day`, read from littleguy's ledger
+/// (`ledger`) or metered by the supervisor.
+#[must_use]
+pub const fn budget_spend(s: DaySpend, day: u64, ledger: bool, add: Tally) -> DaySpend {
+    let r = roll_day(s, day);
+    if ledger {
+        DaySpend {
+            day: r.day,
+            local: r.local,
+            lg: tally_add(r.lg, add),
+        }
+    } else {
+        DaySpend {
+            day: r.day,
+            local: tally_add(r.local, add),
+            lg: r.lg,
+        }
+    }
+}
+// mirror-end budget_spend
+
+// mirror-begin budget_used
+/// The tokens the breaker counts: both tallies, saturating.
+#[must_use]
+pub const fn budget_used(s: DaySpend) -> u64 {
+    if s.lg.tokens <= u64::MAX - s.local.tokens {
+        s.local.tokens + s.lg.tokens
+    } else {
+        u64::MAX
+    }
+}
+// mirror-end budget_used
+
+// mirror-begin restore_lg
+/// The ledger tally after a restart: each field's larger value.
+///
+/// The inputs are the stored tally and what the ledger itself holds of
+/// today. Both are at most the truth, so the result is too: no ledger row
+/// is billed twice, and a row the store missed (a crash before its
+/// `Spend`) or the ledger dropped (littleguy purged it) still counts.
+#[must_use]
+pub const fn restore_lg(stored: Tally, ledger: Tally) -> Tally {
+    tally_max(stored, ledger)
+}
+// mirror-end restore_lg
+
+// mirror-begin restore_budget
+/// The spend restored at boot on UTC day `today` from the stored row.
+///
+/// The same day stands. An earlier day is over: zeroed. One day ahead
+/// (the clock went back across midnight) stands: its counters still apply
+/// on the real next day, and roll the day after. More than one day ahead
+/// is reset to `today`.
+#[must_use]
+pub const fn restore_budget(row: DaySpend, today: u64) -> DaySpend {
+    if row.day < today || row.day - today > 1 {
+        DaySpend {
+            day: today,
+            local: tally_zero(),
+            lg: tally_zero(),
+        }
+    } else {
+        row
+    }
+}
+// mirror-end restore_budget
+
+// mirror-begin prime_budget
+/// The spend after the ledger was read at boot: on `today`, the ledger
+/// tally rises to [`restore_lg`] of it and the ledger's `today`; a spend of
+/// another day is left as it is.
+#[must_use]
+pub const fn prime_budget(s: DaySpend, today: u64, ledger: Tally) -> DaySpend {
+    if s.day == today {
+        DaySpend {
+            day: s.day,
+            local: s.local,
+            lg: restore_lg(s.lg, ledger),
+        }
+    } else {
+        s
+    }
+}
+// mirror-end prime_budget
 
 #[cfg(test)]
 mod tests;

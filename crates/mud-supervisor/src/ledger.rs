@@ -42,6 +42,25 @@ impl LedgerMeter {
         }
     }
 
+    /// What the ledger holds of today's spend as of `now_ms`, read once at
+    /// boot on a fresh meter; `None` when the daemon has no database yet.
+    ///
+    /// Every row of the read window is marked seen, so no later
+    /// [`LedgerMeter::charge`] bills it again. The caller does not add the
+    /// result to the budget: it raises the stored ledger tally to it (each
+    /// field to the larger value, `restore_lg`), since the stored tally
+    /// already holds the rows charged before the restart. A row the store
+    /// missed (a crash before its `Spend`) is counted that way; one that
+    /// littleguy purged keeps the stored floor.
+    ///
+    /// # Errors
+    /// The database exists but cannot be read.
+    pub fn prime(&self, now_ms: u64) -> SqliteResult<Option<Usage>> {
+        // On a fresh meter every row is unseen: the first read marks the
+        // whole window and sums today's rows, which is the prime.
+        self.charge(now_ms)
+    }
+
     /// The spend not charged yet, as of `now_ms`; `None` when the daemon
     /// has no database yet (nothing to read, so the caller keeps what the
     /// daemon reported).
@@ -184,6 +203,37 @@ mod tests {
         assert_eq!(
             meter.charge(TODAY + DAY_MS + 1).unwrap(),
             Some(Usage::default())
+        );
+    }
+
+    #[test]
+    fn a_primed_meter_never_bills_todays_rows_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, conn) = ledger(dir.path());
+        call(&conn, 1, 500, 0, None, TODAY - 10);
+        call(&conn, 2, 40, 2, Some(9), TODAY + 10);
+        call(&conn, 3, 3, 0, None, TODAY + 20);
+        // A restarted MUD: a new meter over the same ledger.
+        let meter = LedgerMeter::new(&path);
+        let primed = meter.prime(TODAY + 30).unwrap().unwrap();
+        assert_eq!(
+            primed,
+            Usage {
+                calls: 2,
+                input_tokens: 43,
+                output_tokens: 2,
+                cost_usd_micros: 9
+            },
+            "today's rows only"
+        );
+        assert_eq!(meter.charge(TODAY + 40).unwrap(), Some(Usage::default()));
+        call(&conn, 4, 1, 1, None, TODAY + 50);
+        assert_eq!(meter.charge(TODAY + 60).unwrap().unwrap().tokens(), 2);
+        assert_eq!(
+            LedgerMeter::new(dir.path().join("none.db"))
+                .prime(TODAY)
+                .unwrap(),
+            None
         );
     }
 

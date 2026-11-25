@@ -26,11 +26,30 @@
 //!   grows within a boot, no key repeats
 //!   (`lemma_wake_keys_never_repeat`).
 //!
+//! - `budget_join`, `roll_day`, `budget_spend`, `budget_used`: a day's
+//!   spend, split into the supervisor's own tally and littleguy's ledger
+//!   tally. The join is a join-semilattice
+//!   (`lemma_budget_join_is_a_semilattice`) and agrees field by field with
+//!   the store's dated join (`lemma_budget_join_is_the_dated_join`); it is
+//!   the least upper bound of the dated order
+//!   (`lemma_budget_join_is_least_upper_bound`). `roll_day` never lowers the
+//!   day and zeroes only on an increase; a spend never goes down in the
+//!   order. So the stored budget, the join of any of the in-memory budgets
+//!   written in any order, never passes the budget in memory
+//!   (`lemma_stored_never_passes_memory`), and on one day the breaker's
+//!   count grows with it (`lemma_used_grows_with_the_order`).
+//! - `restore_lg`: with the stored tally and the ledger's both at most the
+//!   truth, the result is at most the truth and at least each
+//!   (`lemma_restore_lg_stays_below_the_truth`).
+//! - `restore_budget`, `prime_budget`: the boot keeps the same day and the
+//!   next, zeroes an earlier day, resets a later one, and priming only
+//!   raises the ledger tally of today.
+//!
 //! No bound: comparisons, and additions guarded against overflow.
 
 use vstd::prelude::*;
 
-use crate::side::{MacroOp, MacroRow, below, sound, spec_apply};
+use crate::side::{MacroOp, MacroRow, Tally, below, max64, sound, spec_apply, spec_dated};
 
 verus! {
 
@@ -557,6 +576,425 @@ pub proof fn lemma_wake_keys_never_repeat(epoch: u64, boots: Seq<u64>, ns: Seq<u
     }) != (WakeKey { epoch, boot: boots[j], n: ns[j] }) by {
         lemma_keys_increase(boots, ns, i, j);
     }
+}
+
+// ---- budgets (phase 3) ----
+
+#[derive(Clone, Copy)]
+// mirror-begin day_spend
+/// One entity's spend on one UTC day, by where it was metered.
+pub struct DaySpend {
+    /// The UTC day (days since the epoch).
+    pub day: u64,
+    /// Spend the supervisor metered itself.
+    pub local: Tally,
+    /// Spend read from littleguy's ledger.
+    pub lg: Tally,
+}
+// mirror-end day_spend
+
+/// `a` is at most `b` in every field.
+pub open spec fn tle(a: Tally, b: Tally) -> bool {
+    a.tokens <= b.tokens && a.cost_usd_micros <= b.cost_usd_micros && a.calls <= b.calls
+}
+
+/// The dated order: an earlier day, or the same day and every field at
+/// most.
+pub open spec fn le(a: DaySpend, b: DaySpend) -> bool {
+    a.day < b.day || (a.day == b.day && tle(a.local, b.local) && tle(a.lg, b.lg))
+}
+
+pub open spec fn zero() -> Tally {
+    Tally { tokens: 0, cost_usd_micros: 0, calls: 0 }
+}
+
+pub open spec fn spec_tmax(a: Tally, b: Tally) -> Tally {
+    Tally {
+        tokens: max64(a.tokens, b.tokens),
+        cost_usd_micros: max64(a.cost_usd_micros, b.cost_usd_micros),
+        calls: max64(a.calls, b.calls),
+    }
+}
+
+pub open spec fn sat(a: u64, b: u64) -> u64 {
+    if a + b <= u64::MAX { (a + b) as u64 } else { u64::MAX }
+}
+
+pub open spec fn spec_join(a: DaySpend, b: DaySpend) -> DaySpend {
+    if a.day > b.day {
+        a
+    } else if b.day > a.day {
+        b
+    } else {
+        DaySpend { day: a.day, local: spec_tmax(a.local, b.local), lg: spec_tmax(a.lg, b.lg) }
+    }
+}
+
+pub open spec fn spec_used(s: DaySpend) -> u64 {
+    sat(s.local.tokens, s.lg.tokens)
+}
+
+// mirror-begin tally_kernels
+/// No spend.
+#[must_use]
+pub const fn tally_zero() -> (r: Tally)
+    ensures
+        r == zero(),
+{
+    Tally {
+        tokens: 0,
+        cost_usd_micros: 0,
+        calls: 0,
+    }
+}
+
+/// Each field's larger value: the join of two tallies of one day.
+#[must_use]
+pub const fn tally_max(a: Tally, b: Tally) -> (r: Tally)
+    ensures
+        r == spec_tmax(a, b),
+        tle(a, r),
+        tle(b, r),
+{
+    Tally {
+        tokens: if a.tokens > b.tokens {
+            a.tokens
+        } else {
+            b.tokens
+        },
+        cost_usd_micros: if a.cost_usd_micros > b.cost_usd_micros {
+            a.cost_usd_micros
+        } else {
+            b.cost_usd_micros
+        },
+        calls: if a.calls > b.calls { a.calls } else { b.calls },
+    }
+}
+
+/// A tally with the spend `add` added, each field saturating.
+#[must_use]
+pub const fn tally_add(t: Tally, add: Tally) -> (r: Tally)
+    ensures
+        r.tokens == sat(t.tokens, add.tokens),
+        r.cost_usd_micros == sat(t.cost_usd_micros, add.cost_usd_micros),
+        r.calls == sat(t.calls, add.calls),
+        tle(t, r),
+{
+    Tally {
+        tokens: if add.tokens <= u64::MAX - t.tokens {
+            t.tokens + add.tokens
+        } else {
+            u64::MAX
+        },
+        cost_usd_micros: if add.cost_usd_micros <= u64::MAX - t.cost_usd_micros {
+            t.cost_usd_micros + add.cost_usd_micros
+        } else {
+            u64::MAX
+        },
+        calls: if add.calls <= u64::MAX - t.calls {
+            t.calls + add.calls
+        } else {
+            u64::MAX
+        },
+    }
+}
+// mirror-end tally_kernels
+
+// mirror-begin budget_join
+/// The join of two dated spends: the later day wins whole; on the same
+/// day, each field of each tally takes the larger value. A `Spend` upsert
+/// merges this way.
+#[must_use]
+pub const fn budget_join(a: DaySpend, b: DaySpend) -> (r: DaySpend)
+    ensures
+        r == spec_join(a, b),
+{
+    if a.day > b.day {
+        a
+    } else if b.day > a.day {
+        b
+    } else {
+        DaySpend {
+            day: a.day,
+            local: tally_max(a.local, b.local),
+            lg: tally_max(a.lg, b.lg),
+        }
+    }
+}
+// mirror-end budget_join
+
+// mirror-begin roll_day
+/// The spend as of UTC day `day`: zeroed on a later day, else unchanged.
+/// It never rolls back: after the clock went back, the later day stays.
+#[must_use]
+pub const fn roll_day(s: DaySpend, day: u64) -> (r: DaySpend)
+    ensures
+        r.day == max64(s.day, day),
+        day > s.day ==> r.local == zero() && r.lg == zero(),
+        day <= s.day ==> r == s,
+        le(s, r),
+{
+    if day > s.day {
+        DaySpend {
+            day,
+            local: tally_zero(),
+            lg: tally_zero(),
+        }
+    } else {
+        s
+    }
+}
+// mirror-end roll_day
+
+// mirror-begin budget_spend
+/// Records the spend `add` on UTC day `day`, read from littleguy's ledger
+/// (`ledger`) or metered by the supervisor.
+#[must_use]
+pub const fn budget_spend(s: DaySpend, day: u64, ledger: bool, add: Tally) -> (r: DaySpend)
+    ensures
+        r.day == max64(s.day, day),
+        le(s, r),
+        ledger ==> r.local == roll(s, day).local,
+        !ledger ==> r.lg == roll(s, day).lg,
+{
+    let r = roll_day(s, day);
+    if ledger {
+        DaySpend {
+            day: r.day,
+            local: r.local,
+            lg: tally_add(r.lg, add),
+        }
+    } else {
+        DaySpend {
+            day: r.day,
+            local: tally_add(r.local, add),
+            lg: r.lg,
+        }
+    }
+}
+// mirror-end budget_spend
+
+pub open spec fn roll(s: DaySpend, day: u64) -> DaySpend {
+    if day > s.day { DaySpend { day, local: zero(), lg: zero() } } else { s }
+}
+
+// mirror-begin budget_used
+/// The tokens the breaker counts: both tallies, saturating.
+#[must_use]
+pub const fn budget_used(s: DaySpend) -> (r: u64)
+    ensures
+        r == spec_used(s),
+{
+    if s.lg.tokens <= u64::MAX - s.local.tokens {
+        s.local.tokens + s.lg.tokens
+    } else {
+        u64::MAX
+    }
+}
+// mirror-end budget_used
+
+// mirror-begin restore_lg
+/// The ledger tally after a restart: each field's larger value.
+///
+/// The inputs are the stored tally and what the ledger itself holds of
+/// today. Both are at most the truth, so the result is too: no ledger row
+/// is billed twice, and a row the store missed (a crash before its
+/// `Spend`) or the ledger dropped (littleguy purged it) still counts.
+#[must_use]
+pub const fn restore_lg(stored: Tally, ledger: Tally) -> (r: Tally)
+    ensures
+        r == spec_tmax(stored, ledger),
+        tle(stored, r),
+        tle(ledger, r),
+{
+    tally_max(stored, ledger)
+}
+// mirror-end restore_lg
+
+// mirror-begin restore_budget
+/// The spend restored at boot on UTC day `today` from the stored row.
+///
+/// The same day stands. An earlier day is over: zeroed. One day ahead
+/// (the clock went back across midnight) stands: its counters still apply
+/// on the real next day, and roll the day after. More than one day ahead
+/// is reset to `today`.
+#[must_use]
+pub const fn restore_budget(row: DaySpend, today: u64) -> (r: DaySpend)
+    ensures
+        r.day >= today,
+        row.day == today || row.day == today + 1 ==> r == row,
+        row.day < today ==> r.day == today && r.local == zero() && r.lg == zero() && le(row, r),
+        row.day > today + 1 ==> r.day == today && r.local == zero() && r.lg == zero(),
+{
+    if row.day < today || row.day - today > 1 {
+        DaySpend {
+            day: today,
+            local: tally_zero(),
+            lg: tally_zero(),
+        }
+    } else {
+        row
+    }
+}
+// mirror-end restore_budget
+
+// mirror-begin prime_budget
+/// The spend after the ledger was read at boot: on `today`, the ledger
+/// tally rises to [`restore_lg`] of it and the ledger's `today`; a spend of
+/// another day is left as it is.
+#[must_use]
+pub const fn prime_budget(s: DaySpend, today: u64, ledger: Tally) -> (r: DaySpend)
+    ensures
+        r.day == s.day,
+        r.local == s.local,
+        le(s, r),
+        s.day == today ==> r.lg == spec_tmax(s.lg, ledger),
+        s.day != today ==> r == s,
+{
+    if s.day == today {
+        DaySpend {
+            day: s.day,
+            local: s.local,
+            lg: restore_lg(s.lg, ledger),
+        }
+    } else {
+        s
+    }
+}
+// mirror-end prime_budget
+
+/// The join is a join-semilattice: `Spend` upserts converge whatever their
+/// order and however often they repeat.
+pub proof fn lemma_budget_join_is_a_semilattice(a: DaySpend, b: DaySpend, c: DaySpend)
+    ensures
+        spec_join(a, b) == spec_join(b, a),
+        spec_join(spec_join(a, b), c) == spec_join(a, spec_join(b, c)),
+        spec_join(a, a) == a,
+{
+}
+
+/// The kernel's join is the store's: the later day, and each field joined
+/// by `dated_max` (`crate::side`), which the `Spend` upsert runs in SQL.
+pub proof fn lemma_budget_join_is_the_dated_join(a: DaySpend, b: DaySpend)
+    ensures
+        spec_join(a, b).day == max64(a.day, b.day),
+        spec_join(a, b).local.tokens == spec_dated(a.day, a.local.tokens, b.day, b.local.tokens),
+        spec_join(a, b).local.cost_usd_micros == spec_dated(
+            a.day,
+            a.local.cost_usd_micros,
+            b.day,
+            b.local.cost_usd_micros,
+        ),
+        spec_join(a, b).local.calls == spec_dated(a.day, a.local.calls, b.day, b.local.calls),
+        spec_join(a, b).lg.tokens == spec_dated(a.day, a.lg.tokens, b.day, b.lg.tokens),
+        spec_join(a, b).lg.cost_usd_micros == spec_dated(
+            a.day,
+            a.lg.cost_usd_micros,
+            b.day,
+            b.lg.cost_usd_micros,
+        ),
+        spec_join(a, b).lg.calls == spec_dated(a.day, a.lg.calls, b.day, b.lg.calls),
+{
+}
+
+/// The dated order is transitive.
+pub proof fn lemma_le_is_transitive(a: DaySpend, b: DaySpend, c: DaySpend)
+    requires
+        le(a, b),
+        le(b, c),
+    ensures
+        le(a, c),
+{
+}
+
+/// The join is the least upper bound of the dated order.
+pub proof fn lemma_budget_join_is_least_upper_bound(a: DaySpend, b: DaySpend, m: DaySpend)
+    ensures
+        le(a, spec_join(a, b)),
+        le(b, spec_join(a, b)),
+        le(a, m) && le(b, m) ==> le(spec_join(a, b), m),
+{
+}
+
+/// A history of the budget in memory: each state at least the one before
+/// (a spend, a roll, a priming).
+pub open spec fn chain(hist: Seq<DaySpend>) -> bool {
+    forall|i: int| 0 <= i && i + 1 < hist.len() ==> le(#[trigger] hist[i], hist[i + 1])
+}
+
+proof fn lemma_chain_below_last(hist: Seq<DaySpend>, i: int)
+    requires
+        chain(hist),
+        0 <= i < hist.len(),
+    ensures
+        le(hist[i], hist[hist.len() - 1]),
+    decreases hist.len() - i,
+{
+    if i + 1 < hist.len() {
+        lemma_chain_below_last(hist, i + 1);
+        lemma_le_is_transitive(hist[i], hist[i + 1], hist[hist.len() - 1]);
+    }
+}
+
+/// The stored row after the `Spend` writes `writes`, each a snapshot
+/// `hist[k]` of the budget in memory, applied in the order given.
+pub open spec fn stored(start: DaySpend, hist: Seq<DaySpend>, writes: Seq<int>) -> DaySpend
+    decreases writes.len(),
+{
+    if writes.len() == 0 {
+        start
+    } else {
+        spec_join(stored(start, hist, writes.drop_last()), hist[writes.last()])
+    }
+}
+
+/// The stored budget never passes the budget in memory: from a row at most
+/// the first state (the boot restored from it), any subset of the states
+/// written, in any order, repeated or lost, joins to at most the latest.
+pub proof fn lemma_stored_never_passes_memory(start: DaySpend, hist: Seq<DaySpend>, writes: Seq<int>)
+    requires
+        hist.len() > 0,
+        chain(hist),
+        le(start, hist[0]),
+        forall|j: int| 0 <= j < writes.len() ==> 0 <= #[trigger] writes[j] < hist.len(),
+    ensures
+        le(stored(start, hist, writes), hist[hist.len() - 1]),
+    decreases writes.len(),
+{
+    let last = hist[hist.len() - 1];
+    if writes.len() == 0 {
+        lemma_chain_below_last(hist, 0);
+        lemma_le_is_transitive(start, hist[0], last);
+    } else {
+        let w = writes.last();
+        assert(0 <= w < hist.len());
+        lemma_stored_never_passes_memory(start, hist, writes.drop_last());
+        lemma_chain_below_last(hist, w);
+        lemma_budget_join_is_least_upper_bound(stored(start, hist, writes.drop_last()), hist[w], last);
+    }
+}
+
+/// On one day, more in the order is more for the breaker.
+pub proof fn lemma_used_grows_with_the_order(a: DaySpend, b: DaySpend)
+    requires
+        le(a, b),
+        a.day == b.day,
+    ensures
+        spec_used(a) <= spec_used(b),
+{
+}
+
+/// With the stored tally and the ledger's both at most the truth, the
+/// restored tally is at most the truth and at least each.
+pub proof fn lemma_restore_lg_stays_below_the_truth(stored: Tally, ledger: Tally, truth: Tally)
+    requires
+        tle(stored, truth),
+        tle(ledger, truth),
+    ensures
+        tle(spec_tmax(stored, ledger), truth),
+        tle(stored, spec_tmax(stored, ledger)),
+        tle(ledger, spec_tmax(stored, ledger)),
+{
 }
 
 } // verus!

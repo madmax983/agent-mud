@@ -114,8 +114,9 @@ pub const fn dated_max(a_day: u64, a: u64, b_day: u64, b: u64) -> u64 {
 }
 // mirror-end dated_max
 
-/// One UTC day's spend through one channel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// mirror-begin tally
+/// One UTC day's spend through one channel.
 pub struct Tally {
     /// Tokens.
     pub tokens: u64,
@@ -124,6 +125,7 @@ pub struct Tally {
     /// Model calls.
     pub calls: u64,
 }
+// mirror-end tally
 
 impl Tally {
     /// Joins two dated tallies field by field with [`dated_max`]: the

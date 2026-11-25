@@ -339,3 +339,144 @@ async fn a_timed_out_wake_settles_only_once_its_job_is_done() {
         .await
         .expect("settled once the job was done");
 }
+
+/// The states of the agent's runs in its `harvest.db`, with their counts.
+fn runs(db: &std::path::Path) -> HashMap<String, i64> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut q = conn
+        .prepare(
+            "SELECT state, COUNT(*) FROM harvest_executions WHERE workflow_name = ?1 GROUP BY state",
+        )
+        .unwrap();
+    q.query_map([AGENT_WORKFLOW_NAME], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The most events any one run of the agent holds.
+fn most_events_per_run(db: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT COALESCE(MAX(n), 0) FROM (SELECT COUNT(*) AS n FROM harvest_events GROUP BY exec_id)",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Continue-as-new and retention keep `harvest.db` bounded. The spec's
+/// run is 300 wakes at the default 32 ops per run; in a debug build that
+/// takes about 38 s (replay grows within a run, from about 20 ms to 140 ms
+/// a wake, and drops back at each continue-as-new), so this test keeps the
+/// shape at 8 ops per run: ten runs, nine or more of them sealed.
+#[tokio::test(flavor = "multi_thread")]
+async fn harvest_db_history_is_bounded() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let history = HarvestHistory {
+        ops_per_run: 8,
+        ..HarvestHistory::default()
+    };
+    let mind = HarvestMind::new(
+        Arc::new(Scripted::default()) as Arc<dyn AgentModel>,
+        Some(dir.path().to_path_buf()),
+        HashMap::from([(
+            torin.clone(),
+            HarvestPersona {
+                name: "Torin".into(),
+                persona: "A smith.".into(),
+                goal: "Ore.".into(),
+            },
+        )]),
+    )
+    .with_history(history);
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
+    let wakes = 80_u64;
+    let started = std::time::Instant::now();
+    let mut charged = 0;
+    for n in 0..wakes {
+        let ctx = WakeContext {
+            entity: torin.clone(),
+            name: "Torin".into(),
+            priority: Priority::Booked,
+            reason: "test".into(),
+            events: vec![],
+            event_views: vec![],
+            look: Value::Null,
+            macro_tick: false,
+            macro_ticks: 0,
+            login: false,
+            wake_id: format!("wake-{n}"),
+            now_ms: n * 1_000,
+            booked: Vec::new(),
+        };
+        let r = mind.wake(ctx, tools.clone()).await.unwrap();
+        charged += r.usage.tokens();
+    }
+    let took = started.elapsed();
+    eprintln!(
+        "{wakes} wakes at ops_per_run = {}: {took:?}, {:?} per wake",
+        history.ops_per_run,
+        took / u32::try_from(wakes).unwrap()
+    );
+    assert_eq!(
+        mind.tokens_seen(&torin),
+        Some(charged),
+        "the mark is the spend"
+    );
+    let db = dir.path().join("torin").join("harvest.db");
+    let before = runs(&db);
+    let sealed: i64 = before
+        .iter()
+        .filter(|(state, _)| state.as_str() != "RUNNING")
+        .map(|(_, n)| n)
+        .sum();
+    assert!(sealed >= 9, "the agent continued as new: {before:?}");
+    assert_eq!(before.get("RUNNING"), Some(&1), "{before:?}");
+    let most = most_events_per_run(&db);
+    assert!(
+        most <= i64::try_from(history.ops_per_run).unwrap() * 16,
+        "each run stays bounded: {most} events"
+    );
+    drop(mind);
+
+    let mut rt = SqliteRuntime::open(&db).unwrap();
+    sqlite::register(
+        &mut rt,
+        Arc::new(
+            AgentHarness::new(Arc::new(Scripted::default()) as Arc<dyn AgentModel>)
+                .agent(AgentProfile::new(AGENT_KIND)),
+        ),
+    );
+    let report = rt
+        .purge_with(&PurgePolicy::new().override_age(AGENT_WORKFLOW_NAME, Duration::ZERO))
+        .unwrap();
+    assert_eq!(report.removed, u64::try_from(sealed).unwrap());
+    let after = runs(&db);
+    assert_eq!(after.len(), 1, "only the running run is left: {after:?}");
+    assert_eq!(after.get("RUNNING"), Some(&1));
+    let id = AgentId::new(AGENT_KIND, torin.as_str()).unwrap();
+    let state = sqlite::state(&rt, &id).await.unwrap().unwrap();
+    assert_eq!(
+        state.tokens_used, charged,
+        "the token count carried through"
+    );
+}
+
+#[test]
+fn purges_come_at_most_once_per_interval_and_never_with_keep_days_zero() {
+    let h = HarvestHistory::default();
+    assert!(purge_due(h, None, 0), "the first job of a process purges");
+    assert!(!purge_due(h, Some(1_000), 1_000 + h.purge_every_ms - 1));
+    assert!(purge_due(h, Some(1_000), 1_000 + h.purge_every_ms));
+    let keep = HarvestHistory { keep_days: 0, ..h };
+    assert!(!purge_due(keep, None, 0), "0 keeps every run");
+}

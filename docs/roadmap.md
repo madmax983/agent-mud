@@ -2,22 +2,20 @@
 
 Planned work that a decision already shapes. Nothing here is built yet.
 
-## Runtime persistence, phases 3 and 4 (ADR 0011)
+## Runtime persistence, phase 4 (ADR 0011)
 
-Phases 1 (store v1) and 2 (kernels and resumes) are built: the versioned
-schema, epoch and boot, side ops, turns and lanes, the backlog of a failing
-store, events retention with an archive, `truncated` in `mud_events`;
-persisted bookings, macro schedule and count, wake ids from
-`(epoch, boot, n)`, settle before close, plans that resume at their cursor
-(an errand after any outage, a reactive plan within 120 s), rule counters
-by digest, and the kill-and-restart test. Next:
+Phases 1 (store v1), 2 (kernels and resumes) and 3 (budgets) are built:
+the versioned schema, epoch and boot, side ops, turns and lanes, the
+backlog of a failing store, events retention with an archive, `truncated`
+in `mud_events`; persisted bookings, macro schedule and count, wake ids
+from `(epoch, boot, n)`, settle before close, plans that resume at their
+cursor (an errand after any outage, a reactive plan within 120 s), rule
+counters by digest, the kill-and-restart test; the local and littleguy
+tallies joined by UTC day, ledger priming, `harvest_tokens_seen`, and
+HarvestMind's continue-as-new and `purge_with`. Next:
 
-1. **Budgets.** The local and littleguy tallies joined by UTC day, ledger
-   priming, `harvest_tokens_seen`, and HarvestMind's continue-as-new and
-   `purge_with`. A kill with local spend flushed then keeps the budget
-   level (the kill test gains that case).
-2. **Boot derivations.** Immediate-only replay of addressed events, the
-   chatter fold over the event tail, MCP cursors from `seen_seq`.
+- **Boot derivations.** Immediate-only replay of addressed events, the
+  chatter fold over the event tail, MCP cursors from `seen_seq`.
 
 ## Admin rollback
 

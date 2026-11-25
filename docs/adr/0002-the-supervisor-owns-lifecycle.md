@@ -94,7 +94,11 @@ sequenceDiagram
   does not start. Then the supervisor takes the side rows with
   `Game::take_restored()` and opens over them (`Supervisor::open`, phase
   2): bookings, the macro schedule and counters, rule counters and plans
-  to resume. Wake ids are `wake-{epoch:016x}-{boot}-{entity}-{n}`, so a
+  to resume, and (phase 3) each day's spend. Inside `Supervisor::open`,
+  before any wake, every mind is asked to `prime`: a littleguy mind reads
+  its daemon's ledger once and marks every row seen, and the ledger tally
+  rises to what the ledger holds of today; a harvest mind gets back the
+  token count it was charged up to. Wake ids are `wake-{epoch:016x}-{boot}-{entity}-{n}`, so a
   wake is never redelivered under an id littleguy has seen.
 - **Settle before close.** A wake's turn closes, and its entity is free
   for the next wake, only when the mind has really finished
