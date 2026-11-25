@@ -6,6 +6,12 @@
 //! of its config, and a sign-in link to its pages. This client speaks that
 //! protocol: one JSON line out per connection, one response line back.
 //!
+//! lg answers `approvals`, `plans`, `notes`, `overlays` and
+//! `overlay_show` beside its job loop, at once. Every other request here
+//! (`decide`, `refine_propose`, `overlay_put`, `overlay_activate`, `reload`
+//! and `ui_link`) is a loop job: it waits behind a wake chat or a heartbeat
+//! tick that runs, so it gets [`LOOP_JOB_TIMEOUT`], not [`READ_TIMEOUT`].
+//!
 //! The requests are a closed set. There is no `approve`, no `deny` and no
 //! `overlay_rollback`: the MUD never approves a tool call for an agent,
 //! and a rollback is the human's veto on lg's own pages, never the MUD's.
@@ -20,6 +26,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use super::LG_MAX_LINE_BYTES;
+
+/// How long a read beside lg's job loop may take.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a loop job may take: it waits behind a wake chat (120 s by
+/// default) or a heartbeat tick, which may research ideas. It is a cap on
+/// a wait, not a deadline lg keeps.
+pub const LOOP_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What the owner decides about a proposed or active goal. The MUD never
 /// drops or reopens an idea.
@@ -78,6 +92,27 @@ pub enum OwnerRequest {
 }
 
 impl OwnerRequest {
+    /// Whether lg runs this request in its job loop, after the chat or
+    /// tick that runs now, and not beside the loop.
+    #[must_use]
+    pub const fn is_loop_job(&self) -> bool {
+        !matches!(
+            self,
+            Self::Approvals | Self::Plans | Self::Notes | Self::Overlays | Self::OverlayShow { .. }
+        )
+    }
+
+    /// How long to wait for the answer: [`LOOP_JOB_TIMEOUT`] for a loop
+    /// job, [`READ_TIMEOUT`] for a read.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        if self.is_loop_job() {
+            LOOP_JOB_TIMEOUT
+        } else {
+            READ_TIMEOUT
+        }
+    }
+
     /// The `kind` the request carries on the wire.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
@@ -294,8 +329,9 @@ pub enum OwnerError {
 /// Sends `req` over the owner socket at `socket` and reads its answer.
 ///
 /// A loop job (`decide`, `overlay_put`, `overlay_activate`, `reload`,
-/// `refine_propose`) answers when lg's loop runs it, on this connection:
-/// `timeout` should cover a chat or a tick that runs ahead of it.
+/// `refine_propose`, `ui_link`) answers when lg's loop runs it, on this
+/// connection: `timeout` should cover a chat or a tick that runs ahead of
+/// it ([`OwnerRequest::timeout`]).
 ///
 /// # Errors
 /// [`OwnerError::Timeout`] when nothing came in `timeout`,

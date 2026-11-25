@@ -911,42 +911,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_old_mud_toml_keeps_its_meaning() {
+    #[tokio::test]
+    async fn an_old_mud_toml_keeps_its_meaning() {
         // A [littleguy] section written before the autonomy keys.
-        let old: MudConfig = toml::from_str(
-            "[littleguy]\nbin = \"lg\"\ndata_dir = \"data/agents\"\nprovider = \"openrouter\"\nmax_steps = 64\n",
-        )
+        let dir = tempfile::tempdir().unwrap();
+        let old: MudConfig = toml::from_str(&format!(
+            "[minds]\npersistent = \"littleguy\"\n[littleguy]\nbin = {:?}\ndata_dir = {:?}\nprovider = \"openrouter\"\nmax_steps = 64\n",
+            dir.path().join("no-such-lg"),
+            dir.path().join("agents"),
+        ))
         .unwrap();
         let lg = &old.littleguy;
         assert_eq!(lg.provider, "openrouter");
         assert!(lg.research && lg.notes && lg.compaction, "autonomy is on");
         assert_eq!(lg.heartbeat_minutes, 240);
-        let cfg = mud_supervisor::littleguy::LittleguyConfig {
-            research: lg.research,
-            notes: lg.notes,
-            compaction: lg.compaction(),
-            max_request_bytes: lg.max_request_bytes,
-            window: lg.window,
-            heartbeat_minutes: lg.heartbeat_minutes,
-            ..mud_supervisor::littleguy::LittleguyConfig::default()
-        };
-        let text = mud_supervisor::littleguy::render_config(
-            &cfg,
-            &mud_supervisor::littleguy::PersonaText {
-                name: "Torin".into(),
-                persona: "A smith.".into(),
-                goal: "Get ore.".into(),
-                body: "Body.".into(),
-            },
-            4123,
-            false,
-        );
+        // The real path: minds::build passes [littleguy] to each daemon,
+        // which writes its lg.toml before it tries to start.
+        let pack = mud_world::WorldPack::crypt_v01().unwrap();
+        let tokens = mud_mcp::TokenRegistry::new();
+        let m = crate::minds::build(&old, &pack, &tokens, &|_| mud_world::Seq(0), None).unwrap();
+        let marta = mud_world::EntityId::from("marta");
+        assert!(m.littleguy[0].ensure(&marta).await.is_err(), "no binary");
+        let text =
+            std::fs::read_to_string(m.littleguy[0].entity_dir(&marta).join("lg.toml")).unwrap();
         let v: toml::Table = toml::from_str(&text).unwrap();
         assert_eq!(v["tools"]["files"].as_bool(), Some(true), "notes");
+        assert_eq!(v["memory"]["enabled"].as_bool(), Some(true));
+        assert!(v["system"].as_str().unwrap().contains("write_note"));
         assert_eq!(v["heartbeat"]["research"].as_bool(), Some(true));
+        assert_eq!(v["heartbeat"]["every_minutes"].as_integer(), Some(240));
         assert_eq!(v["compaction"]["at_percent"].as_integer(), Some(80));
+        assert_eq!(v["compaction"]["max_resets"].as_integer(), Some(3));
         assert_eq!(v["max_request_bytes"].as_integer(), Some(240_000));
+        assert_eq!(v["window"].as_integer(), Some(30));
+        assert_eq!(v["max_steps"].as_integer(), Some(64));
     }
 
     #[test]

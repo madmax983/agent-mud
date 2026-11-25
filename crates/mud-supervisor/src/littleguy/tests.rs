@@ -39,7 +39,7 @@ fn the_config_points_littleguy_at_the_mud() {
         v["system"]
             .as_str()
             .unwrap()
-            .ends_with(&littleguy_habits(ToolNames::LITTLEGUY)),
+            .ends_with(&littleguy_habits(ToolNames::LITTLEGUY, true)),
         "the wake habit"
     );
     assert!(v["system"].as_str().unwrap().contains("world__mud_wake_me"));
@@ -95,7 +95,7 @@ fn the_config_turns_on_notes_compaction_and_research() {
     assert_eq!(v["heartbeat"]["every_minutes"].as_integer(), Some(240));
     assert_eq!(
         v["heartbeat"]["prompt"].as_str(),
-        Some(heartbeat_prompt(ToolNames::LITTLEGUY).as_str())
+        Some(heartbeat_prompt(ToolNames::LITTLEGUY, true).as_str())
     );
     assert_eq!(v["flow"]["rule_of_two"].as_bool(), Some(true));
     // Each switch is the operator's.
@@ -158,8 +158,46 @@ fn served_names(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// lg's note tools, which it serves only with `tools.files` and `[memory]
+/// enabled` (lg `daemon/reload.rs`, `own_tools`).
+const NOTE_TOOLS: [&str; 4] = ["write_note", "read_note", "list_notes", "delete_note"];
+
 #[test]
 fn every_tool_named_in_the_prompts_exists_under_that_name() {
+    let notes_off = LittleguyConfig {
+        notes: false,
+        ..LittleguyConfig::default()
+    };
+    // Loud, notes off, and quiet (memory off): no prompt names a note
+    // tool that lg does not serve.
+    for (cfg, quiet) in [
+        (LittleguyConfig::default(), false),
+        (notes_off, false),
+        (LittleguyConfig::default(), true),
+    ] {
+        let v: toml::Table =
+            toml::from_str(&render_config(&cfg, &persona().text(), 4123, quiet)).unwrap();
+        let notes_served = v["tools"]["files"].as_bool() == Some(true)
+            && v["memory"]["enabled"].as_bool() == Some(true);
+        assert_eq!(notes_served, cfg.notes && !quiet);
+        let system = v["system"].as_str().unwrap();
+        let tick = v
+            .get("heartbeat")
+            .map_or("", |h| h["prompt"].as_str().unwrap());
+        assert_eq!(tick.is_empty(), quiet, "a quiet config has no tick");
+        for text in [system, tick] {
+            for tool in NOTE_TOOLS {
+                assert!(
+                    notes_served || !text.contains(tool),
+                    "{tool} is named but not served (notes {}, quiet {quiet}): {text}",
+                    cfg.notes
+                );
+            }
+        }
+        if notes_served {
+            assert!(system.contains("write_note") && tick.contains("write_note"));
+        }
+    }
     let v = torin_config(false);
     let mut served = Vec::new();
     for s in v["mcp"]["server"].as_array().unwrap() {
@@ -218,15 +256,16 @@ async fn a_quiet_config_drops_the_heartbeat_and_memory_and_keeps_the_port() {
     assert!(!quiet.contains_key("heartbeat"), "no tick while quiet");
     assert_eq!(quiet["memory"]["enabled"].as_bool(), Some(false));
     let loud = torin_config(false);
-    for key in [
-        "system",
-        "tools",
-        "mcp",
-        "ui",
-        "compaction",
-        "flow",
-        "window",
-    ] {
+    // lg serves no note tool without memory, so the quiet system text
+    // names none; the rest of it stays.
+    let quiet_system = quiet["system"].as_str().unwrap();
+    assert!(!quiet_system.contains("write_note"), "{quiet_system}");
+    assert!(loud["system"].as_str().unwrap().contains("write_note"));
+    assert!(
+        quiet_system.ends_with(&littleguy_habits(ToolNames::LITTLEGUY, false)),
+        "{quiet_system}"
+    );
+    for key in ["tools", "mcp", "ui", "compaction", "flow", "window"] {
         assert_eq!(quiet[key], loud[key], "{key} stays");
     }
     // On a mind, a rewrite keeps the daemon's pages port.
@@ -253,6 +292,7 @@ async fn a_quiet_config_drops_the_heartbeat_and_memory_and_keeps_the_port() {
             child: stand_in(&sock),
             socket: sock.clone(),
             ui_port: 4999,
+            approvals: ApprovalCheck::Off,
         },
     );
     let read = || -> toml::Table {
@@ -477,6 +517,162 @@ async fn ui_link_returns_a_loopback_sign_in_link() {
     );
     let e = ui_link(&sock).await.unwrap_err();
     assert!(e.to_string().contains("do not serve"), "{e}");
+}
+
+/// `ui_link` is a loop job in lg: it answers after the chat or tick that
+/// runs ahead of it, so it waits as long as a wake may run.
+#[tokio::test(start_paused = true)]
+async fn ui_link_waits_behind_a_running_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut req = String::new();
+        reader.read_line(&mut req).await.unwrap();
+        // A wake chat of 100 s runs ahead of the link.
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        let mut stream = reader.into_inner();
+        stream
+            .write_all(
+                b"{\"kind\":\"connect_link\",\"link\":\"http://127.0.0.1:4123/login?token=abc\"}\n",
+            )
+            .await
+            .unwrap();
+        req
+    });
+    let link = ui_link(&sock).await;
+    assert_eq!(
+        link.unwrap(),
+        "http://127.0.0.1:4123/login?token=abc",
+        "the link comes after the wake"
+    );
+    assert_eq!(server.await.unwrap().trim(), r#"{"kind":"ui_link"}"#);
+}
+
+/// A daemon set quiet before its first start starts quiet: `ensure`
+/// writes lg.toml before it spawns, so a missing binary still leaves it.
+#[tokio::test]
+async fn a_daemon_set_quiet_before_its_start_starts_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = LittleguyConfig {
+        bin: dir.path().join("no-such-lg"),
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    mind.set_quiet(&torin, true).await.unwrap();
+    assert!(mind.ensure(&torin).await.is_err(), "no binary");
+    let v: toml::Table =
+        toml::from_str(&std::fs::read_to_string(mind.config_path(&torin)).unwrap()).unwrap();
+    assert!(!v.contains_key("heartbeat"), "no tick while quiet");
+    assert_eq!(v["memory"]["enabled"].as_bool(), Some(false));
+    assert!(!v["system"].as_str().unwrap().contains("write_note"));
+    // Loud again: the next start renders loud.
+    mind.set_quiet(&torin, false).await.unwrap();
+    assert!(mind.ensure(&torin).await.is_err());
+    let v: toml::Table =
+        toml::from_str(&std::fs::read_to_string(mind.config_path(&torin)).unwrap()).unwrap();
+    assert!(v.contains_key("heartbeat"));
+    assert_eq!(v["memory"]["enabled"].as_bool(), Some(true));
+}
+
+/// Each start asks the new daemon `approvals` once and keeps what it
+/// answered, so a daemon with approvals on is seen.
+#[tokio::test]
+async fn each_start_checks_that_approvals_are_off() {
+    let dir = tempfile::tempdir().unwrap();
+    // A stand-in `lg` that only runs; the test serves its socket.
+    let bin = dir.path().join("fake-lg");
+    std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    let cfg = LittleguyConfig {
+        bin,
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let torin = EntityId::from("torin");
+    let mind = Arc::new(LittleguyMind::new(
+        cfg,
+        HashMap::from([(torin.clone(), persona())]),
+    ));
+    assert_eq!(mind.approval_check(&torin).await, None, "not started");
+    let start = tokio::spawn({
+        let (mind, torin) = (Arc::clone(&mind), torin.clone());
+        async move { mind.ensure(&torin).await }
+    });
+    // Once the process runs, open its socket.
+    let pid = mind.entity_dir(&torin).join(PID_FILE);
+    while !pid.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let listener = UnixListener::bind(mind.entity_dir(&torin).join("lg.sock")).unwrap();
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("the start asks approvals")
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut req = String::new();
+    reader.read_line(&mut req).await.unwrap();
+    assert_eq!(req.trim(), r#"{"kind":"approvals"}"#);
+    reader
+        .into_inner()
+        .write_all(
+            b"{\"kind\":\"approvals\",\"entries\":[{\"id\":3,\"tool\":\"mud__mud_command\",\"text\":\"say hi\"}]}\n",
+        )
+        .await
+        .unwrap();
+    start.await.unwrap().unwrap();
+    assert_eq!(
+        mind.approval_check(&torin).await,
+        Some(ApprovalCheck::On { waiting: 1 })
+    );
+    mind.shutdown().await;
+    assert_eq!(mind.approval_check(&torin).await, None, "stopped");
+}
+
+#[tokio::test]
+async fn the_approvals_check_reads_off_on_and_no_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let answer = |name: &str, line: &'static str| {
+        let sock = dir.path().join(name);
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut req = String::new();
+            reader.read_line(&mut req).await.unwrap();
+            let mut stream = reader.into_inner();
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.write_all(b"\n").await.unwrap();
+        });
+        sock
+    };
+    let off = answer(
+        "off.sock",
+        r#"{"kind":"off","message":"approvals are off"}"#,
+    );
+    assert_eq!(check_approvals(&torin, &off).await, ApprovalCheck::Off);
+    let on = answer("on.sock", r#"{"kind":"approvals","entries":[]}"#);
+    assert_eq!(
+        check_approvals(&torin, &on).await,
+        ApprovalCheck::On { waiting: 0 },
+        "on, even with nothing waiting yet"
+    );
+    let odd = answer("odd.sock", r#"{"kind":"error","message":"no"}"#);
+    assert!(matches!(
+        check_approvals(&torin, &odd).await,
+        ApprovalCheck::Unknown(m) if m.contains("no")
+    ));
+    assert!(matches!(
+        check_approvals(&torin, &dir.path().join("none.sock")).await,
+        ApprovalCheck::Unknown(_)
+    ));
 }
 
 #[tokio::test]
@@ -870,6 +1066,7 @@ async fn a_timed_out_wake_settles_only_once_its_op_is_read() {
             child: stand_in(&sock),
             socket: sock.clone(),
             ui_port: 4123,
+            approvals: ApprovalCheck::Off,
         },
     );
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
@@ -976,6 +1173,7 @@ async fn no_second_chat_starts_while_an_op_is_live() {
             child: stand_in(&sock),
             socket: sock.clone(),
             ui_port: 4123,
+            approvals: ApprovalCheck::Off,
         },
     );
     let pack = Arc::new(WorldPack::crypt_v01().unwrap());
@@ -1133,6 +1331,32 @@ async fn a_real_lg_serve_answers_a_wake() {
     }
 }
 
+/// `text` without its terminal colour codes (`ESC [ ... m`).
+fn without_colour(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn colour_codes_are_stripped() {
+    assert_eq!(
+        without_colour("\u{1b}[3mapplied\u{1b}[0m\u{1b}[2m=\u{1b}[0m[\"memory\"]"),
+        r#"applied=["memory"]"#
+    );
+}
+
 /// The supervisor is a real daemon's owner on its socket: reads, a
 /// decision, and a quiet reload that lg applies live.
 #[tokio::test(flavor = "multi_thread")]
@@ -1155,6 +1379,11 @@ async fn a_real_lg_serve_takes_owner_requests() {
     let log = || std::fs::read_to_string(dir.path().join("torin/lg.log")).unwrap_or_default();
     let sock = started.unwrap_or_else(|e| panic!("{e}\n--- lg.log ---\n{}", log()));
     assert_eq!(mind.running_socket(&torin).await.as_ref(), Some(&sock));
+    assert_eq!(
+        mind.approval_check(&torin).await,
+        Some(ApprovalCheck::Off),
+        "the start found approvals off"
+    );
     let t = Duration::from_secs(30);
     let ask = |r: Req| {
         let sock = sock.clone();
@@ -1188,6 +1417,9 @@ async fn a_real_lg_serve_takes_owner_requests() {
     let port = |text: String| -> toml::Table { toml::from_str(&text).unwrap() };
     let before = port(std::fs::read_to_string(mind.config_path(&torin)).unwrap());
     mind.set_quiet(&torin, true).await.unwrap();
+    // lg looks at its config every 2 s and reloads a changed one itself,
+    // so here its watcher applies the rewrite before the explicit reload.
+    tokio::time::sleep(Duration::from_millis(2_600)).await;
     let quiet = ask(Req::Reload).await;
     let Resp::Reloaded {
         applied, restart, ..
@@ -1195,11 +1427,20 @@ async fn a_real_lg_serve_takes_owner_requests() {
     else {
         panic!("{quiet:?}\n{}", log());
     };
-    assert!(
-        applied.iter().any(|a| a == "memory") && applied.iter().any(|a| a == "heartbeat"),
-        "{quiet:?}"
-    );
+    // Any `reloaded` answer is success: this reload or lg's watcher before
+    // it applied memory and heartbeat, and lg logs each reload it applies.
+    let by_us = applied.iter().any(|a| a == "memory") && applied.iter().any(|a| a == "heartbeat");
+    let by_watcher = without_colour(&log()).lines().any(|l| {
+        l.contains("the config reloaded") && l.contains(r#"applied=["memory", "heartbeat"]"#)
+    });
+    assert!(by_us || by_watcher, "{quiet:?}\n{}", log());
     assert!(restart.is_empty(), "{quiet:?}");
+    // The state says so too: lg serves no notes without memory.
+    assert!(
+        matches!(ask(Req::Notes).await, Resp::Off { .. }),
+        "quiet: notes are off\n{}",
+        log()
+    );
     let after = port(std::fs::read_to_string(mind.config_path(&torin)).unwrap());
     assert_eq!(before["ui"], after["ui"], "the pages keep their port");
     mind.set_quiet(&torin, false).await.unwrap();
@@ -1207,6 +1448,11 @@ async fn a_real_lg_serve_takes_owner_requests() {
     assert!(
         matches!(&loud, Resp::Reloaded { restart, .. } if restart.is_empty()),
         "{loud:?}"
+    );
+    assert!(
+        matches!(ask(Req::Notes).await, Resp::Notes { .. }),
+        "loud: notes are back\n{}",
+        log()
     );
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(

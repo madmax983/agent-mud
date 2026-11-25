@@ -49,9 +49,6 @@ use owner::{OwnerRequest, OwnerResponse};
 /// unread.
 pub const LG_MAX_LINE_BYTES: usize = 64 * 1024 - 1;
 
-/// How long a quick owner request (a read, a sign-in link) may take.
-const OWNER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// The tools of the `world` server: reads and wakes, which a quiet tick
 /// may use.
 pub const WORLD_TOOLS: [&str; 4] = ["mud_look", "mud_sheet", "mud_wake_me", "mud_cancel_wake"];
@@ -219,12 +216,17 @@ fn mcp_server(cfg: &LittleguyConfig, id: &str, effect: &str, tools: &[&str]) -> 
 /// `quiet` renders the same file with `[memory] enabled = false` and no
 /// `[heartbeat]`: lg's reload applies both live, so no tick, reflection or
 /// nightly consolidation spends a token. The memory files stay on disk.
+/// Its system text then names no note tool, as lg serves none without
+/// memory (the same holds for `notes = false`).
 /// The config never asks for an owner-gated feature: no `[council]`,
 /// `[skills]`, `[sandbox]`, `[approvals]`, `[scripts]`, `[patches]`,
 /// `[research]`, `[hooks]`, `[followups]` or `allow_actions`.
 #[must_use]
 pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet: bool) -> String {
     let names = ToolNames::LITTLEGUY;
+    // lg serves the note tools only with `tools.files` and `[memory]
+    // enabled`, so the prompts name them only then.
+    let notes = cfg.notes && !quiet;
     let mut root = toml::Table::new();
     root.insert("owner".into(), "mud".into());
     root.insert(
@@ -234,7 +236,7 @@ pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet
         format!(
             "{}\n\n{}",
             system_prompt(names, &p.name, &p.persona, &p.goal, &p.body),
-            littleguy_habits(names)
+            littleguy_habits(names, notes)
         )
         .into(),
     );
@@ -278,7 +280,7 @@ pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet
                 ("every_minutes", i64::from(cfg.heartbeat_minutes).into()),
                 // Researches open ideas; not lg's [research] sweep tool.
                 ("research", cfg.research.into()),
-                ("prompt", heartbeat_prompt(names).into()),
+                ("prompt", heartbeat_prompt(names, notes).into()),
             ])
             .into(),
         );
@@ -542,12 +544,19 @@ fn free_loopback_port() -> std::io::Result<u16> {
 }
 
 /// Asks the daemon at `socket` for a one-time sign-in link to its pages,
-/// as its owner ([`owner`]).
+/// as its owner ([`owner`]). lg makes the link in its job loop, so this
+/// waits behind a wake or a tick that runs ([`owner::LOOP_JOB_TIMEOUT`]).
 ///
 /// # Errors
 /// The socket does not answer, or the daemon refuses.
 pub async fn ui_link(socket: &Path) -> Result<String, MindError> {
-    match owner::request(socket, &OwnerRequest::UiLink, OWNER_READ_TIMEOUT).await {
+    match owner::request(
+        socket,
+        &OwnerRequest::UiLink,
+        OwnerRequest::UiLink.timeout(),
+    )
+    .await
+    {
         Ok(OwnerResponse::ConnectLink { link }) if is_loopback_link(&link) => Ok(link),
         Ok(OwnerResponse::ConnectLink { .. }) => Err(MindError::Failed(
             "littleguy gave a sign-in link that is not on loopback".into(),
@@ -613,20 +622,41 @@ pub(crate) async fn reap_orphan(dir: &Path, socket: &Path) {
     let _ = std::fs::remove_file(pid_file);
 }
 
+/// What a daemon answered when it was asked `approvals` after its start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalCheck {
+    /// `off`: no tool call ever waits for an owner. The MUD expects this.
+    Off,
+    /// Approvals are on: a wake may stop at an approval the MUD never
+    /// gives.
+    On {
+        /// The calls that wait now.
+        waiting: usize,
+    },
+    /// No answer, or one this check does not expect.
+    Unknown(String),
+}
+
 /// Asks a daemon that just started whether any tool call waits for an
 /// owner's approval. The MUD config has no `[sandbox]` and no tool carries
 /// `private_data`, so lg answers `off`; anything else is logged, because
 /// then a wake could stop at an approval the MUD never gives.
-async fn check_approvals(entity: &EntityId, socket: &Path) {
-    match owner::request(socket, &OwnerRequest::Approvals, OWNER_READ_TIMEOUT).await {
-        Ok(OwnerResponse::Off { .. }) => {}
-        Ok(other) => {
-            tracing::warn!(%entity, answer = ?other, "lg serve has approvals on; a wake may wait for one");
-        }
-        Err(e) => {
-            tracing::warn!(%entity, error = %e, "lg serve did not answer the approvals check");
-        }
+async fn check_approvals(entity: &EntityId, socket: &Path) -> ApprovalCheck {
+    let req = OwnerRequest::Approvals;
+    let check = match owner::request(socket, &req, req.timeout()).await {
+        Ok(OwnerResponse::Off { .. }) => return ApprovalCheck::Off,
+        Ok(OwnerResponse::Approvals { entries }) => ApprovalCheck::On {
+            waiting: entries.len(),
+        },
+        Ok(other) => ApprovalCheck::Unknown(format!("{other:?}")),
+        Err(e) => ApprovalCheck::Unknown(e.to_string()),
+    };
+    if let ApprovalCheck::On { waiting } = check {
+        tracing::warn!(%entity, waiting, "lg serve has approvals on; a wake may wait for one");
+    } else {
+        tracing::warn!(%entity, answer = ?check, "lg serve did not answer the approvals check with off");
     }
+    check
 }
 
 #[derive(Debug)]
@@ -636,6 +666,8 @@ struct Daemon {
     /// The loopback port of its pages, kept so a config rewrite (quiet or
     /// loud) never moves them.
     ui_port: u16,
+    /// What it answered to the approvals check after its start.
+    approvals: ApprovalCheck,
 }
 
 /// A mind that runs each entity as its own `lg serve`.
@@ -783,15 +815,16 @@ impl LittleguyMind {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let approvals = check_approvals(entity, &socket).await;
         daemons.insert(
             entity.clone(),
             Daemon {
                 child,
                 socket: socket.clone(),
                 ui_port,
+                approvals,
             },
         );
-        check_approvals(entity, &socket).await;
         Ok(socket)
     }
 
@@ -807,6 +840,17 @@ impl LittleguyMind {
             .await
             .get_mut(entity)
             .and_then(|d| matches!(d.child.try_wait(), Ok(None)).then(|| d.socket.clone()))
+    }
+
+    /// What `entity`'s running daemon answered to the approvals check
+    /// after its start ([`ApprovalCheck::Off`] is expected). `None` while
+    /// no daemon runs.
+    pub async fn approval_check(&self, entity: &EntityId) -> Option<ApprovalCheck> {
+        self.daemons
+            .lock()
+            .await
+            .get_mut(entity)
+            .and_then(|d| matches!(d.child.try_wait(), Ok(None)).then(|| d.approvals.clone()))
     }
 
     /// The author's text of `entity`'s persona, with no token.
@@ -826,8 +870,11 @@ impl LittleguyMind {
 
     /// Renders `entity`'s config quiet (no heartbeat, memory off) or loud,
     /// and rewrites it now when its daemon runs, on the same pages port.
-    /// The daemon applies it at its next `reload`, which the caller sends.
-    /// A daemon that starts later starts with it.
+    /// lg looks at its config file every 2 s and reloads a changed one by
+    /// itself; the caller's `reload` applies it at once if the watcher has
+    /// not yet. So any `reloaded` answer is success, and its `applied` list
+    /// may be empty: the watcher's reload may have applied the change
+    /// first. A daemon that starts later starts with it.
     ///
     /// # Errors
     /// The entity is not this mind's, or the file cannot be written.

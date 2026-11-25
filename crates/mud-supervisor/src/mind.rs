@@ -804,20 +804,30 @@ pub fn persistent_habits(names: ToolNames) -> String {
     )
 }
 
-/// The habits of a littleguy agent, after its [`system_prompt`]: the wake
-/// habit of [`persistent_habits`], its own notes, and what a quiet moment
-/// (an unattended heartbeat tick) may do. Fixed text and tool names.
+/// The habits of a littleguy agent, after its [`system_prompt`].
+///
+/// They hold the wake habit of [`persistent_habits`], its own notes when
+/// `notes` says lg serves the note tools, and what a quiet moment (an
+/// unattended heartbeat tick) may do. Fixed text and tool names.
 #[must_use]
-pub fn littleguy_habits(names: ToolNames) -> String {
+pub fn littleguy_habits(names: ToolNames, notes: bool) -> String {
+    let (note_habit, keep) = if notes {
+        (
+            "- write_note keeps what you learned, under a name you can find again; read your \
+             notes when a name or a place comes back.\n",
+            "notes and plans",
+        )
+    } else {
+        ("", "plans")
+    };
     format!(
         "Your habits:{}\n\
          - {wake_me} books a wake; it is the only way to act in the world later. \
            {cancel_wake} cancels one you no longer need.\n\
          - {events} shows what you perceived since you last read it.\n\
-         - write_note keeps what you learned, under a name you can find again; read your \
-           notes when a name or a place comes back.\n\
+         {note_habit}\
          - In a quiet moment nobody is talking to you: you may read with {look} and {sheet}, \
-           book a wake, and keep notes and plans, but {command} is refused.",
+           book a wake, and keep {keep}, but {command} is refused.",
         persistent_habits(names),
         wake_me = names.wake_me,
         cancel_wake = names.cancel_wake,
@@ -829,16 +839,22 @@ pub fn littleguy_habits(names: ToolNames) -> String {
 }
 
 /// The prompt of a littleguy heartbeat tick: a quiet moment, unattended,
-/// in which the world cannot be changed. Fixed text and tool names.
+/// in which the world cannot be changed. It names `write_note` only when
+/// `notes` says lg serves it. Fixed text and tool names.
 #[must_use]
-pub fn heartbeat_prompt(names: ToolNames) -> String {
+pub fn heartbeat_prompt(names: ToolNames, notes: bool) -> String {
+    let keep = if notes {
+        " Keep what you learned with write_note."
+    } else {
+        ""
+    };
     format!(
         "A quiet moment passes. You cannot act in the world now: {command} is refused and \
          nobody hears you. Call list_plans. If an active goal is due, look with {look} or \
          {sheet} if that helps, and note what you found with goal_progress. Research or \
          conclude an open idea, file a new idea, or propose a goal that serves your private \
          goal. When something needs doing in the world, book a wake with {wake_me} for when it \
-         should happen. Keep what you learned with write_note. Then stop.",
+         should happen.{keep} Then stop.",
         command = names.command,
         look = names.look,
         sheet = names.sheet,
@@ -1062,9 +1078,9 @@ mod tests {
         let system = format!(
             "{}\n\n{}",
             system_prompt(lg, "Torin", "A smith.", "Get ore.", "Body."),
-            littleguy_habits(lg)
+            littleguy_habits(lg, true)
         );
-        let tick = heartbeat_prompt(lg);
+        let tick = heartbeat_prompt(lg, true);
         for text in [&system, &tick] {
             let rest = lg
                 .all()
@@ -1084,6 +1100,20 @@ mod tests {
         );
         assert!(system.contains("write_note"), "{system}");
         assert!(system.contains(&persistent_habits(lg)), "{system}");
+        // Without notes, neither names a note tool, and the rest stays.
+        let (habits, tick_off) = (littleguy_habits(lg, false), heartbeat_prompt(lg, false));
+        for text in [&habits, &tick_off] {
+            assert!(!text.contains("_note"), "{text}");
+            assert!(
+                text.contains(lg.command) && text.contains(lg.wake_me),
+                "{text}"
+            );
+        }
+        assert!(habits.contains("keep plans"), "{habits}");
+        assert_eq!(
+            tick_off,
+            tick.replace(" Keep what you learned with write_note.", "")
+        );
         let bare = system_prompt(ToolNames::BARE, "Torin", "A smith.", "Get ore.", "Body.");
         assert!(
             bare.contains("calling mud_command") && !bare.contains("__"),

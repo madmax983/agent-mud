@@ -165,21 +165,35 @@ sequenceDiagram
 - **The heartbeat is a quiet moment.** Its prompt
   (`mind::heartbeat_prompt`) is fixed text: `mud__mud_command` is refused,
   check plans and due goals, research or file ideas, book a wake for what
-  needs doing in the world, keep notes. lg skips a tick with no model call
-  when no goal is due and no idea waits.
+  needs doing in the world, keep notes (when lg serves them). lg skips a
+  tick with no model call when no goal is due and no idea waits.
 - **The supervisor is each daemon's owner on its socket**
   (`littleguy::owner`). lg takes a caller with its own uid for its owner,
   and the supervisor starts every daemon as itself. The client sends one
   request per connection: `approvals`, `plans`, `decide` (accept, decline,
   drop a goal), `notes`, `overlays`, `overlay_show`, `refine_propose`,
-  `overlay_put`, `overlay_activate`, `reload` and `ui_link`. It has no
+  `overlay_put`, `overlay_activate`, `reload` and `ui_link`. lg answers
+  `approvals`, `plans`, `notes`, `overlays` and `overlay_show` beside its
+  job loop, so they wait 10 s at most. The others are loop jobs: they wait
+  behind a wake chat or a heartbeat tick, so they wait up to 300 s
+  (`owner::LOOP_JOB_TIMEOUT`). The observer's link to an agent's pages
+  therefore waits for the agent's running wake. It has no
   `approve`, `deny` or `overlay_rollback`: a rollback is the human's veto
   on lg's pages. After each start the supervisor asks `approvals` once and
   warns if the answer is not `off`.
 - **The config is written atomically** (a temp file, `fsync`, `rename`),
   and a daemon keeps its pages port, so a rewrite (`set_quiet`: no
   `[heartbeat]` and `[memory] enabled = false`, applied live by `reload`)
-  never moves the observer's link.
+  never moves the observer's link. lg also looks at its config every 2 s
+  and reloads a changed file by itself, so the caller's own `reload` may
+  answer `applied: []`: any `reloaded` answer is success. A caller that
+  must know the effect checks state (a quiet daemon answers `notes` with
+  `off`).
+- **Prompts name only the tools lg serves.** lg serves the note tools
+  only with `tools.files` and `[memory] enabled`. With `[littleguy] notes
+  = false`, or while quiet, the system text and the tick prompt name no
+  note tool (`littleguy_habits(names, notes)`,
+  `heartbeat_prompt(names, notes)`).
 - **The wire bound.** lg reads a socket line of at most 64 KiB and refuses
   a longer one unread. A wake message is JSON that `chat` escapes again,
   so `wake_message` measures each candidate by its escaped size and keeps

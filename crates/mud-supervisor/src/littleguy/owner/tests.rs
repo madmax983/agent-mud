@@ -362,3 +362,38 @@ fn the_owner_client_can_neither_approve_deny_nor_roll_back() {
         }
     }
 }
+
+#[test]
+fn a_loop_job_waits_behind_a_wake_and_a_read_does_not() {
+    // lg answers these beside its job loop (`daemon/reads.rs`).
+    for read in [
+        OwnerRequest::Approvals,
+        OwnerRequest::Plans,
+        OwnerRequest::Notes,
+        OwnerRequest::Overlays,
+        OwnerRequest::OverlayShow { version: 1 },
+    ] {
+        assert!(!read.is_loop_job(), "{read:?}");
+        assert_eq!(read.timeout(), READ_TIMEOUT, "{read:?}");
+    }
+    // These wait their turn in the loop, behind a chat or a tick. A wake
+    // may run for 120 s by default.
+    for job in [
+        OwnerRequest::Decide {
+            decision: PlanDecision::Accept,
+            id: 1,
+        },
+        OwnerRequest::RefinePropose,
+        OwnerRequest::OverlayPut {
+            overlay: "{}".into(),
+        },
+        OwnerRequest::OverlayActivate { version: 1 },
+        OwnerRequest::Reload,
+        OwnerRequest::UiLink,
+    ] {
+        assert!(job.is_loop_job(), "{job:?}");
+        assert_eq!(job.timeout(), LOOP_JOB_TIMEOUT, "{job:?}");
+    }
+    assert!(LOOP_JOB_TIMEOUT >= Duration::from_secs(120) * 2);
+    assert!(READ_TIMEOUT < LOOP_JOB_TIMEOUT);
+}

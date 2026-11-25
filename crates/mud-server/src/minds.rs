@@ -370,6 +370,8 @@ mod tests {
         cfg.littleguy.research = false;
         cfg.littleguy.compaction = false;
         cfg.littleguy.heartbeat_minutes = 15;
+        cfg.littleguy.notes = false;
+        cfg.littleguy.max_request_bytes = 123_456;
         let m = build(&cfg, &pack, &tokens, &|_| Seq(0), None).unwrap();
         let marta = EntityId::from("marta");
         assert!(m.littleguy[0].ensure(&marta).await.is_err(), "no binary");
@@ -380,8 +382,10 @@ mod tests {
         assert_eq!(v["heartbeat"]["research"].as_bool(), Some(false));
         assert_eq!(v["heartbeat"]["every_minutes"].as_integer(), Some(15));
         assert!(!v.contains_key("compaction"));
-        assert_eq!(v["tools"]["files"].as_bool(), Some(true), "notes stay on");
+        assert_eq!(v["tools"]["files"].as_bool(), Some(false), "notes off");
+        assert_eq!(v["max_request_bytes"].as_integer(), Some(123_456));
         let system = v["system"].as_str().unwrap();
+        assert!(!system.contains("write_note"), "no note tool: {system}");
         assert!(system.contains(&pack.body_rules()), "{system}");
         assert!(system.contains("every 5 minutes"), "{system}");
         assert!(!system.contains("every minute"), "{system}");
