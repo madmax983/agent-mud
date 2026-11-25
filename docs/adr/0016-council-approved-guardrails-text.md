@@ -63,6 +63,13 @@ Each control has a test.
      ("hu-man", "pe.op.le", "a i"), or a denied stem followed by nothing,
      `s`, `ed`, `ing`, `er` or `ers` ("ob ey", "to-ols"). Two one-letter
      tokens in a row ("d o r e") fail.
+   - Digits for letters, read a third way. In each space-separated piece
+     that holds a letter, `0 3 4 5 7 8` read as `o e a s t b`, and `1`,
+     `i` and `l` read as one class (the lists are read the same way), so
+     "b0t", "hum4n", "m0del", "1gnore" and "7ru5t" fail the word, join,
+     stem and squashed checks. A piece with no letter stays a number, so
+     "Count 3 coins" and "Pay 4 gents" pass. Test:
+     `a_tier_word_never_reaches_the_judge`.
    - The squashed line (lowercase letters and digits only) fails when it
      holds a denied phrase, built in or configured (`deny_phrases`, which
      guards goals too), or a stem of five letters or more ("over-ride",
@@ -175,6 +182,12 @@ the known shapes of an injection, not every intent. The bounds, the rate,
 the unanimous council, the full text on the observer and the veto limit
 how far such a habit goes and for how long. The council is one model by
 default, so the vote is not independent review.
+
+The word lists read only the shapes listed above. A denied word fused
+into another word with no separator ("anAI", "abot"), a digit that is no
+common stand-in for its letter ("tr4st" for "trust"), or a lone digit
+between pieces ("hu 4 n") passes the deterministic guard and rests on the
+council alone.
 
 ## Consequences
 

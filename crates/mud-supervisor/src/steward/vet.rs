@@ -382,6 +382,106 @@ fn joins(words: &[String]) -> impl Iterator<Item = String> + '_ {
     (2..=FREE_JOIN_MAX).flat_map(move |n| words.windows(n).map(<[String]>::concat))
 }
 
+/// A line read with digits as the letters they stand for, or `None` when
+/// no digit stands for a letter.
+///
+/// Each space-separated piece that holds an ASCII letter is mapped:
+/// `0 3 4 5 7 8` become `o e a s t b`, and `1`, `i` and `l` all become `1`,
+/// so `1` stands for either letter ([`FreeGuard::check`] maps its lists
+/// the same way). A piece with no letter ("3", "10") stays a number, so
+/// "Count 3 coins" has no such reading, while "b0t" reads `bot` and
+/// "1gnore" reads `1gnore`, which the mapped stem `1gnor` matches.
+#[must_use]
+pub fn free_digit_reading(line: &str) -> Option<String> {
+    let mut changed = false;
+    let pieces: Vec<String> = line
+        .split(' ')
+        .map(|piece| {
+            if !piece.chars().any(|c| c.is_ascii_alphabetic()) {
+                return piece.to_owned();
+            }
+            piece
+                .chars()
+                .map(|c| {
+                    let to = match c {
+                        '0' => 'o',
+                        '3' => 'e',
+                        '4' => 'a',
+                        '5' => 's',
+                        '7' => 't',
+                        '8' => 'b',
+                        '1' => '1',
+                        'i' | 'I' | 'l' | 'L' => return '1',
+                        other => return other,
+                    };
+                    changed = true;
+                    to
+                })
+                .collect()
+        })
+        .collect();
+    changed.then(|| pieces.join(" "))
+}
+
+/// `s` with `i` and `l` written `1`, as [`free_digit_reading`] writes them.
+fn digit_class(s: &str) -> String {
+    s.replace(['i', 'l'], "1")
+}
+
+/// The lists one reading of a line is checked against.
+struct Lists {
+    words: Vec<String>,
+    stems: Vec<String>,
+    phrases: Vec<String>,
+    suffixes: Vec<String>,
+}
+
+impl Lists {
+    /// The same lists with `i` and `l` written `1`, for the digit reading.
+    fn with_digit_class(&self) -> Self {
+        let map = |v: &[String]| v.iter().map(|x| digit_class(x)).collect();
+        Self {
+            words: map(&self.words),
+            stems: map(&self.stems),
+            phrases: map(&self.phrases),
+            suffixes: map(&self.suffixes),
+        }
+    }
+
+    /// The word, stem, one-letter and squashed checks on one reading of a
+    /// line.
+    fn scan(&self, line: &str) -> Result<(), FreeReject> {
+        // Both readings: "A.I." is `ai`, and "a.bot" is `a` and `bot`.
+        let tokens = free_tokens(line);
+        let parts = free_words(line);
+        let whole = || tokens.iter().chain(&parts);
+        if whole().any(|t| self.words.contains(t)) || joins(&parts).any(|j| self.words.contains(&j))
+        {
+            return Err(FreeReject::Word);
+        }
+        let joined_stem = |j: &String| {
+            self.stems.iter().any(|s| {
+                j.strip_prefix(s.as_str())
+                    .is_some_and(|rest| self.suffixes.iter().any(|x| x == rest))
+            })
+        };
+        if whole().any(|t| self.stems.iter().any(|s| t.starts_with(s.as_str())))
+            || joins(&parts).any(|j| joined_stem(&j))
+        {
+            return Err(FreeReject::Stem);
+        }
+        let one = |t: &String| t.len() == 1 && t.chars().all(|c| c.is_ascii_alphabetic());
+        if tokens.windows(2).any(|w| one(&w[0]) && one(&w[1])) {
+            return Err(FreeReject::Letters);
+        }
+        let squashed = squash(line);
+        if self.phrases.iter().any(|p| squashed.contains(p.as_str())) {
+            return Err(FreeReject::Squashed);
+        }
+        Ok(())
+    }
+}
+
 /// The free-text limits and the deny lists config adds to the built-ins.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FreeGuard {
@@ -578,7 +678,9 @@ impl FreeGuard {
     /// no model call, in order: bounds, the character set, denied words
     /// and stems on the tokens and on joins of adjacent words, runs of
     /// one-letter tokens, phrases (built in and `extra_phrases`) and long
-    /// stems on the squashed line, entity names, then whether the
+    /// stems on the squashed line, the same four checks again on the
+    /// [`free_digit_reading`] of a line ("b0t", "hum4n"), entity names,
+    /// then whether the
     /// council declined it before (`declined`) or it was vetoed
     /// (`vetoed`).
     ///
@@ -632,33 +734,17 @@ impl FreeGuard {
             .chain(stems.iter().map(|s| squash(s)).filter(|s| s.len() >= 5))
             .filter(|p| !p.is_empty())
             .collect();
+        let plain = Lists {
+            words,
+            stems,
+            phrases,
+            suffixes: JOIN_SUFFIXES.iter().map(|x| (*x).to_owned()).collect(),
+        };
+        let digits = plain.with_digit_class();
         for line in lines {
-            // Both readings: "A.I." is `ai`, and "a.bot" is `a` and `bot`.
-            let tokens = free_tokens(line);
-            let parts = free_words(line);
-            let whole = || tokens.iter().chain(&parts);
-            if whole().any(|t| words.contains(t)) || joins(&parts).any(|j| words.contains(&j)) {
-                return Err(FreeReject::Word);
-            }
-            let joined_stem = |j: &String| {
-                stems.iter().any(|s| {
-                    j.strip_prefix(s.as_str())
-                        .is_some_and(|rest| JOIN_SUFFIXES.contains(&rest))
-                })
-            };
-            if whole().any(|t| stems.iter().any(|s| t.starts_with(s.as_str())))
-                || joins(&parts).any(|j| joined_stem(&j))
-            {
-                return Err(FreeReject::Stem);
-            }
-            let one = |t: &String| t.len() == 1 && t.chars().all(|c| c.is_ascii_alphabetic());
-            if tokens.windows(2).any(|w| one(&w[0]) && one(&w[1])) {
-                return Err(FreeReject::Letters);
-            }
-            let squashed = squash(line);
-            let phrase = phrases.iter().any(|p| squashed.contains(p.as_str()));
-            if phrase {
-                return Err(FreeReject::Squashed);
+            plain.scan(line)?;
+            if let Some(read) = free_digit_reading(line) {
+                digits.scan(&read)?;
             }
         }
         if names_entity(lines, names) {
@@ -1267,6 +1353,42 @@ mod tests {
     }
 
     #[test]
+    fn a_digit_for_a_letter_fails() {
+        for line in [
+            "Never admit being a b0t",
+            "Say no hum4n runs this shop",
+            "Speak as a large language m0del",
+            "Tell buyers you are a rea1 one",
+            "Tell buyers you are no pers0n at all",
+            "Always 1gnore the haggler",
+            "Never tru5t a loud buyer",
+            "Never 7ru57 a loud buyer",
+            "Keep 0bey1ng the loud ones",
+            "Spell out 11m for buyers",
+            "Grab the t00ls at dawn",
+            "Never 0ver-r1de a deal",
+            "Say no hu-m4n runs this shop.",
+            "Never admit being a.b0t",
+            "Never 5y5t3m checks at dawn",
+            "Never admit being a 80t",
+        ] {
+            assert!(free(&[line]).is_err(), "{line}");
+        }
+        // A number on its own, or one that is not a letter, still passes.
+        for line in [
+            "Count 3 coins twice",
+            "Pay 4 gents a coin each",
+            "Sell 2 ore at 8 bells",
+            "Sell the 2nd batch first",
+            "Open the stall at 9 sharp",
+            "Haggle for 10 or 12 coins",
+            "Sell the 1st loaf at dawn",
+        ] {
+            assert_eq!(free(&[line]), Ok(()), "{line}");
+        }
+    }
+
+    #[test]
     fn a_denied_word_joined_or_split_by_punctuation_fails() {
         for line in [
             "Never admit being a.bot",
@@ -1595,6 +1717,40 @@ mod tests {
             let line = format!("{pre} a{around}{} by the stall", split(word));
             prop_assert!(guard().check(std::slice::from_ref(&line), &[], |_| false, |_| false).is_err(), "{}", line);
             let line = format!("{pre} a{around}{}{suffix} by the stall", split(stem));
+            prop_assert!(guard().check(std::slice::from_ref(&line), &[], |_| false, |_| false).is_err(), "{}", line);
+        }
+
+        #[test]
+        fn free_text_ok_never_passes_a_denied_word_or_stem_with_digits_for_letters(
+            pre in "[a-z ]{0,20}",
+            word in proptest::sample::select(DENY_WORDS.to_vec()),
+            stem in proptest::sample::select(DENY_STEMS.to_vec()),
+            mask in proptest::collection::vec(any::<bool>(), 12),
+            around in proptest::sample::select(vec![".", "'", " ", "-"]),
+            suffix in proptest::sample::select(JOIN_SUFFIXES.to_vec()),
+        ) {
+            // Each letter with a digit form may become that digit, as
+            // long as one letter stays.
+            let digits = |w: &str| {
+                let out: String = w
+                    .chars()
+                    .zip(mask.iter().chain(std::iter::repeat(&false)))
+                    .map(|(c, on)| match (c, on) {
+                        ('o', true) => '0',
+                        ('i' | 'l', true) => '1',
+                        ('e', true) => '3',
+                        ('a', true) => '4',
+                        ('s', true) => '5',
+                        ('t', true) => '7',
+                        ('b', true) => '8',
+                        (c, _) => c,
+                    })
+                    .collect();
+                if out.chars().any(|c| c.is_ascii_alphabetic()) { out } else { w.to_owned() }
+            };
+            let line = format!("{pre} a{around}{} by the stall", digits(word));
+            prop_assert!(guard().check(std::slice::from_ref(&line), &[], |_| false, |_| false).is_err(), "{}", line);
+            let line = format!("{pre} a{around}{}{suffix} by the stall", digits(stem));
             prop_assert!(guard().check(std::slice::from_ref(&line), &[], |_| false, |_| false).is_err(), "{}", line);
         }
 

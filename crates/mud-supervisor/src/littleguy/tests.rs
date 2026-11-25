@@ -321,7 +321,7 @@ async fn a_quiet_config_drops_the_heartbeat_and_memory_and_keeps_the_port() {
     mind.daemons.lock().await.insert(
         torin.clone(),
         Daemon {
-            child: stand_in(&sock),
+            child: stand_in(&sock).await,
             socket: sock.clone(),
             ui_port: 4999,
             approvals: ApprovalCheck::Off,
@@ -1017,14 +1017,52 @@ async fn no_daemon_starts_after_shutdown() {
 }
 
 /// A stand-in for a daemon: a shell whose command line names `arg`.
-fn stand_in(arg: &Path) -> tokio::process::Child {
-    tokio::process::Command::new("sh")
+///
+/// It returns once `/proc` shows that command line. Right after a spawn
+/// the kernel may not have set the new program's arguments yet, and
+/// `reap_orphan` then reads an empty command line and leaves the stand-in
+/// alone.
+async fn stand_in(arg: &Path) -> tokio::process::Child {
+    let child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg("sleep 30; true")
         .arg(arg)
         .kill_on_drop(true)
         .spawn()
-        .unwrap()
+        .unwrap();
+    let pid = child.id().unwrap();
+    if Path::new("/proc").exists() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !names(pid, arg) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the stand-in shows its command line");
+    }
+    child
+}
+
+/// Whether the command line of process `pid` names `arg`.
+fn names(pid: u32, arg: &Path) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmd| {
+        cmd.split(|b| *b == 0)
+            .any(|a| a == arg.as_os_str().as_encoded_bytes())
+    })
+}
+
+#[tokio::test]
+async fn a_stand_in_names_its_socket_once_it_is_returned() {
+    if !Path::new("/proc").exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("lg.sock");
+    for _ in 0..20 {
+        let mut child = stand_in(&sock).await;
+        assert!(names(child.id().unwrap(), &sock), "the stand-in has exec'd");
+        child.kill().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1034,10 +1072,10 @@ async fn an_orphan_daemon_from_an_earlier_run_is_stopped() {
     }
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("lg.sock");
-    let mut orphan = stand_in(&sock);
+    let mut orphan = stand_in(&sock).await;
     std::fs::write(dir.path().join(PID_FILE), orphan.id().unwrap().to_string()).unwrap();
     reap_orphan(dir.path(), &sock).await;
-    let status = tokio::time::timeout(Duration::from_secs(5), orphan.wait())
+    let status = tokio::time::timeout(Duration::from_secs(15), orphan.wait())
         .await
         .expect("the orphan was stopped")
         .unwrap();
@@ -1051,7 +1089,7 @@ async fn a_recycled_pid_that_is_not_our_daemon_is_left_alone() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut stranger = stand_in(&dir.path().join("somebody-else.sock"));
+    let mut stranger = stand_in(&dir.path().join("somebody-else.sock")).await;
     std::fs::write(
         dir.path().join(PID_FILE),
         stranger.id().unwrap().to_string(),
@@ -1097,7 +1135,7 @@ async fn a_timed_out_wake_settles_only_once_its_op_is_read() {
     mind.daemons.lock().await.insert(
         torin.clone(),
         Daemon {
-            child: stand_in(&sock),
+            child: stand_in(&sock).await,
             socket: sock.clone(),
             ui_port: 4123,
             approvals: ApprovalCheck::Off,
@@ -1206,7 +1244,7 @@ async fn no_second_chat_starts_while_an_op_is_live() {
     mind.daemons.lock().await.insert(
         torin.clone(),
         Daemon {
-            child: stand_in(&sock),
+            child: stand_in(&sock).await,
             socket: sock.clone(),
             ui_port: 4123,
             approvals: ApprovalCheck::Off,
