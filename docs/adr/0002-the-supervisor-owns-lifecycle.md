@@ -80,16 +80,24 @@ sequenceDiagram
   `Game::stage`, `Game::persist` and `Game::retain` take only the cell;
   `Game::act` and `Game::close_turn` take the world first, so the
   supervisor never calls them while it holds `router`, `state` or the wake
-  book.
+  book. The wake book's own writer lock, which serializes a book or a
+  cancel around its durable write, comes before the world: it is taken
+  only from a tool call, never inside a world closure, and the book's
+  bookings lock is released before `Game::act` runs.
 - **Open order.** `Game::open` migrates `world.db`, mints its epoch once,
   bumps its boot number (one `synchronous = FULL` transaction), reloads the
   whole in-memory event log, and drops side rows of entities the pack no
   longer has. A `world.db` newer than the server is refused and the server
-  does not start. From phase 2 the supervisor takes the side rows with
-  `Game::take_restored()` and opens over them (`Supervisor::open`); wake
-  ids become `wake-{epoch:016x}-{boot}-{entity}-{n}`, so a wake is never
-  redelivered under an id littleguy has seen. Until then wake ids are as
-  above.
+  does not start. Then the supervisor takes the side rows with
+  `Game::take_restored()` and opens over them (`Supervisor::open`, phase
+  2): bookings, the macro schedule and counters, rule counters and plans
+  to resume. Wake ids are `wake-{epoch:016x}-{boot}-{entity}-{n}`, so a
+  wake is never redelivered under an id littleguy has seen.
+- **Settle before close.** A wake's turn closes, and its entity is free
+  for the next wake, only when the mind has really finished
+  (`Mind::settled`): a littleguy op is read and charged or its grace ran
+  out, a harvest job is done. `WakeFinished` still goes to the observer at
+  the timeout.
 
 ## Alternatives
 
