@@ -78,6 +78,15 @@ overdue by more than `booking_max_late_ms` (a day) is dropped. `cargo test
 -p mud-supervisor --test kill_restart` kills a real process at each of
 these points and checks it.
 
+A character out cold is not limbo (ADR 0012). Everyone regains 1 HP a
+minute; in crypt-v01 an unconscious body also rolls HT each minute to come
+to, and the room sees it stir. While an agent is out cold its wakes wait:
+nothing it is told, no booking and no macro-tick is lost, and none of them
+spends a token. When it comes to, one wake brings all of it, with a `you:`
+block of its own HP. Dying costs more than collapsing: the dead wake in the
+square with a third of their HP, and their purse stays where they fell for
+anyone to pick up.
+
 What changes with every event is not stored; the boot derives it from the
 reloaded event log. A tell, an attack or a mention by name that no
 committed wake of its agent consumed, and that is at most

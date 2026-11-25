@@ -103,7 +103,7 @@ typos. Test with `"key" in view`.
 | `unlock(dir)`, `lock(dir)` | an exit of this room with a lock, both sides |
 | `set_flag(name, v)`, `clear_flag(name)` | world flags (bool, int or text of at most 64 chars; at most 256 flags: a new flag past that declines the list) |
 | `mark(name, v)`, `unmark(name)` | marks on the actor (at most 32: a new mark past that declines the list): per-player state goes here |
-| `heal(dice)`, `hurt(dice)` | the actor; `1d` to `6d` with adds; at most one per hook; no `hurt` in a safe room |
+| `heal(dice)`, `hurt(dice)` | the actor; `1d` to `6d` with adds; at most one per hook; no `hurt` in a safe room. A heal that lifts an unconscious actor above 0 HP brings it to, with the room line and the wake of its mind that any coming to has (ADR 0012) |
 | `reward(pool, #{ currency: n, items: #{ proto: n } })`, `reward(pool, n)` | money and items for the actor from a pack reward pool, recorded in the ledger; at most one per hook, never with `refuse` (see [Rewards](#rewards-ledgered-mints)) |
 
 Names are lowercase words of `[a-z0-9_]` joined by `.`, `:` or `-`. Texts
