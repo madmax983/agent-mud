@@ -191,6 +191,10 @@ impl World {
     #[must_use]
     pub fn help_text(&self, actor: &EntityId) -> String {
         let mut help = crate::parser::HELP.to_owned();
+        help.push_str("\nrecovery: ");
+        help.push_str(&self.recovery_rule());
+        help.push(' ');
+        help.push_str(&self.death_rule());
         let here = self.verbs_here(actor);
         if let Some(h) = &self.hooks
             && !here.is_empty()
@@ -916,21 +920,31 @@ impl World {
         });
     }
 
-    fn heal_actor(&mut self, ctx: &mut Ctx, actor: &EntityId, dice: mud_rules::DamageDice) {
+    /// Heals the actor, up to its maximum HP. A heal that lifts one out
+    /// cold above 0 HP brings it to ([`World::come_to`]). A hook runs only
+    /// for an actor that can act, so through a hook this never meets one
+    /// out cold; the call keeps every heal on the one come-to path.
+    pub(super) fn heal_actor(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        dice: mud_rules::DamageDice,
+    ) {
         let roll = dice.roll(&mut self.dice, DamageType::Crushing).max(0);
         let Some(e) = self.state.entities.get_mut(actor) else {
             return;
         };
         let amount = roll.min((e.pools.hp_max - e.pools.hp).max(0));
         e.pools.hp += amount;
-        if e.unconscious && e.pools.hp > 0 {
-            e.unconscious = false;
-        }
+        let hp = e.pools.hp;
         ctx.changes.push(StateChange::Hp {
             entity: actor.clone(),
             delta: amount,
-            hp: e.pools.hp,
+            hp,
         });
+        if hp > 0 {
+            self.come_to(ctx, actor);
+        }
     }
 
     /// Hurts the actor. Returns whether it died of it.

@@ -676,6 +676,93 @@ fn heal_never_exceeds_hp_max() {
     }));
 }
 
+#[test]
+fn one_hook_cannot_hurt_and_then_heal() {
+    let h = Arc::new(FakeHooks::new(
+        vec![verb("hurtme")],
+        effects(vec![
+            ScriptEffect::Hurt(DamageDice::new(1, 0)),
+            ScriptEffect::Heal(DamageDice::new(1, 0)),
+        ]),
+    ));
+    let mut w = world_with(&h);
+    let ada = w.login("ada", 1).unwrap();
+    w.state.entities.get_mut(&ada).unwrap().room = RoomId::from("cellar_landing");
+    w.drain_audit();
+    let r = run(&mut w, &ada, "hurtme");
+    assert_eq!(r.error_code, Some(ErrorCode::ScriptFailed));
+    assert!(matches!(
+        &faults(&mut w)[0],
+        Audit::ScriptFault { message, .. } if message == "at most one heal() or hurt() per hook"
+    ));
+}
+
+#[test]
+fn a_hook_never_runs_for_an_actor_out_cold() {
+    // So a script heal never meets an unconscious actor through a hook:
+    // the command is refused before the hook is called.
+    let h = Arc::new(FakeHooks::new(
+        vec![verb("pry")],
+        effects(vec![ScriptEffect::Heal(DamageDice::new(6, 0))]),
+    ));
+    let mut w = world_with(&h);
+    let ada = in_alley(&mut w);
+    {
+        let me = w.state.entities.get_mut(&ada).unwrap();
+        me.pools.hp = -2;
+        me.unconscious = true;
+    }
+    let r = run(&mut w, &ada, "pry");
+    assert_eq!(r.error_code, Some(ErrorCode::Incapacitated), "{r:?}");
+    assert_eq!(h.calls(), 0);
+}
+
+#[test]
+fn a_script_heal_that_lifts_a_downed_actor_past_0_hp_brings_it_to() {
+    // The heal effect itself, on an actor out cold: it brings her to as
+    // regen does, with the change, the room line and no actor on it.
+    let h = Arc::new(FakeHooks::new(Vec::new(), effects(Vec::new())));
+    let mut w = world_with(&h);
+    let ada = w.login("ada", 1).unwrap();
+    {
+        let me = w.state.entities.get_mut(&ada).unwrap();
+        me.room = RoomId::from("cellar_landing");
+        me.pools.hp = -2;
+        me.unconscious = true;
+    }
+    w.fix_dice([6]);
+    let mut ctx = Ctx::default();
+    w.heal_actor(&mut ctx, &ada, DamageDice::new(1, 0));
+    let me = w.entity(&ada).unwrap();
+    assert_eq!(me.pools.hp, 4);
+    assert!(!me.unconscious, "brought to, not left out cold at 4 HP");
+    assert!(ctx.changes.contains(&StateChange::Status {
+        entity: ada.clone(),
+        status: "unconscious".into(),
+        value: false,
+    }));
+    let came_to: Vec<_> = w
+        .logged()
+        .filter(|e| e.tags.iter().any(|t| t == CAME_TO_TAG))
+        .collect();
+    assert_eq!(came_to.len(), 1, "{came_to:?}");
+    assert!(came_to[0].targets(&ada));
+    assert!(came_to[0].actor.is_none(), "no actor: her mind is woken");
+    // A heal that leaves her at 0 HP or below leaves her out cold.
+    let mut w = world_with(&h);
+    let ada = w.login("ada", 1).unwrap();
+    {
+        let me = w.state.entities.get_mut(&ada).unwrap();
+        me.pools.hp = -6;
+        me.unconscious = true;
+    }
+    w.fix_dice([6]);
+    let mut ctx = Ctx::default();
+    w.heal_actor(&mut ctx, &ada, DamageDice::new(1, 0));
+    assert!(w.entity(&ada).unwrap().unconscious);
+    assert!(!w.logged().any(|e| e.tags.iter().any(|t| t == CAME_TO_TAG)));
+}
+
 // ------------------------------------------------------------ flags and marks
 
 #[test]
@@ -1140,7 +1227,10 @@ fn look_and_help_list_the_verbs_usable_here() {
         plain.look_view(&id("guard_01"))["verbs"],
         serde_json::json!([])
     );
-    assert_eq!(plain.help_text(&id("guard_01")), crate::parser::HELP);
+    let plain_help = plain.help_text(&id("guard_01"));
+    assert!(plain_help.starts_with(crate::parser::HELP));
+    assert!(!plain_help.contains("here:"), "{plain_help}");
+    assert!(plain_help.contains("\nrecovery: "), "{plain_help}");
 }
 
 // ------------------------------------------------------------ compatibility

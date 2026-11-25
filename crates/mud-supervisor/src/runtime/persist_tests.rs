@@ -40,7 +40,7 @@ impl Disk {
         Self::with(WorldPack::crypt_v01().unwrap())
     }
 
-    fn with(pack: WorldPack) -> Self {
+    pub(super) fn with(pack: WorldPack) -> Self {
         Self {
             dir: tempfile::tempdir().unwrap(),
             pack: Arc::new(pack),

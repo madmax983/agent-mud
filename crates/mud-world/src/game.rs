@@ -827,8 +827,9 @@ impl Game {
         self.write(|w, now| w.take_offline(id, now))
     }
 
-    /// Advances world time.
-    pub fn tick(&self) -> Vec<Seq> {
+    /// Advances world time: respawns, and a recovery step when one is due.
+    /// The outcome names who came to.
+    pub fn tick(&self) -> crate::TickOutcome {
         self.write(World::tick)
     }
 

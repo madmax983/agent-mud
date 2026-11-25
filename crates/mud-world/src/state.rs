@@ -114,6 +114,13 @@ impl Entity {
         self.present() && !self.unconscious
     }
 
+    /// Whether it is out cold or dead: online or not, nothing it tries
+    /// lands, and the supervisor holds its mind's wakes.
+    #[must_use]
+    pub const fn incapacitated(&self) -> bool {
+        self.unconscious || self.dead_until_ms.is_some()
+    }
+
     /// The reference events use.
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef {
@@ -171,6 +178,19 @@ pub struct Item {
     /// keeper never resells it for less.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid: Option<i64>,
+    /// The currency inside this one item, in place of its prototype's
+    /// `currency`: a purse the dead dropped holds what they carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<i64>,
+}
+
+impl Item {
+    /// The currency sealed in it: its own amount, else its prototype's.
+    #[must_use]
+    pub fn sealed_currency(&self, pack: &WorldPack) -> Option<i64> {
+        self.currency
+            .or_else(|| pack.items.get(&self.proto).and_then(|d| d.currency))
+    }
 }
 
 /// One notice on a board.
@@ -514,6 +534,7 @@ impl WorldState {
                 locked: def.is_some_and(|d| d.lock.is_some()),
                 stock: false,
                 paid: None,
+                currency: None,
             },
         );
         id
@@ -719,7 +740,7 @@ impl WorldState {
         let sealed: i64 = self
             .items
             .values()
-            .filter_map(|i| pack.items.get(&i.proto).and_then(|d| d.currency))
+            .filter_map(|i| i.sealed_currency(pack))
             .sum();
         held + sealed
     }

@@ -91,6 +91,8 @@ pub struct Persona {
     pub persona: String,
     /// The private goal.
     pub goal: String,
+    /// The pack's rule for a body ([`mud_world::WorldPack::body_rules`]).
+    pub body: String,
     /// Its MCP bearer token.
     pub token: String,
 }
@@ -103,7 +105,7 @@ pub fn render_config(cfg: &LittleguyConfig, p: &Persona, ui_port: u16) -> String
     root.insert("owner".into(), "mud".into());
     root.insert(
         "system".into(),
-        system_prompt(&p.name, &p.persona, &p.goal).into(),
+        system_prompt(&p.name, &p.persona, &p.goal, &p.body).into(),
     );
     root.insert("window".into(), 30.into());
     if cfg.max_steps > 0 {

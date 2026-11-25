@@ -89,6 +89,13 @@ resets the count; each NPC event with no player present increments it; at
 `MAX_AGENT_ONLY_TURNS` (2) the router drops cross-agent wakes in that room
 until reset.
 
+**Out cold, no wakes (ADR 0012).** While an agent is unconscious or dead
+the router holds its wake: events, due bookings and macro-ticks wait with
+it (the proved `wake_admit` kernel: nothing is delivered while it cannot
+act, nothing held is lost). When it comes to, one Immediate "came to" wake
+carries all of it. Each wake message has a `you:` block (HP, FP, wound
+state, unconscious) cut from the agent's own sheet.
+
 **Budget breakers.** Soft cap (80% of the daily budget): double cooldowns,
 no ambient wakes. Hard cap (100%): deterministic fallback until UTC
 midnight, with canned flavor ("Torin grunts and keeps hammering."). The
@@ -113,7 +120,13 @@ One mechanic, `3d6 <= effective skill + modifiers`, for combat, stealth,
 lockpicking, haggling and social checks; all randomness through
 `DiceRng`. ST/DX/IQ/HT (default 10); HP from ST and FP from HT; wound
 states (below 1/3 HP staggered with Dodge halved; at 0 reeling with HT
-rolls to stay conscious; at −HP dying). Attack → Dodge/Parry/Block
+rolls to stay conscious; at −HP dying). Recovery (ADR 0012, pack
+`[recovery]`): 1 HP per step (a minute) for everyone in the world; an
+unconscious entity comes to above 0 HP, or on a successful come-to roll
+(crypt-v01: HT) each step while above −HP, and the room sees it stir.
+Death (pack `[death]`): the dead wake at the respawn room with a share of
+their HP (crypt-v01: a third) and drop their purse where they fell; mobs
+respawn on their own timer. Attack → Dodge/Parry/Block
 (bypassed on a critical) → `(raw − DR).max(0) × multiplier` (crushing and
 burn ×1, cutting ×1.5, impaling ×2). Traits with self-control numbers
 (greedy 12, cowardly 12, impatient 12) roll when a trigger reaches the

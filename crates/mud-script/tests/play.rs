@@ -111,6 +111,8 @@ proptest! {
         let next_item = w.state().next_item;
         let mut items = w.state().items.len();
         let mut minted_items = 0;
+        let mut purses_made = 0;
+        let mut seen_purses = std::collections::BTreeSet::new();
         let mut now = 1_700_000_000_000;
         let mut last = w.last_seq();
         for (line, who) in steps {
@@ -136,21 +138,42 @@ proptest! {
                 .iter()
                 .flat_map(|m| m.items.iter().map(|i| i.id))
                 .collect();
-            prop_assert_eq!(
-                w.state().next_item - next_item,
-                u64::try_from(ledger.len()).unwrap(),
-                "scripts make items only through the ledger"
-            );
-            for id in w.state().items.keys().filter(|i| i.0 >= next_item) {
-                prop_assert!(ledger.contains(id), "{} is not in the ledger", id);
+            // Besides the ledger, only a death makes an item: the purse
+            // the dead drop (`[death] drop_purse`), which holds coins that
+            // moved, never new ones (the money check above).
+            let purse = w.pack().death.purse_item.clone();
+            let purses: Vec<ItemId> = (next_item..w.state().next_item)
+                .map(ItemId)
+                .filter(|i| !ledger.contains(i))
+                .collect();
+            // Each one is checked when it first shows: one command makes at
+            // most one, and only a later command can use it up.
+            let fresh: Vec<ItemId> = purses
+                .iter()
+                .filter(|i| !seen_purses.contains(*i))
+                .copied()
+                .collect();
+            for id in &fresh {
+                let made = w.state().items.get(id).map(|i| (i.proto.clone(), i.currency));
+                let is_purse = made
+                    .as_ref()
+                    .is_some_and(|(p, c)| Some(p) == purse.as_ref() && c.is_some_and(|n| n > 0));
+                prop_assert!(
+                    is_purse,
+                    "{} is not in the ledger and not a dropped purse: {:?}",
+                    id,
+                    made
+                );
+                seen_purses.insert(*id);
             }
             let now_items = w.state().items.len();
             prop_assert!(
-                now_items <= items + (ledger.len() - minted_items),
-                "items are only ever used up, or minted"
+                now_items <= items + (ledger.len() - minted_items) + (purses.len() - purses_made),
+                "items are only ever used up, minted, or dropped as a purse"
             );
             items = now_items;
             minted_items = ledger.len();
+            purses_made = purses.len();
             prop_assert!(w.state().flags.len() <= 256);
         }
     }

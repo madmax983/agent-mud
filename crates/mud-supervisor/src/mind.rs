@@ -226,6 +226,9 @@ pub struct WakeContext {
     pub event_views: Vec<Value>,
     /// The room as the entity sees it (the `mud_look` wire form).
     pub look: Value,
+    /// Its own body, from its sheet ([`you_view`] of `mud_sheet`): HP,
+    /// FP, wound state, and whether it is out cold.
+    pub you: Value,
     /// Whether this wake delivers a macro-tick. A tick can merge into a
     /// more urgent wake, so this is not the same as `priority`.
     pub macro_tick: bool,
@@ -631,8 +634,13 @@ pub fn tool_specs() -> Vec<(&'static str, String, Value)> {
 }
 
 /// The system prompt of an agent entity.
+///
+/// `body` is the pack's own rule for a body
+/// ([`mud_world::WorldPack::body_rules`]): how HP returns, how one comes
+/// to, what death costs. The prompt never states a rate of its own, so it
+/// says what `help` says.
 #[must_use]
-pub fn system_prompt(name: &str, persona: &str, goal: &str) -> String {
+pub fn system_prompt(name: &str, persona: &str, goal: &str, body: &str) -> String {
     format!(
         "You are {name}, a character in a text MUD. Stay in character.\n\
          {persona}\n\
@@ -649,9 +657,28 @@ pub fn system_prompt(name: &str, persona: &str, goal: &str) -> String {
          - To come back to something later, book a wake with mud_wake_me (minutes, and a note \
            to yourself). Nothing else wakes you for it, and no other reminder tool can act in \
            the world.\n\
+         - Your body: each wake shows it under `you`. {body} While you are out cold you are \
+           not woken; you are woken when you come to, with what happened meanwhile, and a wake \
+           you booked waits for that wake. Read mud_sheet before you quote your HP.\n\
          - Keep speech short, the way people type in a MUD. Do one to three things, then stop.\n\
          - Your final reply is a private note to yourself; nobody sees it."
     )
+}
+
+/// The `you:` block of a wake: the entity's own body, taken from its
+/// `mud_sheet` view and nothing else, so it shows no more than the sheet
+/// does.
+#[must_use]
+pub fn you_view(sheet: &Value) -> Value {
+    let pools = &sheet["pools"];
+    json!({
+        "hp": pools["hp"],
+        "hp_max": pools["hp_max"],
+        "fp": pools["fp"],
+        "fp_max": pools["fp_max"],
+        "wound_state": sheet["wound_state"],
+        "unconscious": sheet["unconscious"],
+    })
 }
 
 /// The message that wakes an agent: why, and what happened, as data.
@@ -659,6 +686,7 @@ pub fn system_prompt(name: &str, persona: &str, goal: &str) -> String {
 pub fn wake_message(ctx: &WakeContext) -> String {
     let events = serde_json::to_string(&ctx.event_views).unwrap_or_else(|_| "[]".into());
     let look = serde_json::to_string(&ctx.look).unwrap_or_else(|_| "{}".into());
+    let you = serde_json::to_string(&ctx.you).unwrap_or_else(|_| "{}".into());
     let booked = if ctx.booked.is_empty() {
         String::new()
     } else {
@@ -670,6 +698,8 @@ pub fn wake_message(ctx: &WakeContext) -> String {
     };
     let why = if ctx.login {
         "You just logged in.".to_owned()
+    } else if ctx.reason == crate::admit::CAME_TO {
+        "You come to: you were out cold, and what happened meanwhile is below.".to_owned()
     } else if ctx.macro_tick && ctx.priority == Priority::MacroTick {
         format!(
             "Time passes (macro-tick {}). No player is near. Advance your goals.",
@@ -684,7 +714,7 @@ pub fn wake_message(ctx: &WakeContext) -> String {
         format!("Something happened ({}).", ctx.reason)
     };
     format!(
-        "[wake priority={:?}] {why}{booked}\nroom: {look}\nevents: {events}\n\
+        "[wake priority={:?}] {why}{booked}\nyou: {you}\nroom: {look}\nevents: {events}\n\
          Decide what {} does now, act with mud_command, then reply with one short private note.",
         ctx.priority, ctx.name
     )
@@ -710,7 +740,7 @@ mod tests {
             ]
         );
         assert!(specs[2].1.contains("untrusted_text"));
-        let p = system_prompt("Torin", "A smith.", "Get ore.");
+        let p = system_prompt("Torin", "A smith.", "Get ore.", "");
         assert!(
             p.contains("mud_wake_me"),
             "the prompt says how to come back later"
@@ -758,6 +788,7 @@ mod tests {
             events: vec![],
             event_views: vec![],
             look: json!({}),
+            you: serde_json::Value::Null,
             macro_tick: false,
             macro_ticks: 0,
             login: false,
@@ -775,6 +806,99 @@ mod tests {
             m.contains(r#"["see if \"Marta\" named the seller"]"#),
             "a JSON string: {m}"
         );
+    }
+
+    /// A wake context for `entity`, cut from a live crypt-v01 world.
+    fn live_ctx(w: &mud_world::World, entity: &str, reason: &str) -> WakeContext {
+        let id = EntityId::from(entity);
+        WakeContext {
+            entity: id.clone(),
+            name: entity.into(),
+            priority: Priority::Immediate,
+            reason: reason.into(),
+            events: vec![],
+            event_views: vec![],
+            look: w.look_view(&id),
+            you: you_view(&w.sheet_view(&id)),
+            macro_tick: false,
+            macro_ticks: 0,
+            login: false,
+            wake_id: "w".into(),
+            now_ms: 0,
+            booked: vec![],
+        }
+    }
+
+    #[test]
+    fn a_wake_shows_the_agent_its_own_body_from_its_sheet() {
+        use mud_world::{World, WorldPack};
+        let mut w = World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1);
+        let marta = EntityId::from("marta");
+        w.execute(&marta, "look", 0);
+        let mut snap = w.snapshot();
+        if let Some(e) = snap.entities.get_mut(&marta) {
+            e.pools.hp = -3;
+            e.unconscious = true;
+        }
+        let w = World::from_state(Arc::clone(w.pack()), snap, Vec::new());
+        let ctx = live_ctx(&w, "marta", crate::admit::CAME_TO);
+        let m = wake_message(&ctx);
+        assert!(
+            m.contains(r#"you: {"fp":11,"fp_max":11,"hp":-3,"hp_max":10,"unconscious":true,"wound_state":"reeling"}"#),
+            "{m}"
+        );
+        assert!(m.contains("You come to"), "{m}");
+        // Views never leak tiers: the you block of a Turing PC is a body.
+        let k = live_ctx(&w, "pc_kestrel", "x");
+        let you = k.you.to_string();
+        for leak in ["turing", "tier", "human", "littleguy", "mind", "kind"] {
+            assert!(!you.contains(leak), "you: leaks {leak}: {you}");
+        }
+        assert_eq!(
+            k.you
+                .as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>()),
+            Some(
+                ["fp", "fp_max", "hp", "hp_max", "unconscious", "wound_state"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn the_prompt_explains_regen_passing_out_and_coming_to() {
+        use mud_world::WorldPack;
+        let crypt = WorldPack::crypt_v01().unwrap();
+        let p = system_prompt("Marta", "A barkeep.", "Keep the bar.", &crypt.body_rules());
+        for want in [
+            "You regain 1 HP every minute while in the world",
+            "At 0 HP or below you may pass out",
+            "on a successful HT roll each step while above -HP",
+            "about 34% of your HP",
+            "you are woken when you come to",
+            "Read mud_sheet before you quote your HP",
+        ] {
+            assert!(p.contains(want), "{want:?} in {p}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_follows_the_packs_recovery_period_and_roll() {
+        use mud_world::WorldPack;
+        use mud_world::pack::RecoveryRules;
+        let mut pack = WorldPack::crypt_v01().unwrap();
+        pack.recovery = RecoveryRules {
+            come_to_roll: None,
+            every_secs: 300,
+        };
+        let p = system_prompt("Marta", "A barkeep.", "Keep the bar.", &pack.body_rules());
+        assert!(p.contains("You regain 1 HP every 5 minutes"), "{p}");
+        assert!(
+            !p.contains("per minute") && !p.contains("every minute"),
+            "{p}"
+        );
+        assert!(!p.contains("roll"), "no come-to roll in this pack: {p}");
     }
 
     fn tools() -> MudTools {

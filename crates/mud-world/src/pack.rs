@@ -216,6 +216,141 @@ const fn default_darkness() -> i32 {
     -3
 }
 
+/// The longest recovery step the pack may set, in seconds (an hour).
+pub const MAX_RECOVERY_SECS: u64 = 3_600;
+
+/// `[recovery]` in `world.toml`: how a downed entity comes to.
+///
+/// Every `every_secs`, each entity in the world regains 1 HP, up to its
+/// maximum, and an unconscious one above 0 HP comes to. With
+/// `come_to_roll`, an unconscious one still at 0 HP or below, but above
+/// -HP, also rolls that attribute each step and comes to on a success.
+/// A pack without the table keeps a step of 60 seconds and no roll. A
+/// key the table does not know fails the pack: a typo must not fall back
+/// to a default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRules {
+    /// The attribute an unconscious entity rolls to come to, such as
+    /// `ht`. `None`: only regeneration past 0 HP brings it to.
+    #[serde(default)]
+    pub come_to_roll: Option<String>,
+    /// The seconds between two recovery steps, 1 to
+    /// [`MAX_RECOVERY_SECS`].
+    #[serde(default = "default_recovery_secs")]
+    pub every_secs: u64,
+}
+
+const fn default_recovery_secs() -> u64 {
+    60
+}
+
+impl Default for RecoveryRules {
+    fn default() -> Self {
+        Self {
+            come_to_roll: None,
+            every_secs: default_recovery_secs(),
+        }
+    }
+}
+
+impl RecoveryRules {
+    /// The time between two recovery steps, in ms.
+    #[must_use]
+    pub const fn every_ms(&self) -> u64 {
+        self.every_secs.saturating_mul(1_000)
+    }
+
+    /// The rule in one or two sentences, as `help`, the Incapacitated
+    /// refusal and an agent's system prompt say it.
+    #[must_use]
+    pub fn rule(&self) -> String {
+        let every = match self.every_secs {
+            60 => "minute".to_owned(),
+            n if n % 60 == 0 => format!("{} minutes", n / 60),
+            n => format!("{n} seconds"),
+        };
+        let roll = self.come_to_roll.as_ref().map_or_else(String::new, |a| {
+            format!(
+                ", or on a successful {} roll each step while above -HP",
+                a.to_ascii_uppercase()
+            )
+        });
+        format!(
+            "You regain 1 HP every {every} while in the world. At 0 HP or below you may pass out; \
+             you come to above 0 HP{roll}, and anyone in the room sees it."
+        )
+    }
+}
+
+/// `[death]` in `world.toml`: what dying costs a player or an NPC. Mobs
+/// keep their own respawn (`respawn_minutes`).
+///
+/// A pack without the table keeps a free full heal at `respawn_room`. A
+/// key the table does not know fails the pack, as for `[recovery]`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeathRules {
+    /// The share of its maximum HP the dead wake with, above 0 and at
+    /// most 1. The HP is rounded, and at least 1.
+    #[serde(default = "one")]
+    pub respawn_hp_frac: f64,
+    /// Whether the dead drop their purse where they fell, as one
+    /// `purse_item` that holds the coins.
+    #[serde(default)]
+    pub drop_purse: bool,
+    /// The item prototype a dropped purse is made of. It must carry
+    /// `currency` (its own amount is ignored: the purse holds what the
+    /// dead carried). Required with `drop_purse`.
+    #[serde(default)]
+    pub purse_item: Option<ProtoId>,
+}
+
+impl Default for DeathRules {
+    fn default() -> Self {
+        Self {
+            respawn_hp_frac: one(),
+            drop_purse: false,
+            purse_item: None,
+        }
+    }
+}
+
+impl DeathRules {
+    /// The HP the dead wake with, out of `hp_max`: the share, rounded,
+    /// from 1 to `hp_max` (1 when `hp_max` is below 1).
+    #[must_use]
+    pub fn respawn_hp(&self, hp_max: i32) -> i32 {
+        let share = (f64::from(hp_max) * self.respawn_hp_frac.clamp(0.0, 1.0)).round();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the share is clamped to 0..=1, so the product lies between 0 and hp_max"
+        )]
+        let hp = share as i32;
+        hp.clamp(1, hp_max.max(1))
+    }
+
+    /// The rule in one sentence, as `help` and an agent's system prompt
+    /// say it.
+    #[must_use]
+    pub fn rule(&self) -> String {
+        let hp = if self.respawn_hp_frac >= 1.0 {
+            "whole".to_owned()
+        } else {
+            format!(
+                "with about {}% of your HP",
+                (self.respawn_hp_frac * 100.0).round()
+            )
+        };
+        let purse = if self.drop_purse {
+            ", and your purse stays where you fell"
+        } else {
+            ""
+        };
+        format!("If you die, you wake at the respawn point {hp}{purse}.")
+    }
+}
+
 /// A lock on an exit.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LockDef {
@@ -819,6 +954,10 @@ pub struct PlayerTemplate {
 struct WorldFile {
     world: WorldMeta,
     #[serde(default)]
+    recovery: RecoveryRules,
+    #[serde(default)]
+    death: DeathRules,
+    #[serde(default)]
     rooms: Vec<RoomDef>,
 }
 
@@ -849,6 +988,10 @@ struct CastFile {
 pub struct WorldPack {
     /// `[world]`.
     pub world: WorldMeta,
+    /// `[recovery]`: how a downed entity comes to.
+    pub recovery: RecoveryRules,
+    /// `[death]`: what dying costs.
+    pub death: DeathRules,
     /// Rooms by id.
     pub rooms: BTreeMap<RoomId, RoomDef>,
     /// Room ids in file order.
@@ -890,6 +1033,14 @@ fn parse<T: for<'de> Deserialize<'de>>(file: &'static str, text: &str) -> Result
 }
 
 impl WorldPack {
+    /// What happens to a body in this pack, in a few sentences: its
+    /// recovery rule, then its death rule. An agent's system prompt
+    /// carries it, so the agent reasons from the same rule `help` gives.
+    #[must_use]
+    pub fn body_rules(&self) -> String {
+        format!("{} {}", self.recovery.rule(), self.death.rule())
+    }
+
     /// Loads and checks the pack in `dir`.
     ///
     /// # Errors
@@ -931,6 +1082,8 @@ impl WorldPack {
         let room_order = world.rooms.iter().map(|r| r.id.clone()).collect();
         let pack = Self {
             world: world.world,
+            recovery: world.recovery,
+            death: world.death,
             rooms: world.rooms.into_iter().map(|r| (r.id.clone(), r)).collect(),
             room_order,
             skills: skills.skills,
@@ -1024,6 +1177,7 @@ impl WorldPack {
                 }
             }
         }
+        problems.extend(self.recovery_problems());
         for (id, shop) in &self.economy.shops {
             match self.cast.get(&shop.keeper) {
                 None => problems.push(format!("shop {id} has unknown keeper {:?}", shop.keeper)),
@@ -1144,6 +1298,43 @@ impl WorldPack {
     #[must_use]
     pub fn trait_def(&self, name: &str) -> Option<&TraitDef> {
         self.traits.get(name)
+    }
+}
+
+impl WorldPack {
+    /// The problems of `[recovery]` and `[death]`.
+    fn recovery_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let r = &self.recovery;
+        if !(1..=MAX_RECOVERY_SECS).contains(&r.every_secs) {
+            problems.push(format!("recovery.every_secs is 1 to {MAX_RECOVERY_SECS}"));
+        }
+        if let Some(a) = &r.come_to_roll
+            && Attributes::default().get(a).is_none()
+        {
+            problems.push(format!(
+                "recovery.come_to_roll names unknown attribute {a:?}"
+            ));
+        }
+        let d = &self.death;
+        if !(d.respawn_hp_frac > 0.0 && d.respawn_hp_frac <= 1.0) {
+            problems.push("death.respawn_hp_frac is above 0 and at most 1".into());
+        }
+        match (&d.purse_item, d.drop_purse) {
+            (None, true) => problems.push("death.drop_purse needs death.purse_item".into()),
+            (Some(p), _) => match self.items.get(p) {
+                None => problems.push(format!(
+                    "death.purse_item names unknown item {:?}",
+                    p.as_str()
+                )),
+                Some(def) if def.currency.is_none() => {
+                    problems.push(format!("death.purse_item {p} must carry currency"));
+                }
+                Some(_) => {}
+            },
+            (None, false) => {}
+        }
+        problems
     }
 }
 

@@ -6,12 +6,14 @@
 //! setting. Swords and goblins live in a world pack, not here.
 //!
 //! Every random number flows through [`DiceRng`], so a test or a replay
-//! fixes the dice. The kernels ([`classify`], [`injury`], [`wound_state`])
+//! fixes the dice. The kernels ([`classify`], [`injury`], [`wound_state`],
+//! [`recovery_step`])
 //! are pure and are mirrored by the Verus proofs in `formal/verus`.
 
 mod combat;
 mod damage;
 mod dice;
+mod recovery;
 mod roll;
 mod self_control;
 mod stats;
@@ -19,6 +21,7 @@ mod stats;
 pub use combat::{AttackInput, AttackResolution, DefenseKind, resolve_attack};
 pub use damage::{DamageDice, DamageType, ParseDamageError, injury, swing, thrust};
 pub use dice::{DiceRng, FixedDice, SeededDice};
+pub use recovery::{recovery_rolls, recovery_step};
 pub use roll::{EFFECTIVE_LIMIT, Outcome, SuccessRoll, classify, success_roll};
 pub use self_control::{SelfControlRoll, self_control_roll};
 pub use stats::{Attributes, Pools, WoundState, basic_dodge, defense_from_skill, wound_state};

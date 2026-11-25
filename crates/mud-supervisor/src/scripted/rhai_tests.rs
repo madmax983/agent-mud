@@ -104,6 +104,7 @@ fn ctx(events: Vec<Event>, wake_id: &str) -> WakeContext {
         events,
         event_views: Vec::new(),
         look: Value::Null,
+        you: serde_json::Value::Null,
         macro_tick: false,
         macro_ticks: 0,
         login: false,

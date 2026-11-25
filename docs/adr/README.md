@@ -16,5 +16,6 @@ number, and the number is assigned when the ADR merges.
 | [0009](0009-accounts-live-outside-the-world.md) | Accounts live outside the world |
 | [0010](0010-sandboxed-rhai-scripts.md) | Sandboxed Rhai scripts: data in, data out |
 | [0011](0011-supervisor-state-lives-in-the-world-store.md) | Supervisor state lives in the world store |
+| [0012](0012-downed-not-limbo.md) | Downed, not limbo: coming to wakes the mind, and death costs more |
 
 Planned work that these decisions shape is in [the roadmap](../roadmap.md).

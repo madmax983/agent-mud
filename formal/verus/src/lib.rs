@@ -6,6 +6,7 @@
 
 use vstd::prelude::*;
 
+pub mod admit;
 pub mod budget;
 pub mod chatter;
 pub mod classify;
@@ -15,6 +16,7 @@ pub mod hooks;
 pub mod injury;
 pub mod login_route;
 pub mod persist;
+pub mod recovery;
 pub mod replay;
 pub mod rewards;
 pub mod schedule;

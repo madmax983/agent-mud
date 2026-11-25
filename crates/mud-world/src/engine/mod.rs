@@ -16,7 +16,7 @@ pub use script::{DECLINED, HookStatus, Inadmissible};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use mud_rules::self_control_roll;
+use mud_rules::{recovery_rolls, recovery_step, self_control_roll, success_roll};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -41,6 +41,25 @@ use crate::pack::SELF_WORDS;
 
 /// How long a trait waits between two self-control rolls, in ms.
 pub const NUDGE_COOLDOWN_MS: u64 = 120_000;
+
+/// The tag of the room line an entity's coming to emits.
+///
+/// The event has no actor and targets the entity, so the router wakes the
+/// entity's mind for it as for an attack on it, and never skips it as the
+/// event's own actor.
+pub const CAME_TO_TAG: &str = "came_to";
+
+/// What one world tick did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// The events it emitted (respawns, coming to).
+    pub seqs: Vec<Seq>,
+    /// Who came to, each with the seq of its room line. The supervisor
+    /// wakes each one's mind.
+    pub came_to: Vec<(EntityId, Seq)>,
+    /// What changed: HP, and the `unconscious` status of who came to.
+    pub changes: Vec<StateChange>,
+}
 
 /// A structured error code. Agents branch on these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +374,22 @@ pub enum Audit {
         /// When.
         at_ms: u64,
     },
+    /// An unconscious entity rolled to come to (pack `[recovery]
+    /// come_to_roll`).
+    ComeToRoll {
+        /// Who rolled.
+        entity: EntityId,
+        /// The attribute, such as `ht`.
+        attr: String,
+        /// The roll.
+        roll: mud_rules::SuccessRoll,
+        /// Its HP when it rolled, after the step's regeneration.
+        hp: i32,
+        /// Whether it came to.
+        came_to: bool,
+        /// When.
+        at_ms: u64,
+    },
     /// A world hook's reward was minted and recorded in the ledger.
     Minted {
         /// The hook key.
@@ -503,6 +538,8 @@ pub(crate) struct Ctx {
     pub now: u64,
     pub changes: Vec<StateChange>,
     pub events: Vec<Seq>,
+    /// Who came to, with the seq of the room line.
+    pub came_to: Vec<(EntityId, Seq)>,
 }
 
 type Done = Result<(String, Value), Fail>;
@@ -698,6 +735,17 @@ impl World {
     pub fn execute(&mut self, actor: &EntityId, line: &str, now_ms: u64) -> CommandResult {
         let result = match parse_with(line, &|v| self.is_custom_verb(v)) {
             Ok(cmd) => self.execute_command(actor, &cmd, now_ms),
+            // An unknown word from someone out cold (`wake`, `get up`)
+            // answers with what still works and how recovery goes.
+            Err(ParseError::UnknownVerb(_))
+                if self
+                    .state
+                    .entities
+                    .get(actor)
+                    .is_some_and(|e| e.online && e.incapacitated()) =>
+            {
+                refusal(None, &self.incapacitated_fail(actor))
+            }
             Err(e) => refusal(None, &Fail::from(e)),
         };
         self.audit.push(Audit::Command {
@@ -777,12 +825,15 @@ impl World {
             return Err(Fail::new(ErrorCode::Offline, "you are not in the world"));
         }
         let read_only = cmd.is_read_only();
-        let incapacitated = me.unconscious || me.dead_until_ms.is_some();
-        if incapacitated && !matches!(cmd, Command::Sheet | Command::Help | Command::Who) {
-            return Err(Fail::new(
-                ErrorCode::Incapacitated,
-                "you are in no state to do anything",
-            ));
+        // Out cold, an entity may still read itself, the help, who is on
+        // and where it lies (`look` matches `mud_look`, which is a view).
+        if me.incapacitated()
+            && !matches!(
+                cmd,
+                Command::Sheet | Command::Help | Command::Who | Command::Look
+            )
+        {
+            return Err(self.incapacitated_fail(actor));
         }
         if !read_only {
             let keep_hidden = matches!(cmd, Command::Move { .. } | Command::Attempt { .. });
@@ -1175,9 +1226,126 @@ impl World {
         Some(seq)
     }
 
-    /// Advances world time: respawns mobs and regenerates HP once a minute.
-    pub fn tick(&mut self, now: u64) -> Vec<Seq> {
-        let mut out = Vec::new();
+    /// The refusal of a command from an entity that is out cold or dead:
+    /// what still works, and how it recovers.
+    pub(crate) fn incapacitated_fail(&self, actor: &EntityId) -> Fail {
+        let dead = self
+            .state
+            .entities
+            .get(actor)
+            .is_some_and(|e| e.dead_until_ms.is_some());
+        let state = if dead {
+            "You are dead"
+        } else {
+            "You are unconscious: nothing you try lands until you come to"
+        };
+        Fail::new(
+            ErrorCode::Incapacitated,
+            format!(
+                "{state}. Still works: sheet, help, who, look. {}",
+                self.recovery_rule()
+            ),
+        )
+    }
+
+    /// The recovery rule of this pack, in one or two sentences
+    /// ([`crate::pack::RecoveryRules::rule`]).
+    #[must_use]
+    pub fn recovery_rule(&self) -> String {
+        self.pack.recovery.rule()
+    }
+
+    /// The death rule of this pack, in one sentence ([`crate::pack::DeathRules::rule`]).
+    #[must_use]
+    pub fn death_rule(&self) -> String {
+        self.pack.death.rule()
+    }
+
+    /// Brings an unconscious entity to: clears the flag, records the
+    /// change, and tells the room ("Marta stirs and comes to."). The line
+    /// has no actor: it targets the entity, tagged [`CAME_TO_TAG`]. Returns
+    /// its seq, or `None` when the entity was not unconscious.
+    pub(crate) fn come_to(&mut self, ctx: &mut Ctx, id: &EntityId) -> Option<Seq> {
+        let e = self.state.entities.get_mut(id).filter(|e| e.unconscious)?;
+        e.unconscious = false;
+        let (room, name) = (e.room.clone(), e.name.clone());
+        ctx.changes.push(StateChange::Status {
+            entity: id.clone(),
+            status: "unconscious".into(),
+            value: false,
+        });
+        let spec = Emit::new(
+            EventKind::System,
+            Some(room),
+            format!("{name} stirs and comes to."),
+        )
+        .target(id)
+        .tags([CAME_TO_TAG.to_owned()]);
+        let seq = self.emit(ctx, spec);
+        ctx.came_to.push((id.clone(), seq));
+        Some(seq)
+    }
+
+    /// One recovery step for every entity in the world (see
+    /// [`mud_rules::recovery_step`]): 1 HP back, and coming to above 0 HP
+    /// or on a successful come-to roll.
+    fn recover(&mut self, ctx: &mut Ctx) {
+        let attr = self.pack.recovery.come_to_roll.clone();
+        let ids: Vec<EntityId> = self
+            .state
+            .entities
+            .values()
+            .filter(|e| e.present())
+            .map(|e| e.id.clone())
+            .collect();
+        for id in ids {
+            let Some(e) = self.state.entities.get(&id) else {
+                continue;
+            };
+            let (hp, hp_max, down) = (e.pools.hp, e.pools.hp_max, e.unconscious);
+            let target = attr.as_deref().and_then(|a| e.attrs.get(a));
+            let roll = match (target, &attr) {
+                (Some(t), Some(a)) if recovery_rolls(hp, hp_max, down) => {
+                    Some((a.clone(), success_roll(&mut self.dice, t)))
+                }
+                _ => None,
+            };
+            let ok = roll.as_ref().is_some_and(|(_, r)| r.outcome.is_success());
+            let (next, _, came) = recovery_step(hp, hp_max, down, ok);
+            if let Some((attr, roll)) = roll {
+                self.audit.push(Audit::ComeToRoll {
+                    entity: id.clone(),
+                    attr,
+                    roll,
+                    hp: next,
+                    came_to: came,
+                    at_ms: ctx.now,
+                });
+            }
+            if next != hp
+                && let Some(e) = self.state.entities.get_mut(&id)
+            {
+                e.pools.hp = next;
+                ctx.changes.push(StateChange::Hp {
+                    entity: id.clone(),
+                    delta: next - hp,
+                    hp: next,
+                });
+            }
+            if came {
+                self.come_to(ctx, &id);
+            }
+        }
+    }
+
+    /// Advances world time: respawns mobs, and runs a recovery step for
+    /// every entity in the world each `[recovery] every_secs` (a minute
+    /// by default).
+    pub fn tick(&mut self, now: u64) -> TickOutcome {
+        let mut ctx = Ctx {
+            now,
+            ..Ctx::default()
+        };
         let due: Vec<EntityId> = self
             .state
             .entities
@@ -1198,21 +1366,18 @@ impl World {
                     format!("A {name} crawls out of the dark."),
                 )
                 .actor(&id, "respawn");
-                out.push(self.emit_bare(now, spec));
+                self.emit(&mut ctx, spec);
             }
         }
-        if now.saturating_sub(self.state.last_regen_ms) >= 60_000 {
+        if now.saturating_sub(self.state.last_regen_ms) >= self.pack.recovery.every_ms() {
             self.state.last_regen_ms = now;
-            for e in self.state.entities.values_mut() {
-                if e.present() && e.pools.hp < e.pools.hp_max {
-                    e.pools.hp += 1;
-                    if e.unconscious && e.pools.hp > 0 {
-                        e.unconscious = false;
-                    }
-                }
-            }
+            self.recover(&mut ctx);
         }
-        out
+        TickOutcome {
+            seqs: ctx.events,
+            came_to: ctx.came_to,
+            changes: ctx.changes,
+        }
     }
 
     /// The entity ids of mobs and players, by kind, for tests and tools.
@@ -1260,6 +1425,9 @@ pub fn refusal(verb: Option<&str>, fail: &Fail) -> CommandResult {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod downed_tests;
 
 #[cfg(test)]
 mod script_tests;

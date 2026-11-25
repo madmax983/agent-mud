@@ -406,6 +406,7 @@ fn harvest_torin(dir: &Path) -> HashMap<EntityId, Arc<dyn Mind>> {
                 name: "Torin".into(),
                 persona: "A smith.".into(),
                 goal: "Ore.".into(),
+                body: String::new(),
             },
         )]),
     );

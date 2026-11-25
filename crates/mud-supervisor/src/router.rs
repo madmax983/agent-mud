@@ -13,14 +13,20 @@
 //!
 //! It also runs the per-room anti-chatter counter, the budget breakers,
 //! the Turing attention filter and distracted spells.
+//!
+//! A wake waits while its entity cannot act (it is unconscious or dead):
+//! [`Router::due_where`] holds it ([`crate::admit::wake_admit`]), and what
+//! comes meanwhile merges into it. When the entity comes to, one
+//! Immediate "came to" wake ([`Router::came_to`]) delivers everything.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use mud_world::EntityId;
 use mud_world::pack::{EntityKind, Tier};
-use mud_world::{Event, EventKind, RoomId, Seq, World};
+use mud_world::{CAME_TO_TAG, Event, EventKind, RoomId, Seq, World};
 use serde::{Deserialize, Serialize};
 
+use crate::admit::{Admit, CAME_TO, wake_admit};
 use crate::budget::BudgetLevel;
 use crate::chatter::{ChatterInput, MAX_AGENT_ONLY_TURNS, RoomChatter};
 use crate::replay::replay_due;
@@ -173,6 +179,9 @@ pub struct Router {
     /// bound after a boot whose log does not reach the world's first event
     /// (see [`Router::replay`]).
     unseen_turns: u8,
+    /// The newest come-to line each entity was woken for, so the tick's
+    /// report and the line itself wake it once.
+    came_to_seen: HashMap<EntityId, Seq>,
 }
 
 /// Where the chatter counter reads whether a player saw an agent's event.
@@ -195,6 +204,11 @@ fn reason(ev: &Event, replayed: bool) -> String {
         ev.kind.name(),
         ev.actor.as_ref().map_or("world", |a| a.name.as_str())
     )
+}
+
+/// Whether `ev` is the room line of someone coming to.
+fn is_came_to(ev: &Event) -> bool {
+    ev.tags.iter().any(|t| t == CAME_TO_TAG)
 }
 
 /// Whether `text` names the entity, as a whole word.
@@ -281,6 +295,15 @@ impl Router {
     fn priority_for(ev: &Event, who: &mud_world::state::Entity) -> Option<Priority> {
         let r = &who.id;
         let text = ev.untrusted_text.as_deref().unwrap_or("");
+        if is_came_to(ev) {
+            // Its own come-to is handled by `Router::came_to`; bystanders
+            // notice someone stir.
+            return Some(if ev.targets(r) {
+                Priority::Immediate
+            } else {
+                Priority::Ambient
+            });
+        }
         let immediate = match ev.kind {
             EventKind::SelfControlNudge | EventKind::Tell => true,
             EventKind::Combat | EventKind::GuardIntervene => {
@@ -294,6 +317,11 @@ impl Router {
             return Some(Priority::Immediate);
         }
         if ev.player_actor {
+            return Some(Priority::RoomBatch);
+        }
+        // Someone used an item on it: a draught that brought it round, a
+        // bandage on its wounds.
+        if ev.kind == EventKind::Gear && ev.targets(r) {
             return Some(Priority::RoomBatch);
         }
         match ev.kind {
@@ -455,7 +483,10 @@ impl Router {
     ///   again.
     /// - **Replay.** For each logged event that [`crate::replay::replay_due`]
     ///   accepts for a recipient (after `floor(recipient)`, at most
-    ///   `max_age_ms` old), the router queues the recipient's wake exactly
+    ///   `max_age_ms` old, or of any age for a recipient that is out cold
+    ///   at boot, or that has a come-to line after its floor and at or
+    ///   after the event: its wake was held), the router queues the
+    ///   recipient's wake exactly
     ///   as [`Router::observe`] would, but only an Immediate one (a tell,
     ///   an attack on it, speech naming it); the anti-chatter rule drops
     ///   what it would have dropped. No room batch and no ambient wake is
@@ -478,8 +509,27 @@ impl Router {
         } else {
             self.cfg.max_agent_only_turns
         };
-        let due =
-            |r: &EntityId, ev: &Event| replay_due(ev.seq.0, ev.at_ms, floor(r), now, max_age_ms);
+        // An entity out cold at boot was held, not idle: everything after
+        // its floor is still owed to it, however old, and goes out with
+        // the wake it gets when it comes to. So is everything after its
+        // floor up to an uncommitted come-to line of its own: that wake
+        // carried it, and the crash lost the wake, not the obligation.
+        let mut held_until: HashMap<EntityId, u64> = HashMap::new();
+        for ev in world.logged().filter(|ev| is_came_to(ev)) {
+            for r in &ev.recipients {
+                if ev.targets(r) && ev.seq.0 > floor(r) {
+                    held_until.insert(r.clone(), ev.seq.0);
+                }
+            }
+        }
+        let due = |r: &EntityId, ev: &Event| {
+            let held = world
+                .entity(r)
+                .is_some_and(mud_world::state::Entity::incapacitated)
+                || held_until.get(r).is_some_and(|&up| ev.seq.0 <= up);
+            let age = if held { u64::MAX } else { max_age_ms };
+            replay_due(ev.seq.0, ev.at_ms, floor(r), now, age)
+        };
         let mut notes = Vec::new();
         for ev in world.logged() {
             let (actor_is_agent, allow_cross) = self.chatter(ev, world, Presence::Recipients);
@@ -531,6 +581,10 @@ impl Router {
                 continue;
             };
             if replay.is_some() && priority != Priority::Immediate {
+                continue;
+            }
+            if is_came_to(ev) && ev.targets(r) {
+                notes.push(self.came_to(r, ev.seq, now));
                 continue;
             }
             let drop = |why: &str| RouteNote::Dropped {
@@ -716,6 +770,78 @@ impl Router {
         p.due_ms = p.due_ms.min(now);
     }
 
+    /// Queues the one wake an entity gets when it comes to: Immediate,
+    /// reason [`CAME_TO`], carrying its come-to line `seq`. It merges with
+    /// everything held while the entity could not act. The tick's report
+    /// and the line itself name the same `seq`; only the first wakes it.
+    pub fn came_to(&mut self, entity: &EntityId, seq: Seq, now: u64) -> RouteNote {
+        if self.came_to_seen.get(entity).is_some_and(|s| *s >= seq) {
+            return RouteNote::Dropped {
+                entity: entity.clone(),
+                seq,
+                why: "came to: already woken for it".into(),
+            };
+        }
+        self.came_to_seen.insert(entity.clone(), seq);
+        self.force(entity, Priority::Immediate, CAME_TO, now);
+        let p = self.pending.get_mut(entity);
+        let due_ms = p.map_or(now, |p| {
+            if !p.seqs.contains(&seq) {
+                p.seqs.push(seq);
+            }
+            p.due_ms
+        });
+        RouteNote::Queued {
+            entity: entity.clone(),
+            priority: Priority::Immediate,
+            seq,
+            due_ms,
+        }
+    }
+
+    /// Gives a wake taken as due back to the router, as waiting: its
+    /// entity could not act when the wake started. Everything it carries
+    /// merges into the entity's waiting wake, which stays held until the
+    /// entity comes to. The entity is no longer busy.
+    pub fn hold(&mut self, wake: Wake) {
+        self.busy.remove(&wake.entity);
+        if let Some(plan) = wake.resume {
+            self.resumes.insert(wake.entity, plan);
+            return;
+        }
+        let p = self
+            .pending
+            .entry(wake.entity.clone())
+            .or_insert_with(|| Pending {
+                priority: wake.priority,
+                seqs: Vec::new(),
+                first_ms: 0,
+                due_ms: 0,
+                reason: wake.reason.clone(),
+                macro_tick: false,
+                cooldown_ms: 0,
+                afk_until_ms: None,
+                booked: Vec::new(),
+            });
+        let mut seqs = wake.seqs;
+        for s in std::mem::take(&mut p.seqs) {
+            if !seqs.contains(&s) {
+                seqs.push(s);
+            }
+        }
+        seqs.sort_unstable();
+        p.seqs = seqs;
+        p.macro_tick |= wake.macro_tick;
+        let mut booked = wake.booked;
+        booked.append(&mut p.booked);
+        p.booked = booked;
+        if wake.priority >= p.priority {
+            p.priority = wake.priority;
+            p.reason = wake.reason;
+        }
+        p.due_ms = 0;
+    }
+
     /// Queues the booked wakes that came due for `entity`, now. They merge
     /// into a wake already waiting, which then carries their notes.
     pub fn deliver_booked(
@@ -738,9 +864,9 @@ impl Router {
         }
     }
 
-    /// Takes the plan resumes of the entities that `ready` accepts (online)
-    /// and that have no wake in flight. A resume waits for its entity:
-    /// it runs before any other wake of that entity.
+    /// Takes the plan resumes of the entities that `ready` accepts (online,
+    /// and able to act) and that have no wake in flight. A resume waits
+    /// for its entity: it runs before any other wake of that entity.
     pub fn resumes_due(&mut self, ready: impl Fn(&EntityId) -> bool) -> Vec<Wake> {
         let resuming: Vec<EntityId> = self
             .resumes
@@ -767,13 +893,23 @@ impl Router {
     }
 
     /// Takes the wakes that are due, skipping entities with one in flight
-    /// or a plan resume waiting (see [`Router::resumes_due`]).
+    /// or a plan resume waiting (see [`Router::resumes_due`]). Every entity
+    /// counts as able to act; the supervisor uses [`Router::due_where`].
     pub fn due(&mut self, now: u64) -> Vec<Wake> {
+        self.due_where(now, |_| true)
+    }
+
+    /// Takes the wakes that are due, as [`Router::due`], holding the wake
+    /// of every entity that `can_act` refuses (unconscious or dead): it
+    /// stays waiting, gathers what comes meanwhile, and goes out when the
+    /// entity can act again ([`wake_admit`]).
+    pub fn due_where(&mut self, now: u64, can_act: impl Fn(&EntityId) -> bool) -> Vec<Wake> {
         let ready: Vec<EntityId> = self
             .pending
             .iter()
             .filter(|(e, p)| {
-                p.due_ms <= now && !self.busy.contains(*e) && !self.resumes.contains_key(*e)
+                let free = !self.busy.contains(*e) && !self.resumes.contains_key(*e);
+                wake_admit(can_act(e), free, p.due_ms, now) == Admit::Take
             })
             .map(|(e, _)| e.clone())
             .collect();

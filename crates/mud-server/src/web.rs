@@ -983,6 +983,20 @@ pub fn script_line(a: &mud_world::Audit) -> Option<String> {
             format!("{hook} minted from {pool} ({entity}) · {}", what.join(", "))
         }
         Audit::MindMemoryReset { entity, .. } => format!("memory reset for {entity}"),
+        Audit::ComeToRoll {
+            entity,
+            attr,
+            roll,
+            hp,
+            came_to,
+            ..
+        } => format!(
+            "come-to roll ({entity}) · {}({}) rolled {} at {hp} HP → {}",
+            attr.to_ascii_uppercase(),
+            roll.target,
+            roll.total,
+            if *came_to { "comes to" } else { "stays out" }
+        ),
         Audit::StoreBacklog { dropped, .. } => format!(
             "STORE FAILING: {dropped} unsaved event{} dropped from the backlog",
             if *dropped == 1 { "" } else { "s" }
