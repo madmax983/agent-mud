@@ -162,6 +162,55 @@ async fn a_rhai_mind_leaves_toml_counters_alone() {
 }
 
 #[tokio::test]
+async fn rhai_decides_leaves_nth_counters_unpersisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let clock = Arc::new(ManualClock::new(12 * 3_600_000));
+    let rig = Rig::on(Game::open(pack(), Some(&db), 1, clock).unwrap());
+    let body = "let n = if \"n\" in ctx.memory { ctx.memory.n } else { 0 };\n\
+                if n >= 2 { let x = ctx.nope; }\n\
+                #{ lines: [\"say rhai\"], memory: #{ n: n + 1 } }";
+    let pack = pack();
+    let mut hale: CastDef = pack.cast[&EntityId::from("guard_01")].clone();
+    hale.script =
+        vec![toml::from_str("on = \"enter\"\nnth = 1\ndo = [\"say first time only\"]").unwrap()];
+    let id = EntityId::from("guard_01");
+    let m =
+        ScriptedMind::from_cast([(&id, &hale)]).with_scripts(host(body), Arc::clone(&rig.game), 7);
+    let counts = || -> Vec<i64> {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut q = conn
+            .prepare("SELECT count FROM sup_rule_count WHERE entity = 'guard_01'")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let mut seen = Vec::new();
+    for (i, who) in ["ada", "bo", "cy"].iter().enumerate() {
+        let wake = format!("w{i}");
+        rig.game.open_turn(&id, &wake, Vec::new());
+        let evs = rig.events_of(|g| {
+            g.login(who).unwrap();
+        });
+        m.wake(ctx(evs, &wake), rig.tools("guard_01"))
+            .await
+            .unwrap();
+        let done = SideOp::PlanDone {
+            entity: id.clone(),
+            wake_id: wake.clone(),
+        };
+        rig.game.close_turn(&id, &wake, vec![done]).unwrap();
+        seen.push(counts());
+    }
+    // Rhai decided twice: no count moved. The third wake faulted and ran
+    // the TOML plan, whose nth = 1 rule fired and persisted its count.
+    assert_eq!(seen, [vec![], vec![], vec![1]]);
+    assert_eq!(rig.game.plan_of(&id), None, "each plan ended at close");
+}
+
+#[tokio::test]
 async fn a_faulting_mind_script_runs_the_toml_plan_and_reports() {
     let rig = Rig::new();
     let mut audit = rig.game.subscribe_audit();

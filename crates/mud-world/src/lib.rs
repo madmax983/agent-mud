@@ -27,8 +27,8 @@ pub use engine::{
 };
 pub use event::{ActorRef, Event, EventKind};
 pub use game::{
-    Clock, Durability, Game, ManualClock, RELOAD_EVENTS, Retained, Retention, SideError,
-    SystemClock,
+    Clock, CommitProbe, Durability, Game, ManualClock, RELOAD_EVENTS, Retained, Retention,
+    SideError, SystemClock,
 };
 pub use ids::{EntityId, ItemId, PoolId, ProtoId, RoomId, Seq, ShopId, SkillId};
 pub use pack::WorldPack;

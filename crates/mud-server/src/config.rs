@@ -605,10 +605,21 @@ pub struct SupervisorSection {
     pub first_macro_tick_secs: [u64; 2],
     /// How often the supervisor steps, in ms.
     pub step_ms: u64,
+    /// A reactive plan older than this at boot is abandoned (0 to 1 day).
+    /// An errand (a plan of a macro tick, a booking or a login) resumes
+    /// however long the server was down.
+    pub replay_max_age_ms: u64,
+    /// A booking overdue by more than this at boot is dropped (0 to 30
+    /// days).
+    pub booking_max_late_ms: u64,
+    /// A macro tick missed while the server was down fires once, within
+    /// this many ms of boot (0 to 1 hour).
+    pub catchup_spread_ms: u64,
 }
 
 impl Default for SupervisorSection {
     fn default() -> Self {
+        let d = mud_supervisor::runtime::SupervisorConfig::default();
         Self {
             daily_token_budget: 400_000,
             budgets: BTreeMap::new(),
@@ -616,7 +627,36 @@ impl Default for SupervisorSection {
             macro_tick_scale: 1.0,
             first_macro_tick_secs: [30, 120],
             step_ms: 250,
+            replay_max_age_ms: d.replay_max_age_ms,
+            booking_max_late_ms: d.booking_max_late_ms,
+            catchup_spread_ms: d.catchup_spread_ms,
         }
+    }
+}
+
+impl SupervisorSection {
+    /// Checks the restart settings.
+    ///
+    /// # Errors
+    /// A value is out of bounds; the message names it.
+    pub fn check_restart(&self) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!(
+            self.replay_max_age_ms <= 86_400_000,
+            "[supervisor] replay_max_age_ms must be 0 to 86400000, not {}",
+            self.replay_max_age_ms
+        );
+        ensure!(
+            self.booking_max_late_ms <= 30 * 86_400_000,
+            "[supervisor] booking_max_late_ms must be 0 to 2592000000, not {}",
+            self.booking_max_late_ms
+        );
+        ensure!(
+            self.catchup_spread_ms <= 3_600_000,
+            "[supervisor] catchup_spread_ms must be 0 to 3600000, not {}",
+            self.catchup_spread_ms
+        );
+        Ok(())
     }
 }
 
@@ -884,6 +924,34 @@ mod tests {
         assert!(bad(&|w| w.retention_batch = 0).contains("retention_batch"));
         assert!(bad(&|w| w.retention_batch = 100_001).contains("retention_batch"));
         assert!(toml::from_str::<MudConfig>("[world]\nevents_keep = 1").is_err());
+    }
+
+    #[test]
+    fn supervisor_restart_defaults_and_bounds() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        let d = SupervisorSection::default();
+        assert_eq!(ex.supervisor.replay_max_age_ms, d.replay_max_age_ms);
+        assert_eq!(ex.supervisor.booking_max_late_ms, d.booking_max_late_ms);
+        assert_eq!(ex.supervisor.catchup_spread_ms, d.catchup_spread_ms);
+        assert_eq!(
+            (
+                d.replay_max_age_ms,
+                d.booking_max_late_ms,
+                d.catchup_spread_ms
+            ),
+            (120_000, 86_400_000, 120_000)
+        );
+        d.check_restart().unwrap();
+        let bad = |edit: &dyn Fn(&mut SupervisorSection)| {
+            let mut s = SupervisorSection::default();
+            edit(&mut s);
+            s.check_restart().unwrap_err().to_string()
+        };
+        assert!(bad(&|s| s.replay_max_age_ms = 86_400_001).contains("replay_max_age_ms"));
+        assert!(
+            bad(&|s| s.booking_max_late_ms = 30 * 86_400_000 + 1).contains("booking_max_late_ms")
+        );
+        assert!(bad(&|s| s.catchup_spread_ms = 3_600_001).contains("catchup_spread_ms"));
     }
 
     #[test]

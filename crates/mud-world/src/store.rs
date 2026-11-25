@@ -445,6 +445,14 @@ impl Store {
         side::load_sql(&self.conn)
     }
 
+    /// The stored plan of `entity`, if any.
+    ///
+    /// # Errors
+    /// SQLite fails or the plan does not decode.
+    pub fn plan(&self, entity: &EntityId) -> Result<Option<side::PlanRow>, StoreError> {
+        side::load_plan(&self.conn, entity)
+    }
+
     fn tail(&self, n: usize) -> Result<Vec<Event>, StoreError> {
         let mut q = self
             .conn

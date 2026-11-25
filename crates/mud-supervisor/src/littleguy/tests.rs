@@ -237,6 +237,7 @@ fn no_ledger(dir: &tempfile::TempDir) -> Charge {
     Charge {
         meter: Arc::new(LedgerMeter::new(dir.path().join("no-ledger.db"))),
         now_ms: NOW,
+        until_settled: None,
     }
 }
 
@@ -249,6 +250,7 @@ fn ledger_with(dir: &tempfile::TempDir, tokens: &[i64]) -> Charge {
     Charge {
         meter: Arc::new(LedgerMeter::new(path)),
         now_ms: NOW,
+        until_settled: None,
     }
 }
 

@@ -9,6 +9,13 @@
 //! a Rhai mind script runs it instead: the script sees the TOML plan and
 //! decides. A fault, or a tripped breaker, runs the TOML plan, so TOML is
 //! the safety net. Either way the lines go through the typing gate.
+//!
+//! A plan persists with its cursor (ADR 0011): the mind stages the plan on
+//! its turn, then, before each line, the cursor past that line, so the
+//! cursor commits in the transaction of the line's own effect. After a
+//! crash the [`PlanMind`] resumes the plan at its durable cursor, and each
+//! effectful line takes effect exactly once. The `nth` counters of event
+//! and login rules persist too, keyed by a digest of each rule's text.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,10 +23,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use mud_script::{EventActor, MindWake, ScriptEvent, ScriptHost};
 use mud_world::hooks::{HookOutcome, hook_allowed};
 use mud_world::pack::{CastDef, EntityKind, ScriptRule, ScriptTrigger, Who};
-use mud_world::{Audit, EntityId, Event, EventKind, Game, World};
+use mud_world::side::RuleCountRow;
+use mud_world::{Audit, EntityId, Event, EventKind, Game, SideOp, World};
 
 use crate::mind::{BoxFuture, Mind, MindError, MindReply, MudTools, WakeContext};
-use crate::router::Priority;
+use crate::persist::plan_step;
+use crate::router::{Priority, Resume};
 use crate::turing::mix;
 
 /// The placeholder a script fills with the triggering entity's name.
@@ -32,8 +41,107 @@ type Turns = Vec<(usize, u32)>;
 #[derive(Debug, Default)]
 pub struct ScriptedMind {
     rules: HashMap<EntityId, Vec<ScriptRule>>,
+    /// The persisted key of each rule, by index: its digest and its copy
+    /// number among identical rules.
+    keys: HashMap<EntityId, Vec<(u64, u32)>>,
     fired: Mutex<HashMap<(EntityId, usize), u32>>,
     scripts: Option<Scripts>,
+}
+
+/// The digest of a rule's canonical text: a rule inserted above another
+/// leaves its count alone, and an edited rule counts from 0.
+#[must_use]
+pub fn rule_digest(rule: &ScriptRule) -> u64 {
+    let text = toml::to_string(rule).unwrap_or_default();
+    mix(0, &[b"script-rule", text.as_bytes()])
+}
+
+/// The keys of a list of rules: each rule's digest, and how many identical
+/// rules come before it.
+fn rule_keys(rules: &[ScriptRule]) -> Vec<(u64, u32)> {
+    let mut seen: HashMap<u64, u32> = HashMap::new();
+    rules
+        .iter()
+        .map(|r| {
+            let d = rule_digest(r);
+            let dup = seen.entry(d).or_insert(0);
+            let key = (d, *dup);
+            *dup += 1;
+            key
+        })
+        .collect()
+}
+
+/// Runs `lines[start..]` for `tools`' entity, staging before each line the
+/// cursor past it on the turn of `turn_id`: the cursor commits with the
+/// line's own effect, so a resume never repeats an effect. Returns a note
+/// per line and the durable cursor the run reached.
+async fn run_plan(
+    tools: &MudTools,
+    turn_id: &str,
+    lines: &[String],
+    start: u32,
+) -> (Vec<String>, u32) {
+    let mut notes = Vec::new();
+    let mut cursor = start;
+    for (i, line) in lines.iter().enumerate().skip(start as usize) {
+        let Ok(at) = u32::try_from(i) else { break };
+        let staged = tools.stage(
+            turn_id,
+            vec![SideOp::PlanCursor {
+                entity: tools.entity().clone(),
+                wake_id: turn_id.to_owned(),
+                cursor: at.saturating_add(1),
+            }],
+        );
+        if let Err(e) = staged {
+            tracing::warn!(entity = %tools.entity(), error = %e, "a plan line runs without its cursor");
+        }
+        let r = tools.command(line).await;
+        cursor = plan_step(cursor, at, r.ok && !r.read_only);
+        notes.push(format!("{line} -> {}", if r.ok { "ok" } else { "refused" }));
+    }
+    (notes, cursor)
+}
+
+/// Finishes a plan after a restart: runs its lines from its durable cursor
+/// through the gate, as the mind that made it would have. It calls no
+/// model, so it costs no budget and runs even at the hard cap.
+#[derive(Debug)]
+pub struct PlanMind {
+    plan: Resume,
+}
+
+impl PlanMind {
+    /// The mind that finishes `plan`.
+    #[must_use]
+    pub const fn new(plan: Resume) -> Self {
+        Self { plan }
+    }
+}
+
+impl Mind for PlanMind {
+    fn kind(&self) -> &'static str {
+        "plan"
+    }
+
+    fn wake(
+        &self,
+        _ctx: WakeContext,
+        tools: MudTools,
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
+        Box::pin(async move {
+            let p = &self.plan;
+            let (mut notes, _) = run_plan(&tools, &p.wake_id, &p.lines, p.cursor).await;
+            let ran = notes.len();
+            notes.insert(0, format!("resumed at line {}", p.cursor + 1));
+            Ok(MindReply {
+                text: Some(notes.join("; ")),
+                usage: crate::mind::Usage::default(),
+                commands: u32::try_from(ran).unwrap_or(u32::MAX),
+            })
+        })
+    }
 }
 
 /// The Rhai side of a scripted mind. The mind breakers live in the host
@@ -242,12 +350,18 @@ impl ScriptedMind {
     /// A mind for the scripts of a cast.
     #[must_use]
     pub fn from_cast<'a>(cast: impl IntoIterator<Item = (&'a EntityId, &'a CastDef)>) -> Self {
+        let rules: HashMap<EntityId, Vec<ScriptRule>> = cast
+            .into_iter()
+            .filter(|(_, c)| !c.script.is_empty())
+            .map(|(id, c)| (id.clone(), c.script.clone()))
+            .collect();
+        let keys = rules
+            .iter()
+            .map(|(id, r)| (id.clone(), rule_keys(r)))
+            .collect();
         Self {
-            rules: cast
-                .into_iter()
-                .filter(|(_, c)| !c.script.is_empty())
-                .map(|(id, c)| (id.clone(), c.script.clone()))
-                .collect(),
+            rules,
+            keys,
             fired: Mutex::new(HashMap::new()),
             scripts: None,
         }
@@ -261,7 +375,7 @@ impl ScriptedMind {
         self
     }
 
-    fn count(&self, me: &EntityId, idx: usize) -> u32 {
+    pub(crate) fn count(&self, me: &EntityId, idx: usize) -> u32 {
         self.fired
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -270,12 +384,23 @@ impl ScriptedMind {
             .unwrap_or(0)
     }
 
-    /// Moves the nth counters a plan used, once the plan runs.
-    fn commit_turns(&self, me: &EntityId, turns: &Turns) {
+    /// Moves the nth counters a plan used, once the plan runs, and returns
+    /// them as rows to persist.
+    fn commit_turns(&self, me: &EntityId, turns: &Turns) -> Vec<RuleCountRow> {
+        let keys = self.keys.get(me);
+        let rows = turns
+            .iter()
+            .filter_map(|&(idx, count)| {
+                let &(digest, dup) = keys?.get(idx)?;
+                Some(RuleCountRow { digest, dup, count })
+            })
+            .collect();
         let mut fired = self.fired.lock().unwrap_or_else(PoisonError::into_inner);
         for (idx, n) in turns {
             fired.insert((me.clone(), *idx), *n);
         }
+        drop(fired);
+        rows
     }
 
     /// The commands a wake should run, in order, and the counters they
@@ -330,6 +455,19 @@ impl Mind for ScriptedMind {
         "scripted"
     }
 
+    fn restore(&self, entity: &EntityId, counts: &[RuleCountRow]) {
+        let Some(keys) = self.keys.get(entity) else {
+            return;
+        };
+        let mut fired = self.fired.lock().unwrap_or_else(PoisonError::into_inner);
+        for (idx, (digest, dup)) in keys.iter().enumerate() {
+            // A count whose rule is gone or was edited matches nothing.
+            if let Some(row) = counts.iter().find(|r| r.digest == *digest && r.dup == *dup) {
+                fired.insert((entity.clone(), idx), row.count);
+            }
+        }
+    }
+
     fn wake(
         &self,
         ctx: WakeContext,
@@ -346,21 +484,40 @@ impl Mind for ScriptedMind {
                 Some(s) => s.decide(&ctx, &toml_plan, &tools).await,
                 None => Decision::Toml(String::new()),
             };
+            let mut staged = Vec::new();
             let (plan, why) = match decision {
                 Decision::Lines(lines, why) => (lines, why),
                 Decision::Toml(why) => {
-                    self.commit_turns(&ctx.entity, &turns);
+                    let rows = self.commit_turns(&ctx.entity, &turns);
+                    if !rows.is_empty() {
+                        staged.push(SideOp::RuleCounts {
+                            entity: ctx.entity.clone(),
+                            rows,
+                        });
+                    }
                     (toml_plan, why)
                 }
             };
+            if !plan.is_empty() {
+                staged.push(SideOp::PlanSet {
+                    entity: ctx.entity.clone(),
+                    wake_id: ctx.wake_id.clone(),
+                    lines: plan.clone(),
+                    errand: ctx.macro_tick || ctx.login || !ctx.booked.is_empty(),
+                    started_ms: ctx.now_ms,
+                });
+            }
+            if !staged.is_empty()
+                && let Err(e) = tools.stage(&ctx.wake_id, staged)
+            {
+                tracing::warn!(entity = %ctx.entity, error = %e, "a plan runs without its record");
+            }
             let mut notes = Vec::new();
             if !why.is_empty() {
                 notes.push(why);
             }
-            for line in &plan {
-                let r = tools.command(line).await;
-                notes.push(format!("{line} -> {}", if r.ok { "ok" } else { "refused" }));
-            }
+            let (ran, _) = run_plan(&tools, &ctx.wake_id, &plan, 0).await;
+            notes.extend(ran);
             Ok(MindReply {
                 text: (!notes.is_empty()).then(|| notes.join("; ")),
                 usage: crate::mind::Usage::default(),

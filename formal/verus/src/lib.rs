@@ -14,6 +14,7 @@ pub mod durability;
 pub mod hooks;
 pub mod injury;
 pub mod login_route;
+pub mod persist;
 pub mod rewards;
 pub mod schedule;
 pub mod side;

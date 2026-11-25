@@ -23,6 +23,11 @@ fn the_typing_proof_covers_the_shipped_kernel() -> TestResult {
 }
 
 #[test]
+fn the_persist_proof_covers_the_shipped_kernels() -> TestResult {
+    proof_mirrors("persist")
+}
+
+#[test]
 fn every_proof_module_is_checked() -> TestResult {
     every_proof_module_is_listed()
 }

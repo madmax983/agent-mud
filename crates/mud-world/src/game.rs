@@ -48,7 +48,7 @@ use crate::event::Event;
 use crate::hash::epoch;
 use crate::ids::{EntityId, Seq};
 use crate::pack::WorldPack;
-use crate::side::{SideOp, SideState};
+use crate::side::{PlanRow, SideOp, SideState};
 use crate::state::NameOwner;
 use crate::store::{ScriptMemory, Store, StoreError};
 
@@ -145,7 +145,24 @@ pub struct Game {
     restored: Mutex<Option<SideState>>,
     /// When retention runs next, by the game clock.
     next_retain_ms: AtomicU64,
+    /// The fault-drill probe ([`Game::set_commit_probe`]).
+    probe: ProbeSlot,
 }
+
+/// The probe, behind its own lock (a leaf, taken under the world lock).
+#[derive(Default)]
+struct ProbeSlot(Mutex<Option<CommitProbe>>);
+
+impl std::fmt::Debug for ProbeSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = lock(&self.0).is_some();
+        f.debug_tuple("ProbeSlot").field(&set).finish()
+    }
+}
+
+/// A fault-drill probe: called with the actor of each effectful command
+/// once it is committed ([`Game::set_commit_probe`]).
+pub type CommitProbe = Arc<dyn Fn(&EntityId) + Send + Sync>;
 
 /// Mind script memory, cached, with a reset count per mind.
 #[derive(Debug, Default)]
@@ -204,6 +221,7 @@ impl Game {
             ids,
             restored: Mutex::new(restored),
             next_retain_ms: AtomicU64::new(0),
+            probe: ProbeSlot::default(),
         })
     }
 
@@ -493,6 +511,12 @@ impl Game {
         let r = w.execute(actor, line, now);
         let effectful = r.ok && !r.read_only;
         self.commit(&mut w, now, effectful.then_some(actor));
+        if effectful {
+            let probe = lock(&self.probe.0).clone();
+            if let Some(p) = probe {
+                p(actor);
+            }
+        }
         drop(w);
         r
     }
@@ -622,6 +646,31 @@ impl Game {
             tracing::error!(error = %e, "a side write failed; kept for the next save");
         }
         d
+    }
+
+    /// The stored plan of `entity`: `None` without one, for an in-memory
+    /// world, or when the store fails (the failure is counted and logged).
+    #[must_use]
+    pub fn plan_of(&self, entity: &EntityId) -> Option<PlanRow> {
+        let cell = self.store.as_ref()?;
+        let plan = lock(cell).store.plan(entity);
+        match plan {
+            Ok(p) => p,
+            Err(e) => {
+                self.store_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(error = %e, "reading a plan failed");
+                None
+            }
+        }
+    }
+
+    /// Sets a fault-drill probe, called with the actor after every
+    /// effectful command has been committed, under the world lock, before
+    /// the next command can run. A probe that never returns freezes the
+    /// world right after that commit: the kill-and-restart drills use it to
+    /// stop a process at an exact point. `None` removes it.
+    pub fn set_commit_probe(&self, probe: Option<CommitProbe>) {
+        *lock(&self.probe.0) = probe;
     }
 
     /// Whether retention is due at `now`; claims the run when it is. False

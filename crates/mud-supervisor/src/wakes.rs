@@ -5,12 +5,22 @@
 //! real wake: the supervisor routes it like any other (budgets, one wake
 //! per entity at a time), and the mind may act. The note the agent left is
 //! handed back to it, as its own words, when the wake comes.
+//!
+//! Bookings persist (ADR 0011). A book or a cancel is written to the world
+//! store with `synchronous = FULL` before the agent is told ok; a store
+//! failure answers not ok and keeps nothing. A due booking is taken *in
+//! flight*, not deleted: its row goes in the transaction of the first
+//! effectful command of the wake that carries it, or at that wake's close.
+//! A restart restores every row, with ids that never repeat.
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use mud_world::EntityId;
+use mud_world::side::{BookingRow, MetaKey};
+use mud_world::{EntityId, Game, SideOp};
 use serde::{Deserialize, Serialize};
+
+use crate::persist::{BookingDisposition, booking_disposition, next_booking_id};
 
 /// The most wakes one entity may have booked at once.
 pub const MAX_PENDING: usize = 5;
@@ -24,7 +34,8 @@ pub const MAX_NOTE_CHARS: usize = 280;
 /// One booked wake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Booking {
-    /// Its id, unique within the MUD's run.
+    /// Its id, unique within the world store (never reused, across
+    /// restarts too).
     pub id: u64,
     /// When it is due (ms since the epoch, game clock).
     pub due_ms: u64,
@@ -32,7 +43,7 @@ pub struct Booking {
     pub note: String,
 }
 
-/// Why a wake was not booked.
+/// Why a wake was not booked, or not cancelled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BookError {
     /// The delay is out of range.
@@ -41,18 +52,55 @@ pub enum BookError {
     /// Too many wakes wait already.
     #[error("you already have {MAX_PENDING} wakes booked; cancel one first")]
     Full,
+    /// The world store failed: nothing was booked or cancelled.
+    #[error("the world store failed; nothing changed, try again later")]
+    Store,
 }
 
-#[derive(Debug, Default)]
+impl BookError {
+    /// The stable code of the error, for tool answers.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Minutes => "minutes",
+            Self::Full => "full",
+            Self::Store => "store",
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Inner {
+    /// The id the next booking gets.
     next_id: u64,
     by_entity: BTreeMap<EntityId, Vec<Booking>>,
+    /// Bookings taken by a wake that has not consumed them yet.
+    in_flight: BTreeSet<u64>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            by_entity: BTreeMap::new(),
+            in_flight: BTreeSet::new(),
+        }
+    }
 }
 
 /// Every entity's booked wakes.
+///
+/// Lock order: `writer` comes before the world (a book or a cancel writes
+/// through [`Game::act`], which takes the world lock), so it is never taken
+/// inside a world closure; `inner` is a supervisor lock, taken one at a
+/// time and never held across a `Game` call.
 #[derive(Debug, Default)]
 pub struct WakeBook {
     inner: Mutex<Inner>,
+    /// Serializes books and cancels around their durable write.
+    writer: Mutex<()>,
+    /// Where bookings persist; `None` keeps them in memory only.
+    game: Option<Arc<Game>>,
 }
 
 /// The note kept: control characters gone, at most [`MAX_NOTE_CHARS`].
@@ -65,15 +113,37 @@ fn clean(note: &str) -> String {
         .to_owned()
 }
 
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl WakeBook {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    /// A book that writes every booking through `game`'s store. With an
+    /// in-memory world the writes are no-ops.
+    #[must_use]
+    pub fn persisted(game: Arc<Game>) -> Self {
+        Self {
+            game: Some(game),
+            ..Self::default()
+        }
     }
 
-    /// Books a wake for `entity`, `minutes` after `now_ms`.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        lock(&self.inner)
+    }
+
+    fn write(&self, ops: &[SideOp]) -> Result<(), BookError> {
+        self.game
+            .as_ref()
+            .map_or(Ok(()), |g| g.act(ops).map_err(|_| BookError::Store))
+    }
+
+    /// Books a wake for `entity`, `minutes` after `now_ms`. The booking is
+    /// in the store, durably, when this returns `Ok`.
     ///
     /// # Errors
-    /// The delay is out of range, or [`MAX_PENDING`] wakes wait already.
+    /// The delay is out of range, [`MAX_PENDING`] wakes wait already, or
+    /// the store failed (nothing is kept).
     pub fn book(
         &self,
         entity: &EntityId,
@@ -84,16 +154,36 @@ impl WakeBook {
         if !(MIN_MINUTES..=MAX_MINUTES).contains(&minutes) {
             return Err(BookError::Minutes);
         }
-        let mut inner = self.lock();
-        if inner.by_entity.get(entity).map_or(0, Vec::len) >= MAX_PENDING {
-            return Err(BookError::Full);
-        }
-        inner.next_id += 1;
+        let _writing = lock(&self.writer);
+        let id = {
+            let inner = self.lock();
+            if inner.by_entity.get(entity).map_or(0, Vec::len) >= MAX_PENDING {
+                return Err(BookError::Full);
+            }
+            inner.next_id
+        };
         let booking = Booking {
-            id: inner.next_id,
+            id,
             due_ms: now_ms.saturating_add(u64::from(minutes) * 60_000),
             note: clean(note),
         };
+        self.write(&[
+            SideOp::BookingInsert {
+                row: BookingRow {
+                    id,
+                    entity: entity.clone(),
+                    due_ms: booking.due_ms,
+                    note: booking.note.clone(),
+                    booked_ms: now_ms,
+                },
+            },
+            SideOp::MetaMax {
+                key: MetaKey::NextBookingId,
+                value: id,
+            },
+        ])?;
+        let mut inner = self.lock();
+        inner.next_id = inner.next_id.max(id.saturating_add(1));
         let list = inner.by_entity.entry(entity.clone()).or_default();
         list.push(booking.clone());
         list.sort_by_key(|b| (b.due_ms, b.id));
@@ -102,21 +192,38 @@ impl WakeBook {
     }
 
     /// Cancels `entity`'s booking `id`. Whether there was one.
-    pub fn cancel(&self, entity: &EntityId, id: u64) -> bool {
-        let mut inner = self.lock();
-        let Some(list) = inner.by_entity.get_mut(entity) else {
-            return false;
-        };
-        let before = list.len();
-        list.retain(|b| b.id != id);
-        let removed = list.len() < before;
-        if list.is_empty() {
-            inner.by_entity.remove(entity);
+    ///
+    /// # Errors
+    /// The store failed: the booking stays.
+    pub fn cancel(&self, entity: &EntityId, id: u64) -> Result<bool, BookError> {
+        let _writing = lock(&self.writer);
+        let held = self
+            .lock()
+            .by_entity
+            .get(entity)
+            .is_some_and(|list| list.iter().any(|b| b.id == id));
+        if !held {
+            return Ok(false);
         }
-        removed
+        self.write(&[SideOp::BookingDelete { ids: vec![id] }])?;
+        self.remove(entity, &[id]);
+        Ok(true)
     }
 
-    /// `entity`'s bookings, soonest first.
+    fn remove(&self, entity: &EntityId, ids: &[u64]) {
+        let mut inner = self.lock();
+        for id in ids {
+            inner.in_flight.remove(id);
+        }
+        if let Some(list) = inner.by_entity.get_mut(entity) {
+            list.retain(|b| !ids.contains(&b.id));
+            if list.is_empty() {
+                inner.by_entity.remove(entity);
+            }
+        }
+    }
+
+    /// `entity`'s bookings, soonest first (in flight included).
     #[must_use]
     pub fn pending(&self, entity: &EntityId) -> Vec<Booking> {
         self.lock()
@@ -132,142 +239,115 @@ impl WakeBook {
         self.lock().by_entity.clone()
     }
 
+    /// Whether booking `id` is in flight: taken by a wake that has not
+    /// consumed it yet.
+    #[must_use]
+    pub fn in_flight(&self, id: u64) -> bool {
+        self.lock().in_flight.contains(&id)
+    }
+
     /// Takes the bookings due by `now_ms` of each entity that `ready`
-    /// accepts (online, and not hard-stopped). A booking of an entity that
-    /// is not ready stays, and comes due again at its next chance.
+    /// accepts (online, and not hard-stopped), and marks them in flight:
+    /// they stay booked until a wake consumes them ([`WakeBook::consumed`])
+    /// or gives them back ([`WakeBook::requeue`]). A booking of an entity
+    /// that is not ready stays, and comes due again at its next chance.
     pub fn take_due(
         &self,
         now_ms: u64,
         ready: impl Fn(&EntityId) -> bool,
     ) -> Vec<(EntityId, Vec<Booking>)> {
         let mut inner = self.lock();
+        let Inner {
+            by_entity,
+            in_flight,
+            ..
+        } = &mut *inner;
         let mut out = Vec::new();
-        for (entity, list) in &mut inner.by_entity {
-            if list.first().is_none_or(|b| b.due_ms > now_ms) || !ready(entity) {
-                continue;
-            }
+        for (entity, list) in by_entity.iter() {
             let due: Vec<Booking> = list
                 .iter()
-                .filter(|b| b.due_ms <= now_ms)
+                .filter(|b| b.due_ms <= now_ms && !in_flight.contains(&b.id))
                 .cloned()
                 .collect();
-            list.retain(|b| b.due_ms > now_ms);
+            if due.is_empty() || !ready(entity) {
+                continue;
+            }
+            in_flight.extend(due.iter().map(|b| b.id));
             out.push((entity.clone(), due));
         }
-        inner.by_entity.retain(|_, list| !list.is_empty());
         drop(inner);
         out
     }
 
-    /// Drops every booking of `entity` (it left the world for good).
+    /// Gives taken bookings back: their wake never ran (the entity went
+    /// offline) or ran a mind that does not see them (the budget fallback).
+    /// They come due again at the next chance.
+    pub fn requeue(&self, ids: &[u64]) {
+        let mut inner = self.lock();
+        for id in ids {
+            inner.in_flight.remove(id);
+        }
+    }
+
+    /// Forgets bookings a wake carried: its turn consumes their rows.
+    pub fn consumed(&self, entity: &EntityId, ids: &[u64]) {
+        self.remove(entity, ids);
+    }
+
+    /// Drops every booking of `entity` in memory (it left the world for
+    /// good; its rows go with the entity's).
     pub fn forget(&self, entity: &EntityId) {
-        self.lock().by_entity.remove(entity);
+        let mut inner = self.lock();
+        if let Some(list) = inner.by_entity.remove(entity) {
+            for b in list {
+                inner.in_flight.remove(&b.id);
+            }
+        }
+    }
+
+    /// Restores the stored bookings at boot, with nothing in flight, and
+    /// the id counter past every id issued (`meta`: the highest id the
+    /// store recorded). Each is disposed of by [`booking_disposition`]: a
+    /// booking not due yet waits (its due time clamped to [`MAX_MINUTES`]
+    /// from now, if the clock went back); a due one fires when its entity
+    /// is ready; one overdue by more than `max_late_ms` is dropped and
+    /// returned, for the caller to delete and report.
+    pub fn restore(
+        &self,
+        rows: impl IntoIterator<Item = BookingRow>,
+        meta: u64,
+        now_ms: u64,
+        max_late_ms: u64,
+    ) -> Vec<BookingRow> {
+        let mut inner = self.lock();
+        let mut dropped = Vec::new();
+        let mut max_id = 0;
+        let latest = now_ms.saturating_add(u64::from(MAX_MINUTES) * 60_000);
+        for row in rows {
+            max_id = max_id.max(row.id);
+            match booking_disposition(row.due_ms, now_ms, max_late_ms) {
+                BookingDisposition::Drop => dropped.push(row),
+                BookingDisposition::Wait | BookingDisposition::Fire => {
+                    let list = inner.by_entity.entry(row.entity.clone()).or_default();
+                    if !list.iter().any(|b| b.id == row.id) {
+                        list.push(Booking {
+                            id: row.id,
+                            due_ms: row.due_ms.min(latest),
+                            note: row.note,
+                        });
+                    }
+                }
+            }
+        }
+        for list in inner.by_entity.values_mut() {
+            list.sort_by_key(|b| (b.due_ms, b.id));
+        }
+        inner.in_flight.clear();
+        inner.next_id = inner.next_id.max(next_booking_id(meta, max_id));
+        drop(inner);
+        dropped
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use proptest::prelude::*;
-
-    use super::*;
-
-    fn torin() -> EntityId {
-        EntityId::from("torin")
-    }
-
-    #[test]
-    fn a_booking_comes_due_once_with_its_note() {
-        let book = WakeBook::default();
-        let b = book
-            .book(&torin(), 1_000, 25, "check the board for ore")
-            .unwrap();
-        assert_eq!(b.due_ms, 1_000 + 25 * 60_000);
-        assert!(book.take_due(b.due_ms - 1, |_| true).is_empty(), "not yet");
-        let due = book.take_due(b.due_ms, |_| true);
-        assert_eq!(due, vec![(torin(), vec![b])]);
-        assert!(book.take_due(u64::MAX, |_| true).is_empty(), "once");
-        assert!(book.pending(&torin()).is_empty(), "taken");
-    }
-
-    #[test]
-    fn an_entity_that_is_not_ready_keeps_its_booking() {
-        let book = WakeBook::default();
-        let b = book.book(&torin(), 0, 1, "x").unwrap();
-        assert!(book.take_due(b.due_ms + 5, |_| false).is_empty(), "held");
-        assert_eq!(book.take_due(b.due_ms + 9, |_| true)[0].1, vec![b]);
-    }
-
-    #[test]
-    fn limits_hold() {
-        let book = WakeBook::default();
-        assert_eq!(book.book(&torin(), 0, 0, "x"), Err(BookError::Minutes));
-        assert_eq!(
-            book.book(&torin(), 0, MAX_MINUTES + 1, "x"),
-            Err(BookError::Minutes)
-        );
-        for m in 1..=5 {
-            book.book(&torin(), 0, m, "x").unwrap();
-        }
-        assert_eq!(book.book(&torin(), 0, 9, "x"), Err(BookError::Full));
-        assert!(
-            book.book(&EntityId::from("marta"), 0, 9, "x").is_ok(),
-            "per entity"
-        );
-        let first = book.pending(&torin())[0].id;
-        assert!(book.cancel(&torin(), first));
-        assert!(!book.cancel(&torin(), first), "once");
-        assert!(book.book(&torin(), 0, 9, "x").is_ok(), "room again");
-    }
-
-    #[test]
-    fn a_note_is_kept_clean_and_short() {
-        let book = WakeBook::default();
-        let long = format!("line\nbreak\u{7}{}", "x".repeat(400));
-        let b = book.book(&torin(), 0, 5, &long).unwrap();
-        assert!(b.note.starts_with("linebreak"));
-        assert_eq!(b.note.chars().count(), MAX_NOTE_CHARS);
-    }
-
-    #[test]
-    fn several_due_bookings_come_together_soonest_first() {
-        let book = WakeBook::default();
-        let late = book.book(&torin(), 0, 10, "late").unwrap();
-        let soon = book.book(&torin(), 0, 2, "soon").unwrap();
-        let later = book.book(&torin(), 0, 60, "later").unwrap();
-        let due = book.take_due(10 * 60_000, |_| true);
-        assert_eq!(due, vec![(torin(), vec![soon, late])]);
-        assert_eq!(book.pending(&torin()), vec![later]);
-        book.forget(&torin());
-        assert!(book.all().is_empty());
-    }
-
-    proptest! {
-        /// No entity ever holds more than MAX_PENDING bookings, every
-        /// booking is due at least a minute after it was made, and every
-        /// booking is taken at most once.
-        #[test]
-        fn bookings_stay_bounded_and_fire_once(
-            ops in proptest::collection::vec((0u8..3, 0u32..20, 0u64..600_000), 0..120)
-        ) {
-            let book = WakeBook::default();
-            let mut now = 0u64;
-            let mut fired = std::collections::BTreeSet::new();
-            for (who, minutes, step) in ops {
-                now += step;
-                let e = EntityId::new(format!("e{who}"));
-                if let Ok(b) = book.book(&e, now, minutes, "n") {
-                    prop_assert!(b.due_ms >= now + 60_000);
-                }
-                for (_, due) in book.take_due(now, |_| true) {
-                    for b in due {
-                        prop_assert!(b.due_ms <= now);
-                        prop_assert!(fired.insert(b.id), "fired twice");
-                    }
-                }
-                for list in book.all().values() {
-                    prop_assert!(list.len() <= MAX_PENDING);
-                }
-            }
-        }
-    }
-}
+mod tests;

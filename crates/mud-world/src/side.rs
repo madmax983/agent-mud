@@ -861,6 +861,41 @@ fn load_plans(conn: &Connection, side: &mut SideState) -> Result<(), StoreError>
     Ok(())
 }
 
+/// The plan of one entity, if it has one.
+///
+/// # Errors
+/// SQLite fails or the plan's lines do not decode.
+pub(crate) fn load_plan(
+    conn: &Connection,
+    entity: &EntityId,
+) -> Result<Option<PlanRow>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT wake_id, lines, cursor, errand, started_ms FROM sup_plan WHERE entity = ?1",
+            [entity.as_str()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((wake_id, lines, cursor, errand, started_ms)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(PlanRow {
+        wake_id,
+        lines: serde_json::from_str(&lines)?,
+        cursor: uint32(cursor),
+        errand: errand != 0,
+        started_ms: uint(started_ms),
+    }))
+}
+
 fn load_rule_counts(conn: &Connection, side: &mut SideState) -> Result<(), StoreError> {
     let mut q = conn.prepare(
         "SELECT entity, digest, dup, count FROM sup_rule_count ORDER BY entity, digest, dup",

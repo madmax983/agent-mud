@@ -818,6 +818,47 @@ async fn the_observer_counts_logins_with_the_token_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_booked_wake_survives_a_restart_and_the_observer_shows_it_escaped() {
+    use mud_mcp::WakeBooker as _;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let torin = mud_world::EntityId::from("torin");
+    let note = "<b>is the ore in?</b>";
+    let first = {
+        let db = db.clone();
+        let (_, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+        let wakes = mud_server::SupervisorWakes(Arc::clone(&built.mud.sup));
+        let r = wakes.wake_me(&torin, 30, note);
+        assert_eq!(r["ok"], true, "{r}");
+        r["booked"]["id"].as_u64().unwrap()
+    };
+    // A second server on the same file: the booking came back from it.
+    let (addr, built) = boot_cfg(None, move |c| c.world.db = Some(db)).await;
+    let pending = built.mud.sup.wakes().pending(&torin);
+    assert_eq!(pending.len(), 1);
+    assert_eq!((pending[0].id, pending[0].note.as_str()), (first, note));
+    let token = built.mud.admin_token.clone();
+    let page = http()
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("booked: &lt;b&gt;is the ore in?&lt;/b&gt;"),
+        "the note shows, escaped: {page}"
+    );
+    assert!(!page.contains(note), "never as markup");
+    let next = mud_server::SupervisorWakes(Arc::clone(&built.mud.sup)).wake_me(&torin, 5, "x");
+    assert!(
+        next["booked"]["id"].as_u64().unwrap() > first,
+        "ids never repeat"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_stay_signed_in_box_follows_remember_days() {
     for (days, shown) in [(30, true), (0, false)] {
         let (addr, _) = boot_cfg(None, |c| c.accounts.remember_days = days).await;

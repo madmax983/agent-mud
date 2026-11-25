@@ -184,6 +184,8 @@ function fmt(k,m){
   if(k==='wake'){
     if(m.kind==='wake_started')return `wake    ${m.entity}  ${m.priority} via ${m.mind}: ${m.reason}`;
     if(m.kind==='wake_finished'){const u=m.usage||{};return `done    ${m.entity}  ${m.ok?'ok':'FAILED'} · ${(u.input_tokens||0)+(u.output_tokens||0)} tok · budget ${m.budget}${m.note?' · '+m.note:''}`;}
+    if(m.kind==='booking_dropped')return `booking ${m.entity}  #${m.id} dropped at boot: due ${new Date(m.due_ms).toLocaleString()}, too late`;
+    if(m.kind==='plan_abandoned')return `plan    ${m.entity}  abandoned at boot after ${m.cursor}/${m.len} lines: too old to resume`;
     return `typing  ${m.entity}  line dropped: combat broke out`;
   }
   if(k==='roll')return `roll    ${m.entity}  ${m.trait_name}(${m.roll.target_number}) rolled ${m.roll.total} → ${m.nudged?'FAILED, nudged':'resisted'}`;
@@ -895,7 +897,9 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
             ObserverEvent::Route(_) => "route",
             ObserverEvent::WakeStarted { .. }
             | ObserverEvent::WakeFinished { .. }
-            | ObserverEvent::Interrupted { .. } => "wake",
+            | ObserverEvent::Interrupted { .. }
+            | ObserverEvent::BookingDropped { .. }
+            | ObserverEvent::PlanAbandoned { .. } => "wake",
             ObserverEvent::Session { .. } | ObserverEvent::Afk { .. } => "session",
         };
         Some(sse(name, &serde_json::to_value(&*e).ok()?))

@@ -8,11 +8,15 @@
 //! for kestrel, the hidden agent PC: the same replies, one bcrypt verify
 //! each. Then the world's scripts answer: Hale greets the human
 //! on his Rhai mind, `listen` in the Dark Alley is a custom verb, and
-//! saying Vich's name twitches the fence's curtain. `mud smoke` runs it and
-//! prints the transcript; a test runs it in CI.
+//! saying Vich's name twitches the fence's curtain. Last, a restart drill:
+//! a process on a `world.db` is frozen for good right after torin's first
+//! line commits (what a kill leaves on disk), the file is opened again, and
+//! torin's plan resumes from its cursor: still one BOUNTY. `mud smoke` runs
+//! it and prints the transcript; a test runs it in CI.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context as _, ensure};
 use mud_accounts::{Accounts, AccountsConfig, Peer, Secret};
@@ -146,6 +150,7 @@ pub async fn run() -> anyhow::Result<Transcript> {
     let rx = game.subscribe();
     let mut rig = Rig { sup, clock, rx };
     play(&game, &accounts, &mut rig).await?;
+    let drill = restart_drill().await?;
     let mut out = Transcript::default();
     while let Ok(ev) = all.try_recv() {
         let room = ev.room.as_ref().map_or("-", RoomId::as_str).to_owned();
@@ -168,6 +173,7 @@ pub async fn run() -> anyhow::Result<Transcript> {
             out.wakes.push(format!("{entity} ({priority:?}): {reason}"));
         }
     }
+    out.lines.extend(drill);
     // Only Hale's Rhai mind says "evening, <name>" (his TOML rule says
     // "move along"), and it greets kestrel, an agent PC, as any player.
     ensure!(
@@ -215,6 +221,142 @@ fn setup() -> anyhow::Result<(Arc<Game>, Arc<Supervisor>, Arc<ManualClock>)> {
         cfg,
     );
     Ok((game, sup, clock))
+}
+
+/// A folder of its own under the system temp folder, removed on drop.
+struct DrillDir(PathBuf);
+
+impl DrillDir {
+    fn new() -> anyhow::Result<Self> {
+        let mut tag = [0u8; 8];
+        getrandom::fill(&mut tag).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
+        let dir = std::env::temp_dir().join(format!("mud-smoke-{:016x}", u64::from_le_bytes(tag)));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for DrillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// When the drill starts, by the game clock.
+const DRILL_T0: u64 = 20 * 3_600_000;
+
+/// A process of the drill: the world in `db` and torin on his scripted
+/// mind, with every row the store kept restored.
+fn drill_open(db: &Path, now: u64) -> anyhow::Result<(Arc<Game>, Rig)> {
+    let pack = Arc::new(WorldPack::crypt_v01()?);
+    let clock = Arc::new(ManualClock::new(now));
+    let game = Game::open(Arc::clone(&pack), Some(db), 7, clock.clone())?;
+    let typing = Gate::new(Arc::clone(&game), 7, 0.0);
+    let torin: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
+    let restored = game.take_restored().unwrap_or_default();
+    let sup = Supervisor::open(
+        Arc::clone(&game),
+        typing,
+        HashMap::from([(EntityId::from("torin"), torin)]),
+        Arc::new(FallbackMind::from_cast(&pack.cast)),
+        SupervisorConfig {
+            first_macro_tick_secs: [86_400, 86_400],
+            ..SupervisorConfig::default()
+        },
+        restored,
+    );
+    let rx = game.subscribe();
+    Ok((game, Rig { sup, clock, rx }))
+}
+
+fn bounties(game: &Game) -> usize {
+    game.read(|w| {
+        w.state().rooms[&RoomId::from("notice_market")]
+            .board
+            .iter()
+            .filter(|p| p.author.name == "Torin" && p.text.contains("BOUNTY"))
+            .count()
+    })
+}
+
+/// The restart drill. The first process runs on a thread of its own; the
+/// moment torin's `move e` commits, that thread stops for good, holding
+/// the world, as a killed process would. A second process opens the same
+/// file: the macro tick is consumed, the plan's cursor is 1, and the
+/// resume runs the other four lines. One BOUNTY, and torin is home.
+async fn restart_drill() -> anyhow::Result<Vec<String>> {
+    let dir = DrillDir::new()?;
+    let db = dir.0.join("world.db");
+    let (killed_tx, killed) = tokio::sync::oneshot::channel::<()>();
+    let first_db = db.clone();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok((game, mut rig)) = drill_open(&first_db, DRILL_T0) else {
+                return;
+            };
+            let torin = EntityId::from("torin");
+            let signal = Mutex::new(Some(killed_tx));
+            game.set_commit_probe(Some(Arc::new(move |actor: &EntityId| {
+                if *actor != torin {
+                    return;
+                }
+                let tx = signal.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(tx) = tx {
+                    let _ = tx.send(());
+                }
+                // The kill: this process never runs another line.
+                loop {
+                    std::thread::park();
+                }
+            })));
+            rig.sup.fire_macro_tick(&EntityId::from("torin"));
+            let _ = rig.run_for(5_000).await;
+        });
+    });
+    killed
+        .await
+        .context("the first process never committed torin's first line")?;
+    let (game, mut rig) = drill_open(&db, DRILL_T0 + 1_000)?;
+    let torin = EntityId::from("torin");
+    let plan = game.plan_of(&torin).context("no plan was left to resume")?;
+    ensure!(
+        plan.cursor == 1 && plan.errand,
+        "the plan was not left at its first line: {plan:?}"
+    );
+    ensure!(
+        bounties(&game) == 0,
+        "the bounty was posted before the kill"
+    );
+    rig.run_for(2_000).await?;
+    let posts = bounties(&game);
+    ensure!(
+        posts == 1,
+        "after the restart torin posted {posts} bounties, not 1"
+    );
+    ensure!(
+        game.plan_of(&torin).is_none(),
+        "the resumed plan did not finish"
+    );
+    let home = game.read(|w| w.entity(&torin).map(|e| e.room.to_string()));
+    ensure!(
+        home.as_deref() == Some("smithy"),
+        "torin did not walk home after the resume: {home:?}"
+    );
+    Ok(vec![
+        "restart drill: killed after torin's `move e` committed".to_owned(),
+        format!(
+            "restart drill: reopened at boot {}, resumed at line {} of {}, {posts} BOUNTY on the board",
+            game.boot(),
+            plan.cursor + 1,
+            plan.lines.len()
+        ),
+    ])
 }
 
 /// Plays the v0.1 done criteria, the accounts' turn, then the scripts'.
@@ -328,6 +470,13 @@ mod tests {
         assert!(
             t.lines.iter().any(|l| l.contains("scripts rhai-")),
             "the version marker is in the log"
+        );
+        assert!(
+            t.lines
+                .iter()
+                .any(|l| l.contains("resumed at line 2 of 5, 1 BOUNTY")),
+            "the restart drill ran: {:?}",
+            t.lines
         );
     }
 }
