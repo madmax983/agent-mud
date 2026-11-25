@@ -114,6 +114,16 @@ pub const fn dated_max(a_day: u64, a: u64, b_day: u64, b: u64) -> u64 {
 }
 // mirror-end dated_max
 
+// mirror-begin rev_join
+/// Whether a Steward row written at rev `incoming` replaces the one stored
+/// at rev `stored`: the higher rev wins, and an equal rev is the same
+/// write retried, so it changes nothing.
+#[must_use]
+pub const fn rev_join(stored: u64, incoming: u64) -> bool {
+    incoming > stored
+}
+// mirror-end rev_join
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 // mirror-begin tally
 /// One UTC day's spend through one channel.
@@ -180,6 +190,19 @@ pub struct PlanRow {
     pub errand: bool,
     /// When the plan started.
     pub started_ms: u64,
+}
+
+/// One entity's Steward row (`sup_steward`, ADR 0015). The Steward owns
+/// the body and its schema; the store only keeps the newest rev.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StewardStored {
+    /// The write's number: every write raises it, and the store keeps the
+    /// highest ([`rev_join`]).
+    pub rev: u64,
+    /// The body's schema, the Steward's own.
+    pub schema: u32,
+    /// The body. It may hold text an agent wrote: data, escaped on render.
+    pub body: serde_json::Value,
 }
 
 /// One entity's `sup_entity` row.
@@ -379,6 +402,18 @@ pub enum SideOp {
         /// The seq.
         seq: u64,
     },
+    /// Stores an entity's Steward row when `rev` is above the stored one
+    /// ([`rev_join`]): a retried or reordered write never moves it back.
+    Steward {
+        /// Whose.
+        entity: EntityId,
+        /// The write's number.
+        rev: u64,
+        /// The body's schema.
+        schema: u32,
+        /// The body.
+        body: serde_json::Value,
+    },
     /// Forgets every row of an entity the pack no longer has.
     DropEntity {
         /// Whose.
@@ -403,6 +438,8 @@ pub struct SideState {
     pub plans: BTreeMap<EntityId, PlanRow>,
     /// `sup_rule_count`, by entity, ordered by digest and dup.
     pub rule_counts: BTreeMap<EntityId, Vec<RuleCountRow>>,
+    /// `sup_steward`, by entity.
+    pub steward: BTreeMap<EntityId, StewardStored>,
 }
 
 impl SideState {
@@ -414,6 +451,7 @@ impl SideState {
             .keys()
             .chain(self.plans.keys())
             .chain(self.rule_counts.keys())
+            .chain(self.steward.keys())
             .chain(self.bookings.values().map(|b| &b.entity))
             .cloned()
             .collect();
@@ -589,10 +627,32 @@ impl SideState {
                 let row = self.entity_mut(entity, now_ms);
                 row.seen_seq = row.seen_seq.max(*seq);
             }
+            SideOp::Steward {
+                entity,
+                rev,
+                schema,
+                body,
+            } => {
+                if self
+                    .steward
+                    .get(entity)
+                    .is_none_or(|s| rev_join(s.rev, *rev))
+                {
+                    self.steward.insert(
+                        entity.clone(),
+                        StewardStored {
+                            rev: *rev,
+                            schema: *schema,
+                            body: body.clone(),
+                        },
+                    );
+                }
+            }
             SideOp::DropEntity { entity } => {
                 self.entities.remove(entity);
                 self.plans.remove(entity);
                 self.rule_counts.remove(entity);
+                self.steward.remove(entity);
                 self.bookings.retain(|_, b| &b.entity != entity);
             }
         }
@@ -838,8 +898,37 @@ pub(crate) fn apply_sql(tx: &Transaction<'_>, op: &SideOp, now_ms: u64) -> Resul
             )?
             .execute(params![entity.as_str(), int(*seq)])?;
         }
+        SideOp::Steward {
+            entity,
+            rev,
+            schema,
+            body,
+        } => {
+            // The SQL twin of `rev_join`: only a higher rev replaces.
+            tx.prepare_cached(
+                "INSERT INTO sup_steward (entity, rev, schema, body, saved_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (entity) DO UPDATE SET
+                    rev = excluded.rev, schema = excluded.schema,
+                    body = excluded.body, saved_ms = excluded.saved_ms
+                 WHERE excluded.rev > sup_steward.rev",
+            )?
+            .execute(params![
+                entity.as_str(),
+                int(*rev),
+                i64::from(*schema),
+                serde_json::to_string(body)?,
+                int(now_ms)
+            ])?;
+        }
         SideOp::DropEntity { entity } => {
-            for table in ["sup_entity", "sup_booking", "sup_plan", "sup_rule_count"] {
+            for table in [
+                "sup_entity",
+                "sup_booking",
+                "sup_plan",
+                "sup_rule_count",
+                "sup_steward",
+            ] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE entity = ?1"),
                     params![entity.as_str()],
@@ -872,6 +961,7 @@ pub(crate) fn load_sql(conn: &Connection) -> Result<SideState, StoreError> {
     load_bookings(conn, &mut side)?;
     load_plans(conn, &mut side)?;
     load_rule_counts(conn, &mut side)?;
+    load_steward(conn, &mut side)?;
     Ok(side)
 }
 
@@ -1026,6 +1116,37 @@ fn load_rule_counts(conn: &Connection, side: &mut SideState) -> Result<(), Store
     // Digests are stored bit for bit; order them as numbers.
     for list in side.rule_counts.values_mut() {
         list.sort();
+    }
+    Ok(())
+}
+
+/// Loads the Steward rows. A body that is not JSON loads as `null`, which
+/// the Steward replaces with a fresh row: one bad row never stops a boot.
+fn load_steward(conn: &Connection, side: &mut SideState) -> Result<(), StoreError> {
+    let mut q =
+        conn.prepare("SELECT entity, rev, schema, body FROM sup_steward ORDER BY entity")?;
+    let rows = q.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (entity, rev, schema, body) = row?;
+        let body = serde_json::from_str(&body).unwrap_or_else(|e| {
+            tracing::warn!(%entity, error = %e, "a steward row is not JSON; it loads empty");
+            serde_json::Value::Null
+        });
+        side.steward.insert(
+            EntityId::new(entity),
+            StewardStored {
+                rev: uint(rev),
+                schema: uint32(schema),
+                body,
+            },
+        );
     }
     Ok(())
 }
