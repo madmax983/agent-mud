@@ -56,6 +56,8 @@ pub struct HarvestPersona {
     pub persona: String,
     /// The private goal.
     pub goal: String,
+    /// The pack's rule for a body ([`mud_world::WorldPack::body_rules`]).
+    pub body: String,
 }
 
 /// How a harvest agent's history stays bounded (`[minds.harvest]`).
@@ -218,6 +220,7 @@ impl HarvestMind {
                         &persona.name,
                         &persona.persona,
                         &persona.goal,
+                        &persona.body,
                     ))
                     .window(self.window)
                     .max_ops_per_run(self.history.ops_per_run.max(1)),

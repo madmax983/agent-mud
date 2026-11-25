@@ -44,14 +44,19 @@ that, death was a free full heal at the square, cheaper than collapsing.
   bookings come back from `sup_booking`, and the boot replay waives the
   `replay_max_age_ms` window for a recipient that is out cold at boot: its
   wake was held, not idle, so an addressed event after its floor is still
-  owed. A room batch or an ambient wake is not replayed for anyone (ADR
+  owed. It waives the window too for an addressed event at or before a
+  come-to line of the recipient that is after its floor: the process
+  died inside the come-to wake, before its turn committed, and that wake
+  carried the event. A room batch or an ambient wake is not replayed for anyone (ADR
   0011, phase 4).
 - **Agents know their body.** Each wake message carries a `you:` block
   next to `room:`, cut from `sheet_view` only (HP, FP, wound state,
   unconscious), so it shows nothing the sheet does not and never a tier
-  or a mind. The system prompt says HP returns 1 per minute, that at 0 HP
-  or below you may pass out, that you are woken when you come to, and to
-  read `mud_sheet` before quoting HP. A refused command from an entity out
+  or a mind. The system prompt carries the pack's own rule for a body
+  (`WorldPack::body_rules`: the same recovery and death sentences `help`
+  gives, so a pack with another period or no come-to roll says so), that
+  you are woken when you come to, and to read `mud_sheet` before quoting
+  HP. A refused command from an entity out
   cold says what still works (`sheet`, `help`, `who`, `look`) and the
   pack's recovery rule; an unknown word typed out cold (`wake`) gets the
   same hint. `look` works out cold, read-only, as `mud_look` did. `help`

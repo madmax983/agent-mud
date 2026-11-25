@@ -1248,45 +1248,17 @@ impl World {
         )
     }
 
-    /// The recovery rule of this pack, in one or two sentences.
+    /// The recovery rule of this pack, in one or two sentences
+    /// ([`crate::pack::RecoveryRules::rule`]).
     #[must_use]
     pub fn recovery_rule(&self) -> String {
-        let r = &self.pack.recovery;
-        let every = match r.every_secs {
-            60 => "minute".to_owned(),
-            n if n % 60 == 0 => format!("{} minutes", n / 60),
-            n => format!("{n} seconds"),
-        };
-        let roll = r.come_to_roll.as_ref().map_or_else(String::new, |a| {
-            format!(
-                ", or on a successful {} roll each step while above -HP",
-                a.to_ascii_uppercase()
-            )
-        });
-        format!(
-            "You regain 1 HP every {every} while in the world. At 0 HP or below you may pass out; \
-             you come to above 0 HP{roll}, and anyone in the room sees it."
-        )
+        self.pack.recovery.rule()
     }
 
-    /// The death rule of this pack, in one sentence.
+    /// The death rule of this pack, in one sentence ([`crate::pack::DeathRules::rule`]).
     #[must_use]
     pub fn death_rule(&self) -> String {
-        let d = &self.pack.death;
-        let hp = if d.respawn_hp_frac >= 1.0 {
-            "whole".to_owned()
-        } else {
-            format!(
-                "with about {}% of your HP",
-                (d.respawn_hp_frac * 100.0).round()
-            )
-        };
-        let purse = if d.drop_purse {
-            ", and your purse stays where you fell"
-        } else {
-            ""
-        };
-        format!("If you die, you wake at the respawn point {hp}{purse}.")
+        self.pack.death.rule()
     }
 
     /// Brings an unconscious entity to: clears the flag, records the

@@ -920,7 +920,16 @@ impl World {
         });
     }
 
-    fn heal_actor(&mut self, ctx: &mut Ctx, actor: &EntityId, dice: mud_rules::DamageDice) {
+    /// Heals the actor, up to its maximum HP. A heal that lifts one out
+    /// cold above 0 HP brings it to ([`World::come_to`]). A hook runs only
+    /// for an actor that can act, so through a hook this never meets one
+    /// out cold; the call keeps every heal on the one come-to path.
+    pub(super) fn heal_actor(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        dice: mud_rules::DamageDice,
+    ) {
         let roll = dice.roll(&mut self.dice, DamageType::Crushing).max(0);
         let Some(e) = self.state.entities.get_mut(actor) else {
             return;

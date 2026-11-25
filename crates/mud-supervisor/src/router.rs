@@ -484,7 +484,9 @@ impl Router {
     /// - **Replay.** For each logged event that [`crate::replay::replay_due`]
     ///   accepts for a recipient (after `floor(recipient)`, at most
     ///   `max_age_ms` old, or of any age for a recipient that is out cold
-    ///   at boot: its wake was held), the router queues the recipient's wake exactly
+    ///   at boot, or that has a come-to line after its floor and at or
+    ///   after the event: its wake was held), the router queues the
+    ///   recipient's wake exactly
     ///   as [`Router::observe`] would, but only an Immediate one (a tell,
     ///   an attack on it, speech naming it); the anti-chatter rule drops
     ///   what it would have dropped. No room batch and no ambient wake is
@@ -509,11 +511,22 @@ impl Router {
         };
         // An entity out cold at boot was held, not idle: everything after
         // its floor is still owed to it, however old, and goes out with
-        // the wake it gets when it comes to.
+        // the wake it gets when it comes to. So is everything after its
+        // floor up to an uncommitted come-to line of its own: that wake
+        // carried it, and the crash lost the wake, not the obligation.
+        let mut held_until: HashMap<EntityId, u64> = HashMap::new();
+        for ev in world.logged().filter(|ev| is_came_to(ev)) {
+            for r in &ev.recipients {
+                if ev.targets(r) && ev.seq.0 > floor(r) {
+                    held_until.insert(r.clone(), ev.seq.0);
+                }
+            }
+        }
         let due = |r: &EntityId, ev: &Event| {
             let held = world
                 .entity(r)
-                .is_some_and(mud_world::state::Entity::incapacitated);
+                .is_some_and(mud_world::state::Entity::incapacitated)
+                || held_until.get(r).is_some_and(|&up| ev.seq.0 <= up);
             let age = if held { u64::MAX } else { max_age_ms };
             replay_due(ev.seq.0, ev.at_ms, floor(r), now, age)
         };

@@ -52,6 +52,7 @@ fn littleguy_mind(
     cfg: &MudConfig,
     alias: &str,
     members: &[(&EntityId, &CastDef)],
+    body: &str,
     tokens: &TokenRegistry,
     cursor: &dyn Fn(&EntityId) -> Seq,
 ) -> anyhow::Result<LittleguyMind> {
@@ -81,6 +82,7 @@ fn littleguy_mind(
                 name: c.name.clone(),
                 persona: c.persona.clone(),
                 goal: c.goal.clone(),
+                body: body.to_owned(),
                 token,
             },
         );
@@ -166,6 +168,9 @@ pub fn build(
                 .push((id, c)),
         }
     }
+    // Every agent's prompt states the pack's own rule for a body, the one
+    // `help` gives, never a rate of its own.
+    let body = pack.body_rules();
     let mut littleguy = Vec::new();
     for ((rt, alias), members) in groups {
         let mind: Arc<dyn Mind> = match rt {
@@ -184,6 +189,7 @@ pub fn build(
                                 name: c.name.clone(),
                                 persona: c.persona.clone(),
                                 goal: c.goal.clone(),
+                                body: body.clone(),
                             },
                         )
                     })
@@ -206,14 +212,21 @@ pub fn build(
                     .map(|(id, c)| {
                         (
                             (*id).clone(),
-                            (c.name.clone(), c.persona.clone(), c.goal.clone()),
+                            (
+                                c.name.clone(),
+                                c.persona.clone(),
+                                c.goal.clone(),
+                                body.clone(),
+                            ),
                         )
                     })
                     .collect();
                 Arc::new(AmbientMind::new(client, cards))
             }
             Runtime::Littleguy => {
-                let m = Arc::new(littleguy_mind(cfg, &alias, &members, tokens, cursor)?);
+                let m = Arc::new(littleguy_mind(
+                    cfg, &alias, &members, &body, tokens, cursor,
+                )?);
                 littleguy.push(Arc::clone(&m));
                 m
             }
@@ -321,6 +334,34 @@ mod tests {
             "scripted"
         );
         assert_eq!(m.littleguy.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_agent_prompt_states_the_packs_own_body_rule() {
+        // A pack whose recovery step is 5 minutes, with no come-to roll:
+        // the prompt an lg serve gets says so, as `help` does.
+        let mut pack = WorldPack::crypt_v01().unwrap();
+        pack.recovery = mud_world::pack::RecoveryRules {
+            come_to_roll: None,
+            every_secs: 300,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = TokenRegistry::new();
+        let mut cfg = MudConfig::default();
+        cfg.minds.persistent = Runtime::Littleguy;
+        cfg.littleguy.bin = dir.path().join("no-such-lg");
+        cfg.littleguy.data_dir = dir.path().join("agents");
+        let m = build(&cfg, &pack, &tokens, &|_| Seq(0), None).unwrap();
+        let marta = EntityId::from("marta");
+        assert!(m.littleguy[0].ensure(&marta).await.is_err(), "no binary");
+        let text =
+            std::fs::read_to_string(m.littleguy[0].entity_dir(&marta).join("lg.toml")).unwrap();
+        let v: toml::Table = toml::from_str(&text).unwrap();
+        let system = v["system"].as_str().unwrap();
+        assert!(system.contains(&pack.body_rules()), "{system}");
+        assert!(system.contains("every 5 minutes"), "{system}");
+        assert!(!system.contains("every minute"), "{system}");
+        assert!(!system.contains("roll"), "{system}");
     }
 
     #[test]

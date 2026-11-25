@@ -634,8 +634,13 @@ pub fn tool_specs() -> Vec<(&'static str, String, Value)> {
 }
 
 /// The system prompt of an agent entity.
+///
+/// `body` is the pack's own rule for a body
+/// ([`mud_world::WorldPack::body_rules`]): how HP returns, how one comes
+/// to, what death costs. The prompt never states a rate of its own, so it
+/// says what `help` says.
 #[must_use]
-pub fn system_prompt(name: &str, persona: &str, goal: &str) -> String {
+pub fn system_prompt(name: &str, persona: &str, goal: &str, body: &str) -> String {
     format!(
         "You are {name}, a character in a text MUD. Stay in character.\n\
          {persona}\n\
@@ -652,10 +657,9 @@ pub fn system_prompt(name: &str, persona: &str, goal: &str) -> String {
          - To come back to something later, book a wake with mud_wake_me (minutes, and a note \
            to yourself). Nothing else wakes you for it, and no other reminder tool can act in \
            the world.\n\
-         - Your body: each wake shows it under `you`. HP returns 1 per minute anywhere while \
-           you are in the world. At 0 HP or below you may pass out. While you are out cold you \
-           are not woken; you are woken when you come to, with what happened meanwhile, and a \
-           wake you booked waits for that wake. Read mud_sheet before you quote your HP.\n\
+         - Your body: each wake shows it under `you`. {body} While you are out cold you are \
+           not woken; you are woken when you come to, with what happened meanwhile, and a wake \
+           you booked waits for that wake. Read mud_sheet before you quote your HP.\n\
          - Keep speech short, the way people type in a MUD. Do one to three things, then stop.\n\
          - Your final reply is a private note to yourself; nobody sees it."
     )
@@ -736,7 +740,7 @@ mod tests {
             ]
         );
         assert!(specs[2].1.contains("untrusted_text"));
-        let p = system_prompt("Torin", "A smith.", "Get ore.");
+        let p = system_prompt("Torin", "A smith.", "Get ore.", "");
         assert!(
             p.contains("mud_wake_me"),
             "the prompt says how to come back later"
@@ -864,15 +868,37 @@ mod tests {
 
     #[test]
     fn the_prompt_explains_regen_passing_out_and_coming_to() {
-        let p = system_prompt("Marta", "A barkeep.", "Keep the bar.");
+        use mud_world::WorldPack;
+        let crypt = WorldPack::crypt_v01().unwrap();
+        let p = system_prompt("Marta", "A barkeep.", "Keep the bar.", &crypt.body_rules());
         for want in [
-            "HP returns 1 per minute anywhere while you are in the world",
+            "You regain 1 HP every minute while in the world",
             "At 0 HP or below you may pass out",
+            "on a successful HT roll each step while above -HP",
+            "about 34% of your HP",
             "you are woken when you come to",
             "Read mud_sheet before you quote your HP",
         ] {
             assert!(p.contains(want), "{want:?} in {p}");
         }
+    }
+
+    #[test]
+    fn the_prompt_follows_the_packs_recovery_period_and_roll() {
+        use mud_world::WorldPack;
+        use mud_world::pack::RecoveryRules;
+        let mut pack = WorldPack::crypt_v01().unwrap();
+        pack.recovery = RecoveryRules {
+            come_to_roll: None,
+            every_secs: 300,
+        };
+        let p = system_prompt("Marta", "A barkeep.", "Keep the bar.", &pack.body_rules());
+        assert!(p.contains("You regain 1 HP every 5 minutes"), "{p}");
+        assert!(
+            !p.contains("per minute") && !p.contains("every minute"),
+            "{p}"
+        );
+        assert!(!p.contains("roll"), "no come-to roll in this pack: {p}");
     }
 
     fn tools() -> MudTools {

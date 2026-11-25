@@ -416,6 +416,20 @@ fn a_bad_recovery_or_death_table_fails_the_pack() {
     assert!(bad_death("[death]\ndrop_purse = true").contains("needs death.purse_item"));
     assert!(bad_death("[death]\npurse_item = \"ghost\"").contains("unknown item \"ghost\""));
     assert!(bad_death("[death]\npurse_item = \"dagger\"").contains("must carry currency"));
+    // A misspelt key is an error, not a silent default: a typo must not
+    // undo a free full heal's cost or the come-to roll.
+    let typo = err("[recovery]\ncome_to = \"ht\"\n");
+    assert!(
+        typo.contains("unknown field") && typo.contains("come_to"),
+        "{typo}"
+    );
+    let typo = bad_death(
+        "[death]\nrespawn_hp_fraction = 0.34\ndrop_purse = true\npurse_item = \"dropped_purse\"",
+    );
+    assert!(
+        typo.contains("unknown field") && typo.contains("respawn_hp_fraction"),
+        "{typo}"
+    );
     let pack = src("").unwrap();
     assert_eq!(pack.recovery, RecoveryRules::default(), "no table: no roll");
 }

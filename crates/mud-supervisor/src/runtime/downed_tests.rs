@@ -34,10 +34,13 @@ struct Seen {
     message: String,
 }
 
-/// Remembers every wake and does nothing.
+/// Remembers every wake and does nothing; armed with a game, it stops
+/// that game's store writes inside its first wake (a crash before the
+/// wake's turn commits).
 #[derive(Debug, Default)]
 struct Recorder {
     seen: Mutex<Vec<Seen>>,
+    crash: Mutex<Option<Arc<Game>>>,
 }
 
 impl Recorder {
@@ -66,6 +69,10 @@ impl Mind for Recorder {
                 you: ctx.you.clone(),
                 message: crate::mind::wake_message(&ctx),
             });
+            let crash = self.crash.lock().unwrap().take();
+            if let Some(game) = crash {
+                game.refuse_store_writes(true).unwrap();
+            }
             Ok(MindReply::default())
         })
     }
@@ -285,6 +292,59 @@ async fn a_held_tell_and_booking_survive_a_restart_and_wake_her_when_she_comes_t
     assert_eq!(seen[0].reason, CAME_TO);
     assert_eq!(seen[0].booked, ["before the restart"]);
     assert!(seen[0].message.contains("hold on"), "{}", seen[0].message);
+}
+
+#[tokio::test]
+async fn a_crash_inside_the_come_to_wake_keeps_what_was_held_for_it() {
+    // She comes to and her wake opens with the held tell and booking; the
+    // process dies before the turn commits. At the next boot she can act,
+    // and the tell is older than the replay window: it was held, not
+    // ignored, so it still goes out with her next wake.
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    pack.recovery = RecoveryRules::default();
+    let disk = Disk::with(pack);
+    seed(&disk, &downed(&disk.pack, &[(&marta(), -3)]));
+    let m = Arc::new(Recorder::default());
+    let up = {
+        let mut run = start(&disk, T0, quiet(), minds(&[(&marta(), &m)]));
+        *m.crash.lock().unwrap() = Some(Arc::clone(&run.game));
+        run.sup
+            .wakes()
+            .book(&marta(), T0, 1, "before the crash")
+            .unwrap();
+        let ada = run.game.login("ada").unwrap();
+        let tell = run
+            .game
+            .execute(&ada, "tell marta are you alive down there?");
+        assert!(tell.ok, "{tell:?}");
+        run.run_for(5 * MINUTE, 1_000).await;
+        let seen = m.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].reason, CAME_TO);
+        assert!(
+            seen[0].message.contains("are you alive"),
+            "{}",
+            seen[0].message
+        );
+        came_to_at(&run.game, &marta()).unwrap().0
+    };
+    let boot = up + 60_000;
+    assert!(boot - T0 > 2 * MINUTE, "the tell is past the replay window");
+    let m2 = Arc::new(Recorder::default());
+    let mut run = start(&disk, boot, quiet(), minds(&[(&marta(), &m2)]));
+    assert!(
+        run.game.read(|w| !w.entity(&marta()).unwrap().unconscious),
+        "she came to before the crash"
+    );
+    run.run_for(5_000, 1_000).await;
+    let seen = m2.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].message.contains("are you alive down there?"),
+        "the held tell is not lost: {}",
+        seen[0].message
+    );
+    assert_eq!(seen[0].booked, ["before the crash"]);
 }
 
 #[tokio::test]

@@ -225,8 +225,11 @@ pub const MAX_RECOVERY_SECS: u64 = 3_600;
 /// maximum, and an unconscious one above 0 HP comes to. With
 /// `come_to_roll`, an unconscious one still at 0 HP or below, but above
 /// -HP, also rolls that attribute each step and comes to on a success.
-/// A pack without the table keeps a step of 60 seconds and no roll.
+/// A pack without the table keeps a step of 60 seconds and no roll. A
+/// key the table does not know fails the pack: a typo must not fall back
+/// to a default.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryRules {
     /// The attribute an unconscious entity rolls to come to, such as
     /// `ht`. `None`: only regeneration past 0 HP brings it to.
@@ -257,13 +260,36 @@ impl RecoveryRules {
     pub const fn every_ms(&self) -> u64 {
         self.every_secs.saturating_mul(1_000)
     }
+
+    /// The rule in one or two sentences, as `help`, the Incapacitated
+    /// refusal and an agent's system prompt say it.
+    #[must_use]
+    pub fn rule(&self) -> String {
+        let every = match self.every_secs {
+            60 => "minute".to_owned(),
+            n if n % 60 == 0 => format!("{} minutes", n / 60),
+            n => format!("{n} seconds"),
+        };
+        let roll = self.come_to_roll.as_ref().map_or_else(String::new, |a| {
+            format!(
+                ", or on a successful {} roll each step while above -HP",
+                a.to_ascii_uppercase()
+            )
+        });
+        format!(
+            "You regain 1 HP every {every} while in the world. At 0 HP or below you may pass out; \
+             you come to above 0 HP{roll}, and anyone in the room sees it."
+        )
+    }
 }
 
 /// `[death]` in `world.toml`: what dying costs a player or an NPC. Mobs
 /// keep their own respawn (`respawn_minutes`).
 ///
-/// A pack without the table keeps a free full heal at `respawn_room`.
+/// A pack without the table keeps a free full heal at `respawn_room`. A
+/// key the table does not know fails the pack, as for `[recovery]`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeathRules {
     /// The share of its maximum HP the dead wake with, above 0 and at
     /// most 1. The HP is rounded, and at least 1.
@@ -302,6 +328,26 @@ impl DeathRules {
         )]
         let hp = share as i32;
         hp.clamp(1, hp_max.max(1))
+    }
+
+    /// The rule in one sentence, as `help` and an agent's system prompt
+    /// say it.
+    #[must_use]
+    pub fn rule(&self) -> String {
+        let hp = if self.respawn_hp_frac >= 1.0 {
+            "whole".to_owned()
+        } else {
+            format!(
+                "with about {}% of your HP",
+                (self.respawn_hp_frac * 100.0).round()
+            )
+        };
+        let purse = if self.drop_purse {
+            ", and your purse stays where you fell"
+        } else {
+            ""
+        };
+        format!("If you die, you wake at the respawn point {hp}{purse}.")
     }
 }
 
@@ -987,6 +1033,14 @@ fn parse<T: for<'de> Deserialize<'de>>(file: &'static str, text: &str) -> Result
 }
 
 impl WorldPack {
+    /// What happens to a body in this pack, in a few sentences: its
+    /// recovery rule, then its death rule. An agent's system prompt
+    /// carries it, so the agent reasons from the same rule `help` gives.
+    #[must_use]
+    pub fn body_rules(&self) -> String {
+        format!("{} {}", self.recovery.rule(), self.death.rule())
+    }
+
     /// Loads and checks the pack in `dir`.
     ///
     /// # Errors

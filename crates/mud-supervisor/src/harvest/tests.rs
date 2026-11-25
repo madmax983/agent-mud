@@ -40,6 +40,19 @@ impl AgentModel for Scripted {
     }
 }
 
+/// The one persona of these tests: Torin the smith, as `id`.
+fn smith(id: EntityId) -> HashMap<EntityId, HarvestPersona> {
+    HashMap::from([(
+        id,
+        HarvestPersona {
+            name: "Torin".into(),
+            persona: "A smith.".into(),
+            goal: "Ore.".into(),
+            body: String::new(),
+        },
+    )])
+}
+
 fn call(id: &str, name: &str, args: Value) -> ChatResponse {
     ChatResponse {
         content: vec![ContentPart::ToolCall {
@@ -82,14 +95,7 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
     let mind = HarvestMind::new(
         Arc::clone(&model) as Arc<dyn AgentModel>,
         Some(dir.path().to_path_buf()),
-        HashMap::from([(
-            torin.clone(),
-            HarvestPersona {
-                name: "Torin".into(),
-                persona: "A smith.".into(),
-                goal: "Ore.".into(),
-            },
-        )]),
+        smith(torin.clone()),
     );
     let ctx = WakeContext {
         entity: torin.clone(),
@@ -210,14 +216,7 @@ async fn a_timed_out_wake_is_charged_when_its_job_ends() {
     let mind = HarvestMind::new(
         Arc::clone(&model) as Arc<dyn AgentModel>,
         None,
-        HashMap::from([(
-            torin.clone(),
-            HarvestPersona {
-                name: "Torin".into(),
-                persona: "A smith.".into(),
-                goal: "Ore.".into(),
-            },
-        )]),
+        smith(torin.clone()),
     );
     let ctx = |id: &str| WakeContext {
         entity: torin.clone(),
@@ -301,14 +300,7 @@ async fn a_timed_out_wake_settles_only_once_its_job_is_done() {
     let mind = HarvestMind::new(
         Arc::clone(&model) as Arc<dyn AgentModel>,
         None,
-        HashMap::from([(
-            torin.clone(),
-            HarvestPersona {
-                name: "Torin".into(),
-                persona: "A smith.".into(),
-                goal: "Ore.".into(),
-            },
-        )]),
+        smith(torin.clone()),
     );
     let ctx = WakeContext {
         entity: torin.clone(),
@@ -391,14 +383,7 @@ async fn harvest_db_history_is_bounded() {
     let mind = HarvestMind::new(
         Arc::new(Scripted::default()) as Arc<dyn AgentModel>,
         Some(dir.path().to_path_buf()),
-        HashMap::from([(
-            torin.clone(),
-            HarvestPersona {
-                name: "Torin".into(),
-                persona: "A smith.".into(),
-                goal: "Ore.".into(),
-            },
-        )]),
+        smith(torin.clone()),
     )
     .with_history(history);
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
@@ -511,14 +496,7 @@ async fn the_worker_purges_sealed_runs_older_than_keep_days() {
     let mind = HarvestMind::new(
         Arc::new(Scripted::default()) as Arc<dyn AgentModel>,
         Some(dir.path().to_path_buf()),
-        HashMap::from([(
-            torin.clone(),
-            HarvestPersona {
-                name: "Torin".into(),
-                persona: "A smith.".into(),
-                goal: "Ore.".into(),
-            },
-        )]),
+        smith(torin.clone()),
     )
     .with_history(history);
     let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());

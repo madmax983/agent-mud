@@ -66,10 +66,14 @@ pub const HISTORY_CAP: usize = 24;
 /// The tool rounds of one ambient wake.
 pub const MAX_STEPS: u32 = 4;
 
+/// The fixed card of one ambient NPC: its name, persona, goal and the
+/// pack's rule for a body ([`mud_world::WorldPack::body_rules`]).
+pub type Card = (String, String, String, String);
+
 /// Light NPC minds.
 pub struct AmbientMind {
     client: Arc<dyn LlmClient>,
-    cards: HashMap<EntityId, (String, String, String)>,
+    cards: HashMap<EntityId, Card>,
     history: Mutex<HashMap<EntityId, Vec<ChatMessage>>>,
 }
 
@@ -98,12 +102,9 @@ pub fn trim_history(mut messages: Vec<ChatMessage>, cap: usize) -> Vec<ChatMessa
 }
 
 impl AmbientMind {
-    /// A mind over `client`. `cards` holds each entity's name, persona and goal.
+    /// A mind over `client`. `cards` holds each entity's [`Card`].
     #[must_use]
-    pub fn new(
-        client: Arc<dyn LlmClient>,
-        cards: HashMap<EntityId, (String, String, String)>,
-    ) -> Self {
+    pub fn new(client: Arc<dyn LlmClient>, cards: HashMap<EntityId, Card>) -> Self {
         Self {
             client,
             cards,
@@ -111,18 +112,13 @@ impl AmbientMind {
         }
     }
 
-    fn agent(
-        &self,
-        card: &(String, String, String),
-        tools: &MudTools,
-        spent: UsageRecorder,
-    ) -> Agent {
+    fn agent(&self, card: &Card, tools: &MudTools, spent: UsageRecorder) -> Agent {
         let client: Arc<dyn LlmClient> = Arc::new(Metered {
             inner: Arc::clone(&self.client),
             spent,
         });
         let mut agent = Agent::new(client)
-            .system_prompt(system_prompt(&card.0, &card.1, &card.2))
+            .system_prompt(system_prompt(&card.0, &card.1, &card.2, &card.3))
             .max_steps(MAX_STEPS);
         for (name, description, schema) in tool_specs() {
             let t = tools.clone();
@@ -280,6 +276,7 @@ mod tests {
                     "Hale".into(),
                     "A watchman.".into(),
                     "Keep the peace.".into(),
+                    String::new(),
                 ),
             )]),
         );
@@ -371,7 +368,10 @@ mod tests {
         let guard = EntityId::from("guard_01");
         let mind = AmbientMind::new(
             Arc::new(Hangs::default()),
-            HashMap::from([(guard.clone(), ("Hale".into(), "W.".into(), "P.".into()))]),
+            HashMap::from([(
+                guard.clone(),
+                ("Hale".into(), "W.".into(), "P.".into(), String::new()),
+            )]),
         );
         let ctx = WakeContext {
             entity: guard.clone(),

@@ -15,6 +15,7 @@ fn persona() -> Persona {
         name: "Torin".into(),
         persona: "A gruff smith.".into(),
         goal: "Get ore.".into(),
+        body: "You regain 1 HP every 5 minutes while in the world.".into(),
         token: "secret-token".into(),
     }
 }
@@ -26,6 +27,13 @@ fn the_config_points_littleguy_at_the_mud() {
     let v: toml::Table = toml::from_str(&text).unwrap();
     assert_eq!(v["owner"].as_str(), Some("mud"));
     assert!(v["system"].as_str().unwrap().contains("Get ore."));
+    assert!(
+        v["system"]
+            .as_str()
+            .unwrap()
+            .contains("You regain 1 HP every 5 minutes"),
+        "the pack's body rule, not one of the prompt's own"
+    );
     let server = &v["mcp"]["server"][0];
     assert_eq!(server["url"].as_str(), Some("http://127.0.0.1:3000/mcp"));
     assert_eq!(server["bearer_env"].as_str(), Some(TOKEN_ENV));
