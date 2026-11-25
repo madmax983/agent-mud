@@ -692,6 +692,15 @@ impl World {
             .any(|e| e.kind == EntityKind::Player && e.present() && &e.room == room)
     }
 
+    /// Whether a player character other than `except` is present in
+    /// `room`.
+    #[must_use]
+    pub fn player_present_except(&self, room: &RoomId, except: &EntityId) -> bool {
+        self.state.entities.values().any(|e| {
+            e.kind == EntityKind::Player && e.present() && &e.room == room && &e.id != except
+        })
+    }
+
     /// The entities present in `room`.
     pub fn present_in<'a>(&'a self, room: &'a RoomId) -> impl Iterator<Item = &'a Entity> + 'a {
         self.state
@@ -1398,7 +1407,7 @@ impl World {
                     Some(room),
                     format!("A {name} crawls out of the dark."),
                 )
-                .actor(&id, "respawn");
+                .actor(&id, crate::event::VERB_RESPAWN);
                 self.emit(&mut ctx, spec);
             }
         }

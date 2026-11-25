@@ -67,6 +67,20 @@ impl EventKind {
     }
 }
 
+/// The verb of the engine's line about a body collapsing.
+pub const VERB_COLLAPSE: &str = "collapse";
+/// The verb of the engine's line about a body staggering, badly hurt.
+pub const VERB_STAGGER: &str = "stagger";
+/// The verb of the engine's line about a death.
+pub const VERB_DIE: &str = "die";
+/// The verb of the engine's line about a respawn.
+pub const VERB_RESPAWN: &str = "respawn";
+
+/// The verbs of the engine's own lines about a body. Such a line names the
+/// body as its actor, but nobody chose to act: the attention router counts
+/// it as the world, never as its actor's turn.
+pub const BODY_VERBS: [&str; 4] = [VERB_COLLAPSE, VERB_STAGGER, VERB_DIE, VERB_RESPAWN];
+
 /// An entity as an event names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorRef {
@@ -136,6 +150,16 @@ impl Event {
     #[must_use]
     pub fn is_by(&self, entity: &EntityId) -> bool {
         self.actor.as_ref().is_some_and(|a| &a.id == entity)
+    }
+
+    /// Whether this is the engine's own line about a body (its verb is
+    /// one of [`BODY_VERBS`]): a collapse, a stagger, a death or a
+    /// respawn, which its actor suffered rather than did.
+    #[must_use]
+    pub fn is_body_line(&self) -> bool {
+        self.verb
+            .as_deref()
+            .is_some_and(|v| BODY_VERBS.contains(&v))
     }
 
     /// Whether `entity` is its target.

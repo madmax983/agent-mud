@@ -81,13 +81,26 @@ flowchart TB
 | Immediate | attack on the entity, a tell, a self-control nudge, speech naming it | 0–500 ms | wakes at once, bypasses AFK |
 | RoomBatch | player say/emote/enter/leave/drop in the room | 2–4 s rolling | one wake per burst |
 | Ambient | NPC activity while a player is present | 5–10 s + cooldown | selective attention, cooldown |
-| MacroTick | timer, 2–6 h ± 20% | none | only with no player in the room |
+| MacroTick | timer, 2–6 h ± 20% | none | only with no other player in the room (a hidden PC alone gets its own) |
 
 **Anti-chatter.** Each room tracks `agent_only_turns` and
 `player_present`. A player event (human or agent PC) or a macro-tick
 resets the count; each NPC event with no player present increments it; at
 `MAX_AGENT_ONLY_TURNS` (2) the router drops cross-agent wakes in that room
-until reset.
+until reset. The engine's own line about a body (a collapse, a stagger, a
+death, a respawn) is the world's: it neither counts nor resets, whoever's
+body it is (the proved `chatter_input_for`, ADR 0014).
+
+**A wake ends when its mind does (ADR 0014).** An entity stays busy until
+its mind has really finished (a littleguy op read after a timeout), so no
+second chat starts while an op is live. A wake's bound
+(`[supervisor] wake_timeout_ms`, 120 s, or per tier in
+`wake_timeout_ms_by_tier`) counts only the time outside the gate's typing
+holds (the proved `wake_expired`), so a hidden PC typing a long notice is
+not cut off. When the mind settles, its next wake drops the events it
+already read with `mud_events`. Combat that interrupts a held line wakes
+the PC only if no wake of it is running. Spend that comes in after a
+wake's line has its own feed line (`late`).
 
 **Out cold, no wakes (ADR 0012).** While an agent is unconscious or dead
 the router holds its wake: events, due bookings and macro-ticks wait with
@@ -110,7 +123,9 @@ Friction, not prose: session windows shifted by a daily offset (±20
 min); a 35% selective-attention filter (100% on goal keywords); 2–6 min
 distracted spells while idle in town; a typing-delay buffer
 (`reaction 800..2200 + (chars/5)/(wpm/60) s × jitter 0.85..1.15`, moves
-and combat 600..1400 ms; combat cancels a buffered line and re-wakes);
+and combat 600..1400 ms; combat cancels a buffered line and re-wakes,
+unless a wake of the PC is still running; typing time never counts toward
+a wake's timeout);
 selfish concrete goals and a terse lowercase style; blind testing (never
 announce how many are online).
 

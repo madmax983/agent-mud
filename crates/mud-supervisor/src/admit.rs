@@ -12,6 +12,10 @@
 //! router polls, no wake is delivered while the entity cannot act, and
 //! every held item is delivered exactly once, in order, by the first wake
 //! after it can act again.
+//!
+//! [`wake_expired`] bounds a running wake: only the time its entity spent
+//! outside the gate's holds counts toward the timeout, so a hidden PC that
+//! types a long notice is not cut off for typing.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // mirror-begin admit_enum
@@ -45,6 +49,18 @@ pub const fn wake_admit(can_act: bool, free: bool, due_ms: u64, now_ms: u64) -> 
 }
 // mirror-end wake_admit
 
+// mirror-begin wake_expired
+/// Whether a wake is past its bound of `timeout_ms`.
+///
+/// It has run `elapsed_ms`, `held_ms` of them with a line of its entity
+/// held at the gate (a hidden PC typing). Only the time outside the holds
+/// counts: a slow typist is not a mind that hangs.
+#[must_use]
+pub const fn wake_expired(elapsed_ms: u64, held_ms: u64, timeout_ms: u64) -> bool {
+    elapsed_ms.saturating_sub(held_ms) >= timeout_ms
+}
+// mirror-end wake_expired
+
 /// The reason of the wake an entity gets when it comes to.
 pub const CAME_TO: &str = "came to";
 
@@ -62,5 +78,21 @@ mod tests {
         assert_eq!(wake_admit(true, true, 5, 5), Admit::Take);
         assert_eq!(wake_admit(true, true, 6, 5), Admit::Wait);
         assert_eq!(wake_admit(true, false, 0, 5), Admit::Wait);
+    }
+
+    #[test]
+    fn only_the_time_outside_holds_counts() {
+        assert!(wake_expired(120_000, 0, 120_000));
+        assert!(!wake_expired(119_999, 0, 120_000));
+        assert!(
+            !wake_expired(164_999, 45_000, 120_000),
+            "a 45 s hold extends the bound"
+        );
+        assert!(wake_expired(165_000, 45_000, 120_000));
+        assert!(
+            !wake_expired(10, 50, 1),
+            "held longer than run: nothing counts"
+        );
+        assert!(wake_expired(10, 50, 0));
     }
 }

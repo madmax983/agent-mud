@@ -265,6 +265,8 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         replay_max_age_ms: s.replay_max_age_ms,
         booking_max_late_ms: s.booking_max_late_ms,
         catchup_spread_ms: s.catchup_spread_ms,
+        wake_timeout_ms: s.wake_timeout_ms,
+        wake_timeout_ms_by_tier: s.wake_timeout_ms_by_tier,
         ..SupervisorConfig::default()
     };
     // Then the supervisor restores the rows (bookings, the macro schedule,

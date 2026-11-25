@@ -16,6 +16,7 @@ use mud_world::engine::{Fail, refusal};
 use mud_world::pack::Tier;
 use mud_world::{Command, CommandResult, EntityId, ErrorCode, Game, parse_with};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::turing::{action_delay_ms, mix, speech_delay_ms};
 
@@ -32,7 +33,62 @@ pub struct Gate {
     held: Mutex<Held>,
 }
 
-type Held = HashMap<EntityId, HashMap<u64, Arc<Notify>>>;
+/// The lines held at the gate, and how long each entity has spent with at
+/// least one line held.
+#[derive(Debug, Default)]
+struct Held {
+    lines: HashMap<EntityId, HashMap<u64, Arc<Notify>>>,
+    clocks: HashMap<EntityId, HoldClock>,
+}
+
+/// The time one entity spent with a line held: the holds that ended, and
+/// the start of the one going on. Overlapping holds count once.
+#[derive(Debug, Default, Clone, Copy)]
+struct HoldClock {
+    done: Duration,
+    since: Option<Instant>,
+}
+
+impl HoldClock {
+    fn total(&self, now: Instant) -> Duration {
+        self.done
+            + self
+                .since
+                .map_or(Duration::ZERO, |s| now.saturating_duration_since(s))
+    }
+}
+
+impl Held {
+    fn insert(&mut self, entity: &EntityId, nonce: u64, notify: Arc<Notify>) {
+        let lines = self.lines.entry(entity.clone()).or_default();
+        if lines.is_empty() {
+            let clock = self.clocks.entry(entity.clone()).or_default();
+            clock.since.get_or_insert_with(Instant::now);
+        }
+        lines.insert(nonce, notify);
+    }
+
+    /// Removes one line of `entity` (by its nonce) or all of them; the
+    /// entity's clock stops when none is left.
+    fn remove(&mut self, entity: &EntityId, nonce: Option<u64>) -> Vec<Arc<Notify>> {
+        let Some(lines) = self.lines.get_mut(entity) else {
+            return Vec::new();
+        };
+        let gone: Vec<Arc<Notify>> = match nonce {
+            Some(n) => lines.remove(&n).into_iter().collect(),
+            None => lines.drain().map(|(_, n)| n).collect(),
+        };
+        if lines.is_empty() {
+            self.lines.remove(entity);
+            if let Some(clock) = self.clocks.get_mut(entity)
+                && let Some(since) = clock.since.take()
+            {
+                clock.done += Instant::now().saturating_duration_since(since);
+            }
+        }
+        gone
+    }
+}
 
 /// Removes one run's held entry when the run ends, however it ends: done,
 /// interrupted, or dropped mid-hold by a timeout or a cancelled request.
@@ -44,13 +100,10 @@ struct HeldGuard<'a> {
 
 impl Drop for HeldGuard<'_> {
     fn drop(&mut self) {
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(lines) = held.get_mut(self.entity) {
-            lines.remove(&self.nonce);
-            if lines.is_empty() {
-                held.remove(self.entity);
-            }
-        }
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(self.entity, Some(self.nonce));
     }
 }
 
@@ -63,7 +116,7 @@ impl Gate {
             seed,
             counter: AtomicU64::new(0),
             scale: scale.max(0.0),
-            held: Mutex::new(HashMap::new()),
+            held: Mutex::new(Held::default()),
         })
     }
 
@@ -119,8 +172,26 @@ impl Gate {
         self.held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .lines
             .get(entity)
             .is_some_and(|lines| !lines.is_empty())
+    }
+
+    /// How long `entity` has spent with at least one line held, in ms,
+    /// since the gate was made, the hold going on included. It never goes
+    /// down; a wake's timeout leaves out what it grew by during the wake
+    /// ([`crate::admit::wake_expired`]). By the tokio clock, so a test with
+    /// paused time reads it.
+    #[must_use]
+    pub fn held_ms(&self, entity: &EntityId) -> u64 {
+        let total = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clocks
+            .get(entity)
+            .map_or(Duration::ZERO, |c| c.total(Instant::now()));
+        u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Drops every held line of `entity`. Returns whether one was held.
@@ -129,9 +200,8 @@ impl Gate {
             .held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(entity)
-            .unwrap_or_default();
-        for n in lines.values() {
+            .remove(entity, None);
+        for n in &lines {
             n.notify_one();
         }
         !lines.is_empty()
@@ -146,9 +216,7 @@ impl Gate {
             self.held
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .entry(entity.clone())
-                .or_default()
-                .insert(nonce, Arc::clone(&notify));
+                .insert(entity, nonce, Arc::clone(&notify));
             let guard = HeldGuard {
                 held: &self.held,
                 entity,
@@ -306,6 +374,39 @@ mod tests {
         for t in tasks {
             assert_eq!(t.await.unwrap().error_code, Some(ErrorCode::Interrupted));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_clock_counts_overlapping_holds_once() {
+        let g = game();
+        let k = EntityId::from("pc_kestrel");
+        g.bring_online(&k);
+        let gate = Gate::new(Arc::clone(&g), 9, 1.0);
+        assert_eq!(gate.held_ms(&k), 0);
+        let line = "say a line long enough to take a few seconds to type out";
+        let typed = gate.hold_ms(&k, line, 0);
+        let (g1, k1) = (Arc::clone(&gate), k.clone());
+        let one = tokio::spawn(async move { g1.run(&k1, line).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (g2, k2) = (Arc::clone(&gate), k.clone());
+        let two = tokio::spawn(async move { g2.run(&k2, "move w").await });
+        assert!(one.await.unwrap().ok);
+        assert!(two.await.unwrap().ok);
+        let held = gate.held_ms(&k);
+        assert!(
+            held >= typed && held <= typed + 1_500,
+            "the move's hold overlaps the say's: {held} vs {typed}"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(gate.held_ms(&k), held, "no line held: the clock stands");
+        let (g3, k3) = (Arc::clone(&gate), k.clone());
+        let three = tokio::spawn(async move { g3.run(&k3, "say interrupted line here").await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(gate.held_ms(&k), held + 300, "the hold going on counts");
+        assert!(gate.interrupt(&k));
+        assert!(!three.await.unwrap().ok);
+        assert_eq!(gate.held_ms(&k), held + 300, "an interrupt stops the clock");
+        assert_eq!(gate.held_ms(&EntityId::from("marta")), 0);
     }
 
     #[tokio::test(start_paused = true)]

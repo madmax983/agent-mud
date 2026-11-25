@@ -147,6 +147,10 @@ pub struct Game {
     next_retain_ms: AtomicU64,
     /// The fault-drill probe ([`Game::set_commit_probe`]).
     probe: ProbeSlot,
+    /// The newest event [`Game::events`] handed each entity in this
+    /// process (`mud_events`, in process or over MCP). A leaf lock, taken
+    /// after the world's is released.
+    read_marks: Mutex<BTreeMap<EntityId, Seq>>,
 }
 
 /// The probe, behind its own lock (a leaf, taken under the world lock).
@@ -222,6 +226,7 @@ impl Game {
             restored: Mutex::new(restored),
             next_retain_ms: AtomicU64::new(0),
             probe: ProbeSlot::default(),
+            read_marks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -851,19 +856,40 @@ impl Game {
     /// newest [`EVENT_LOG_CAP`]).
     #[must_use]
     pub fn events(&self, viewer: &EntityId, since: Seq, limit: usize) -> serde_json::Value {
-        self.read(|w| {
+        let (handed, value) = self.read(|w| {
             let evs = w.events_since(viewer, since, limit);
             let cursor = evs.last().map_or(since, |e| e.seq);
             let room = w.entity(viewer).map(|e| e.room.clone());
             let truncated =
                 events_truncated(since.0, w.oldest_logged().map(|s| s.0), w.last_seq().0);
-            serde_json::json!({
+            let value = serde_json::json!({
                 "cursor": cursor,
                 "room_id": room,
                 "events": evs.iter().map(|e| e.view_for(viewer)).collect::<Vec<_>>(),
                 "truncated": truncated,
-            })
-        })
+            });
+            (evs.last().map(|e| e.seq), value)
+        });
+        if let Some(seq) = handed {
+            lock(&self.read_marks)
+                .entry(viewer.clone())
+                .and_modify(|m| *m = (*m).max(seq))
+                .or_insert(seq);
+        }
+        value
+    }
+
+    /// The newest event [`Game::events`] handed `viewer` in this process,
+    /// or `Seq(0)`. The supervisor reads it when a wake's mind has really
+    /// finished: a waiting wake of the entity no longer carries the events
+    /// at or below it, which the mind already saw. The mark is not stored;
+    /// a restart starts it again at 0.
+    #[must_use]
+    pub fn read_mark(&self, viewer: &EntityId) -> Seq {
+        lock(&self.read_marks)
+            .get(viewer)
+            .copied()
+            .unwrap_or(Seq(0))
     }
 }
 
@@ -914,6 +940,37 @@ mod tests {
         let mine = again.events(&ada, Seq(0), 10);
         assert_eq!(mine["events"].as_array().map(Vec::len), Some(2));
         assert_eq!(again.store_errors(), 0);
+    }
+
+    #[test]
+    fn the_read_mark_is_the_newest_event_handed_out() {
+        let game = Game::new(
+            World::new(pack(), 7),
+            None,
+            Arc::new(ManualClock::new(1_000)),
+        );
+        let ada = game.login("ada").unwrap();
+        assert_eq!(game.read_mark(&ada), Seq(0), "nothing handed out yet");
+        assert!(game.execute(&ada, "say one").ok);
+        assert!(game.execute(&ada, "say two").ok);
+        let all = game.events(&ada, Seq(0), 10);
+        let last = Seq(all["cursor"].as_u64().unwrap());
+        assert_eq!(game.read_mark(&ada), last);
+        let first = game.events(&ada, Seq(0), 1);
+        assert!(Seq(first["cursor"].as_u64().unwrap()) < last);
+        assert_eq!(
+            game.read_mark(&ada),
+            last,
+            "an older read never moves it back"
+        );
+        let none = game.events(&ada, last, 10);
+        assert_eq!(none["events"].as_array().map(Vec::len), Some(0));
+        assert_eq!(game.read_mark(&ada), last);
+        assert_eq!(
+            game.read_mark(&EntityId::from("marta")),
+            Seq(0),
+            "each entity has its own"
+        );
     }
 
     #[test]
