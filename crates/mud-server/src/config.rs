@@ -620,7 +620,7 @@ pub struct ModelConfig {
 /// Every key has a code default, so a `[littleguy]` written before a key
 /// existed keeps working: notes, research and compaction are on unless
 /// turned off.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LittleguySection {
     /// The `lg` binary.
@@ -657,6 +657,8 @@ pub struct LittleguySection {
     pub max_request_bytes: u64,
     /// Turns of transcript the agent sees (at least 1).
     pub window: u32,
+    /// `[littleguy.steward]`: the MUD as each daemon's owner (ADR 0015).
+    pub steward: mud_supervisor::steward::StewardConfig,
 }
 
 impl Default for LittleguySection {
@@ -678,6 +680,7 @@ impl Default for LittleguySection {
             compaction_max_resets: c.max_resets,
             max_request_bytes: d.max_request_bytes,
             window: d.window,
+            steward: mud_supervisor::steward::StewardConfig::default(),
         }
     }
 }
@@ -700,6 +703,62 @@ impl LittleguySection {
         );
         ensure!(self.window >= 1, "[littleguy] window must be at least 1");
         Ok(())
+    }
+
+    /// Checks `[littleguy.steward]` against the model aliases in `models`.
+    ///
+    /// # Errors
+    /// A council alias is not in `[models]`, or a value is out of bounds;
+    /// the message names it.
+    pub fn check_steward(&self, models: &BTreeMap<String, ModelConfig>) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let s = &self.steward;
+        for alias in s.council_model.iter().chain(&s.council_models) {
+            ensure!(
+                models.contains_key(alias),
+                "[littleguy.steward] names the council model {alias:?}, but there is no [models.{alias}]"
+            );
+        }
+        ensure!(
+            s.council_members % 2 == 1 && (1..=7).contains(&s.council_members),
+            "[littleguy.steward] council_members must be odd, 1 to 7, not {}",
+            s.council_members
+        );
+        ensure!(
+            s.council_members == 1 || (s.council_temperature > 0.0 && s.council_temperature <= 2.0),
+            "[littleguy.steward] council_temperature must be above 0 and at most 2 with more than one member, not {}",
+            s.council_temperature
+        );
+        ensure!(
+            (1..=100).contains(&s.max_council_votes_per_day),
+            "[littleguy.steward] max_council_votes_per_day must be 1 to 100, not {}",
+            s.max_council_votes_per_day
+        );
+        ensure!(
+            s.every_secs >= 1 && s.owner_timeout_secs >= 1 && s.max_intent_tries >= 1,
+            "[littleguy.steward] every_secs, owner_timeout_secs and max_intent_tries must be at least 1"
+        );
+        ensure!(
+            s.title_chars >= 1 && s.why_chars >= 1,
+            "[littleguy.steward] title_chars and why_chars must be at least 1"
+        );
+        for p in &s.deny_phrases {
+            ensure!(
+                !p.trim().is_empty() && p.is_ascii(),
+                "[littleguy.steward] deny_phrases entries must be non-empty ASCII, not {p:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The `[models]` alias of the council: `council_model`, or `council`
+    /// when that alias exists. `None`: no judge.
+    #[must_use]
+    pub fn council_alias(&self, models: &BTreeMap<String, ModelConfig>) -> Option<String> {
+        self.steward
+            .council_model
+            .clone()
+            .or_else(|| models.contains_key("council").then(|| "council".to_owned()))
     }
 
     /// The `[compaction]` to render, if on.
@@ -945,6 +1004,88 @@ mod tests {
         assert_eq!(v["max_request_bytes"].as_integer(), Some(240_000));
         assert_eq!(v["window"].as_integer(), Some(30));
         assert_eq!(v["max_steps"].as_integer(), Some(64));
+    }
+
+    #[test]
+    fn the_example_sets_the_steward_and_its_council() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        let s = &ex.littleguy.steward;
+        assert!(s.enabled);
+        assert_eq!(s.council_model.as_deref(), Some("council"));
+        assert!(ex.models.contains_key("council"));
+        assert_eq!(
+            ex.littleguy.council_alias(&ex.models).as_deref(),
+            Some("council")
+        );
+        assert!(ex.littleguy.check_steward(&ex.models).is_ok());
+        assert!(
+            include_str!("../../../mud.toml.example")
+                .contains("https://openrouter.ai/rankings/decisions#top-models"),
+            "the example links the decision ranking"
+        );
+        assert_eq!(
+            s,
+            &mud_supervisor::steward::StewardConfig {
+                council_model: Some("council".into()),
+                ..mud_supervisor::steward::StewardConfig::default()
+            },
+            "the example sets the code defaults"
+        );
+    }
+
+    #[test]
+    fn steward_keys_are_checked() {
+        assert!(
+            toml::from_str::<MudConfig>("[littleguy.steward]\ncouncil_modle = \"x\"").is_err(),
+            "an unknown steward key is refused"
+        );
+        let models = BTreeMap::from([(
+            "council".to_owned(),
+            ModelConfig {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "m".into(),
+                key_env: "K".into(),
+            },
+        )]);
+        let bad = |edit: &dyn Fn(&mut LittleguySection)| {
+            let mut s = LittleguySection::default();
+            edit(&mut s);
+            s.check_steward(&models).unwrap_err().to_string()
+        };
+        assert!(bad(&|s| s.steward.council_model = Some("typo".into())).contains("[models.typo]"));
+        assert!(
+            bad(&|s| s.steward.council_models = vec!["other".into()]).contains("[models.other]")
+        );
+        assert!(bad(&|s| s.steward.council_members = 2).contains("council_members"));
+        assert!(bad(&|s| s.steward.council_members = 9).contains("council_members"));
+        assert!(bad(&|s| s.steward.council_temperature = 0.0).contains("council_temperature"));
+        assert!(
+            bad(&|s| s.steward.max_council_votes_per_day = 0).contains("max_council_votes_per_day")
+        );
+        assert!(bad(&|s| s.steward.every_secs = 0).contains("every_secs"));
+        assert!(bad(&|s| s.steward.title_chars = 0).contains("title_chars"));
+        assert!(bad(&|s| s.steward.deny_phrases = vec![" ".into()]).contains("deny_phrases"));
+        assert!(bad(&|s| s.steward.deny_phrases = vec!["é".into()]).contains("deny_phrases"));
+        let one = LittleguySection {
+            steward: mud_supervisor::steward::StewardConfig {
+                council_members: 1,
+                council_temperature: 0.0,
+                ..mud_supervisor::steward::StewardConfig::default()
+            },
+            ..LittleguySection::default()
+        };
+        assert!(
+            one.check_steward(&models).is_ok(),
+            "one member may be greedy"
+        );
+        let d = LittleguySection::default();
+        assert!(d.check_steward(&BTreeMap::new()).is_ok());
+        assert_eq!(
+            d.council_alias(&BTreeMap::new()),
+            None,
+            "no alias: no judge"
+        );
+        assert_eq!(d.council_alias(&models).as_deref(), Some("council"));
     }
 
     #[test]

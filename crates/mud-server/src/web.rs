@@ -60,6 +60,8 @@ pub struct Mud {
     pub shutdown: tokio_util::sync::CancellationToken,
     /// The littleguy minds, for the observer's links to their pages.
     pub littleguy: Vec<Arc<mud_supervisor::littleguy::LittleguyMind>>,
+    /// The Steward, when it runs (ADR 0015).
+    pub steward: Option<Arc<mud_supervisor::steward::Steward>>,
     /// The world's scripts, unless `[scripts] enabled = false`.
     pub scripts: Option<Arc<mud_script::ScriptHost>>,
     /// Player accounts. Only the transports hold it; the script engine
@@ -193,11 +195,12 @@ function fmt(k,m){
   if(k==='roll')return `roll    ${m.entity}  ${m.trait_name}(${m.roll.target_number}) rolled ${m.roll.total} → ${m.nudged?'FAILED, nudged':'resisted'}`;
   if(k==='script')return `script  ${m.text}`;
   if(k==='booking')return `booking ${m.entity}  #${m.id} ${m.action} · due ${new Date(m.due_ms).toLocaleString()}`;
+  if(k==='steward'){const v=m.votes?` · votes ${m.votes[0]} yes, ${m.votes[1]} no`:'';const r=(m.reasons||[]).length?` · ${m.reasons.join(' | ')}`:'';return `steward ${m.entity}  ${m.item}${m.id!=null?' #'+m.id:''} ${m.action} (${m.code})${v}${m.text?' · '+m.text:''}${r}`;}
   if(k==='session')return m.kind==='afk'?`afk     ${m.entity}  until ${new Date(m.until_ms).toLocaleTimeString()}`:`session ${m.entity}  ${m.online?'logged in':'logged out'}`;
   return `world   [${m.room||'-'}] ${m.who}${m.human?' (human)':''}: ${m.text}`;
 }
 function cls(k,m){if(k==='roll')return 'soft';if(k==='world')return m.kind==='tell'?'tell':'muted';return '';}
-['route','wake','roll','world','session','script','booking'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
+['route','wake','roll','world','session','script','booking','steward'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
 ";
 
 /// The page scripts are files, not inline: the app's CSP allows
@@ -683,7 +686,7 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
         p { "Logins: " (logins.ok) " ok · " (logins.failed) " failed · " (logins.held) " held · " (logins.created) " new · " (logins.resumed) " resumed" }
         p { "Tokens today: " strong { (tokens) } " · cost: $" (format!("{dollars:.4}")) }
         table {
-            tr { th { "entity" } th { "tier / mind" } th { "where" } th { "budget" } th { "last wake" } th { "goal" } th { "macro" } th { "state" } }
+            tr { th { "entity" } th { "tier / mind" } th { "where" } th { "budget" } th { "last wake" } th { "goal" } th { "autonomy" } th { "macro" } th { "state" } }
             @for e in snap["entities"].as_array().into_iter().flatten() {
                 tr {
                     td { strong { (e["name"].as_str().unwrap_or("")) } br; span.muted { (e["id"].as_str().unwrap_or("")) } }
@@ -704,6 +707,7 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
                         } @else { span.muted { "never" } }
                     }
                     td { (e["goal"].as_str().unwrap_or("")) }
+                    td { (autonomy_cell(&e["autonomy"])) }
                     td { (e["macro_ticks"]) br;
                         form hx-post=(format!("/observer/macro-tick/{}?token={token}", url_escape(e["id"].as_str().unwrap_or("")))) hx-swap="none" {
                             button type="submit" { "tick" }
@@ -725,6 +729,47 @@ async fn observer_entities(State(state): State<AppState>, Query(q): Query<Admin>
         }
     }
     .into_response()
+}
+
+/// The Steward's view of one agent (ADR 0015): its goals as lg lists
+/// them, and what the Steward holds open. Goal titles are the agent's own
+/// text; maud escapes them. The littleguy link beside it opens lg's goals
+/// page, the veto.
+fn autonomy_cell(a: &Value) -> Markup {
+    let goals = |key: &str| -> Vec<String> {
+        a[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|g| {
+                format!(
+                    "#{} {}",
+                    g["id"],
+                    g["title"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
+                )
+            })
+            .collect()
+    };
+    html! {
+        @if a.is_object() {
+            @for g in goals("active") { span { "active " (g) } br; }
+            @for g in goals("proposed") { span.muted { "proposed " (g) } br; }
+            span.muted {
+                (a["ideas"].as_u64().unwrap_or(0)) " ideas"
+                @if let Some(n) = a["notes"]["count"].as_u64() { " · " (n) " notes" }
+            }
+            @if a["quiet"] == true { br; span.hard { "quiet (hard budget)" } }
+            @if let Some(i) = a["intent"].as_str() { br; span.soft { "sending: " (i) } }
+            @for off in a["off"].as_array().into_iter().flatten() { br; span.muted { "off: " (off.as_str().unwrap_or("")) } }
+        } @else {
+            span.muted { "—" }
+        }
+    }
 }
 
 /// Opens an agent's littleguy pages (goals, notes, skills, memory,
@@ -892,8 +937,21 @@ async fn macro_tick(
     Json(note).into_response()
 }
 
+/// One feed line. The JSON carries agent and player text (goal titles,
+/// speech) as strings; `<`, `>` and `&` go as JSON escapes, so no markup
+/// is ever on the wire, and the page renders each row as text.
 fn sse(name: &str, data: &Value) -> SseEvent {
-    SseEvent::default().event(name).data(data.to_string())
+    SseEvent::default().event(name).data(json_text(data))
+}
+
+/// `data` as JSON with `<`, `>` and `&` escaped (`\u003c`, …): the same
+/// value to a JSON reader.
+#[must_use]
+pub fn json_text(data: &Value) -> String {
+    data.to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
 }
 
 /// The observer feed: supervisor decisions, self-control rolls and every
@@ -917,6 +975,7 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
                 | ObserverEvent::PlanAbandoned { .. } => "wake",
                 ObserverEvent::Session { .. } | ObserverEvent::Afk { .. } => "session",
                 ObserverEvent::Booking { .. } => "booking",
+                ObserverEvent::Steward(_) => "steward",
             };
             Some(sse(name, &serde_json::to_value(&*e).ok()?))
         });
@@ -1259,6 +1318,15 @@ mod tests {
             archived,
             "events archived: 38 written, 40 trimmed, through seq 40"
         );
+    }
+
+    #[test]
+    fn feed_json_carries_no_markup_and_reads_the_same() {
+        let v = json!({ "text": "<script>a && b</script>", "n": 1 });
+        let text = json_text(&v);
+        assert!(!text.contains('<') && !text.contains('>') && !text.contains('&'));
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
+        assert!(OBSERVER_JS.contains("k==='steward'"));
     }
 
     #[test]

@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {w}");
             }
             println!(
-                "\nsmoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty, one budget and one answered tell across a restart, a booked wake delivered)"
+                "\nsmoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty, one budget and one answered tell across a restart, a booked wake delivered, the Steward idle without littleguy)"
             );
             Ok(())
         }

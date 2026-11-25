@@ -118,6 +118,19 @@ what littleguy's ledger reported, stored with every wake's close and
 restored at boot, with each littleguy meter primed from its ledger, so a
 restart keeps the breaker where it was.
 
+**The autonomy loop (ADR 0015).** A littleguy agent plans for itself
+between wakes: a heartbeat tick is a quiet moment that may read, keep
+notes, research ideas, propose a goal and book a wake, never act in the
+world. The Steward, the supervisor as each daemon's owner on its socket,
+decides each proposed goal: a text guard with no model call, the proved
+`goal_verdict` (caps on active goals and daily accepts, a TTL on every
+wait), then a strict majority of a tool-less council on a `[models]`
+alias. Each decision is written to `world.db` as an intent before `decide`
+is sent, shown on the observer and noted in the agent's next wake. An
+accepted goal is pursued on a macro tick or a booked wake, whose message
+lists it as data. At the hard budget cap the daemon goes quiet (no
+heartbeat, no memory), and lg's own goals page stays the veto.
+
 ## 4. Turing PCs
 
 Friction, not prose: session windows shifted by a daily offset (±20

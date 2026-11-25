@@ -1119,7 +1119,7 @@ async fn booking_events_are_escaped() {
         .await
         .unwrap();
     assert!(
-        js.contains("k==='booking'") && js.contains("'booking'].forEach"),
+        js.contains("k==='booking'") && js.contains("'booking','steward'].forEach"),
         "the page listens for booking lines"
     );
     assert!(
@@ -1161,4 +1161,105 @@ async fn booking_events_are_escaped() {
         !seen.contains("guard_01"),
         "a refused booking is no booking"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn steward_events_are_escaped() {
+    let (addr, built) = boot().await;
+    let token = built.mud.admin_token.clone();
+    let js = http()
+        .get(format!("http://{addr}/static/mud/observer.js"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        js.contains("k==='steward'") && js.contains("'steward'].forEach"),
+        "the page listens for steward lines"
+    );
+    assert!(js.contains("d.textContent=") && !js.contains("innerHTML"));
+    let mut resp = http()
+        .get(format!("http://{addr}/observer/feed?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let title = "<script>alert('zq-goal')</script> & co";
+    built
+        .mud
+        .sup
+        .publish_steward(mud_supervisor::steward::StewardEvent {
+            entity: mud_world::EntityId::from("torin"),
+            item: "goal".into(),
+            id: Some(4),
+            action: "declined".into(),
+            code: "declined_council".into(),
+            votes: Some([1, 2]),
+            text: Some(title.into()),
+            reasons: vec!["<b>no</b>".into()],
+        });
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !seen.contains("declined_council") {
+        let chunk = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .expect("the steward line never came")
+            .unwrap()
+            .unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.contains("event: steward"), "{seen}");
+    assert!(!seen.contains('<'), "no markup on the wire: {seen}");
+    let data = seen
+        .lines()
+        .skip_while(|l| *l != "event: steward")
+        .find_map(|l| l.strip_prefix("data: "))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(v["text"], title, "the same text to a JSON reader");
+    assert_eq!(v["kind"], "steward");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_autonomy_panel_escapes_goal_titles() {
+    let (addr, built) = boot().await;
+    let token = built.mud.admin_token.clone();
+    let torin = mud_world::EntityId::from("torin");
+    built.mud.sup.set_autonomy(
+        &torin,
+        mud_supervisor::steward::AutonomyView {
+            active: vec![mud_supervisor::steward::GoalView {
+                id: 4,
+                title: "<script>alert(1)</script>".into(),
+                why: "x".into(),
+            }],
+            proposed: vec![mud_supervisor::steward::GoalView {
+                id: 5,
+                title: "<img src=x onerror=alert(2)>".into(),
+                why: "y".into(),
+            }],
+            ideas: 2,
+            quiet: true,
+            intent: Some("accept".into()),
+            ..Default::default()
+        },
+    );
+    let html = http()
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{html}"
+    );
+    assert!(html.contains("&lt;img src=x"), "{html}");
+    assert!(!html.contains("<script>alert") && !html.contains("<img src"));
+    assert!(html.contains("quiet (hard budget)") && html.contains("sending: accept"));
+    assert!(html.contains("2 ideas"));
 }

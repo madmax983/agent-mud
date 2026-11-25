@@ -19,5 +19,6 @@ number, and the number is assigned when the ADR merges.
 | [0012](0012-downed-not-limbo.md) | Downed, not limbo: coming to wakes the mind, and death costs more |
 | [0013](0013-shops-keep-their-stock-and-retreat-is-a-walk.md) | Shops keep their stock in a fixture, and a retreat is a walk |
 | [0014](0014-a-wake-ends-when-its-mind-does.md) | A wake ends when its mind does, and owes only what it did not read |
+| [0015](0015-the-supervisor-is-every-daemons-owner.md) | The supervisor is every daemon's owner: the Steward decides goals with guards and a council |
 
 Planned work that these decisions shape is in [the roadmap](../roadmap.md).

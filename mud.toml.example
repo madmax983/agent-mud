@@ -58,6 +58,15 @@ base_url = "https://openrouter.ai/api/v1"
 model = "deepseek/deepseek-chat"
 key_env = "OPENROUTER_API_KEY"
 
+# The council's model (ADR 0015): the Steward asks it, with no tools, whether a
+# goal an agent proposed for itself fits the game. Pick a model that ranks well
+# for decisions and put its id here:
+# https://openrouter.ai/rankings/decisions#top-models
+[models.council]
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-chat"
+key_env = "OPENROUTER_API_KEY"
+
 [littleguy]
 bin = "lg"
 data_dir = "data/agents"
@@ -77,6 +86,33 @@ max_request_bytes = 240000       # keep under the provider's window; 0 is lg's 2
 window = 30                      # turns of transcript the agent sees
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
+# The Steward (ADR 0015): the MUD is each daemon's owner. It decides the goals
+# an agent proposes for itself (text guards, then a council of council_members
+# votes), keeps a daemon quiet at the hard budget cap, and shows each decision
+# on the observer. lg's own goals page stays the veto. With no council model,
+# proposed goals wait and expire. Each key below is its code default.
+[littleguy.steward]
+enabled = true
+every_secs = 60                  # one pass over the running daemons
+owner_timeout_secs = 30          # a decide or reload waits behind lg's loop this long
+intent_retry_secs = 600          # an unanswered decide is sent again after this
+max_intent_tries = 5             # then the agent's actions wait stuck_backoff_hours
+stuck_backoff_hours = 6
+council_model = "council"        # a [models] alias; unset: "council" when it exists
+council_models = []              # more aliases; members cycle council_model, then these
+council_temperature = 0.7        # above 0 (at most 2) with more than one member
+council_members = 3              # odd, 1 to 7; with one alias they are samples of one model
+max_council_votes_per_day = 12   # ballots per agent per game-clock day (1 to 100)
+max_decisions_per_pass = 2
+max_active_goals = 3
+max_goal_accepts_per_day = 2
+min_check_minutes = 60           # a goal checked more often is declined
+proposal_ttl_hours = 48          # a goal still waiting then is declined
+goal_stale_days = 7              # an active goal with no new note this long is dropped
+title_chars = 120
+why_chars = 800
+deny_phrases = []                # added to the built-in phrases, never replacing them
+quiet_on_hard = true             # at the hard cap: no heartbeat, no memory, no tick spend
 
 [supervisor]
 daily_token_budget = 400000      # per agent per UTC day; 0 is unlimited
