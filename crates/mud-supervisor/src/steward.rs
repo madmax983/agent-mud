@@ -23,9 +23,11 @@
 //!    dropped.
 //! 5. Refine ([`refine`], with `[littleguy] refine` on): the pointer
 //!    check of lg's active overlay, every pass; the empty baseline at first
-//!    contact; and, when due, lg's proposer under a claim, a menu ballot,
-//!    and a put and an activate one move above the baseline. A human's
-//!    move pauses refine.
+//!    contact; and, when due, lg's proposer under a claim, a menu ballot
+//!    (or, with `refine = "free"` and not for a Turing-tier entity, the
+//!    free-text guard and a unanimous council, ADR 0016), and a put and an
+//!    activate one move above the baseline. A human's move pauses refine;
+//!    a free text that comes to name an entity is revoked.
 //! 6. Notes: counted, for the observer.
 //!
 //! Every decision is published on the observer feed and noted for the
@@ -155,6 +157,17 @@ pub struct StewardConfig {
     pub refine_charge_tokens: u64,
     /// Menu items active at once at most.
     pub max_guardrails: u32,
+    /// Free mode: the whole candidate, lines joined by `\n`, in
+    /// characters at most (ADR 0016).
+    pub refine_max_chars: usize,
+    /// Free mode: lines at most.
+    pub refine_max_lines: usize,
+    /// Free mode: characters of one line at most.
+    pub refine_line_chars: usize,
+    /// Free mode: words refused, added to [`vet::DENY_WORDS`].
+    pub refine_deny_words: Vec<String>,
+    /// Free mode: stems refused, added to [`vet::DENY_STEMS`].
+    pub refine_deny_stems: Vec<String>,
     /// Entities whose refine pause, recorded in an earlier boot, ends at
     /// this boot. Remove an entity once it is resumed.
     pub resume_refine: Vec<String>,
@@ -195,6 +208,11 @@ impl Default for StewardConfig {
             refine_min_wakes: 20,
             refine_charge_tokens: 30_000,
             max_guardrails: 3,
+            refine_max_chars: 600,
+            refine_max_lines: 6,
+            refine_line_chars: 160,
+            refine_deny_words: Vec::new(),
+            refine_deny_stems: Vec::new(),
             resume_refine: Vec::new(),
             guardrail: Vec::new(),
         }
@@ -219,6 +237,19 @@ impl StewardConfig {
         TextLimits {
             title_chars: self.title_chars,
             why_chars: self.why_chars,
+        }
+    }
+
+    /// The free-text guard: the limits, and the deny lists config adds to
+    /// the built-in ones.
+    #[must_use]
+    pub fn free_guard(&self) -> vet::FreeGuard {
+        vet::FreeGuard {
+            max_lines: self.refine_max_lines,
+            line_chars: self.refine_line_chars,
+            max_chars: self.refine_max_chars,
+            extra_words: self.refine_deny_words.clone(),
+            extra_stems: self.refine_deny_stems.clone(),
         }
     }
 
@@ -294,8 +325,13 @@ pub struct OverlayView {
     pub pointer: Option<u64>,
     /// The empty baseline: one Roll back on lg's page returns to it.
     pub baseline: Option<u64>,
-    /// What the Steward's active text came from (menu ids), if any.
+    /// What the Steward's active text came from (menu ids, or `free`), if
+    /// any.
     pub source: Option<String>,
+    /// The active free-text lines, without the preamble: model text a
+    /// unanimous council approved (ADR 0016), escaped on render.
+    #[serde(default)]
+    pub lines: Vec<String>,
     /// Why refine is paused, if it is.
     pub paused: Option<String>,
     /// The version lg's Roll back button would activate, as far as the
@@ -311,10 +347,11 @@ pub struct OverlayView {
 pub struct ChainEntry {
     /// lg's version.
     pub version: u64,
-    /// `baseline`, or the menu ids.
+    /// `baseline`, the menu ids, or `free`.
     pub label: String,
     /// Its guardrails text as put (`""` for the baseline): operator text
-    /// in menu mode, escaped on render.
+    /// in menu mode, the preamble and model lines in free mode; escaped on
+    /// render.
     pub text: String,
     /// Whether lg has it active.
     pub active: bool,
@@ -358,8 +395,9 @@ pub struct StewardEvent {
     pub code: String,
     /// Yes and no votes, when the council voted.
     pub votes: Option<[u32; 2]>,
-    /// The goal title (untrusted, cut to [`VIEW_CHARS`]), or the menu ids
-    /// and text of an overlay.
+    /// The goal title (untrusted, cut to [`VIEW_CHARS`]), the menu ids and
+    /// text of an overlay, or the full free-text candidate (untrusted, at
+    /// most `refine_max_chars`, never cut).
     pub text: Option<String>,
     /// The council's reasons, each cut to 200 characters: here only,
     /// never for lg or the agent.
@@ -1486,6 +1524,8 @@ fn goal_view(g: &GoalEntry) -> GoalView {
     }
 }
 
+#[cfg(test)]
+mod free_tests;
 #[cfg(test)]
 mod refine_tests;
 #[cfg(test)]

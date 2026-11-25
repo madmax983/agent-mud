@@ -1,10 +1,20 @@
-//! Step 5 of a pass: refine (ADR 0015, phase 4).
+//! Step 5 of a pass: refine (ADR 0015, phase 4; free text, ADR 0016).
 //!
 //! lg's proposer (`refine_propose`) reads an agent's recent play and
 //! writes a revision of its overlay. The Steward never activates that
 //! proposal. In `menu` mode it is only evidence: the council picks
 //! operator menu items from it, and the Steward puts and activates
 //! `{"guardrails": <the picked items>}` itself.
+//!
+//! In `free` mode (ADR 0016), and never for a Turing-tier entity, the
+//! Steward takes only the proposal's `guardrails` string, strips the
+//! preamble it wrote before, and runs the deterministic guard
+//! ([`vet::FreeGuard::check`]). A candidate that passes goes to every
+//! council member as the exact lines; only a unanimous council of at least
+//! [`vet::FREE_MIN_MEMBERS`] activates it ([`vet::overlay_verdict`]). The
+//! Steward puts `{"guardrails": preamble + lines}` and nothing else. An
+//! active free text that comes to name an entity (a player registers a
+//! matching name) is revoked on the next pass.
 //!
 //! lg's `overlay_activate` takes no expected version, so the Steward keeps
 //! its own view of lg's active version (`pointer`) and checks every move:
@@ -40,14 +50,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use mud_world::EntityId;
+use mud_world::pack::Tier;
+use serde_json::Value;
 
 use super::council::Ballot;
 use super::state::{Authored, IntentAction, OverlaySource, Pause, Purpose};
-use super::vet::{self, PointerVerdict};
+use super::vet::{self, EntityName, OverlayVerdict, PointerVerdict};
 use super::{OwnedDaemons, Run, Steward, StewardEvent, StewardNote, StewardPoint};
 use crate::budget::BudgetLevel;
-use crate::littleguy::PersonaText;
 use crate::littleguy::owner::{self, OverlayEntry, OwnerError, OwnerRequest, OwnerResponse};
+use crate::littleguy::{PersonaText, RefineMode};
 use crate::mind::Usage;
 use crate::runtime::Supervisor;
 
@@ -189,6 +201,9 @@ impl Steward {
         }
         let ov = &run.row.overlay;
         if !can_act || ov.paused.is_some() || ov.baseline.is_none() || ov.pointer.is_none() {
+            return;
+        }
+        if self.revoke_if_named(e, socket, run, now).await {
             return;
         }
         if let Some(pending) = run.row.overlay.pending.take() {
@@ -495,7 +510,87 @@ impl Steward {
         match source {
             OverlaySource::Baseline => String::new(),
             OverlaySource::Menu { ids } => vet::render_guardrails(&self.menu, ids),
+            OverlaySource::Free { lines } => vet::render_free(lines),
         }
+    }
+
+    /// Every entity of the world, players included, by name and aliases:
+    /// what a free text must never name.
+    fn entity_names(&self) -> Vec<EntityName> {
+        self.sup.game().read(|w| {
+            w.state()
+                .entities
+                .values()
+                .map(|x| EntityName {
+                    name: x.name.clone(),
+                    aliases: x.aliases.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Whether `e` is a Turing-tier entity. Read here and never shown: a
+    /// hidden PC's habits come from the operator menu only.
+    fn is_turing(&self, e: &EntityId) -> bool {
+        self.sup
+            .game()
+            .read(|w| w.entity(e).is_some_and(|x| x.tier == Tier::Turing))
+    }
+
+    /// Revokes a free text of the Steward's that names an entity now (9.5
+    /// step 7): a pending one is dropped, an active one is cleared back to
+    /// the baseline; either is vetoed for good. This is the Steward
+    /// withdrawing its own text, not a pause. Returns whether it moved.
+    async fn revoke_if_named(&self, e: &EntityId, socket: &Path, run: &mut Run, now: u64) -> bool {
+        let hits = |a: &Authored, cast: &[EntityName]| {
+            a.source
+                .free_lines()
+                .is_some_and(|lines| vet::names_entity(lines, cast))
+        };
+        let (active, pending) = (&run.row.overlay.active, &run.row.overlay.pending);
+        if !active
+            .iter()
+            .chain(pending)
+            .any(|a| a.source.free_lines().is_some())
+        {
+            return false;
+        }
+        let names = self.entity_names();
+        if let Some(p) = run.row.overlay.pending.take_if(|p| hits(p, &names)) {
+            run.row.veto(p.digest);
+            run.dirty = true;
+            self.write(e, run, true);
+            self.revoked_event(e, &p);
+        }
+        let Some(a) = run.row.overlay.active.clone().filter(|a| hits(a, &names)) else {
+            return false;
+        };
+        let Some(b) = run.row.overlay.baseline else {
+            return false;
+        };
+        run.row.veto(a.digest);
+        run.dirty = true;
+        self.write(e, run, true);
+        self.revoked_event(e, &a);
+        let pointer = run.row.overlay.pointer;
+        if self.clear(e, socket, run, b, pointer, now).await {
+            self.note_plain(e, "overlay_off");
+        }
+        true
+    }
+
+    fn revoked_event(&self, e: &EntityId, a: &Authored) {
+        tracing::info!(entity = %e, version = a.version, "a free text names an entity now; it is revoked");
+        self.publish_full(StewardEvent {
+            entity: e.clone(),
+            item: "overlay".into(),
+            id: as_id(a.version),
+            action: "revoked".into(),
+            code: "names_entity".into(),
+            votes: None,
+            text: Some(a.text.clone()),
+            reasons: Vec::new(),
+        });
     }
 
     /// Puts the overlay of `source` (intent first). Returns its version
@@ -1163,8 +1258,16 @@ impl Steward {
             Some(OwnerResponse::Proposed { version, overlay }) => {
                 // The proposer's own version: never activated.
                 run.row.overlay.see(version);
-                self.publish(e, "overlay", as_id(version), "proposed", "menu", None, None);
-                self.menu_pick(d, e, socket, run, &overlay, now).await;
+                // A Turing-tier entity always uses the menu: a habit such
+                // as "say you are not a real person" would leak its tier.
+                let free = self.cfg.refine == RefineMode::Free && !self.is_turing(e);
+                let mode = if free { "free" } else { "menu" };
+                self.publish(e, "overlay", as_id(version), "proposed", mode, None, None);
+                if free {
+                    self.free_pick(d, e, socket, run, &overlay, now).await;
+                } else {
+                    self.menu_pick(d, e, socket, run, &overlay, now).await;
+                }
             }
             Some(OwnerResponse::Kept) => {
                 self.publish(e, "overlay", None, "kept", "kept", None, None);
@@ -1277,7 +1380,23 @@ impl Steward {
             return;
         }
         self.publish_full(event("voted", "menu"));
-        let source = OverlaySource::Menu { ids };
+        self.put_and_chain(e, socket, run, OverlaySource::Menu { ids }, now)
+            .await;
+    }
+
+    /// Puts the text of `source` (or reuses a version of it put before,
+    /// once lg shows it unchanged), then activates it one move above the
+    /// baseline.
+    async fn put_and_chain(
+        &self,
+        e: &EntityId,
+        socket: &Path,
+        run: &mut Run,
+        source: OverlaySource,
+        now: u64,
+    ) {
+        let text = self.source_text(&source);
+        let digest = vet::overlay_digest(&text);
         let ov = &run.row.overlay;
         let reuse = ov
             .authored
@@ -1310,6 +1429,144 @@ impl Steward {
             now,
         )
         .await;
+    }
+
+    /// The free-text path on a proposal (9.5): extract the `guardrails`
+    /// string only, normalize it (the preamble goes), guard it, put the
+    /// exact lines to every member, and activate only on
+    /// [`vet::overlay_verdict`]. Every candidate is published in full.
+    async fn free_pick(
+        &self,
+        d: &dyn OwnedDaemons,
+        e: &EntityId,
+        socket: &Path,
+        run: &mut Run,
+        proposal: &str,
+        now: u64,
+    ) {
+        // 1. Extract: the string `guardrails` only. Every other part of the
+        // proposal is dropped here and never reaches lg again.
+        let Some(raw) = extract_guardrails(proposal) else {
+            self.publish(e, "overlay", None, "kept", "no_candidate", None, None);
+            return;
+        };
+        // 2. Normalize, without the preamble.
+        let lines = vet::normalize_free(&raw);
+        let candidate = lines.join("\n");
+        let current: Vec<String> = run
+            .row
+            .overlay
+            .active
+            .as_ref()
+            .and_then(|a| a.source.free_lines())
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
+        let event = |action: &str, code: &str, votes: Option<[u32; 2]>, reasons: Vec<String>| {
+            StewardEvent {
+                entity: e.clone(),
+                item: "overlay".into(),
+                id: None,
+                action: action.into(),
+                code: code.into(),
+                votes,
+                text: Some(candidate.clone()),
+                reasons,
+            }
+        };
+        if !current.is_empty() && lines == current {
+            self.publish_full(event("kept", "kept", None, Vec::new()));
+            return;
+        }
+        // 3. Guard: no model call.
+        let names = self.entity_names();
+        if let Err(why) = self.cfg.free_guard().check(
+            &lines,
+            &names,
+            |digest| run.row.overlay_declined(digest),
+            |digest| run.row.is_vetoed(digest),
+        ) {
+            tracing::info!(entity = %e, check = why.check(), "the free-text guard declined a candidate");
+            self.publish_full(event("declined", why.code(), None, Vec::new()));
+            return;
+        }
+        // 4. Council, on the exact lines.
+        let Some((yes, no, reasons)) = self.free_votes(d, e, &current.join("\n"), &candidate).await
+        else {
+            return;
+        };
+        run.row.ballots.cast(now);
+        run.dirty = true;
+        let votes = Some([yes, no]);
+        let level = self
+            .sup
+            .budget_of(e)
+            .map_or(BudgetLevel::Normal, |(level, _)| level);
+        match vet::overlay_verdict(
+            true,
+            yes,
+            self.cfg.council_members,
+            vet::FREE_MIN_MEMBERS,
+            run.row.overlay.paused.is_some(),
+            level == BudgetLevel::Normal,
+        ) {
+            OverlayVerdict::Hold => {
+                let code = if run.row.overlay.paused.is_some() {
+                    "paused"
+                } else {
+                    "budget"
+                };
+                self.publish_full(event("waiting", code, votes, reasons));
+            }
+            OverlayVerdict::Decline => {
+                run.row.decline_overlay(vet::free_digest(&lines));
+                self.publish_full(event("declined", "declined_council", votes, reasons));
+            }
+            OverlayVerdict::Activate => {
+                self.publish_full(event("voted", "free", votes, reasons));
+                // 5 and 6. Render and activate: the preamble and the lines
+                // the council saw, nothing else.
+                self.put_and_chain(e, socket, run, OverlaySource::Free { lines }, now)
+                    .await;
+            }
+        }
+    }
+
+    /// Each member's vote on the free-text `candidate`: yes, no, and the
+    /// reasons; `None` without a judge. A failed vote is a no.
+    async fn free_votes(
+        &self,
+        d: &dyn OwnedDaemons,
+        e: &EntityId,
+        current: &str,
+        candidate: &str,
+    ) -> Option<(u32, u32, Vec<String>)> {
+        let judge = self.judge.as_ref()?;
+        let brief = d.brief(e).unwrap_or_else(|| PersonaText {
+            name: String::new(),
+            persona: String::new(),
+            goal: String::new(),
+            body: String::new(),
+        });
+        let (mut yes, mut no, mut reasons) = (0, 0, Vec::new());
+        for member in 0..self.cfg.council_members {
+            let ballot = Ballot::overlay(member, &brief, current, candidate);
+            match judge.vote(&ballot).await {
+                Ok((vote, usage)) => {
+                    self.sup.record_spend(e, usage);
+                    if vote.yes {
+                        yes += 1;
+                    } else {
+                        no += 1;
+                    }
+                    reasons.extend(vote.reason);
+                }
+                Err(err) => {
+                    tracing::warn!(entity = %e, error = %err, "a council vote failed; it counts as a no");
+                    no += 1;
+                }
+            }
+        }
+        Some((yes, no, reasons))
     }
 
     /// Each member's menu picks on `evidence`, counted per item, and the
@@ -1371,13 +1628,19 @@ impl Steward {
         let ov = &run.row.overlay;
         super::OverlayView {
             mode: match self.cfg.refine {
-                crate::littleguy::RefineMode::Free => "free",
-                _ => "menu",
+                RefineMode::Free => "free",
+                RefineMode::Menu | RefineMode::Off => "menu",
             }
             .to_owned(),
             pointer: ov.pointer,
             baseline: ov.baseline,
             source: ov.active.as_ref().map(|a| a.source.label()),
+            lines: ov
+                .active
+                .as_ref()
+                .and_then(|a| a.source.free_lines())
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
             paused: ov.paused.as_ref().map(|p| p.code.clone()),
             rollback_to: ov.rollback_to,
             chain: ov
@@ -1392,5 +1655,17 @@ impl Steward {
                 })
                 .collect(),
         }
+    }
+}
+
+/// The string `guardrails` of a proposal's overlay JSON, if it has one.
+/// Nothing else of the proposal is read.
+fn extract_guardrails(proposal: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(proposal) {
+        Ok(Value::Object(mut obj)) => match obj.remove("guardrails") {
+            Some(Value::String(g)) => Some(g),
+            _ => None,
+        },
+        _ => None,
     }
 }

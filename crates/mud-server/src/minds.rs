@@ -247,7 +247,7 @@ pub fn build(
         }
     }
     if !littleguy.is_empty() {
-        for w in cfg.littleguy.warnings() {
+        for w in cfg.littleguy.warnings(&cfg.models) {
             tracing::warn!("{w}");
         }
     }

@@ -80,6 +80,8 @@ pub(super) struct Opts {
     pub(super) mind: Noop,
     pub(super) fake: Option<Arc<FakeDaemons>>,
     pub(super) judge_of: Option<Arc<ScriptedJudge>>,
+    /// A row restored for torin, as if an earlier boot wrote it.
+    pub(super) seed: Option<StewardRow>,
 }
 
 impl Default for Opts {
@@ -92,6 +94,7 @@ impl Default for Opts {
             mind: Noop::default(),
             fake: None,
             judge_of: None,
+            seed: None,
         }
     }
 }
@@ -106,7 +109,17 @@ pub(super) fn rig(o: Opts) -> Rig {
     let events = game.subscribe();
     // As mud-server's build(): the Steward's rows are split off first.
     let mut restored = game.take_restored().unwrap_or_default();
-    let rows = std::mem::take(&mut restored.steward);
+    let mut rows = std::mem::take(&mut restored.steward);
+    if let Some(row) = o.seed {
+        rows.insert(
+            torin(),
+            StewardStored {
+                rev: 1,
+                schema: ROW_SCHEMA,
+                body: row.body(),
+            },
+        );
+    }
     let typing = Gate::new(Arc::clone(&game), 1, 0.0);
     let mind = Arc::new(o.mind);
     let sup = Supervisor::open(

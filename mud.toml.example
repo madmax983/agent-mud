@@ -88,9 +88,14 @@ window = 30                      # turns of transcript the agent sees
 # and lets the council pick standing reminders from the operator menu below;
 # it puts and activates them itself, one move above an empty baseline, so one
 # Roll back on the agent's littleguy page returns to the baseline and pauses
-# refine for that agent. "off" | "menu" | "free" ("free" is not available yet
-# and runs as "menu"). Needs an lg built with the refine feature unless "off".
-refine = "menu"
+# refine for that agent. "off" | "menu" | "free". Needs an lg built with the
+# refine feature unless "off". The code default is "menu".
+# "free" is the exception of ADR 0016 (docs/adr/0016-council-approved-guardrails-text.md):
+# the habit lines lg's proposer wrote from the agent's play, which holds what
+# players said, go into the agent's instructions after a deterministic guard
+# and a unanimous council of at least three. A Turing-tier agent still uses
+# the menu. Use "menu" to keep model text out of every agent's instructions.
+refine = "free"
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
 # The Steward (ADR 0015): the MUD is each daemon's owner. It decides the goals
@@ -128,6 +133,13 @@ refine_every_hours = 168         # at least 24 between two proposes of an agent
 refine_min_wakes = 20            # at least 1 wake between two proposes
 refine_charge_tokens = 30000     # charged per propose (lg's proposer writes no ledger row)
 max_guardrails = 3               # menu items active at once
+# Free text (refine = "free", ADR 0016): the bounds of one candidate, and deny
+# lists that add to the built-in words and stems (never replacing them).
+refine_max_chars = 600           # the whole candidate, 100 to 2000
+refine_max_lines = 6             # 1 to 12
+refine_line_chars = 160          # one line, 20 to 300
+refine_deny_words = []           # whole words, ASCII letters and digits
+refine_deny_stems = []           # a word that starts with one is refused
 resume_refine = []               # agents whose refine pause ends at the next boot; remove them after
 # The operator menu; with none, the code default menu (brevity, pacing,
 # in_character, look_first, fair_prices, follow_through) is used.
