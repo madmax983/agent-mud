@@ -194,15 +194,38 @@ async fn a_mind_that_hangs_still_times_out_on_its_tiers_bound() {
 
 // ---- the next wake carries only what the mind did not read ----
 
+/// How the first wake of a [`Reader`] ends, once it has read its events.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// It answers.
+    #[default]
+    Answers,
+    /// The mind fails (a socket error, a wait for an approval).
+    Fails,
+    /// littleguy's `no_answer`: a provider error or a refusal after the
+    /// model already called `mud_events`.
+    NoAnswer,
+}
+
 /// Torin's first wake waits for the test, reads `mud_events`, waits again,
-/// and answers; every wake records the seqs it carried.
+/// and ends as `end` says; every wake records the seqs it carried.
 #[derive(Debug, Default)]
 struct Reader {
     started: Notify,
     read: Notify,
     go: Notify,
     done: Notify,
+    end: End,
     wakes: Mutex<Vec<(String, Vec<Seq>)>>,
+}
+
+impl Reader {
+    fn ending(end: End) -> Self {
+        Self {
+            end,
+            ..Self::default()
+        }
+    }
 }
 
 impl Mind for Reader {
@@ -232,6 +255,17 @@ impl Mind for Reader {
                     .await;
                 self.done.notify_one();
                 self.go.notified().await;
+                match self.end {
+                    End::Answers => {}
+                    End::Fails => return Err(MindError::Failed("the socket closed".into())),
+                    End::NoAnswer => {
+                        return Ok(MindReply {
+                            text: Some("no answer: provider error".into()),
+                            unanswered: true,
+                            ..MindReply::default()
+                        });
+                    }
+                }
             }
             Ok(MindReply::default())
         })
@@ -337,6 +371,178 @@ async fn a_wake_of_only_read_events_is_dropped() {
     r.clock.advance(1_000);
     assert!(r.sup.step().is_empty());
     assert_eq!(reader.wakes.lock().unwrap().len(), 1);
+}
+
+/// Runs torin's first wake to its end around one tell: the tell comes
+/// while the wake runs, the mind reads it with `mud_events`, and the wake
+/// ends as the mind's [`End`] says. Returns the rig and the tell's seq.
+async fn a_tell_read_in_a_wake(mind: Arc<Reader>) -> (Rig, Seq) {
+    let r = rig(
+        quiet(),
+        0.0,
+        HashMap::from([(torin(), Arc::clone(&mind) as Arc<dyn Mind>)]),
+    );
+    let mut rx = r.game.subscribe();
+    let ada = r.game.login("ada").unwrap();
+    while let Ok(ev) = rx.try_recv() {
+        r.sup.observe(&ev);
+    }
+    let one = wake_now(&r, &torin());
+    mind.started.notified().await;
+    assert!(r.game.execute(&ada, "tell torin meet at the smithy").ok);
+    let tell = last_for_torin(&r.game);
+    while let Ok(ev) = rx.try_recv() {
+        r.sup.observe(&ev);
+    }
+    mind.read.notify_one();
+    mind.done.notified().await;
+    assert_eq!(r.game.read_mark(&torin()), tell, "the mind read the tell");
+    mind.go.notify_one();
+    for h in one {
+        h.await.unwrap();
+    }
+    (r, tell)
+}
+
+#[tokio::test]
+async fn a_tell_read_by_a_wake_that_failed_still_wakes_the_mind() {
+    // Reading an event is not answering it: a wake that failed, or ended
+    // with littleguy's `no_answer`, after `mud_events` owes the tell still.
+    for end in [End::Fails, End::NoAnswer] {
+        let mind = Arc::new(Reader::ending(end));
+        let (r, tell) = a_tell_read_in_a_wake(Arc::clone(&mind)).await;
+        assert!(
+            r.sup.seen_seq(&torin()) < Some(tell),
+            "{end:?}: the floor stays below the tell"
+        );
+        r.clock.advance(1_000);
+        for h in r.sup.step() {
+            h.await.unwrap();
+        }
+        let wakes = mind.wakes.lock().unwrap().clone();
+        assert_eq!(wakes.len(), 2, "{end:?}: {wakes:?}");
+        assert_eq!(
+            wakes[1],
+            ("tell by ada".to_owned(), vec![tell]),
+            "{end:?}: the tell wakes it"
+        );
+    }
+}
+
+/// The signals between a [`ReadsLate`] op and the test.
+#[derive(Debug, Default)]
+struct Signals {
+    started: Notify,
+    read: Notify,
+    go: Notify,
+    done: Notify,
+}
+
+/// A littleguy-like mind whose first op outlives its wake: the op reads
+/// its events after the wake timed out, waits for the test, and answers
+/// late (or does not), as `lg serve` does after a timeout.
+#[derive(Debug, Default)]
+struct ReadsLate {
+    in_flight: InFlight,
+    answers: bool,
+    signals: Arc<Signals>,
+    wakes: Mutex<Vec<Vec<Seq>>>,
+}
+
+impl Mind for ReadsLate {
+    fn kind(&self) -> &'static str {
+        "reads-late"
+    }
+
+    fn wake(
+        &self,
+        ctx: WakeContext,
+        tools: MudTools,
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
+        let first = {
+            let mut w = self.wakes.lock().unwrap();
+            w.push(ctx.events.iter().map(|e| e.seq).collect());
+            w.len() == 1
+        };
+        if !first {
+            return Box::pin(async { Ok(MindReply::default()) });
+        }
+        let guard = self.in_flight.start(&ctx.entity);
+        let (signals, answers) = (Arc::clone(&self.signals), self.answers);
+        // The op, on a task of its own: the wake's timeout drops only the
+        // wake's future.
+        tokio::spawn(async move {
+            signals.started.notify_one();
+            signals.read.notified().await;
+            let _ = tools
+                .call("mud_events", &serde_json::json!({ "since_seq": 0 }))
+                .await;
+            signals.done.notify_one();
+            signals.go.notified().await;
+            if answers {
+                tools.usage_sink().answered_late(&ctx.entity);
+            }
+            drop(guard);
+        });
+        Box::pin(std::future::pending())
+    }
+
+    fn settled(&self, entity: &EntityId) -> BoxFuture<'_, ()> {
+        self.in_flight.settled(entity)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_wake_drops_what_it_read_only_if_its_op_answered_late() {
+    for answers in [true, false] {
+        let cfg = SupervisorConfig {
+            wake_timeout_ms: 50,
+            ..quiet()
+        };
+        let mind = Arc::new(ReadsLate {
+            answers,
+            ..ReadsLate::default()
+        });
+        let r = rig(
+            cfg,
+            0.0,
+            HashMap::from([(torin(), Arc::clone(&mind) as Arc<dyn Mind>)]),
+        );
+        let mut rx = r.game.subscribe();
+        let ada = r.game.login("ada").unwrap();
+        while let Ok(ev) = rx.try_recv() {
+            r.sup.observe(&ev);
+        }
+        let one = wake_now(&r, &torin());
+        let signals = Arc::clone(&mind.signals);
+        signals.started.notified().await;
+        // Past the bound: the wake times out, its op runs on.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(lock(&r.sup.router).is_busy(&torin()), "{answers}");
+        assert!(r.game.execute(&ada, "tell torin meet at the smithy").ok);
+        let tell = last_for_torin(&r.game);
+        while let Ok(ev) = rx.try_recv() {
+            r.sup.observe(&ev);
+        }
+        signals.read.notify_one();
+        signals.done.notified().await;
+        signals.go.notify_one();
+        for h in one {
+            h.await.unwrap();
+        }
+        r.clock.advance(1_000);
+        for h in r.sup.step() {
+            h.await.unwrap();
+        }
+        let wakes = mind.wakes.lock().unwrap().clone();
+        if answers {
+            assert_eq!(wakes.len(), 1, "answered late: nothing owed: {wakes:?}");
+            assert_eq!(r.sup.seen_seq(&torin()), Some(tell));
+        } else {
+            assert_eq!(wakes.len(), 2, "no late answer: {wakes:?}");
+            assert_eq!(wakes[1], vec![tell], "the tell still wakes it");
+        }
+    }
 }
 
 #[test]

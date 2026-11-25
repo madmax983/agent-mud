@@ -150,6 +150,114 @@ async fn a_tell_just_before_a_crash_is_answered_once() {
     }
 }
 
+/// Marta's first wake: it waits for the test, reads `mud_events` (a tell
+/// came meanwhile), answers aloud and ends. Later wakes are only counted.
+#[derive(Debug, Default)]
+struct ReadsThenAnswers {
+    started: tokio::sync::Notify,
+    read: tokio::sync::Notify,
+    wakes: StdMutex<Vec<Vec<Seq>>>,
+}
+
+impl Mind for ReadsThenAnswers {
+    fn kind(&self) -> &'static str {
+        "reads-then-answers"
+    }
+
+    fn wake(
+        &self,
+        ctx: WakeContext,
+        tools: MudTools,
+    ) -> BoxFuture<'_, Result<MindReply, MindError>> {
+        Box::pin(async move {
+            let first = {
+                let mut w = self.wakes.lock().unwrap();
+                w.push(ctx.events.iter().map(|e| e.seq).collect());
+                w.len() == 1
+            };
+            if first {
+                self.started.notify_one();
+                self.read.notified().await;
+                let _ = tools
+                    .call("mud_events", &serde_json::json!({ "since_seq": 0 }))
+                    .await;
+                tools.command("say aye").await;
+            }
+            Ok(MindReply::default())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_tell_the_mind_read_and_answered_is_not_replayed_after_a_restart() {
+    // ADR 0014: the turn's close stores the read mark, so a boot replay
+    // does not hand out again a tell the op read with `mud_events` and
+    // answered.
+    let disk = Disk::new();
+    let mind = Arc::new(ReadsThenAnswers::default());
+    let minds = HashMap::from([(marta(), Arc::clone(&mind) as Arc<dyn Mind>)]);
+    let r = start(&disk, T0, quiet(), minds);
+    let mut rx = r.game.subscribe();
+    let feed = |rx: &mut tokio::sync::broadcast::Receiver<Arc<mud_world::Event>>| {
+        while let Ok(ev) = rx.try_recv() {
+            r.sup.observe(&ev);
+        }
+    };
+    let first = ada_tells_marta(&r, "evening");
+    feed(&mut rx);
+    // Past the tell's jitter: marta's wake starts (ada's login may wake
+    // others first).
+    let mut wakes = Vec::new();
+    for _ in 0..40 {
+        r.clock.advance(250);
+        wakes.extend(r.sup.step());
+        tokio::task::yield_now().await;
+        if !mind.wakes.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(10), mind.started.notified())
+        .await
+        .expect("marta's wake started");
+    // While the wake runs: a second tell, which the op then reads.
+    let read = ada_tells_marta(&r, "an ale please");
+    feed(&mut rx);
+    mind.read.notify_one();
+    for h in wakes {
+        h.await.unwrap();
+    }
+    feed(&mut rx);
+    assert_eq!(r.game.read_mark(&marta()), read, "the op read the tell");
+    assert_eq!(
+        mind.wakes.lock().unwrap().clone(),
+        [vec![first]],
+        "the wake carried the first tell only"
+    );
+    assert!(lock(&r.sup.router).is_idle(&marta()), "nothing owed live");
+    drop(rx);
+    drop(r);
+    let stored = disk.sql(
+        "SELECT seen_seq FROM sup_entity WHERE entity = 'marta'",
+        |row| row.get::<_, i64>(0),
+    );
+    assert_eq!(
+        stored
+            .iter()
+            .map(|s| u64::try_from(*s).unwrap())
+            .collect::<Vec<_>>(),
+        [read.0],
+        "the close stored the read mark, past the wake's own tell"
+    );
+
+    // The next boot replays nothing: the floor is past the read tell.
+    let (second, minds) = answering_marta();
+    let mut r = start(&disk, T0 + 10_000, quiet(), minds);
+    assert_eq!(r.sup.seen_seq(&marta()), Some(read));
+    r.run_for(10_000, 500).await;
+    assert!(second.wakes().is_empty(), "{:?}", second.wakes());
+    assert_eq!(r.said(&marta()), ["aye"], "answered once");
+}
+
 #[tokio::test]
 async fn a_tell_older_than_the_window_is_not_replayed() {
     let disk = Disk::new();

@@ -40,9 +40,9 @@ That stays, and is now tested against the littleguy socket protocol.
 - **The next wake owes only what the mind did not read.** `Game::events`
   (`mud_events`, in process and over MCP) records the newest event it
   handed each entity: its read mark, in memory. When a wake's mind has
-  settled, the router drops from the entity's waiting wake every event at
-  or below the mark (`Router::finish_seen`); its priority and reason fall
-  back to what is left, and a wake left with no event and no cause outside
+  settled and it answered, the router drops from the entity's waiting
+  wake every event at or below the mark (`Router::finish_seen`); its
+  priority and reason fall back to what is left, and a wake left with no event and no cause outside
   the event stream (a login, a come-to, a booking, a macro tick, an
   interrupt, a wake given back) is dropped. An event that came after the
   last read still wakes the mind. The close of the turn also stores the
@@ -50,6 +50,17 @@ That stays, and is now tested against the littleguy socket protocol.
   cursor after a restart do not hand the read events out again. A crash
   before the close loses the mark, and the boot replays them once: the
   safe direction.
+- **Reading is not answering.** Only a mind that finished its turn drops
+  what it read: a reply that is an answer, or, for a wake that timed
+  out, an op that answered when it was read late (`chat_charged` marks it
+  with `UsageSink::answered_late`). A wake that failed (a socket error, a
+  wait for an approval) or ended with littleguy's `no_answer` (a provider
+  error or a refusal after the model called `mud_events`) leaves its
+  waiting wake and the stored `seen_seq` as they were: the events it was
+  handed still wake the mind, live and after a restart. An in-process
+  mind that times out (a harvest job) marks no late answer, so it owes
+  its reads too: the safe direction. A wake's own events count as seen
+  when it opens, as before.
 - **An interrupt does not stack a wake.** Combat still drops a held line
   with `INTERRUPTED` and publishes it; it forces an Immediate wake only
   when the PC has no wake running. A running wake reads the result and
@@ -78,7 +89,8 @@ That stays, and is now tested against the littleguy socket protocol.
 - A Turing PC that types a 45 s notice under a 30 s bound ends its wake
   ok. A mind that hangs still times out on its tier's bound.
 - A littleguy op that reads its tells and answers them is not woken again
-  for them, after the wake or after a restart. A mind that never calls
+  for them, after the wake or after a restart. One that fails after
+  reading them is woken for them again. A mind that never calls
   `mud_events` (a scripted mind reads only its wake's events) is not
   affected.
 - The read mark is per process and not a view: no entity sees it, and it

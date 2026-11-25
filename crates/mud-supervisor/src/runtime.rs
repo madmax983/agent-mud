@@ -1230,10 +1230,14 @@ impl Supervisor {
         let res = self
             .bounded(
                 &wake.entity,
-                self.timeout_of(&wake.entity),
+                self.wake_timeout_of(&wake.entity),
                 mind.wake(ctx, tools),
             )
             .await;
+        // Whether the mind finished its turn: a reply that is an answer. A
+        // failure, littleguy's `no_answer` or a timeout is not one, unless
+        // the op answered once read late (checked when it settles).
+        let answered = matches!(&res, Some(Ok(r)) if !r.unanswered);
         let (ok, reply) = match res {
             Some(Ok(r)) => (true, r),
             Some(Err(e)) => (
@@ -1274,13 +1278,15 @@ impl Supervisor {
             took_ms: end.saturating_sub(start),
         });
         mind.settled(&wake.entity).await;
-        self.close_wake(&wake.entity, &turn);
+        let late = self.usage.take_answered_late(&wake.entity);
+        self.close_wake(&wake.entity, &turn, answered || late);
     }
 
     /// Closes a wake whose mind has really finished ([`Mind::settled`]):
     /// charges its late spend, stores the day's tallies, the harvest mark
-    /// and what the mind read with its turn's close, and frees the entity.
-    fn close_wake(&self, entity: &EntityId, turn: &str) {
+    /// and, if the mind `answered`, what it read, with its turn's close, and
+    /// frees the entity.
+    fn close_wake(&self, entity: &EntityId, turn: &str, answered: bool) {
         // What the mind spent after the timeout (a job or an op read late)
         // is in the sink by now: charge it, so the close stores the day's
         // tallies and the harvest mark together, and they agree.
@@ -1288,10 +1294,15 @@ impl Supervisor {
         let mark = self.minds.get(entity).and_then(|m| m.tokens_seen(entity));
         let now = self.game.now_ms();
         self.charge(now, vec![(entity.clone(), late)]);
-        // The newest event the mind was handed (`mud_events`) while it ran:
-        // it saw that far, so neither its next wake nor a boot replay owes
-        // it those events again.
-        let seen = self.game.read_mark(entity);
+        // The newest event the mind was handed (`mud_events`): a mind that
+        // answered saw that far, so neither its next wake nor a boot replay
+        // owes it those events again. Reading is not answering: a wake that
+        // failed or ended with no answer still owes all it was handed.
+        let seen = if answered {
+            self.game.read_mark(entity)
+        } else {
+            Seq(0)
+        };
         let spend = lock(&self.state).get_mut(entity).map(|s| {
             s.seen_seq = s.seen_seq.max(seen.0);
             spend_op(entity, &s.budget, mark)
@@ -1314,12 +1325,20 @@ impl Supervisor {
             tracing::warn!(entity = %entity, error = %e, "a wake's turn did not close");
         }
         // The mind has really finished: its next wake no longer carries
-        // what it read.
-        lock(&self.router).finish_seen(entity, self.game.now_ms(), seen);
+        // what it read and answered.
+        let now = self.game.now_ms();
+        if answered {
+            lock(&self.router).finish_seen(entity, now, seen);
+        } else {
+            lock(&self.router).finish(entity, now);
+        }
     }
 
-    /// The wake bound of `entity`'s tier, in ms.
-    fn timeout_of(&self, entity: &EntityId) -> u64 {
+    /// The wake bound of `entity`'s tier, in ms: its tier's entry in
+    /// `wake_timeout_ms_by_tier`, else `wake_timeout_ms` (the server and
+    /// tests read it).
+    #[must_use]
+    pub fn wake_timeout_of(&self, entity: &EntityId) -> u64 {
         let tier = self
             .game
             .read(|w| w.entity(entity).map(|e| e.tier))

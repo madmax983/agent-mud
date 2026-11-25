@@ -93,7 +93,8 @@ chat. A wake's timeout (`[supervisor] wake_timeout_ms`, or per tier in
 `[supervisor.wake_timeout_ms_by_tier]`) leaves out the time a hidden PC
 spends typing, so kestrel can type a long notice without its wake failing.
 The next wake carries only the events the mind did not already read with
-`mud_events`, and spend that arrives after a wake's line shows up in the
+`mud_events` and answer (a wake that failed after reading still owes
+them), and spend that arrives after a wake's line shows up in the
 observer feed as its own `late` line.
 
 A shop keeps its stock in the shop (ADR 0013): Marta's ale is on the shelf

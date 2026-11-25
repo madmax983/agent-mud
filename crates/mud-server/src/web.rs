@@ -187,7 +187,8 @@ function fmt(k,m){
     if(m.kind==='late_spend'){const u=m.usage||{};return `late    ${m.entity}  +${(u.input_tokens||0)+(u.output_tokens||0)} tok after its wake · budget ${m.budget}`;}
     if(m.kind==='booking_dropped')return `booking ${m.entity}  #${m.id} dropped at boot: due ${new Date(m.due_ms).toLocaleString()}, too late`;
     if(m.kind==='plan_abandoned')return `plan    ${m.entity}  abandoned at boot after ${m.cursor}/${m.len} lines: too old to resume`;
-    return `typing  ${m.entity}  line dropped: combat broke out`;
+    if(m.kind==='interrupted')return `typing  ${m.entity}  line dropped: combat broke out`;
+    return `wake    ${m.entity}  ${m.kind}`;
   }
   if(k==='roll')return `roll    ${m.entity}  ${m.trait_name}(${m.roll.target_number}) rolled ${m.roll.total} → ${m.nudged?'FAILED, nudged':'resisted'}`;
   if(k==='script')return `script  ${m.text}`;

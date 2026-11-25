@@ -237,6 +237,7 @@ pub async fn chat(socket: &Path, message_id: &str, text: &str) -> Result<MindRep
                         cost_usd_micros: u.cost_usd_micros,
                     },
                     commands: 0,
+                    unanswered: false,
                 })
             }
             Response::Duplicate { last_answer } => Ok(MindReply {
@@ -245,6 +246,7 @@ pub async fn chat(socket: &Path, message_id: &str, text: &str) -> Result<MindRep
             }),
             Response::NoAnswer { reason } => Ok(MindReply {
                 text: Some(format!("no answer: {reason}")),
+                unanswered: true,
                 ..MindReply::default()
             }),
             Response::Waiting { approval } | Response::Busy { approval } => {
@@ -298,7 +300,9 @@ impl Charge {
 /// or nothing within [`LATE_REPLY_GRACE`]), the spend is read from the
 /// daemon's ledger (see [`crate::ledger`]) and goes in exactly one place:
 /// the reply, if the wake still waits for it, else `sink`. Spend the daemon
-/// makes after that is charged by the next wake.
+/// makes after that is charged by the next wake. A reply that comes after
+/// the wake gave up also marks the sink that the op answered
+/// ([`UsageSink::answered_late`]); a late `no_answer` or error does not.
 pub(crate) async fn chat_charged(
     socket: PathBuf,
     message_id: String,
@@ -314,6 +318,11 @@ pub(crate) async fn chat_charged(
             Ok(Ok(mut r)) => {
                 r.usage = charge.settle(&entity, r.usage).await;
                 if let Err(Ok(r)) = tx.send(Ok(r)) {
+                    // The wake gave up first: the answer, like the spend,
+                    // goes to the sink.
+                    if !r.unanswered {
+                        sink.answered_late(&entity);
+                    }
                     sink.add(&entity, r.usage);
                 }
             }

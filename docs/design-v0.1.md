@@ -97,8 +97,9 @@ second chat starts while an op is live. A wake's bound
 (`[supervisor] wake_timeout_ms`, 120 s, or per tier in
 `wake_timeout_ms_by_tier`) counts only the time outside the gate's typing
 holds (the proved `wake_expired`), so a hidden PC typing a long notice is
-not cut off. When the mind settles, its next wake drops the events it
-already read with `mud_events`. Combat that interrupts a held line wakes
+not cut off. When the mind settles having answered, its next wake drops
+the events it already read with `mud_events`; a wake that failed or
+ended with no answer still owes them. Combat that interrupts a held line wakes
 the PC only if no wake of it is running. Spend that comes in after a
 wake's line has its own feed line (`late`).
 

@@ -214,6 +214,61 @@ async fn a_reply_after_the_wake_was_given_up_is_still_charged() {
     }
     assert_eq!(late.tokens(), 5_200);
     assert_eq!(late.calls, 3);
+    assert!(
+        sink.take_answered_late(&torin),
+        "the late reply is an answer: the wake's close drops what it read"
+    );
+    assert!(!sink.take_answered_late(&torin), "taken once");
+}
+
+#[tokio::test]
+async fn a_late_no_answer_or_error_is_not_an_answer() {
+    // The op read its events, then the model failed: the wake that gave up
+    // on it still owes them.
+    for answer in [
+        r#"{"kind":"no_answer","reason":"provider error"}"#,
+        r#"{"kind":"waiting","approval":4}"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("lg.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut req = String::new();
+            reader.read_line(&mut req).await.unwrap();
+            go_rx.await.unwrap();
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(format!("{answer}\n").as_bytes()).await;
+        });
+        let torin = EntityId::from("torin");
+        let sink = Arc::new(UsageSink::default());
+        let in_flight = InFlight::default();
+        let charge = Charge {
+            until_settled: Some(Arc::new(in_flight.start(&torin))),
+            ..no_ledger(&dir)
+        };
+        let cut = tokio::time::timeout(
+            Duration::from_millis(100),
+            chat_charged(
+                sock.clone(),
+                "wake-torin-9".into(),
+                "hello".into(),
+                torin.clone(),
+                Arc::clone(&sink),
+                charge,
+            ),
+        )
+        .await;
+        assert!(cut.is_err(), "the wake timed out");
+        go_tx.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), in_flight.settled(&torin))
+            .await
+            .expect("the op was read");
+        assert!(!sink.take_answered_late(&torin), "{answer}");
+    }
 }
 
 #[tokio::test]
@@ -237,7 +292,12 @@ async fn a_reply_in_time_is_not_charged_twice() {
     .await
     .unwrap();
     assert_eq!(r.usage.tokens(), 12);
+    assert!(!r.unanswered);
     assert!(sink.take(&torin).is_zero());
+    assert!(
+        !sink.take_answered_late(&torin),
+        "an answer in time is in the reply"
+    );
 }
 
 /// A charge with no ledger file: the daemon's reported usage stands.
@@ -288,6 +348,7 @@ async fn a_no_answer_is_charged_from_the_ledger() {
     )
     .await
     .unwrap();
+    assert!(r.unanswered, "a no_answer is not an answer");
     assert!(r.text.unwrap().contains("every tool round"));
     assert_eq!(r.usage.tokens(), 7_000);
     assert_eq!(r.usage.calls, 2);

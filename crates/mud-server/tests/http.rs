@@ -40,6 +40,16 @@ async fn boot_full(
     admin_token: Option<&str>,
     tweak: impl FnOnce(&mut MudConfig),
 ) -> (SocketAddr, Arc<Built>, autumn_web::AppState) {
+    boot_edit(admin_token, tweak, |_| {}).await
+}
+
+/// [`boot_full`], with `edit` applied to what `build` made before the
+/// server takes it.
+async fn boot_edit(
+    admin_token: Option<&str>,
+    tweak: impl FnOnce(&mut MudConfig),
+    edit: impl FnOnce(&mut Built),
+) -> (SocketAddr, Arc<Built>, autumn_web::AppState) {
     let state = Arc::new(std::sync::Mutex::new(None::<autumn_web::AppState>));
     let seen = Arc::clone(&state);
     let mut cfg = MudConfig::default();
@@ -48,6 +58,7 @@ async fn boot_full(
     cfg.accounts.bcrypt_cost = 4;
     tweak(&mut cfg);
     let mut built = build(&cfg).await.unwrap();
+    edit(&mut built);
     if let Some(t) = admin_token {
         built.mud = Arc::new(web::Mud {
             admin_token: t.to_owned(),
@@ -955,5 +966,136 @@ async fn the_feed_opens_with_what_the_boot_dropped() {
     assert!(
         !seen.contains("zq-private"),
         "the note stays out of the feed"
+    );
+}
+
+/// A littleguy-like mind: its op outlives the wake and charges its spend
+/// to the sink once read, after the wake's line.
+#[derive(Debug, Default)]
+struct SpendsLate {
+    in_flight: mud_supervisor::mind::InFlight,
+}
+
+impl mud_supervisor::mind::Mind for SpendsLate {
+    fn kind(&self) -> &'static str {
+        "spends-late"
+    }
+
+    fn wake(
+        &self,
+        ctx: mud_supervisor::mind::WakeContext,
+        tools: mud_supervisor::mind::MudTools,
+    ) -> mud_supervisor::mind::BoxFuture<
+        '_,
+        Result<mud_supervisor::mind::MindReply, mud_supervisor::mind::MindError>,
+    > {
+        let guard = self.in_flight.start(&ctx.entity);
+        let (sink, who) = (Arc::clone(tools.usage_sink()), ctx.entity);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            sink.add(
+                &who,
+                mud_supervisor::mind::Usage {
+                    calls: 3,
+                    input_tokens: 41_000,
+                    output_tokens: 900,
+                    cost_usd_micros: 0,
+                },
+            );
+            drop(guard);
+        });
+        Box::pin(std::future::pending())
+    }
+
+    fn settled(&self, entity: &mud_world::EntityId) -> mud_supervisor::mind::BoxFuture<'_, ()> {
+        self.in_flight.settled(entity)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_feed_shows_a_timed_out_wakes_late_spend() {
+    // ADR 0014: the spend of an op read after its wake timed out reaches
+    // the observer page as a `late` line, not as "0 tok".
+    let torin = mud_world::EntityId::from("torin");
+    let who = torin.clone();
+    let (addr, built, _) = boot_edit(
+        None,
+        |_| {},
+        move |b| {
+            use mud_supervisor::runtime::{Supervisor, SupervisorConfig};
+            let game = Arc::clone(&b.mud.game);
+            let pack = mud_world::WorldPack::crypt_v01().unwrap();
+            let mind: Arc<dyn mud_supervisor::mind::Mind> = Arc::new(SpendsLate::default());
+            let sup = Supervisor::new(
+                Arc::clone(&game),
+                mud_supervisor::gate::Gate::new(Arc::clone(&game), 5, 0.0),
+                std::collections::HashMap::from([(who, mind)]),
+                Arc::new(mud_supervisor::scripted::FallbackMind::from_cast(
+                    &pack.cast,
+                )),
+                SupervisorConfig {
+                    wake_timeout_ms: 50,
+                    first_macro_tick_secs: [3_600, 3_600],
+                    ..SupervisorConfig::default()
+                },
+            );
+            b.mud = Arc::new(web::Mud {
+                sup,
+                ..(*b.mud).clone()
+            });
+        },
+    )
+    .await;
+    let token = built.mud.admin_token.clone();
+    let js = http()
+        .get(format!("http://{addr}/static/mud/observer.js"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        js.contains("m.kind==='late_spend'") && js.contains("tok after its wake"),
+        "the page formats the line"
+    );
+    let mut resp = http()
+        .get(format!("http://{addr}/observer/feed?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // The feed is open: a wake that times out and charges late.
+    let sup = Arc::clone(&built.mud.sup);
+    let tick = sup.fire_macro_tick(&torin);
+    assert!(
+        matches!(tick, mud_supervisor::router::RouteNote::Queued { .. }),
+        "{tick:?}"
+    );
+    for h in sup.step() {
+        h.await.unwrap();
+    }
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !seen.contains("late_spend") {
+        let chunk = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .expect("the late spend never reached the feed")
+            .unwrap()
+            .unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let line = seen
+        .split("\n\n")
+        .find(|e| e.contains("late_spend"))
+        .unwrap();
+    assert!(line.contains("event: wake"), "the wake category: {line}");
+    assert!(line.contains("\"entity\":\"torin\""), "{line}");
+    assert!(line.contains("\"input_tokens\":41000"), "{line}");
+    assert!(line.contains("\"output_tokens\":900"), "{line}");
+    let done = seen.find("wake_finished").expect("the wake's own line");
+    assert!(
+        done < seen.find("late_spend").unwrap(),
+        "after the wake's line"
     );
 }

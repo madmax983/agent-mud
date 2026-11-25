@@ -187,6 +187,7 @@ impl Mind for AmbientMind {
                     cost_usd_micros: 0,
                 },
                 commands: 0,
+                unanswered: false,
             })
         })
     }

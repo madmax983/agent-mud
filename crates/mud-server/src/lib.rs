@@ -832,6 +832,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_wake_bounds_of_mud_toml_reach_the_supervisor() {
+        // The example's `turing = 180000` must not fall back silently to
+        // the default bound.
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        let mut cfg = MudConfig::default();
+        cfg.world.db = None;
+        cfg.accounts.bcrypt_cost = 4;
+        cfg.supervisor.wake_timeout_ms = 90_000;
+        cfg.supervisor.wake_timeout_ms_by_tier = ex.supervisor.wake_timeout_ms_by_tier;
+        cfg.supervisor.wake_timeout_ms_by_tier.ambient = Some(30_000);
+        let built = build(&cfg).await.unwrap();
+        let bound = |e: &str| built.mud.sup.wake_timeout_of(&EntityId::from(e));
+        assert_eq!(bound("pc_kestrel"), 180_000, "turing, from the example");
+        assert_eq!(bound("marta"), 90_000, "persistent: the default bound");
+        assert_eq!(bound("guard_01"), 30_000, "ambient, set here");
+    }
+
     #[test]
     fn only_a_generated_token_is_logged_and_it_is_encoded() {
         let bind: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
