@@ -91,7 +91,11 @@ boot derives them from the reloaded event log (`Router::replay`, called by
   is online at boot. A macro-tick reset is not an event, and a player who
   was in the room but did not perceive the event is not counted, so the
   fold can only hold more than the live counters did: the safe direction
-  (`lemma_fold_holds_at_least`, ADR 0006). When the log does not reach
+  (`lemma_fold_holds_at_least`, ADR 0006). A tell has no room: it counts
+  in the rooms its sender and recipient stood in when it was sent, which
+  the engine records on the event (`party_rooms`), so the fold counts it
+  in the same rooms as the live counter after they move. A tell from an
+  older log, without those rooms, holds every room. When the log does not reach
   back to the world's first event, a room's count before its first logged
   event is unknown; such a room, and every room the log never shows,
   starts held at the bound until a human or a macro-tick resets it.

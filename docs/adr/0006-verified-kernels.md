@@ -14,7 +14,7 @@ verbatim in `formal/verus/src/`, where Verus proves their properties:
 | `injury` | mud-rules | never negative, zero iff no penetration, multipliers exact, monotonic |
 | `wound_state` | mud-rules | thresholds exact, less HP is never better |
 | `shift_minute` | mud-world | stays in 0..1440, shifting back restores |
-| `chatter_step` | mud-supervisor | at most `max` agent-only wakes between resets, for every `max`; the boot fold over the reloaded event log, where a missing macro-tick reset reads as no change and an unseen player as none, and a room of unknown history starts at the bound, holds at least as much as the live counter did and lets through only what it let through (`lemma_fold_holds_at_least`, ADR 0011 phase 4) |
+| `chatter_step` | mud-supervisor | at most `max` agent-only wakes between resets, for every `max`; the boot fold over the reloaded event log, where a missing macro-tick reset reads as no change and an unseen player as none, a roomless event counts in the rooms its parties stood in when it was emitted (recorded on the event), and a room of unknown history starts at the bound, holds at least as much as the live counter did and lets through only what it let through (`lemma_fold_holds_at_least`, ADR 0011 phase 4) |
 | `budget_level` | mud-supervisor | Hard/Soft/Normal exactly at the thresholds, monotonic |
 | `typing_delay_ms` | mud-supervisor | no overflow, at least the reaction time, monotonic |
 | `conn_step` | mud-server | an open is admitted only under both caps; no underflow; caps hold for every sequence |

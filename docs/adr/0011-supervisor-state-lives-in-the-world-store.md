@@ -335,9 +335,15 @@ fresh ids through the normal, ready-gated paths.
     hold more: `lemma_fold_holds_at_least` proves that inputs which each
     count at least as much, from a start that holds at least as much, end
     holding at least as much and allow only what the live counter allowed.
-    When the log does not reach the world's first event, a room's count
-    before its first logged event is unknown, so that room, and every room
-    the log never shows, starts held at the bound until a human or a
+    The lemma needs each event to feed the same room live and at boot. A
+    roomless event (a tell) counts in the rooms of its parties, and they
+    may move before a boot, so the engine records those rooms on the event
+    when it emits it (`Event::party_rooms`, never in an entity view); live
+    and boot both count the tell there. A tell from a log written before
+    that field existed holds every room at the bound, since its rooms are
+    unknown. When the log does not reach the world's first event, a room's
+    count before its first logged event is unknown, so that room, and every
+    room the log never shows, starts held at the bound until a human or a
     macro-tick resets it.
   - **MCP cursors.** Tokens are issued at boot. The server takes the side
     rows before it builds the minds and issues each littleguy agent's

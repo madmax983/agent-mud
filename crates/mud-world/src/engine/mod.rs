@@ -13,7 +13,7 @@ mod social;
 
 pub use script::{DECLINED, HookStatus, Inadmissible};
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use mud_rules::self_control_roll;
@@ -980,6 +980,20 @@ impl World {
         let actor = spec.actor.as_ref().and_then(|a| self.state.entities.get(a));
         let human_actor = actor.is_some_and(|e| e.human);
         let player_actor = actor.is_some_and(|e| e.kind == EntityKind::Player);
+        // A roomless event keeps where its parties stood, for the
+        // anti-chatter counters: they may move before a boot folds it.
+        let party_rooms: Vec<RoomId> = if spec.room.is_none() {
+            spec.actor
+                .iter()
+                .chain(&recipients)
+                .filter_map(|id| self.state.entities.get(id))
+                .map(|e| e.room.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let event = Event {
             seq,
             at_ms: now,
@@ -995,6 +1009,7 @@ impl World {
             recipients,
             human_actor,
             player_actor,
+            party_rooms,
         };
         self.log.push_back(event.clone());
         while self.log.len() > EVENT_LOG_CAP {

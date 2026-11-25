@@ -312,6 +312,23 @@ impl Router {
         })
     }
 
+    /// Counts an agent event whose rooms are unknown (a reloaded tell from
+    /// a log that predates `Event::party_rooms`). An agent-alone one may
+    /// have counted in any room, so every room, seen or not, holds at the
+    /// bound until a human or a macro-tick resets it, and the event wakes
+    /// no other agent: the safe direction (`lemma_fold_holds_at_least`).
+    fn hold_everywhere(&mut self, input: ChatterInput) -> bool {
+        if input != ChatterInput::AgentAlone {
+            return true;
+        }
+        let max = self.cfg.max_agent_only_turns;
+        for room in self.rooms.values_mut() {
+            room.agent_only_turns = room.agent_only_turns.max(max);
+        }
+        self.unseen_turns = self.unseen_turns.max(max);
+        false
+    }
+
     /// Steps the anti-chatter counters for `ev`. Returns whether its actor
     /// is an agent-played NPC and whether it may wake other agents.
     ///
@@ -361,31 +378,49 @@ impl Router {
             && actor_is_agent
             && let Some(a) = actor
         {
-            // A roomless agent event (a tell) still counts, in the room of
-            // the actor and of each party it reaches: agent-only unless a
-            // human is with one of them.
-            let rooms: BTreeSet<&RoomId> = std::iter::once(&a.room)
-                .chain(
-                    ev.recipients
-                        .iter()
-                        .filter(|r| !ev.is_by(r))
-                        .filter_map(|r| world.entity(r))
-                        .map(|t| &t.room),
+            // A roomless agent event (a tell) still counts, in the rooms
+            // its parties stood in when it happened: agent-only unless a
+            // human is with one of them. The engine records those rooms on
+            // the event, so a boot counts it where the live counter did,
+            // however far the parties have walked since.
+            let rooms: Option<BTreeSet<RoomId>> = if !ev.party_rooms.is_empty() {
+                Some(ev.party_rooms.iter().cloned().collect())
+            } else if presence == Presence::Live {
+                Some(
+                    std::iter::once(&a.room)
+                        .chain(
+                            ev.recipients
+                                .iter()
+                                .filter(|r| !ev.is_by(r))
+                                .filter_map(|r| world.entity(r))
+                                .map(|t| &t.room),
+                        )
+                        .cloned()
+                        .collect(),
                 )
-                .collect();
-            let here = match presence {
-                Presence::Live => rooms.iter().any(|room| world.player_present(room)),
-                Presence::Recipients => player_saw(),
+            } else {
+                // A log written before the engine recorded the rooms: the
+                // positions now say nothing about where the parties were.
+                None
+            };
+            let here = match (presence, &rooms) {
+                (Presence::Live, Some(rooms)) => {
+                    rooms.iter().any(|room| world.player_present(room))
+                }
+                _ => player_saw(),
             };
             let input = if here {
                 ChatterInput::AgentWithHuman
             } else {
                 ChatterInput::AgentAlone
             };
-            rooms.into_iter().fold(true, |allow, room| {
-                let ok = self.room(room).step(input, max);
-                allow && ok
-            })
+            match rooms {
+                Some(rooms) => rooms.iter().fold(true, |allow, room| {
+                    let ok = self.room(room).step(input, max);
+                    allow && ok
+                }),
+                None => self.hold_everywhere(input),
+            }
         } else {
             true
         };
@@ -410,11 +445,14 @@ impl Router {
     /// - **Chatter.** Every logged event is folded, oldest first, through
     ///   the counters ([`crate::chatter::chatter_step`]), reading presence
     ///   from its recipients. A macro-tick reset is not an event, so the
-    ///   fold can only hold more than the live counters did. When the log
-    ///   does not reach back to the world's first event, a room's count
-    ///   before its first logged event is unknown and starts held (at the
-    ///   bound), and so does a room the log never shows: only a human or a
-    ///   macro-tick opens it again.
+    ///   fold can only hold more than the live counters did. A roomless
+    ///   event counts in the rooms recorded on it (`Event::party_rooms`),
+    ///   where the live counter counted it; one from an older log, which
+    ///   lacks them, holds every room. When the log does not reach back to
+    ///   the world's first event, a room's count before its first logged
+    ///   event is unknown and starts held (at the bound), and so does a
+    ///   room the log never shows: only a human or a macro-tick opens it
+    ///   again.
     /// - **Replay.** For each logged event that [`crate::replay::replay_due`]
     ///   accepts for a recipient (after `floor(recipient)`, at most
     ///   `max_age_ms` old), the router queues the recipient's wake exactly

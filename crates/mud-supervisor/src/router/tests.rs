@@ -675,3 +675,113 @@ fn a_history_the_log_does_not_reach_starts_held() {
     assert_eq!(r.agent_only_turns(&taproom), 0);
     assert_eq!(r.agent_only_turns(&RoomId::from("dark_alley")), 0);
 }
+
+/// Asserts that the boot router holds at least as much as the live one in
+/// every room either of them counts.
+fn holds_at_least(live: &Router, boot: &Router) {
+    let max = live.cfg.max_agent_only_turns;
+    for room in live.rooms.keys().chain(boot.rooms.keys()) {
+        let (l, b) = (live.agent_only_turns(room), boot.agent_only_turns(room));
+        assert!(b.min(max) >= l.min(max), "{room}: live {l} boot {b}");
+    }
+}
+
+#[test]
+fn a_tell_counts_where_its_parties_stood_when_it_was_sent() {
+    // The guard tells marta from the square, then walks into the taproom.
+    // The fold counts the tell in the square, as the live counter did, not
+    // where the guard stands at boot.
+    let mut w = world();
+    let mut live = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let guard = id("guard_01");
+    let square = RoomId::from("town_square");
+    assert_eq!(
+        w.entity(&guard).map(|g| g.room.clone()),
+        Some(square.clone())
+    );
+    run(&mut w, &mut live, &rt, &guard, "tell marta psst", 100);
+    run(&mut w, &mut live, &rt, &guard, "e", 200);
+    assert_eq!(live.agent_only_turns(&square), 2, "the tell and the leave");
+    let w = reloaded(&w, 0);
+    let mut r = Router::new(RouterConfig::default());
+    r.replay(&w, &rt, 300, |_| u64::MAX, 120_000);
+    for (room, c) in &live.rooms {
+        assert_eq!(r.agent_only_turns(room), c.agent_only_turns, "{room}");
+    }
+    holds_at_least(&live, &r);
+}
+
+#[test]
+fn a_room_held_by_a_tell_stays_held_after_the_teller_moves() {
+    let mut w = world();
+    let mut live = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let vich = id("vich");
+    let taproom = RoomId::from("rusty_flagon_taproom");
+    for d in ["w", "n", "e"] {
+        run(&mut w, &mut live, &rt, &vich, d, 10);
+    }
+    let ada = w.login("ada", 20).unwrap();
+    run(&mut w, &mut live, &rt, &ada, "e", 30);
+    run(&mut w, &mut live, &rt, &ada, "say hi", 40);
+    run(&mut w, &mut live, &rt, &ada, "w", 50);
+    assert_eq!(live.agent_only_turns(&taproom), 0, "the human reset it");
+    run(&mut w, &mut live, &rt, &vich, "tell torin hello", 60);
+    assert_eq!(live.agent_only_turns(&taproom), 1);
+    run(&mut w, &mut live, &rt, &vich, "w", 70);
+    assert_eq!(live.agent_only_turns(&taproom), 2, "held");
+    let w = reloaded(&w, 0);
+    let mut r = Router::new(RouterConfig::default());
+    r.replay(&w, &rt, 80, |_| u64::MAX, 120_000);
+    assert_eq!(r.agent_only_turns(&taproom), 2, "still held after a boot");
+    holds_at_least(&live, &r);
+}
+
+#[test]
+fn a_tell_from_an_older_log_holds_every_room() {
+    // A log written before the engine recorded the parties' rooms: the
+    // fold cannot know where the tell counted, so every room holds.
+    let mut w = world();
+    let mut live = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let guard = id("guard_01");
+    run(&mut w, &mut live, &rt, &guard, "tell marta psst", 100);
+    run(&mut w, &mut live, &rt, &guard, "e", 200);
+    let recent: Vec<Event> = w
+        .logged()
+        .cloned()
+        .map(|mut e| {
+            e.party_rooms.clear();
+            e
+        })
+        .collect();
+    let old = World::from_state(Arc::clone(w.pack()), w.snapshot(), recent);
+    let mut r = Router::new(RouterConfig::default());
+    r.replay(&old, &rt, 300, |_| u64::MAX, 120_000);
+    holds_at_least(&live, &r);
+    let max = RouterConfig::default().max_agent_only_turns;
+    for room in ["town_square", "rusty_flagon_taproom", "dark_alley"] {
+        let held = r.agent_only_turns(&RoomId::from(room));
+        assert!(held >= max, "{room}: {held}");
+    }
+    // A tell a player perceived keeps the count, as it did live.
+    let mut w = world();
+    let mut live = Router::new(RouterConfig::default());
+    let ada = w.login("ada", 0).unwrap();
+    run(&mut w, &mut live, &rt, &guard, "tell ada psst", 100);
+    let recent: Vec<Event> = w
+        .logged()
+        .cloned()
+        .map(|mut e| {
+            e.party_rooms.clear();
+            e
+        })
+        .collect();
+    let old = World::from_state(Arc::clone(w.pack()), w.snapshot(), recent);
+    let mut r = Router::new(RouterConfig::default());
+    r.replay(&old, &rt, 300, |_| u64::MAX, 120_000);
+    holds_at_least(&live, &r);
+    assert_eq!(r.agent_only_turns(&RoomId::from("dark_alley")), 0);
+    assert!(w.entity(&ada).is_some());
+}

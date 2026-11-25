@@ -115,6 +115,14 @@ pub struct Event {
     /// as a human one. No entity view shows it.
     #[serde(default)]
     pub player_actor: bool,
+    /// For an event with no room (a tell): the rooms its actor and its
+    /// recipients stood in when it happened, sorted, without repeats. The
+    /// anti-chatter counters count such an event in these rooms, live and
+    /// when the log is folded at boot, when the parties have since moved.
+    /// Empty for an event with a room, and in a log written before the
+    /// field existed. No entity view shows it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub party_rooms: Vec<RoomId>,
 }
 
 impl Event {
@@ -223,6 +231,7 @@ mod tests {
             recipients: vec![EntityId::from("pc_kestrel"), EntityId::from("marta")],
             human_actor: false,
             player_actor: true,
+            party_rooms: vec![],
         }
     }
 
