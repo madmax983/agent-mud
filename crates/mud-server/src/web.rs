@@ -121,12 +121,12 @@ pub fn routes() -> Vec<autumn_web::Route> {
 }
 
 const STYLE: &str = r"
-:root{--bg:#fbfaf7;--fg:#1d1d1b;--dim:#6b6a65;--acc:#7a4b12;--err:#a1261b;--ev:#26507a;--line:#e3e0d8}
-@media (prefers-color-scheme:dark){:root{--bg:#141412;--fg:#e6e3da;--dim:#9a978d;--acc:#e0a458;--err:#ef7d6f;--ev:#8ab4e0;--line:#2c2b27}}
+:root{--bg:#fbfaf7;--fg:#1d1d1b;--dim:#6b6a65;--acc:#7a4b12;--err:#a1261b;--ev:#26507a;--tell:#8a2f8f;--line:#e3e0d8}
+@media (prefers-color-scheme:dark){:root{--bg:#141412;--fg:#e6e3da;--dim:#9a978d;--acc:#e0a458;--err:#ef7d6f;--ev:#8ab4e0;--tell:#d79ad9;--line:#2c2b27}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
 main{max-width:960px;margin:0 auto;padding:16px}h1{font-size:18px;margin:0 0 12px}
 #out{white-space:pre-wrap;border:1px solid var(--line);border-radius:6px;padding:12px;height:70vh;overflow-y:auto}
-.narrative{color:var(--fg)}.event{color:var(--ev)}.error{color:var(--err)}.system{color:var(--acc)}
+.narrative{color:var(--fg)}.event{color:var(--ev)}.tell{color:var(--tell)}.error{color:var(--err)}.system{color:var(--acc)}
 form{display:flex;gap:8px;margin-top:8px}input{flex:1;font:inherit;padding:8px;background:transparent;color:var(--fg);border:1px solid var(--line);border-radius:6px}
 button{font:inherit;padding:8px 14px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer}
 table{border-collapse:collapse;width:100%;font-size:13px}td,th{border-bottom:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}
@@ -195,7 +195,8 @@ function fmt(k,m){
   if(k==='session')return m.kind==='afk'?`afk     ${m.entity}  until ${new Date(m.until_ms).toLocaleTimeString()}`:`session ${m.entity}  ${m.online?'logged in':'logged out'}`;
   return `world   [${m.room||'-'}] ${m.who}${m.human?' (human)':''}: ${m.text}`;
 }
-['route','wake','roll','world','session','script'].forEach(k=>es.addEventListener(k,e=>row(k==='roll'?'soft':(k==='world'?'muted':''),fmt(k,JSON.parse(e.data)))));
+function cls(k,m){if(k==='roll')return 'soft';if(k==='world')return m.kind==='tell'?'tell':'muted';return '';}
+['route','wake','roll','world','session','script'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
 ";
 
 /// The page scripts are files, not inline: the app's CSP allows
@@ -288,6 +289,11 @@ pub enum ServerMsg<'a> {
         /// The text.
         text: &'a str,
     },
+    /// A private message to or from them.
+    Tell {
+        /// The text.
+        text: &'a str,
+    },
     /// A refusal.
     Error {
         /// The text.
@@ -330,6 +336,7 @@ impl<'a> ServerMsg<'a> {
         match l.kind {
             LineKind::Narrative => Self::Narrative { text },
             LineKind::Event => Self::Event { text },
+            LineKind::Tell => Self::Tell { text },
             LineKind::Error => Self::Error { text },
             LineKind::System => Self::System { text },
             LineKind::Prompt => Self::Prompt { text, secret: None },
@@ -1105,6 +1112,7 @@ mod tests {
             ),
             (line(LineKind::Event, "b"), r#"{"kind":"event","text":"b"}"#),
             (line(LineKind::Error, "c"), r#"{"kind":"error","text":"c"}"#),
+            (line(LineKind::Tell, "t"), r#"{"kind":"tell","text":"t"}"#),
             (
                 line(LineKind::System, "d"),
                 r#"{"kind":"system","text":"d"}"#,
@@ -1166,6 +1174,16 @@ mod tests {
         }
         assert!(TERMINAL_JS.contains("textContent"));
         assert!(!TERMINAL_JS.contains("cookie"), "no route trusts a cookie");
+    }
+
+    #[test]
+    fn tells_have_their_own_colour_in_both_themes_and_the_feed() {
+        let (light, dark) = STYLE
+            .split_once("@media (prefers-color-scheme:dark)")
+            .unwrap();
+        assert!(light.contains("--tell:") && dark.contains("--tell:"));
+        assert!(STYLE.contains(".tell{color:var(--tell)}"));
+        assert!(OBSERVER_JS.contains("m.kind==='tell'"));
     }
 
     #[test]

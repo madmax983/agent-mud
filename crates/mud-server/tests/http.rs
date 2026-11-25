@@ -279,6 +279,11 @@ async fn two_players_share_a_room_over_websockets() {
         theirs["text"], "ada says, \"<b>hello</b> bo\"",
         "raw text; the page renders it with textContent"
     );
+    send(&mut ada, json!({ "cmd": "tell bo meet me at the gate" })).await;
+    let sent = until(&mut ada, "You tell").await;
+    assert_eq!(sent["kind"], "tell", "the sender's echo is a tell line");
+    let heard = until(&mut bo, "tells you").await;
+    assert_eq!(heard["kind"], "tell", "the terminal colours a tell apart");
     send(&mut bo, json!({ "cmd": "dance" })).await;
     assert_eq!(until(&mut bo, "unknown verb").await["kind"], "error");
     drop(bo);

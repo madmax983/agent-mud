@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use mud_accounts::{Accounts, AuthError, Authenticated, IssuedToken, Peer, Secret};
-use mud_world::{EntityId, Event, Game};
+use mud_world::{EntityId, Event, EventKind, Game};
 
 /// Which answer a secret prompt wants, for the browser's password manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,9 @@ pub enum LineKind {
     Narrative,
     /// Something that happened around them.
     Event,
+    /// A private message to or from them: a tell. Clients colour it apart
+    /// from the room's events.
+    Tell,
     /// A refusal.
     Error,
     /// A server notice.
@@ -300,7 +303,9 @@ impl Session {
             return Vec::new();
         }
         let r = self.game.execute(&self.entity, line);
-        let kind = if r.ok {
+        let kind = if r.ok && r.verb.as_deref() == Some("tell") {
+            LineKind::Tell
+        } else if r.ok {
             LineKind::Narrative
         } else {
             LineKind::Error
@@ -472,7 +477,14 @@ impl Session {
     #[must_use]
     pub fn render(&self, ev: &Event) -> Option<Line> {
         (ev.reaches(&self.entity) && !ev.is_by(&self.entity))
-            .then(|| Line::new(LineKind::Event, ev.render_line(&self.entity)))
+            .then(|| {
+                let kind = if ev.kind == EventKind::Tell {
+                    LineKind::Tell
+                } else {
+                    LineKind::Event
+                };
+                Line::new(kind, ev.render_line(&self.entity))
+            })
             .filter(|l| !l.text.is_empty())
     }
 }

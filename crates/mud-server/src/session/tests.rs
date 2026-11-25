@@ -346,3 +346,23 @@ async fn a_password_change_can_be_cancelled_mistyped_or_refused() {
     }
     assert!(format!("{:?}", Change::Current).contains("Current"));
 }
+
+#[tokio::test]
+async fn a_tell_is_a_tell_line_for_both_ends_and_speech_is_not() {
+    let (g, p, a) = (game(), Arc::new(Presence::default()), accounts().await);
+    let (ada, _) = open(&g, &p, &a, "ada", Transport::Web).await;
+    let (bo, _) = open(&g, &p, &a, "bo", Transport::Web).await;
+    let mut rx = g.subscribe();
+    let out = ada.command("tell bo meet me at the gate");
+    assert_eq!(out[0].kind, LineKind::Tell);
+    assert!(out[0].text.starts_with("You tell") && out[0].text.contains("meet me at the gate"));
+    let ev = rx.try_recv().unwrap();
+    let heard = bo.render(&ev).unwrap();
+    assert_eq!(heard.kind, LineKind::Tell);
+    assert!(heard.text.contains("tells you"));
+    let out = ada.command("say hello");
+    assert_eq!(out[0].kind, LineKind::Narrative);
+    let ev = rx.try_recv().unwrap();
+    assert_eq!(bo.render(&ev).unwrap().kind, LineKind::Event);
+    assert_eq!(ada.command("tell nobody hi")[0].kind, LineKind::Error);
+}
