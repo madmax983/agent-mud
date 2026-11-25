@@ -33,6 +33,11 @@ fn the_replay_proof_covers_the_shipped_kernels() -> TestResult {
 }
 
 #[test]
+fn the_admit_proof_covers_the_shipped_kernel() -> TestResult {
+    proof_mirrors("admit")
+}
+
+#[test]
 fn every_proof_module_is_checked() -> TestResult {
     every_proof_module_is_listed()
 }

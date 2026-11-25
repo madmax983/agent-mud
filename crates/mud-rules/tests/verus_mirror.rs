@@ -50,6 +50,11 @@ fn the_durability_proof_covers_the_shipped_kernels() -> TestResult {
 }
 
 #[test]
+fn the_recovery_proof_covers_the_shipped_kernels() -> TestResult {
+    proof_mirrors("recovery")
+}
+
+#[test]
 fn every_proof_module_is_checked() -> TestResult {
     every_proof_module_is_listed()
 }
