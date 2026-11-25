@@ -411,6 +411,14 @@ impl Supervisor {
                             today = now / DAY_MS,
                             "a budget stored more than a day ahead of the clock was reset"
                         );
+                        // The store is reset too: its stale day would drop
+                        // today's spend and come back on that day.
+                        ops.push(SideOp::SpendReset {
+                            entity: e.clone(),
+                            day: s.budget.spend.day,
+                            local: s.budget.spend.local,
+                            lg: s.budget.spend.lg,
+                        });
                     }
                 }
             }
@@ -836,14 +844,25 @@ impl Supervisor {
         })
     }
 
-    /// Charges spend that came in after its wake ended (a model that kept
-    /// going after a timeout).
+    /// Charges spend that came in after its wake closed (a model that
+    /// kept going, ambient chatter).
+    ///
+    /// The spend of an entity whose wake is still open stays in the sink
+    /// for that wake's close. A harvest job raises its token mark before
+    /// it hands its spend over, and only the close stores the mark: a
+    /// tally stored here, ahead of its mark, would be charged again after
+    /// a kill before the close (ADR 0011). Once the close is done no job
+    /// of the entity runs, so the stored mark already covers what is
+    /// left.
     ///
     /// The new tallies are stored through [`Game::persist`]: a lost late
     /// `Spend` is a bounded under-charge, and the next close stores the
     /// day again.
     fn charge_late_spend(&self, now: u64) {
-        let late = self.usage.take_all();
+        let late = {
+            let router = lock(&self.router);
+            self.usage.take_where(|e| !router.is_busy(e))
+        };
         if late.is_empty() {
             return;
         }

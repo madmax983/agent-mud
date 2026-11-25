@@ -471,6 +471,116 @@ async fn harvest_db_history_is_bounded() {
     );
 }
 
+/// The agent's sealed runs, by id.
+fn sealed_ids(db: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut q = conn
+        .prepare(
+            "SELECT exec_id FROM harvest_executions
+             WHERE workflow_name = ?1 AND state <> 'RUNNING' ORDER BY exec_id",
+        )
+        .unwrap();
+    q.query_map([AGENT_WORKFLOW_NAME], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The worker's own purge, after a job: sealed runs older than
+/// `keep_days` go, at most once per `purge_every_ms` of game time; fresh
+/// sealed runs and the RUNNING run stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_purges_sealed_runs_older_than_keep_days() {
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let game = Game::new(
+        World::new(Arc::clone(&pack), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let history = HarvestHistory {
+        ops_per_run: 2,
+        ..HarvestHistory::default()
+    };
+    let mind = HarvestMind::new(
+        Arc::new(Scripted::default()) as Arc<dyn AgentModel>,
+        Some(dir.path().to_path_buf()),
+        HashMap::from([(
+            torin.clone(),
+            HarvestPersona {
+                name: "Torin".into(),
+                persona: "A smith.".into(),
+                goal: "Ore.".into(),
+            },
+        )]),
+    )
+    .with_history(history);
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
+    let mut n = 0_u64;
+    let mut wake_at = async |now_ms: u64| {
+        n += 1;
+        let ctx = WakeContext {
+            entity: torin.clone(),
+            name: "Torin".into(),
+            priority: Priority::Booked,
+            reason: "test".into(),
+            events: vec![],
+            event_views: vec![],
+            look: Value::Null,
+            macro_tick: false,
+            macro_ticks: 0,
+            login: false,
+            wake_id: format!("wake-{n}"),
+            now_ms,
+            booked: Vec::new(),
+        };
+        mind.wake(ctx, tools.clone()).await.unwrap();
+        // The purge runs after the reply, before the job settles.
+        mind.settled(&torin).await;
+    };
+    // The first job of the process purges: nothing is old yet.
+    for i in 0..6 {
+        wake_at(i * 1_000).await;
+    }
+    let db = dir.path().join("torin").join("harvest.db");
+    let aged = sealed_ids(&db);
+    assert!(aged.len() >= 2, "the agent continued as new: {aged:?}");
+    // Those runs closed four days ago on harvest's clock (microseconds).
+    let four_days_us: i64 = 4 * 86_400 * 1_000_000;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE harvest_executions SET closed_at = closed_at - ?1 WHERE closed_at IS NOT NULL",
+            [four_days_us],
+        )
+        .unwrap();
+    // Within the purge interval nothing goes, and fresh runs are sealed.
+    for i in 6..10 {
+        wake_at(i * 1_000).await;
+    }
+    let all = sealed_ids(&db);
+    assert!(
+        aged.iter().all(|id| all.contains(id)),
+        "no purge within purge_every_ms"
+    );
+    let fresh: Vec<String> = all.into_iter().filter(|id| !aged.contains(id)).collect();
+    assert!(!fresh.is_empty(), "a fresh run was sealed");
+    // An interval later, the next job purges the old runs only.
+    wake_at(10_000 + history.purge_every_ms).await;
+    let left = sealed_ids(&db);
+    assert!(
+        aged.iter().all(|id| !left.contains(id)),
+        "the old runs are gone: {left:?}"
+    );
+    assert!(
+        fresh.iter().all(|id| left.contains(id)),
+        "runs younger than keep_days stay"
+    );
+    assert_eq!(runs(&db).get("RUNNING"), Some(&1), "the running run stays");
+}
+
 #[test]
 fn purges_come_at_most_once_per_interval_and_never_with_keep_days_zero() {
     let h = HarvestHistory::default();

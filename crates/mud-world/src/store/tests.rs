@@ -502,6 +502,66 @@ fn a_side_op_commits_with_the_events_or_not_at_all() {
     assert_eq!(s.load_side().unwrap().entities[&ada()].seen_seq, 9);
 }
 
+#[test]
+fn a_spend_reset_moves_the_day_back_and_later_spend_joins_it() {
+    let mut s = Store::open_in_memory(1, 0).unwrap();
+    let t = |tokens: u64| Tally {
+        tokens,
+        cost_usd_micros: tokens / 2,
+        calls: 1,
+    };
+    let ops = [
+        // A day stored ahead of the clock, with a harvest mark.
+        SideOp::Spend {
+            entity: ada(),
+            day: 9,
+            local: t(800),
+            lg: t(200),
+            harvest_tokens_seen: Some(40),
+        },
+        // A plain Spend of an earlier day cannot move it back.
+        SideOp::Spend {
+            entity: ada(),
+            day: 4,
+            local: t(5),
+            lg: Tally::default(),
+            harvest_tokens_seen: None,
+        },
+        SideOp::SpendReset {
+            entity: ada(),
+            day: 4,
+            local: Tally::default(),
+            lg: Tally::default(),
+        },
+        SideOp::Spend {
+            entity: ada(),
+            day: 4,
+            local: t(30),
+            lg: t(6),
+            harvest_tokens_seen: None,
+        },
+    ];
+    let mut model = SideState::default();
+    for (i, op) in ops.iter().enumerate() {
+        s.apply_side(std::slice::from_ref(op), i as u64, Fsync::Normal)
+            .unwrap();
+        model.apply(op, i as u64);
+    }
+    let side = s.load_side().unwrap();
+    let row = &side.entities[&ada()];
+    assert_eq!(row.budget_day, 4, "the day moved back");
+    assert_eq!((row.local, row.lg), (t(30), t(6)), "and the new day joins");
+    assert_eq!(row.harvest_tokens_seen, Some(40), "the mark is kept");
+    model.epoch = side.epoch;
+    model.boot = side.boot;
+    assert_eq!(side, model, "SQL and the model agree");
+    // A second reset is the same as one.
+    s.apply_side(&ops[2..3], 9, Fsync::Normal).unwrap();
+    s.apply_side(&ops[2..3], 10, Fsync::Normal).unwrap();
+    let row = &s.load_side().unwrap().entities[&ada()];
+    assert_eq!((row.budget_day, row.local), (4, Tally::default()));
+}
+
 fn arb_tally() -> impl Strategy<Value = Tally> {
     (0u64..50, 0u64..50, 0u64..5).prop_map(|(tokens, cost_usd_micros, calls)| Tally {
         tokens,

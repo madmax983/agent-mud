@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use autumn_harvest_agent::{
     AgentError, AgentModel, BoxFuture as HBoxFuture, ChatRequest, ChatResponse, ContentPart,
@@ -17,7 +18,7 @@ use super::*;
 use crate::harvest::{HarvestMind, HarvestPersona};
 use crate::ledger::LedgerMeter;
 use crate::ledger::fake::{call, ledger};
-use crate::mind::{BoxFuture, MindError};
+use crate::mind::{BoxFuture, InFlight, InFlightGuard, MindError};
 
 /// A mind that spends on every wake: a fixed amount it metered itself, or
 /// what a littleguy ledger holds that it has not charged yet.
@@ -223,6 +224,90 @@ async fn a_clock_that_goes_back_does_not_reset_todays_spend() {
 }
 
 #[tokio::test]
+async fn a_budget_reset_far_ahead_is_stored_and_the_new_day_survives_restarts() {
+    let disk = Disk::new();
+    // The clock ran three days fast, and torin spent to Hard on day 5.
+    let mut r = start(
+        &disk,
+        5 * DAY + T0,
+        budget(1_000),
+        torin_on(Spender::local(1_000)),
+    );
+    one_wake(&mut r).await;
+    assert_eq!(level_and_spend(&r).0, BudgetLevel::Hard);
+    drop(r);
+    // The clock is fixed: day 2. The reset is stored, not only in memory.
+    let mut r = start(
+        &disk,
+        2 * DAY + T0,
+        budget(1_000),
+        torin_on(Spender::local(900)),
+    );
+    assert_eq!(level_and_spend(&r).0, BudgetLevel::Normal, "reset");
+    assert_eq!(stored(&disk), (2, 0, 0, None), "the reset is stored");
+    one_wake(&mut r).await;
+    let soft = level_and_spend(&r);
+    assert_eq!(soft.0, BudgetLevel::Soft);
+    assert_eq!(stored(&disk), (2, 900, 0, None), "day 2's spend is stored");
+    drop(r);
+    // A restart on day 2 keeps day 2's spend and gives no new allowance.
+    let r = start(
+        &disk,
+        2 * DAY + T0 + 60_000,
+        budget(1_000),
+        torin_on(Spender::local(900)),
+    );
+    assert_eq!(
+        level_and_spend(&r),
+        soft,
+        "the spend after the reset stands"
+    );
+    // The same process runs on to the real day 5, spending nothing.
+    r.clock.set(5 * DAY + T0 + 1_000);
+    let before = level_and_spend(&r);
+    assert_eq!(before.0, BudgetLevel::Normal);
+    drop(r);
+    // The stale day-5 counters never come back.
+    let r = start(
+        &disk,
+        5 * DAY + T0 + 2_000,
+        budget(1_000),
+        torin_on(Spender::local(900)),
+    );
+    assert_eq!(level_and_spend(&r), before, "a restart keeps the level");
+}
+
+#[tokio::test]
+async fn late_spend_outside_a_wake_is_stored_by_the_next_step() {
+    let disk = Disk::new();
+    let mut r = start(&disk, T0, budget(1_000), torin_on(Spender::local(100)));
+    one_wake(&mut r).await;
+    assert_eq!(stored(&disk).1, 100);
+    // A model that kept going after its wake closed reports late.
+    r.sup.usage.add(
+        &torin(),
+        Usage {
+            calls: 1,
+            input_tokens: 7,
+            ..Usage::default()
+        },
+    );
+    for h in r.sup.step() {
+        h.await.unwrap();
+    }
+    assert_eq!(stored(&disk).1, 107, "the step stores the late spend");
+    drop(r);
+    let r = start(
+        &disk,
+        T0 + 60_000,
+        budget(1_000),
+        torin_on(Spender::local(100)),
+    );
+    assert_eq!(level_and_spend(&r).1.local.tokens, 107);
+    assert_eq!(level_and_spend(&r).1.local.calls, 2);
+}
+
+#[tokio::test]
 async fn littleguy_spend_is_not_counted_twice() {
     // Day 1, so the ledger has a yesterday.
     let t0 = DAY + T0;
@@ -367,4 +452,150 @@ async fn harvest_spend_unflushed_at_a_crash_is_charged_once() {
         4 * one,
         "and never again"
     );
+}
+
+/// A mind that counts lifetime tokens as a harvest agent does. The count
+/// lives in its "file" (`used`) and outlasts a restart; the mark (what the
+/// budget was charged up to) is per process and comes back from the
+/// store. A wake adds `per_wake` to the count and charges what the count
+/// passed the mark. A held wake returns at once and leaves its job open:
+/// the test ends the job late ([`Lifetime::finish_late`]) and then lets
+/// the wake settle ([`Lifetime::release`]).
+#[derive(Debug)]
+struct Lifetime {
+    used: Arc<AtomicU64>,
+    per_wake: u64,
+    mark: StdMutex<Option<u64>>,
+    in_flight: InFlight,
+    held: StdMutex<Option<InFlightGuard>>,
+    hold_next: AtomicBool,
+}
+
+impl Lifetime {
+    fn new(used: &Arc<AtomicU64>, per_wake: u64) -> Arc<Self> {
+        Arc::new(Self {
+            used: Arc::clone(used),
+            per_wake,
+            mark: StdMutex::new(None),
+            in_flight: InFlight::default(),
+            held: StdMutex::new(None),
+            hold_next: AtomicBool::new(false),
+        })
+    }
+
+    fn is_held(&self) -> bool {
+        self.held.lock().unwrap().is_some()
+    }
+
+    /// The held job ends: the count rises by `n`, the mark is raised, and
+    /// then the spend goes to the supervisor's sink, as the harvest
+    /// worker does on a timed-out or failed job.
+    fn finish_late(&self, sup: &Supervisor, entity: &EntityId, n: u64) {
+        let now = self.used.fetch_add(n, Ordering::SeqCst) + n;
+        *self.mark.lock().unwrap() = Some(now);
+        sup.usage.add(
+            entity,
+            Usage {
+                calls: 1,
+                input_tokens: n,
+                ..Usage::default()
+            },
+        );
+    }
+
+    fn release(&self) {
+        self.held.lock().unwrap().take();
+    }
+}
+
+impl Mind for Lifetime {
+    fn kind(&self) -> &'static str {
+        "lifetime"
+    }
+
+    fn restore_tokens_seen(&self, _: &EntityId, seen: u64) {
+        *self.mark.lock().unwrap() = Some(seen);
+    }
+
+    fn tokens_seen(&self, _: &EntityId) -> Option<u64> {
+        *self.mark.lock().unwrap()
+    }
+
+    fn settled(&self, entity: &EntityId) -> BoxFuture<'_, ()> {
+        self.in_flight.settled(entity)
+    }
+
+    fn wake(&self, ctx: WakeContext, _: MudTools) -> BoxFuture<'_, Result<MindReply, MindError>> {
+        let reply = if self.hold_next.swap(false, Ordering::SeqCst) {
+            *self.held.lock().unwrap() = Some(self.in_flight.start(&ctx.entity));
+            MindReply::default()
+        } else {
+            let before = self.used.load(Ordering::SeqCst);
+            let from = self.mark.lock().unwrap().map_or(before, |m| m.min(before));
+            let now = self.used.fetch_add(self.per_wake, Ordering::SeqCst) + self.per_wake;
+            *self.mark.lock().unwrap() = Some(now);
+            MindReply {
+                usage: Usage {
+                    calls: 1,
+                    input_tokens: now - from,
+                    ..Usage::default()
+                },
+                ..MindReply::default()
+            }
+        };
+        Box::pin(async move { Ok(reply) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_spend_of_an_open_wake_is_stored_with_its_mark() {
+    let disk = Disk::new();
+    let used = Arc::new(AtomicU64::new(0));
+    let m = Lifetime::new(&used, 10);
+    let mut r = start(&disk, T0, budget(1_000_000), torin_on(m.clone()));
+    one_wake(&mut r).await;
+    assert_eq!(stored(&disk), (0, 10, 0, Some(10)));
+    // A wake whose job outlives it: the wake returns, the close waits for
+    // the job to settle.
+    m.hold_next.store(true, Ordering::SeqCst);
+    r.sup.fire_macro_tick(&torin());
+    let mut open = Vec::new();
+    for _ in 0..40 {
+        open.extend(r.sup.step());
+        if m.is_held() {
+            break;
+        }
+        r.clock.advance(500);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(m.is_held(), "the held wake started");
+    // The job ends 15 tokens later, and a clock step runs before the close.
+    m.finish_late(&r.sup, &torin(), 15);
+    for h in r.sup.step() {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        stored(&disk),
+        (0, 10, 0, Some(10)),
+        "no tally is stored ahead of its mark"
+    );
+    // A kill before the close commits.
+    r.game.refuse_store_writes(true).unwrap();
+    m.release();
+    for h in open {
+        h.await.unwrap();
+    }
+    assert_eq!(level_and_spend(&r).1.local.tokens, 25, "in memory");
+    drop(r);
+
+    let m = Lifetime::new(&used, 10);
+    let mut r = start(&disk, T0 + 60_000, budget(1_000_000), torin_on(m.clone()));
+    assert_eq!(level_and_spend(&r).1.local.tokens, 10);
+    one_wake(&mut r).await;
+    assert_eq!(
+        level_and_spend(&r).1.local.tokens,
+        35,
+        "every token the agent used is charged once"
+    );
+    assert_eq!(stored(&disk), (0, 35, 0, Some(35)));
 }

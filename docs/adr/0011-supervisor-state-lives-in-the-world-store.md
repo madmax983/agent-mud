@@ -106,6 +106,7 @@ rows never enter `WorldState`: they are not physics, and no view shows them.
 | `RuleCountsDrop` | deletes the counts of rules that are gone, by `(digest, dup)` |
 | `ScriptMemory` | a Rhai mind's memory, last writer wins (it rides on the wake's turn; not a side row) |
 | `Spend`, `Booked` | the dated join: the later UTC day wins; the same day takes the larger value; `harvest_tokens_seen = max` |
+| `SpendReset` | boot only: sets the day and both tallies outright (a row stored more than a day ahead of the clock); the harvest mark stays |
 | `BookingInsert` / `BookingDelete` | insert once by id / delete |
 | `MetaMax` | raises `next_booking_id` (never `epoch` or `boot`) |
 | `SeenSeq` | `max` |
@@ -146,7 +147,9 @@ turns (`entity → { wake_id, staged ops }`) and the backlog of a failed save.
    change waits, else it defers behind the backlog (`Durability::Deferred`).
    Only ops whose loss is a safe regression use it: a macro schedule, a
    late spend, boot-time cleanups. Nothing that precedes an external effect
-   uses it.
+   uses it. The boot-time cleanups (`DropEntity`, `RuleCountsDrop`,
+   `SpendReset`) are the only ops that are not monotone; they are written
+   while no wake can run.
 
 **A failing store.** A failed save keeps its events, ledger rows and ops in
 the backlog, and the next commit (or `act`) retries them all, with a fresh
@@ -266,12 +269,17 @@ fresh ids through the normal, ready-gated paths.
   next day and roll the day after: a documented over-restriction). Each
   close stores the day's absolute tallies (`Spend`) with its turn; late
   spend and `record_spend` store theirs through `persist` (a lost one is a
-  bounded under-charge). At boot `Supervisor::open` restores each row with
-  `restore_budget` (the same day and one day ahead stand, an earlier day is
-  zeroed, more than one day ahead is reset with a warning; the stored row
-keeps its later day, since the join never moves a day back, so until the
-clock reaches that day the new day's spend is not stored and a further
-restart under-charges it), then asks every
+  bounded under-charge). Late spend is the spend of an entity whose wake
+  is closed: the clock step leaves the sink entry of an entity with an
+  open wake (the router still has it busy) to that wake's close, which
+  stores it with the harvest mark that covers it. At boot
+  `Supervisor::open` restores each row with `restore_budget` (the same day
+  and one day ahead stand, an earlier day is zeroed, more than one day
+  ahead is reset with a warning). The join never moves a day back, so the
+  boot also stores a reset with `SpendReset`: otherwise the stale later
+  day would drop every `Spend` of the real day, a later restart would
+  hand out a fresh allowance, and on that later day the stale counters
+  would come back. Then the boot asks every
   mind to `prime`: a littleguy mind reads its daemon's ledger once, marks
   every row of the window seen and returns today's, and the supervisor
   raises the ledger tally to the componentwise max (`prime_budget`,
@@ -380,7 +388,10 @@ breaker stands where it stood: a hard stop survives a restart. What a
 crash can lose is the spend after the last stored close (an LLM mind's
 turn in flight): a littleguy mind gets it back from its ledger at boot,
 and a harvest mind from its token mark; other minds under-charge by at
-most that turn.
+most that turn. No stored tally counts harvest tokens past the stored
+mark: only a close stores a harvest entity's spend while its job can run,
+and it stores the mark with it, so a kill at any point charges each token
+once.
 
 **Deterministic plans (Scripted runtime, Rhai minds; phase 2).** Every
 effectful line commits with `PlanCursor` past it, in the same transaction.

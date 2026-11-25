@@ -114,11 +114,19 @@ impl UsageSink {
 
     /// Takes what everyone owes.
     pub fn take_all(&self) -> Vec<(EntityId, Usage)> {
-        self.owed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain()
-            .collect()
+        self.take_where(|_| true)
+    }
+
+    /// Takes what each entity that `take` accepts owes, and leaves the
+    /// rest owed.
+    pub fn take_where(&self, take: impl Fn(&EntityId) -> bool) -> Vec<(EntityId, Usage)> {
+        let mut owed = self.owed.lock().unwrap_or_else(PoisonError::into_inner);
+        let (taken, kept) = std::mem::take(&mut *owed)
+            .into_iter()
+            .partition(|(e, _)| take(e));
+        *owed = kept;
+        drop(owed);
+        taken.into_iter().collect()
     }
 }
 
@@ -799,5 +807,25 @@ mod tests {
         meter.recorder().add(one);
         assert_eq!(meter.settle(), one, "a settled meter reports in the reply");
         assert!(tools.usage_sink().take_all().is_empty(), "and owes nothing");
+    }
+
+    #[test]
+    fn take_where_leaves_the_spend_it_refuses_owed() {
+        let sink = UsageSink::default();
+        let (torin, marta) = (EntityId::from("torin"), EntityId::from("marta"));
+        let one = Usage {
+            calls: 1,
+            input_tokens: 5,
+            ..Usage::default()
+        };
+        sink.add(&torin, one);
+        sink.add(&marta, one);
+        sink.add(&marta, one);
+        let taken = sink.take_where(|e| e == &marta);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0, marta);
+        assert_eq!(taken[0].1.tokens(), 10);
+        assert!(sink.take(&marta).is_zero(), "taken once");
+        assert_eq!(sink.take(&torin), one, "the refused spend stays owed");
     }
 }
