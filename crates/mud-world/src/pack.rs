@@ -351,6 +351,39 @@ impl DeathRules {
     }
 }
 
+/// `[combat]` in `world.toml`: how a fight lets go of you.
+///
+/// A pack without the table keeps the strict rule: with a hostile in the
+/// room, every way out needs `flee`. A key the table does not know fails
+/// the pack, as for `[recovery]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombatRules {
+    /// Whether walking back out by the way you came in is a normal move,
+    /// with no flee roll and no strike, even with a hostile in the room.
+    /// Every other exit still needs `flee`. The strike on entering a lair
+    /// stays.
+    #[serde(default)]
+    pub retreat_free: bool,
+}
+
+impl CombatRules {
+    /// How to leave a fight, in two sentences, as `help` and an agent's
+    /// system prompt say it.
+    #[must_use]
+    pub const fn rule(&self) -> &'static str {
+        if self.retreat_free {
+            "With a hostile in the room, you may walk back out the way you came in; any other \
+             way needs flee, a DX check, and each hostile strikes you if it fails. A bare flee \
+             runs back the way you came, else to a room with no hostile in it."
+        } else {
+            "With a hostile in the room, every way out needs flee, a DX check, and each hostile \
+             strikes you if it fails. A bare flee runs back the way you came, else to a room \
+             with no hostile in it."
+        }
+    }
+}
+
 /// A lock on an exit.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LockDef {
@@ -362,6 +395,10 @@ pub struct LockDef {
     /// What `look` says about it.
     #[serde(default)]
     pub describe: Option<String>,
+    /// Minutes after it is opened that it locks itself again, on both
+    /// sides. `None`: it stays open until something locks it.
+    #[serde(default)]
+    pub relock_minutes: Option<u32>,
 }
 
 /// An item placed in a room by the pack.
@@ -661,6 +698,21 @@ pub struct ShopDef {
     /// Fixed buying prices by item.
     #[serde(default)]
     pub prices: BTreeMap<ProtoId, i64>,
+    /// The item prototype of the shop's fixture: a fixed container in the
+    /// shop room that holds the stock, so the stock stays in the shop
+    /// whoever walks off. `None`: the stock lives on the keeper's body,
+    /// and the shop goes wherever the keeper goes.
+    #[serde(default)]
+    pub fixture: Option<ProtoId>,
+    /// The shop room, where the fixture stands. Defaults to the keeper's
+    /// starting room. Only for a shop with a fixture.
+    #[serde(default)]
+    pub room: Option<RoomId>,
+    /// An honesty box: the fixture sells at its posted prices with nobody
+    /// minding it, and the coins go to the keeper. Buying from customers
+    /// still needs the keeper. Only for a shop with a fixture.
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 const fn half() -> f64 {
@@ -913,6 +965,10 @@ pub struct CastDef {
     /// Minutes until a dead mob returns.
     #[serde(default)]
     pub respawn_minutes: Option<u32>,
+    /// A soft post: the rooms it keeps. Nothing holds it there; away from
+    /// it, its macro-tick cue says the way back.
+    #[serde(default)]
+    pub post: Option<PostDef>,
     /// The persona prompt. Private.
     #[serde(default)]
     pub persona: String,
@@ -928,6 +984,14 @@ pub struct CastDef {
     /// Its deterministic script.
     #[serde(default)]
     pub script: Vec<ScriptRule>,
+}
+
+/// A soft post of a cast entry (`post = { rooms = [...] }`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PostDef {
+    /// The rooms of the post. The first is where the cue sends it back.
+    pub rooms: Vec<RoomId>,
 }
 
 /// The template of a new human player.
@@ -957,6 +1021,8 @@ struct WorldFile {
     recovery: RecoveryRules,
     #[serde(default)]
     death: DeathRules,
+    #[serde(default)]
+    combat: CombatRules,
     #[serde(default)]
     rooms: Vec<RoomDef>,
 }
@@ -992,6 +1058,8 @@ pub struct WorldPack {
     pub recovery: RecoveryRules,
     /// `[death]`: what dying costs.
     pub death: DeathRules,
+    /// `[combat]`: how a fight lets go.
+    pub combat: CombatRules,
     /// Rooms by id.
     pub rooms: BTreeMap<RoomId, RoomDef>,
     /// Room ids in file order.
@@ -1034,11 +1102,16 @@ fn parse<T: for<'de> Deserialize<'de>>(file: &'static str, text: &str) -> Result
 
 impl WorldPack {
     /// What happens to a body in this pack, in a few sentences: its
-    /// recovery rule, then its death rule. An agent's system prompt
+    /// recovery rule, its death rule, then how to leave a fight. An agent's system prompt
     /// carries it, so the agent reasons from the same rule `help` gives.
     #[must_use]
     pub fn body_rules(&self) -> String {
-        format!("{} {}", self.recovery.rule(), self.death.rule())
+        format!(
+            "{} {} {}",
+            self.recovery.rule(),
+            self.death.rule(),
+            self.combat.rule()
+        )
     }
 
     /// Loads and checks the pack in `dir`.
@@ -1084,6 +1157,7 @@ impl WorldPack {
             world: world.world,
             recovery: world.recovery,
             death: world.death,
+            combat: world.combat,
             rooms: world.rooms.into_iter().map(|r| (r.id.clone(), r)).collect(),
             room_order,
             skills: skills.skills,
@@ -1178,6 +1252,7 @@ impl WorldPack {
             }
         }
         problems.extend(self.recovery_problems());
+        problems.extend(self.shop_problems());
         for (id, shop) in &self.economy.shops {
             match self.cast.get(&shop.keeper) {
                 None => problems.push(format!("shop {id} has unknown keeper {:?}", shop.keeper)),
@@ -1333,6 +1408,81 @@ impl WorldPack {
                 Some(_) => {}
             },
             (None, false) => {}
+        }
+        problems
+    }
+
+    /// The room a shop trades in: its `room`, else its keeper's starting
+    /// room. `None` for a shop with no fixture (it trades wherever its
+    /// keeper stands) or an unknown shop.
+    #[must_use]
+    pub fn shop_room(&self, shop: &ShopId) -> Option<&RoomId> {
+        let def = self.economy.shops.get(shop)?;
+        def.fixture.as_ref()?;
+        def.room
+            .as_ref()
+            .or_else(|| self.cast.get(&def.keeper).map(|k| &k.room))
+    }
+
+    /// The problems of shop fixtures, soft posts and relocking exits.
+    fn shop_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut fixtures = BTreeMap::new();
+        for (id, shop) in &self.economy.shops {
+            match &shop.fixture {
+                None => {
+                    if shop.room.is_some() {
+                        problems.push(format!("shop {id}: room needs a fixture"));
+                    }
+                    if shop.unattended {
+                        problems.push(format!("shop {id}: unattended needs a fixture"));
+                    }
+                }
+                Some(f) => {
+                    match self.items.get(f) {
+                        None => problems.push(format!(
+                            "shop {id} fixture names unknown item {:?}",
+                            f.as_str()
+                        )),
+                        Some(d) if !(d.container && d.fixed) || d.lock.is_some() => {
+                            problems.push(format!(
+                                "shop {id} fixture {f} must be a fixed, unlocked container"
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                    if let Some(other) = fixtures.insert(f, id) {
+                        problems.push(format!("shops {other} and {id} share the fixture {f}"));
+                    }
+                    if let Some(r) = &shop.room
+                        && !self.rooms.contains_key(r)
+                    {
+                        problems.push(format!("shop {id} names unknown room {r:?}"));
+                    }
+                }
+            }
+        }
+        for (id, c) in &self.cast {
+            if let Some(post) = &c.post {
+                if post.rooms.is_empty() {
+                    problems.push(format!("cast {id}: post needs at least one room"));
+                }
+                for r in &post.rooms {
+                    if !self.rooms.contains_key(r) {
+                        problems.push(format!("cast {id} post names unknown room {r:?}"));
+                    }
+                }
+            }
+        }
+        for r in self.rooms.values() {
+            for (dir, l) in &r.locks {
+                if l.relock_minutes == Some(0) {
+                    problems.push(format!(
+                        "room {} lock {dir}: relock_minutes is at least 1",
+                        r.id
+                    ));
+                }
+            }
         }
         problems
     }

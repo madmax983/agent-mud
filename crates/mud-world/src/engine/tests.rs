@@ -16,6 +16,18 @@ fn id(s: &str) -> EntityId {
     EntityId::from(s)
 }
 
+/// crypt-v01 with its shop fixtures taken out: every keeper carries its
+/// stock on its body, as a pack with no `fixture` does.
+fn body_stock_world() -> World {
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    for shop in pack.economy.shops.values_mut() {
+        shop.fixture = None;
+        shop.room = None;
+        shop.unattended = false;
+    }
+    World::new(Arc::new(pack), 42)
+}
+
 fn ok(w: &mut World, who: &EntityId, line: &str) -> CommandResult {
     let r = w.execute(who, line, 1_000);
     assert!(r.ok, "{line:?} failed: {r:?}");
@@ -218,6 +230,7 @@ fn darkness_costs_three_without_a_light() {
     let mut w = world();
     let ada = w.login("ada", 1).unwrap();
     place(&mut w, &ada, "cellar_landing");
+    ok(&mut w, &ada, "unequip torch");
     let me = w.entity(&ada).unwrap().clone();
     assert_eq!(w.skill_level(&me, &SkillId::from("stealth")), Some(7));
     assert_eq!(w.look_view(&ada)["light_level"], "dark");
@@ -253,7 +266,7 @@ fn buying_and_selling_move_money_both_ways() {
 
 #[test]
 fn a_shopkeeper_cannot_give_merchandise_away() {
-    let mut w = world();
+    let mut w = body_stock_world();
     let ada = w.login("ada", 1).unwrap();
     ok(&mut w, &ada, "w");
     let torin = id("torin");
@@ -393,7 +406,11 @@ fn a_dead_mob_drops_loot_and_respawns() {
 
 #[test]
 fn entering_a_lair_draws_an_attack_and_blocks_walking_out() {
-    let mut w = world();
+    // The strict rule, with no `[combat] retreat_free`: every way out of
+    // a fight needs flee.
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    pack.combat.retreat_free = false;
+    let mut w = World::new(Arc::new(pack), 42);
     let ada = w.login("ada", 1).unwrap();
     place(&mut w, &ada, "cellar_landing");
     w.fix_dice([6, 6, 6]);
@@ -519,6 +536,7 @@ fn healing_and_gear() {
     assert_eq!(w.entity(&ada).unwrap().pools.hp, 10);
     assert_eq!(err(&mut w, &ada, "equip bandage"), ErrorCode::NoSuchItem);
     ok(&mut w, &ada, "unequip dagger");
+    ok(&mut w, &ada, "unequip torch");
     assert!(w.entity(&ada).unwrap().equipped.is_empty());
     let sheet = w.sheet_view(&ada);
     assert_eq!(sheet["currency"], 25);
@@ -713,6 +731,7 @@ fn the_dark_hides_the_room_and_its_contents() {
     let mut w = world();
     let ada = w.login("ada", 1).unwrap();
     place(&mut w, &ada, "ossuary_crypt");
+    ok(&mut w, &ada, "unequip torch");
     let v = w.look_view(&ada);
     assert_eq!(v["entities"], serde_json::json!([]));
     assert_eq!(v["items"], serde_json::json!([]));
@@ -740,7 +759,7 @@ fn wounds_show_in_look_and_sheets_list_traits() {
 
 #[test]
 fn a_shopkeeper_cannot_use_merchandise_without_a_sale() {
-    let mut w = world();
+    let mut w = body_stock_world();
     let ada = w.login("ada", 1).unwrap();
     ok(&mut w, &ada, "e");
     let marta = id("marta");

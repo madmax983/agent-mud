@@ -3,13 +3,19 @@
 name = "silver"
 short = "s"
 
-# A shop belongs to an entity of cast.toml. `stock` items start in its
-# inventory and are merchandise: the server refuses to let the keeper
-# give them away without a sale (POLICY_TRADE_REQUIRED).
+# A shop belongs to an entity of cast.toml. `stock` items are merchandise:
+# they leave the shop only through a sale (POLICY_TRADE_REQUIRED).
+# `fixture` names the fixed container (items.toml) that holds the stock in
+# the shop room (`room`, by default the keeper's starting room). The stock
+# stays there whoever walks off, and it sells while the keeper can act in
+# that room. `unattended = true` makes it an honesty box that sells with
+# nobody minding it. A shop with no fixture keeps its stock on the
+# keeper's body.
 # `buys` lists the tags or item ids the keeper buys, at `buy_rate` of the
 # value. `prices` overrides the buying price of one item.
 [shops.marta]
 keeper = "marta"
+fixture = "flagon_shelf"
 stock = ["ale", "ale", "ale", "ale", "ale", "torch", "torch", "healing_draught"]
 buys = ["loot"]
 buy_rate = 0.4
@@ -17,6 +23,7 @@ sell_markup = 1.0
 
 [shops.torin]
 keeper = "torin"
+fixture = "smithy_rack"
 stock = ["broadsword", "shortsword", "dagger", "leather_jerkin", "lantern", "spear"]
 buys = ["iron_ore"]
 buy_rate = 0.5
@@ -25,6 +32,7 @@ prices = { iron_ore = 15 }
 
 [shops.vich]
 keeper = "vich"
+fixture = "fence_crate"
 stock = ["grate_key", "bandage", "bandage", "torch"]
 buys = ["loot", "ore"]
 buy_rate = 0.6

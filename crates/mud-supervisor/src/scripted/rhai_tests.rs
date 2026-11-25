@@ -454,13 +454,84 @@ async fn hale_greets_kestrel_exactly_as_a_human() {
         [
             "move along. and stay out of the alley after dark.",
             "move along. and stay out of the alley after dark.",
-            "back again, ada? the grate stays shut.",
-            "back again, kestrel? the grate stays shut.",
+            "back again, ada? stay off that grate.",
+            "back again, kestrel? stay off that grate.",
         ]
     );
     let memory = rig.game.script_memory(&EntityId::from("guard_01"), 1);
     assert_eq!(memory["warned"]["pc_ada"], 2);
     assert_eq!(memory["warned"]["pc_kestrel"], 2);
+}
+
+/// What Hale says to "the grate" where he stands, and where he ends up.
+async fn hale_on_the_grate(rig: &Rig, m: &ScriptedMind, ada: &EntityId, wake: &str) -> String {
+    let evs = rig.events_of(|g| {
+        assert!(g.execute(ada, "say what about the grate").ok);
+    });
+    let before = rig.hale_said().len();
+    m.wake(ctx(evs, wake), rig.tools("guard_01")).await.unwrap();
+    rig.hale_said()[before..].join(" | ")
+}
+
+#[tokio::test]
+async fn hale_says_locked_only_when_he_sees_the_grate_locked() {
+    let rig = Rig::new();
+    let pack = pack();
+    let bundled = Arc::new(ScriptHost::bundled_crypt_v01(&pack).unwrap());
+    let m = mind(&rig, &bundled);
+    let hale = EntityId::from("guard_01");
+    let ada = rig.game.login("ada").unwrap();
+    let room = |who: &EntityId| rig.game.read(|w| w.entity(who).unwrap().room.to_string());
+    // In the square he cannot see the grate, so he says nothing of a lock.
+    let said = hale_on_the_grate(&rig, &m, &ada, "w1").await;
+    assert_eq!(
+        said,
+        "stay off that grate. vich has the only key, and vich has a price."
+    );
+    // At the grate, and it is locked: he says so, then walks back to his post.
+    assert!(rig.game.execute(&hale, "s").ok);
+    assert!(rig.game.execute(&ada, "s").ok);
+    let said = hale_on_the_grate(&rig, &m, &ada, "w2").await;
+    assert!(said.starts_with("grate's locked for a reason"), "{said}");
+    assert_eq!(room(&hale), "town_square", "back to his post");
+    // Ada buys the key from Vich and opens the grate.
+    for line in ["e", "buy key", "w", "use key"] {
+        let r = rig.game.execute(&ada, line);
+        assert!(r.ok, "{line}: {r:?}");
+    }
+    assert!(rig.game.execute(&hale, "s").ok);
+    let said = hale_on_the_grate(&rig, &m, &ada, "w3").await;
+    assert!(
+        !said.contains("locked"),
+        "never locked about an open grate: {said}"
+    );
+    assert!(said.starts_with("that grate's standing open"), "{said}");
+    assert_eq!(room(&hale), "town_square");
+}
+
+#[tokio::test]
+async fn hale_at_his_post_stays_put() {
+    let rig = Rig::new();
+    let pack = pack();
+    let bundled = Arc::new(ScriptHost::bundled_crypt_v01(&pack).unwrap());
+    let m = mind(&rig, &bundled);
+    let hale = EntityId::from("guard_01");
+    let r = m
+        .wake(ctx(Vec::new(), "w1"), rig.tools("guard_01"))
+        .await
+        .unwrap();
+    assert_eq!(r.commands, 0, "nothing to say, nowhere to go");
+    // Off his post with nobody about, he still takes a step home.
+    assert!(rig.game.execute(&hale, "n").ok);
+    let r = m
+        .wake(ctx(Vec::new(), "w2"), rig.tools("guard_01"))
+        .await
+        .unwrap();
+    assert_eq!(r.commands, 1);
+    assert_eq!(
+        rig.game.read(|w| w.entity(&hale).unwrap().room.to_string()),
+        "town_square"
+    );
 }
 
 #[tokio::test]

@@ -29,7 +29,7 @@ an informal Turing experiment.
   agent-authored text (say, emote, tell, board post) is quarantined inside
   an `untrusted_text` envelope. Server-side rules enforce permissions (a
   shopkeeper cannot give stocked merchandise without a completed sale,
-  whatever the LLM asks).
+  whatever the LLM asks, and nobody takes stock out of a shop fixture).
 - **Setting-agnostic engine.** The Rust core knows nothing about swords,
   goblins or silver. Fantasy is just the first data-driven world pack
   (`worlds/crypt-v01/`).
@@ -126,7 +126,12 @@ unconscious entity comes to above 0 HP, or on a successful come-to roll
 (crypt-v01: HT) each step while above −HP, and the room sees it stir.
 Death (pack `[death]`): the dead wake at the respawn room with a share of
 their HP (crypt-v01: a third) and drop their purse where they fell; mobs
-respawn on their own timer. Attack → Dodge/Parry/Block
+respawn on their own timer. Leaving a fight (ADR 0013, pack `[combat]`):
+with a hostile in the room every way out needs `flee` (DX; each hostile
+strikes on a failure), except that with `retreat_free` (crypt-v01) the
+way you came in is a normal walk; a bare `flee` runs back the way you
+came, else to a room with no hostile. Mobs strike only a body that still
+acts. Attack → Dodge/Parry/Block
 (bypassed on a critical) → `(raw − DR).max(0) × multiplier` (crushing and
 burn ×1, cutting ×1.5, impaling ×2). Traits with self-control numbers
 (greedy 12, cowardly 12, impatient 12) roll when a trigger reaches the
@@ -165,8 +170,17 @@ Town (safe; guards intervene): Notice Board and Market, Smithy, Town
 Square, Rusty Flagon, Dark Alley, Fence's Backroom. Cellar and crypt
 (dark, −3 without a light): Cellar Landing, Wine Vault, Rat Warren,
 Flooded Cistern, Ossuary Crypt. The alley grate is locked (lockpicking −2
-or the key). Giant rats in the vault and warren, a rusted lockbox in the
-cistern, a skeletal warden and a dwarven iron-ore cache in the ossuary.
+or the key) and locks itself again 30 minutes after it is opened. Giant
+rats in the vault and warren, a rusted lockbox in the cistern, a skeletal
+warden and a dwarven iron-ore cache in the ossuary.
+
+Shops (ADR 0013): Marta's stock sits on the shelf behind the bar, Torin's
+on the weapon rack, Vich's in his crate of oddments. A shop sells while
+its keeper can act in its room (`unattended = true` makes an honesty
+box), so a keeper who goes below leaves the stock at home. Each keeper,
+and Hale, has a soft post: away from it, the macro-tick cue gives the way
+back. Torin wields a broadsword and wears a jerkin; every player starts
+with a lit torch.
 
 Since v0.2 the pack also ships Rhai world scripts (`scripts.toml`,
 `scripts/`): `pray` in the ossuary, `listen` in the alley and on the

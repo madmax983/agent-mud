@@ -91,5 +91,6 @@ that, death was a free full heal at the square, cheaper than collapsing.
   woken within a second of it, not at their bookings.
 - A dropped purse gives corpse runs and looting. It is an item in a room
   and is saved with the world.
-- Shop stock still lives on the keeper's body, and keepers still roam;
-  that is the next change (shop fixtures and soft posts).
+- Shop stock lived on the keeper's body, and keepers roamed with it;
+  ADR 0013 moves the stock into a shop fixture and gives keepers a soft
+  post.

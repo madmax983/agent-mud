@@ -181,8 +181,10 @@ proptest! {
 
 #[test]
 fn the_same_play_twice_gives_the_same_snapshot_and_log() {
+    // The offset picks a fixed play in which the bounty is paid. A bare
+    // flee now runs back the way it came, so the walk differs from before.
     let steps: Vec<(usize, usize)> = (0..200)
-        .map(|i| ((i * 7 + 3) % LINES.len(), i % 3))
+        .map(|i| ((i * 7 + 6) % LINES.len(), i % 3))
         .collect();
     let (a, la) = play(99, &steps);
     let (b, lb) = play(99, &steps);

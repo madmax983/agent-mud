@@ -19,7 +19,7 @@ max_consecutive_faults = 3
 file = "minds/hale.rhai"
 runtime = "rhai"
 memory_schema = 1
-config = { night_from = 20, night_to = 6 }
+config = { night_from = 20, night_to = 6, grate_room = "dark_alley", grate_dir = "d" }
 
 [rooms.ossuary_crypt]
 file = "rooms/ossuary.rhai"

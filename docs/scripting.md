@@ -231,7 +231,10 @@ than copying `ctx` in a loop.
 `fn on_wake(ctx)` sees `ctx.hook`, `ctx.priority` (`immediate`,
 `room_batch`, `ambient`, `macro_tick`, `booked`), `ctx.macro_tick`,
 `ctx.macro_ticks`, `ctx.login`, `ctx.now_ms`, `ctx.me` (the actor facts,
-without marks), `ctx.here` (what `look` shows), `ctx.events` (at most 32:
+without marks, plus `ctx.me.post`: `()`, or `#{ rooms, at_post }` with
+`return_to`, `return_title` and `way`, a list of exits such as `["n"]`,
+when away from a soft post), `ctx.here` (what `look` shows, with each
+exit's `locked`), `ctx.events` (at most 32:
 `seq, kind, verb, tags, room, actor{id,name,kind}|(), target|(), is_self,
 at_me, text`), `ctx.booked` (`id, due_ms, note`), `ctx.toml_plan` (the
 lines the TOML rules would run), `ctx.memory` (a copy you may change) and
@@ -291,7 +294,7 @@ running when you reset does not save its memory over the reset.
 
 ```sh
 cargo run -p mud-server --bin mud -- check worlds/crypt-v01
-# crypt-v01: 11 rooms, 19 items, 14 skills, 8 cast, 3 shops, 1 reward pool — ok
+# crypt-v01: 11 rooms, 23 items, 14 skills, 8 cast, 3 shops, 1 reward pool — ok
 # scripts rhai-… (7 files: 1 mind, 2 rooms, 2 items, 3 verbs) — ok
 ```
 
@@ -320,5 +323,7 @@ not start on a problem.
   the warden and answers `use charm on warden`.
 - `minds/hale.rhai`: Hale (on Rhai through `runtime = "rhai"`) warns
   players off the alley, by night by name, remembers who he warned today,
-  and answers talk of the grate. He greets kestrel exactly as he greets a
-  human.
+  and answers talk of the grate. He says it is locked only when he stands
+  at it (`config.grate_room`, `config.grate_dir`) and `ctx.here` shows it
+  locked, and off his post (`ctx.me.post`) he takes a step back toward it.
+  He greets kestrel exactly as he greets a human.
