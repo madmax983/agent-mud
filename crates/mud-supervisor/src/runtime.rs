@@ -130,11 +130,17 @@ struct EntityState {
 
 /// The supervisor.
 ///
-/// Lock order: the world (`Game::read`, `Game::write` and every other
-/// `Game` call) comes first. The supervisor's own `router` and `state`
+/// Lock order: `world → (router | state | wakebook, one at a time) → store
+/// cell`. The world (`Game::read`, `Game::write` and every other `Game`
+/// call) comes first. The supervisor's own `router`, `state` and wake-book
 /// locks may be taken inside a world closure, one at a time, but are never
 /// held while calling into `Game`, never nested in each other, and the
-/// gate's lock is a leaf. Breaking this order deadlocks the whole world.
+/// gate's lock is a leaf. The store cell inside `Game` is the last leaf:
+/// `Game::open_turn`, `Game::stage`, `Game::persist` and `Game::retain`
+/// take only it, while `Game::act` and `Game::close_turn` take the world
+/// first, so they are never called with `router`, `state` or the wake
+/// book held (ADR 0002, ADR 0011). Breaking this order deadlocks the whole
+/// world.
 #[derive(Debug)]
 pub struct Supervisor {
     game: Arc<Game>,
@@ -411,13 +417,23 @@ impl Supervisor {
         self.macro_ticks(now);
         self.booked_wakes(now);
         let wakes = lock(&self.router).due(now);
-        wakes
+        let mut tasks: Vec<JoinHandle<()>> = wakes
             .into_iter()
             .map(|w| {
                 let me = Arc::clone(self);
                 tokio::spawn(async move { me.run_wake(w).await })
             })
-            .collect()
+            .collect();
+        if self.game.retention_due(now) {
+            // Archive, then trim, old events off the async workers; each
+            // batch holds only the store cell, so commands go on.
+            let game = Arc::clone(&self.game);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                // `retain` logs and counts its own failures.
+                let _ = game.retain(now);
+            }));
+        }
+        tasks
     }
 
     fn context(&self, wake: &Wake) -> WakeContext {

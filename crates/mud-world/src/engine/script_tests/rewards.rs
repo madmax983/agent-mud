@@ -579,7 +579,7 @@ fn the_snapshot_keeps_totals_and_the_store_keeps_the_ledger() {
         size(&w)
     );
     // The store appends the rows with the events, in one transaction.
-    let mut store = crate::store::Store::open_in_memory().unwrap();
+    let mut store = crate::store::Store::open_in_memory(1, 0).unwrap();
     store
         .save("crypt-v01", &w.snapshot(), &w.drain_fresh(), &ledger, 5)
         .unwrap();
@@ -598,14 +598,14 @@ fn a_game_saves_each_mint_with_its_command() {
     let db = dir.path().join("world.db");
     let (_, w, ada) = begging(vec![bounty()]);
     let clock = Arc::new(crate::game::ManualClock::new(DAY));
-    let store = crate::store::Store::open(&db).unwrap();
+    let store = crate::store::Store::open(&db, 1, 0).unwrap();
     let game = crate::game::Game::new(w, Some(store), clock);
     assert!(game.execute(&ada, "beg").ok);
     assert!(game.execute(&ada, "beg").ok);
     assert!(game.read(|w| w.fresh_mints().is_empty()), "drained on save");
     assert_eq!(game.store_errors(), 0);
     drop(game);
-    let store = crate::store::Store::open(&db).unwrap();
+    let store = crate::store::Store::open(&db, 1, 0).unwrap();
     let ledger = store.mints().unwrap();
     assert_eq!(ledger.len(), 2);
     assert!(ledger.iter().all(|m| m.entity == ada && m.currency == 20));

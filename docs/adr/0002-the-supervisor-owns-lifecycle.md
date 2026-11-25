@@ -72,6 +72,25 @@ sequenceDiagram
   S->>S: budget.spend(new ledger rows)
 ```
 
+## Amended by ADR 0011: lock order and open order
+
+- **Lock order.** `world → (router | state | wakebook, one at a time) →
+  store cell`. The store cell inside `Game` (the store, the open turns and
+  the backlog of a failed save) is the last leaf. `Game::open_turn`,
+  `Game::stage`, `Game::persist` and `Game::retain` take only the cell;
+  `Game::act` and `Game::close_turn` take the world first, so the
+  supervisor never calls them while it holds `router`, `state` or the wake
+  book.
+- **Open order.** `Game::open` migrates `world.db`, mints its epoch once,
+  bumps its boot number (one `synchronous = FULL` transaction), reloads the
+  whole in-memory event log, and drops side rows of entities the pack no
+  longer has. A `world.db` newer than the server is refused and the server
+  does not start. From phase 2 the supervisor takes the side rows with
+  `Game::take_restored()` and opens over them (`Supervisor::open`); wake
+  ids become `wake-{epoch:016x}-{boot}-{entity}-{n}`, so a wake is never
+  redelivered under an id littleguy has seen. Until then wake ids are as
+  above.
+
 ## Alternatives
 
 - **In-process harvest agent** (`HarvestMind`): the same durable agent

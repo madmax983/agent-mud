@@ -40,6 +40,16 @@ fn the_rewards_proof_covers_the_shipped_kernel() -> TestResult {
 }
 
 #[test]
+fn the_side_merge_proof_covers_the_shipped_kernels() -> TestResult {
+    proof_mirrors("side")
+}
+
+#[test]
+fn the_durability_proof_covers_the_shipped_kernels() -> TestResult {
+    proof_mirrors("durability")
+}
+
+#[test]
 fn every_proof_module_is_checked() -> TestResult {
     every_proof_module_is_listed()
 }

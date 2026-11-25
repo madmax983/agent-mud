@@ -129,7 +129,9 @@ fn tools() -> Vec<Tool> {
             format!(
                 "What your character perceived: speech, arrivals, fights and more, oldest \
                  first, with the `cursor` to read from next. Omit `since_seq` to read on from \
-                 where your last such call stopped; pass it to re-read from any point. {UNTRUSTED}"
+                 where your last such call stopped; pass it to re-read from any point. \
+                 `truncated: true` means some events after that point are too old to read \
+                 any more. {UNTRUSTED}"
             ),
             object(json!({
                 "type": "object",

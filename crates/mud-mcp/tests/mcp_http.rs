@@ -279,6 +279,7 @@ mod http {
         call(&ada_client, "mud_command", json!({ "cmd": "say one" })).await;
         let first = call(&bob_client, "mud_events", json!({})).await;
         assert_eq!(texts(&first), ["one"]);
+        assert_eq!(first["truncated"], false, "the whole log is in memory");
         let cursor = first["cursor"].as_u64().unwrap();
         assert!(cursor > 0);
 

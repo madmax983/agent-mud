@@ -215,6 +215,8 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     } else {
         None
     };
+    let retention = cfg.world.retention()?;
+    // A world.db newer than this server is refused here, unchanged.
     let game = Game::open(
         Arc::clone(&pack),
         cfg.world.db.as_deref(),
@@ -222,6 +224,9 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         Arc::new(SystemClock),
     )
     .context("opening the world")?;
+    if let Some(r) = retention {
+        game.set_retention(r);
+    }
     let hooks = scripts.clone().map(|h| h as Arc<dyn WorldHooks>);
     game.write(|w, now| w.set_hooks(hooks, now, HooksChange::Start));
     if let Some(h) = &scripts {
@@ -736,6 +741,41 @@ mod tests {
                 .to_string()
                 .contains("trusted_proxies is empty")
         );
+    }
+
+    #[tokio::test]
+    async fn the_world_section_sets_retention_and_a_newer_world_db_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = MudConfig::default();
+        let db = dir.path().join("world.db");
+        cfg.world.db = Some(db.clone());
+        cfg.accounts.bcrypt_cost = 4;
+        cfg.world.events_keep_days = 30;
+        cfg.world.archive_dir = Some(dir.path().join("arch"));
+        let built = build(&cfg).await.unwrap();
+        let r = built.mud.game.retention().unwrap();
+        assert_eq!(r.keep_days, 30);
+        assert_eq!(r.archive_dir, dir.path().join("arch"));
+        assert_eq!(built.mud.game.boot(), 1);
+        drop(built);
+        // A bad bound is refused before the world opens.
+        cfg.world.retention_batch = 0;
+        let err = build(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("retention_batch"), "{err}");
+        cfg.world.retention_batch = 5_000;
+        // A file a newer server wrote is refused, and left as it was.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let err = format!("{:#}", build(&cfg).await.unwrap_err());
+        assert!(err.contains("opening the world"), "{err}");
+        assert!(err.contains("schema version 2"), "{err}");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
     }
 
     #[test]

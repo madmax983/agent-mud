@@ -2,6 +2,9 @@
 
 Status: accepted
 
+ADRs are numbered in merge order (see [the index](README.md)); design docs
+say "the accounts ADR", not a number.
+
 ## Context
 
 Humans and LLM agents share one world. An agent that can describe an
