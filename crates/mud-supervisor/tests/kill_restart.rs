@@ -599,7 +599,7 @@ async fn steward_after_kill(dir: &Path, daemon: &ParentDaemon, decides_at_kill: 
     );
     let row = steward.row(&torin()).await.unwrap();
     assert!(row.intent.is_none());
-    assert_eq!(row.accepts.reserved - row.accepts.refunded, 1);
+    assert_eq!(row.accepts.reserved, 1);
     after_restart(dir, &p, &[]);
 }
 

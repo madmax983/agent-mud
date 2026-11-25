@@ -54,9 +54,14 @@ pass:
    Then each proposed goal, oldest first, at most
    `max_decisions_per_pass`:
    - the **text guard** (no model call): an empty or long title, a long
-     reason, a control character, a link, a denied phrase on the squashed
-     text (the built-in `DENY_PHRASES` plus `deny_phrases`, which never
-     replaces them), or a title declined before;
+     reason, a hidden character (a control, a format character such as a
+     bidi override or a zero-width space, a line or paragraph separator),
+     a brace (no goal holds JSON, and a quoted vote must never reach a
+     ballot), a link, a word that mixes ASCII letters with another
+     script's (a homoglyph spelling), a denied phrase on the squashed text
+     (folded first: fullwidth forms to plain letters, accents dropped; the
+     built-in `DENY_PHRASES` plus `deny_phrases`, which never replaces
+     them), or a title declined before;
    - the proved **`goal_verdict`** with the active count, the day's live
      accepts and `can_vote` (a judge, a `Normal` budget, and the day's
      ballots under `max_council_votes_per_day`). Every wait, whatever its
@@ -68,10 +73,19 @@ pass:
      accept reserves its place under the day's cap in the same write. A
      lost answer keeps the intent; the next pass settles it from the
      listing (the goal active: accepted, once; still proposed: sent again
-     after `intent_retry_secs`; gone: a human decided first, and the
-     reservation is refunded). After `max_intent_tries` sends the intent
-     is dropped as stuck and the entity's actions wait
-     `stuck_backoff_hours`; reads go on.
+     after `intent_retry_secs`, but never at `Hard`; gone: published as
+     `gone`). A `decide` that lg answers with an error ("not a proposed
+     goal") reads the listing again at once. A reservation is never
+     refunded: lg lists only proposed and active goals, so a goal a human
+     declined and one our accept made active that the agent then finished
+     look the same, and the cap errs on the safe side. After
+     `max_intent_tries` sends the intent is dropped as stuck and the
+     entity's actions wait `stuck_backoff_hours`; reads go on. A stuck
+     accept keeps its reservation, since a queued `decide` may still run:
+     the row remembers it, a later listing that shows the goal active
+     settles it as accepted (published and noted once), and a new vote on
+     the same goal that day reuses its place (in the proved day model, a
+     refund followed by its ask).
    - An active goal with no new note for `goal_stale_days` is dropped.
      Every time is the game clock; lg's own stamps are compared only with
      themselves.
@@ -85,8 +99,10 @@ text; the persona and private goal are the author's; the proposal goes in
 only as `untrusted_text` in a JSON message built with `serde_json`. A
 persuasion goal (follow, serve, court, pester another character) is play
 and is allowed; a goal that breaks character, discusses being an AI or its
-tools, or reaches outside the game is not. `parse_vote` takes the first
-object of the expected shape; anything else is a no. A vote's reason goes
+tools, or reaches outside the game is not. `parse_vote` reads the top-level
+objects of the expected shape, which must all agree: a member that
+quotes the proposal before or after its own answer is no answer, and
+anything else is a no. A vote that fails (the model is down) is a no. A vote's reason goes
 to the observer feed only, never to lg, the agent or another ballot. Each
 vote is the supervisor's own (`local`) spend.
 

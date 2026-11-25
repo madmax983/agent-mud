@@ -43,8 +43,14 @@ pub struct GoalSeen {
     pub cap_noted: bool,
 }
 
-/// A day count of accepts: reserved when a `decide accept` is about to be
-/// sent, refunded when a human decided the goal first.
+/// A day count of accepts, reserved when a `decide accept` is about to be
+/// sent.
+///
+/// A reservation is never given back. lg lists only proposed and active
+/// goals, so a goal that a human declined and one that our accept made
+/// active and the agent then finished both vanish from the listing; and a
+/// `decide` that got no answer may still run from lg's queue. Either may
+/// be a live accept, so the cap errs on the safe side.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Accepts {
@@ -52,16 +58,14 @@ pub struct Accepts {
     pub day: u64,
     /// Accepts reserved that day.
     pub reserved: u32,
-    /// Of those, refunded.
-    pub refunded: u32,
 }
 
 impl Accepts {
-    /// The live accepts of the day of `now_ms`.
+    /// The accepts reserved on the day of `now_ms`.
     #[must_use]
     pub const fn today(&self, now_ms: u64) -> u32 {
         if self.day == now_ms / DAY_MS {
-            self.reserved.saturating_sub(self.refunded)
+            self.reserved
         } else {
             0
         }
@@ -71,21 +75,21 @@ impl Accepts {
     pub const fn reserve(&mut self, now_ms: u64) {
         let day = now_ms / DAY_MS;
         if self.day != day {
-            *self = Self {
-                day,
-                reserved: 0,
-                refunded: 0,
-            };
+            *self = Self { day, reserved: 0 };
         }
         self.reserved = self.reserved.saturating_add(1);
     }
+}
 
-    /// Gives one accept back, on the day it was reserved.
-    pub const fn refund(&mut self, now_ms: u64) {
-        if self.day == now_ms / DAY_MS && self.refunded < self.reserved {
-            self.refunded += 1;
-        }
-    }
+/// An accept whose intent was given up as stuck. Its `decide` may still
+/// run from lg's queue, so its reservation stays, and the next listing
+/// that shows the goal active settles it as accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StuckAccept {
+    /// The goal.
+    pub goal: i64,
+    /// The game-clock day its accept was reserved.
+    pub day: u64,
 }
 
 /// Council ballots cast on one game-clock day.
@@ -197,7 +201,7 @@ pub struct Intent {
 pub struct StewardRow {
     /// The goals the last `plans` listed, by id.
     pub goals: BTreeMap<i64, GoalSeen>,
-    /// Accepts reserved and refunded today.
+    /// Accepts reserved today.
     pub accepts: Accepts,
     /// Ballots cast today.
     pub ballots: Ballots,
@@ -209,6 +213,8 @@ pub struct StewardRow {
     pub intents: u64,
     /// Actions wait until then after an intent was stuck.
     pub stuck_until_ms: Option<u64>,
+    /// A stuck accept that lg may still apply.
+    pub stuck_accept: Option<StuckAccept>,
     /// Wakes that ended well since the last refine.
     pub wakes_since_refine: u32,
 }
@@ -272,13 +278,9 @@ mod tests {
         a.reserve(10);
         a.reserve(20);
         assert_eq!(a.today(30), 2);
-        a.refund(40);
-        assert_eq!(a.today(40), 1);
         assert_eq!(a.today(DAY_MS + 1), 0, "a new day");
-        a.refund(DAY_MS + 1);
-        assert_eq!(a.refunded, 1, "a refund on another day is ignored");
         a.reserve(DAY_MS + 5);
-        assert_eq!((a.day, a.reserved, a.refunded), (1, 1, 0));
+        assert_eq!((a.day, a.reserved), (1, 1));
         let mut b = Ballots::default();
         b.cast(1);
         b.cast(2);
@@ -293,6 +295,7 @@ mod tests {
         let mut row = StewardRow::default();
         row.open(IntentAction::Accept { goal: 4 }, 9);
         row.decline(7);
+        row.stuck_accept = Some(StuckAccept { goal: 3, day: 2 });
         let body = row.body();
         assert_eq!(body["intent"]["action"]["kind"], "accept");
         assert_eq!(StewardRow::from_body(ROW_SCHEMA, &body), Some(row));

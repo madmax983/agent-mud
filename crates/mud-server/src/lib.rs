@@ -665,6 +665,18 @@ pub async fn stop_on(
     }
 }
 
+/// Starts the supervisor and, when it runs, the Steward. The handles hold
+/// every task of both, so [`stop_on`] aborts the Steward with the
+/// supervisor, before any daemon is killed.
+#[must_use]
+pub fn spawn_tasks(built: &Built) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = built.mud.sup.spawn(built.step);
+    if let Some(steward) = &built.steward {
+        tasks.extend(steward.spawn());
+    }
+    tasks
+}
+
 /// Runs the server until a signal stops it.
 ///
 /// # Errors
@@ -679,11 +691,7 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
         mcp = %cfg.server.mcp_url(),
         "the MUD is up"
     );
-    let mut tasks = built.mud.sup.spawn(built.step);
-    // The Steward stops with the supervisor: its tasks are aborted first.
-    if let Some(steward) = &built.steward {
-        tasks.extend(steward.spawn());
-    }
+    let mut tasks = spawn_tasks(&built);
     if let Some(addr) = cfg.server.telnet {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -973,7 +981,13 @@ mod tests {
         let built = build(&cfg).await.unwrap();
         let steward = built.steward.clone().expect("the Steward runs");
         assert!(!steward.has_judge());
-        let tasks = steward.spawn();
+        let held = Arc::strong_count(&steward);
+        // As serve() does: the Steward starts with the supervisor.
+        let tasks = spawn_tasks(&built);
+        assert!(
+            Arc::strong_count(&steward) > held,
+            "the Steward's tasks run"
+        );
         let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
         assert_eq!(text.matches("no council model").count(), 1, "{text}");
         let no_judge = built
@@ -986,9 +1000,26 @@ mod tests {
             })
             .count();
         assert_eq!(no_judge, 3, "one per agent: marta, torin, vich");
+        // stop_on aborts every handle spawn_tasks gave: the Steward's too.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopper = tokio::spawn(stop_on(
+            shutdown.clone(),
+            tasks
+                .iter()
+                .map(tokio::task::JoinHandle::abort_handle)
+                .collect(),
+            built.littleguy.clone(),
+        ));
+        shutdown.cancel();
+        stopper.await.unwrap();
         for t in tasks {
-            t.abort();
+            let _ = t.await;
         }
+        assert_eq!(
+            Arc::strong_count(&steward),
+            held,
+            "no Steward task outlives the stop"
+        );
     }
 
     #[tokio::test]

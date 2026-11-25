@@ -2,8 +2,9 @@
 //!
 //! [`FakeDaemons`] serves one Unix socket per entity in a temp dir. Each
 //! socket answers owner requests from a goal list it keeps, records every
-//! line, and can drop a `decide` (no answer, not applied) or answer it
-//! late (applied at once, answered long after the client gave up).
+//! line, and can drop a `decide` (no answer, not applied), answer it late
+//! (applied at once, answered long after the client gave up), or answer
+//! it with lg's "not a proposed goal" after something else decided first.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -42,6 +43,12 @@ pub enum DecideMode {
     Drop,
     /// Apply it at once, answer long after the client gave up.
     Late,
+    /// Apply it first (an earlier queued decide of ours), then answer this
+    /// one with lg's error: the goal is no longer proposed.
+    AppliedThenError,
+    /// Remove the goal first (a human declined it), then answer with lg's
+    /// error.
+    RemovedThenError,
 }
 
 /// The state behind one fake socket.
@@ -141,8 +148,13 @@ impl FakeState {
                 let decision = v["decision"].as_str().unwrap_or_default().to_owned();
                 let id = v["id"].as_i64().unwrap_or_default();
                 let mode = self.modes.pop_front().unwrap_or(DecideMode::Answer);
-                if mode == DecideMode::Drop {
-                    return (None, String::new());
+                match mode {
+                    DecideMode::Drop => return (None, String::new()),
+                    DecideMode::AppliedThenError => {
+                        let _ = self.apply(&decision, id);
+                    }
+                    DecideMode::RemovedThenError => self.goals.retain(|g| g.id != id),
+                    DecideMode::Answer | DecideMode::Late => {}
                 }
                 let answer = match self.apply(&decision, id) {
                     Ok(()) => self.plans().to_string(),
@@ -233,6 +245,20 @@ impl FakeDaemon {
             .iter()
             .find(|g| g.id == id)
             .map(|g| g.status.clone())
+    }
+
+    /// Sets the status of goal `id`, as lg's loop would.
+    pub fn set_status(&self, id: i64, status: &str) {
+        if let Some(g) = self
+            .state
+            .lock()
+            .unwrap()
+            .goals
+            .iter_mut()
+            .find(|g| g.id == id)
+        {
+            g.status = status.into();
+        }
     }
 
     pub fn remove(&self, id: i64) {
@@ -405,26 +431,34 @@ impl OwnedDaemons for FakeDaemons {
 }
 
 /// A judge that answers from a script (then yes) and records each ballot.
+/// A `None` in the script is a vote that fails (the model is down).
 #[derive(Debug, Default)]
 pub struct ScriptedJudge {
-    pub votes: Mutex<VecDeque<Vote>>,
+    pub votes: Mutex<VecDeque<Option<Vote>>>,
     pub ballots: Mutex<Vec<Ballot>>,
 }
 
 impl ScriptedJudge {
     pub fn script(&self, votes: &[bool]) {
-        self.votes
-            .lock()
-            .unwrap()
-            .extend(votes.iter().map(|&yes| Vote {
+        self.votes.lock().unwrap().extend(votes.iter().map(|&yes| {
+            Some(Vote {
                 yes,
                 ids: Vec::new(),
                 reason: Some(if yes { "fits" } else { "breaks" }.into()),
-            }));
+            })
+        }));
     }
 
     pub fn push(&self, vote: Vote) {
-        self.votes.lock().unwrap().push_back(vote);
+        self.votes.lock().unwrap().push_back(Some(vote));
+    }
+
+    /// The next `n` votes fail.
+    pub fn fail(&self, n: usize) {
+        self.votes
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(None, n));
     }
 
     pub fn calls(&self) -> usize {
@@ -458,16 +492,17 @@ pub const VOTE_USAGE: Usage = Usage {
 impl Judge for ScriptedJudge {
     fn vote<'a>(&'a self, ballot: &'a Ballot) -> BoxFuture<'a, Result<(Vote, Usage), MindError>> {
         self.ballots.lock().unwrap().push(ballot.clone());
-        let vote = self
-            .votes
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Vote {
+        let vote = self.votes.lock().unwrap().pop_front().unwrap_or_else(|| {
+            Some(Vote {
                 yes: true,
                 ids: Vec::new(),
                 reason: Some("fits".into()),
-            });
-        Box::pin(std::future::ready(Ok((vote, VOTE_USAGE))))
+            })
+        });
+        let result = vote.map_or_else(
+            || Err(MindError::Failed("the council model is down".into())),
+            |v| Ok((v, VOTE_USAGE)),
+        );
+        Box::pin(std::future::ready(result))
     }
 }

@@ -53,7 +53,7 @@ use crate::littleguy::owner::{
 use crate::mind::{BoxFuture, MindError, Usage};
 use crate::runtime::{ObserverEvent, Supervisor};
 use council::{Ballot, Judge};
-use state::{IntentAction, ROW_SCHEMA, StewardRow};
+use state::{IntentAction, ROW_SCHEMA, StewardRow, StuckAccept};
 use vet::{GoalAsk, GoalCaps, GoalVerdict, TextLimits, TextVerdict};
 
 /// The daemons the Steward owns: the seam between it and littleguy.
@@ -543,6 +543,7 @@ impl Steward {
                 run.row.stuck_until_ms = None;
                 run.dirty = true;
             }
+            self.settle_stuck(e, run, &listing);
             self.reconcile(e, socket, run, &mut listing, now, level)
                 .await;
             let stuck = run.row.stuck_until_ms.is_some();
@@ -704,7 +705,7 @@ impl Steward {
         now: u64,
         level: BudgetLevel,
     ) {
-        if self.settle_intent(e, run, listing, now) {
+        if self.settle_intent(e, run, listing) {
             return;
         }
         let Some(intent) = run.row.intent else {
@@ -718,6 +719,14 @@ impl Steward {
             let goal = intent.action.goal();
             tracing::warn!(entity = %e, goal, tries = intent.tries, "an owner action got no answer; the Steward backs off");
             run.row.intent = None;
+            if let IntentAction::Accept { goal } = intent.action {
+                // A queued decide may still run: the reservation stays, and
+                // a later listing settles it (`settle_stuck`).
+                run.row.stuck_accept = Some(StuckAccept {
+                    goal,
+                    day: run.row.accepts.day,
+                });
+            }
             run.row.stuck_until_ms =
                 Some(now.saturating_add(self.cfg.stuck_backoff_hours.saturating_mul(3_600_000)));
             run.dirty = true;
@@ -744,7 +753,7 @@ impl Steward {
 
     /// Settles the intent against `listing` if the listing shows it done.
     /// Returns whether it was settled.
-    fn settle_intent(&self, e: &EntityId, run: &mut Run, listing: &Listing, now: u64) -> bool {
+    fn settle_intent(&self, e: &EntityId, run: &mut Run, listing: &Listing) -> bool {
         let Some(intent) = run.row.intent else {
             return false;
         };
@@ -768,8 +777,9 @@ impl Steward {
                 }
                 Some("proposed") => false,
                 _ => {
-                    // A human decided it first: the reservation goes back.
-                    run.row.accepts.refund(now);
+                    // Gone: a human declined it, or our accept applied and
+                    // the agent finished it (lg lists neither). The
+                    // reservation stays: the cap errs on the safe side.
                     self.publish(e, "goal", Some(g), "gone", "gone", None, None);
                     true
                 }
@@ -782,6 +792,35 @@ impl Steward {
             run.dirty = true;
         }
         done
+    }
+
+    /// Settles a stuck accept from `listing`: active, it is accepted after
+    /// all (published and noted once, on the place it kept); gone, it is
+    /// over; still proposed, it waits, and a new vote on it reuses its place.
+    fn settle_stuck(&self, e: &EntityId, run: &mut Run, listing: &Listing) {
+        let Some(stuck) = run.row.stuck_accept else {
+            return;
+        };
+        let g = stuck.goal;
+        match listing.status(g) {
+            Some("proposed") => return,
+            Some("active") => {
+                let title = listing.title(g);
+                self.publish(
+                    e,
+                    "goal",
+                    Some(g),
+                    "accepted",
+                    "accepted",
+                    None,
+                    title.as_deref(),
+                );
+                self.note(e, "accepted", g, title);
+            }
+            _ => self.publish(e, "goal", Some(g), "gone", "gone", None, None),
+        }
+        run.row.stuck_accept = None;
+        run.dirty = true;
     }
 
     /// Sends the `decide` of `action` (its intent is written) and settles
@@ -824,7 +863,7 @@ impl Steward {
         if let Some(l) = answer {
             *listing = l;
             Self::seen(run, listing, now);
-            self.settle_intent(e, run, listing, now);
+            self.settle_intent(e, run, listing);
         }
     }
 
@@ -959,6 +998,11 @@ impl Steward {
         );
         let cap = self.cfg.max_council_votes_per_day;
         let ballots = run.row.ballots.today(now);
+        // A stuck accept of this goal, reserved today, keeps its place: the
+        // goal is not counted against itself, and a new accept reuses it.
+        let reuse = run.row.stuck_accept.is_some_and(|s| {
+            s.goal == g.id && s.day == now / DAY_MS && run.row.accepts.day == s.day
+        });
         let can_vote = self.judge.is_some() && level == BudgetLevel::Normal && ballots < cap;
         let first = run.row.goals.get(&g.id).map_or(now, |s| s.first_seen_ms);
         let ask = GoalAsk {
@@ -967,7 +1011,7 @@ impl Steward {
                 .check_every_minutes
                 .map_or(0, |m| u32::try_from(m.max(0)).unwrap_or(u32::MAX)),
             active: listing.active(),
-            accepted_today: run.row.accepts.today(now),
+            accepted_today: run.row.accepts.today(now).saturating_sub(u32::from(reuse)),
             can_vote,
             age_ms: now.saturating_sub(first),
         };
@@ -993,12 +1037,18 @@ impl Steward {
                 let votes = Some([yes, no]);
                 if vet::council_majority(yes, self.cfg.council_members) {
                     let action = IntentAction::Accept { goal: g.id };
-                    let saved = run.row.accepts;
-                    run.row.accepts.reserve(now);
+                    let saved = (run.row.accepts, run.row.stuck_accept);
+                    if !reuse {
+                        run.row.accepts.reserve(now);
+                    }
+                    if run.row.stuck_accept.is_some_and(|s| s.goal == g.id) {
+                        // The new intent settles this goal from now on.
+                        run.row.stuck_accept = None;
+                    }
                     run.row.open(action, now);
                     if !self.write(e, run, true) {
                         run.row.intent = None;
-                        run.row.accepts = saved;
+                        (run.row.accepts, run.row.stuck_accept) = saved;
                         return false;
                     }
                     self.point(StewardPoint::IntentWritten, e);

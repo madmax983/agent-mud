@@ -27,30 +27,7 @@ async fn ctrl_c_stops_the_server_and_every_daemon() {
         l.local_addr().unwrap().port()
     };
     let agents = dir.path().join("agents");
-    let config = dir.path().join("mud.toml");
-    std::fs::write(
-        &config,
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-admin_token_env = "MUD_SHUTDOWN_TEST_TOKEN"
-[world]
-db = "{db}"
-[minds]
-persistent = "littleguy"
-[littleguy]
-bin = "{bin}"
-data_dir = "{agents}"
-provider = "offline"
-[supervisor]
-typing_scale = 0.0
-"#,
-            db = dir.path().join("world.db").display(),
-            agents = agents.display(),
-        ),
-    )
-    .unwrap();
+    let config = write_config(dir.path(), port, &bin);
     let mut mud = tokio::process::Command::new(env!("CARGO_BIN_EXE_mud"))
         .arg("serve")
         .arg("--config")
@@ -95,6 +72,9 @@ typing_scale = 0.0
         .collect();
     // Let each daemon open its MCP session.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    // `serve` runs the Steward: a pass reads each running daemon, and the
+    // observer shows what it read.
+    wait_for_a_steward_pass(&http, port, &dir.path().join("mud.log")).await;
 
     let interrupted = tokio::process::Command::new("kill")
         .arg("-INT")
@@ -117,6 +97,68 @@ typing_scale = 0.0
                     .is_ok_and(|s| s.split_whitespace().nth(2) == Some("Z"))
         });
         assert!(gone, "lg serve {pid} outlived the MUD:\n{}", log());
+    }
+}
+
+/// Writes the `mud.toml` of the check: littleguy minds on `bin`, offline,
+/// and a Steward pass every second.
+#[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
+fn write_config(dir: &Path, port: u16, bin: &str) -> std::path::PathBuf {
+    let agents = dir.join("agents");
+    let config = dir.join("mud.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[server]
+bind = "127.0.0.1:{port}"
+admin_token_env = "MUD_SHUTDOWN_TEST_TOKEN"
+[world]
+db = "{db}"
+[minds]
+persistent = "littleguy"
+[littleguy]
+bin = "{bin}"
+data_dir = "{agents}"
+provider = "offline"
+[littleguy.steward]
+every_secs = 1
+[supervisor]
+typing_scale = 0.0
+"#,
+            db = dir.join("world.db").display(),
+            agents = agents.display(),
+        ),
+    )
+    .unwrap();
+    config
+}
+
+/// Waits until the observer shows what a Steward pass read of each of the
+/// three daemons.
+#[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
+async fn wait_for_a_steward_pass(http: &reqwest::Client, port: u16, log: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let page = http
+            .get(format!(
+                "http://127.0.0.1:{port}/observer/entities?token={TOKEN}"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if page.matches(" ideas").count() == 3 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no Steward pass read the daemons:\n{page}\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 

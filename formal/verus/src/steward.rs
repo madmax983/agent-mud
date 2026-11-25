@@ -143,8 +143,10 @@ pub proof fn lemma_no_two_disjoint_majorities(yes: u32, other: u32, members: u32
 }
 
 /// One step of a day: a goal asked with its own text, check, active count,
-/// vote and age, judged on the live accept count; or a refund (a human
-/// decided the goal first).
+/// vote and age, judged on the live accept count; or a refund. The
+/// Steward never refunds a place outright; it reuses one: a stuck accept's
+/// goal, asked again the same day, is judged without its own place and
+/// takes it back (a refund, then its ask).
 pub enum DayStep {
     Ask(bool, u32, u32, bool, u64),
     Refund,
