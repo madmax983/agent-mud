@@ -13,7 +13,7 @@ far too late for "back in 25 minutes".
 ## Decision
 
 - **`mud_wake_me(minutes, note)` books a real wake.** It is an MCP tool
-  (and an in-process tool for harvest and plugin-agent minds) that books
+  (and an in-process tool for harvest and scripted minds) that books
   in the supervisor's `WakeBook`: 1 minute to 7 days ahead, at most 5
   pending per entity, a note of at most 280 characters (control
   characters dropped). `mud_cancel_wake(id)` drops one. Like every tool it
@@ -26,9 +26,11 @@ far too late for "back in 25 minutes".
   at a time, and the mind may act. An agent that is not in the world (a
   Turing PC between sessions) keeps its booking until it is back.
 - **The note comes back as the agent's own words, as data.** The wake
-  message says a booked wake is due and gives the notes as a JSON array of
-  strings. A note may quote what a player said, so the tool descriptions
-  carry the untrusted-text warning too.
+  message says, in fixed text, that a booked wake is due, and gives the
+  notes on a line of their own, `booked: [{"id":…,"untrusted_text":…}]`.
+  A note may quote what a player said, so it travels as `untrusted_text`
+  everywhere (the wake message, `mud_wake_me`'s answer and its `pending`
+  list), and the tool descriptions carry the untrusted-text warning too.
 - **The prompt points at it.** The system prompt says to book a wake with
   `mud_wake_me` to come back to something, and that no other reminder tool
   can act in the world.
@@ -62,7 +64,7 @@ sequenceDiagram
   Note over B: 25 minutes pass (game clock)
   S->>B: take_due(now, online agents)
   S->>R: deliver_booked(entity, bookings) at Priority::Booked
-  R->>A: wake: "A wake you booked is due. Your own notes: [...]"
+  R->>A: wake: "A wake you booked is due." booked: [{id, untrusted_text}]
   A->>M: mud_command ...
 ```
 
@@ -72,3 +74,34 @@ sequenceDiagram
   gate as every other wake.
 - An agent can book wakes in a chain; each costs a wake and counts against
   its budget, and at most 5 wait at once.
+
+## Amended by the autonomy work (phase 1): limits, holds, expiry
+
+- **A daily cap.** An entity may book at most 24 wakes in one game-clock
+  (UTC) day, besides at most 5 waiting at once. The limits are a proved
+  kernel: the constants and `book_verdict` sit between mirror markers in
+  `wakes.rs` and in `formal/verus/src/bookings.rs` (ADR 0006). The day's
+  count commits with the booking, in the same write (`SideOp::Booked`
+  beside the `BookingInsert`, joined in the store by the proved
+  `dated_max`), comes back at boot from `sup_entity.booked_day` and
+  `booked_today`, and a cancel never lowers it. The 25th ask is answered
+  `{"ok":false,"error_code":"daily_cap"}`.
+- **Who may book.** Only a Persistent or Turing entity with a mind
+  (`Supervisor::can_book`). Ambient NPCs, mobs, humans and entities no
+  mind plays are answered `no_wakes`, on MCP and in process alike, and
+  ambient minds no longer see the wake tools or the wake habit in their
+  prompt (ADR 0005): the wake line is `persistent_habits()`, appended
+  only for minds that book.
+- **Holds.** A due booking waits while its agent is offline, out cold, at
+  its hard cap, away for a spell (`afk_until`), or chatter-held (ADR
+  0003). It fires at the agent's next ready step; nothing is lost.
+- **Live expiry.** A booking overdue by more than `booking_max_late_ms`
+  is dropped while the server runs too, by the same proved
+  `booking_disposition` the boot uses, so a running server and a
+  restarted one agree. Its row is deleted through `Game::persist` (a lost
+  delete is redone at the next boot).
+- **The observer feed** shows `booking` lines: `booked`, `fired` (a wake
+  carries it to its mind), `held` (once per hold), `dropped`,
+  `cancelled` and `requeued` (a wake took it but never showed it to a
+  mind). The note never goes in the feed; the boot's `booking_dropped`
+  line stays.

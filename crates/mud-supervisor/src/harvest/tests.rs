@@ -49,6 +49,7 @@ fn smith(id: EntityId) -> HashMap<EntityId, HarvestPersona> {
             persona: "A smith.".into(),
             goal: "Ore.".into(),
             body: String::new(),
+            wakes: true,
         },
     )])
 }

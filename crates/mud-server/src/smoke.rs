@@ -11,7 +11,9 @@
 //! saying Vich's name twitches the fence's curtain. Last, a restart drill:
 //! a process on a `world.db` is frozen for good right after torin's first
 //! line commits (what a kill leaves on disk), the file is opened again, and
-//! torin's plan resumes from its cursor: still one BOUNTY. `mud smoke` runs
+//! torin's plan resumes from its cursor: still one BOUNTY. A booking drill
+//! has torin's scripted mind book a wake, which comes a minute later and
+//! carries his act. `mud smoke` runs
 //! it and prints the transcript; a test runs it in CI.
 
 use std::collections::HashMap;
@@ -151,7 +153,8 @@ pub async fn run() -> anyhow::Result<Transcript> {
     let rx = game.subscribe();
     let mut rig = Rig { sup, clock, rx };
     play(&game, &accounts, &mut rig).await?;
-    let drill = restart_drill().await?;
+    let mut drill = restart_drill().await?;
+    drill.push(booking_drill().await?);
     let mut out = Transcript::default();
     while let Ok(ev) = all.try_recv() {
         let room = ev.room.as_ref().map_or("-", RoomId::as_str).to_owned();
@@ -416,6 +419,102 @@ async fn tell_drill(db: &Path, game: &Arc<Game>, rig: Rig, at: u64) -> anyhow::R
     ))
 }
 
+/// Torin's mind for the booking drill: on his first wake he says what he
+/// will do and books a wake a minute ahead; on the booked wake he does it.
+const BOOKING_MIND: &str = r#"fn on_wake(ctx) {
+    if ctx.booked.len() > 0 {
+        #{ lines: ["say back at the forge, as promised"] }
+    } else if "booked" in ctx.memory {
+        #{ lines: [] }
+    } else {
+        #{ lines: ["say I will see to the forge in a minute"], memory: #{ booked: true },
+           wake_me: #{ minutes: 1, note: "see to the forge" } }
+    }
+}
+"#;
+
+/// The booking drill (ADR 0008): torin, a Persistent agent on a scripted
+/// mind, books a wake on his macro tick, and a minute later the wake comes
+/// and he acts in it. The observer sees it booked and fired.
+async fn booking_drill() -> anyhow::Result<String> {
+    let pack = Arc::new(WorldPack::crypt_v01()?);
+    let clock = Arc::new(ManualClock::new(DRILL_T0));
+    let mut sources = mud_script::ScriptSources {
+        manifest: Some(
+            "[minds.torin]\nfile = \"torin.rhai\"\nruntime = \"rhai\"\nmemory_schema = 1\n"
+                .to_owned(),
+        ),
+        ..mud_script::ScriptSources::default()
+    };
+    sources
+        .files
+        .insert("torin.rhai".to_owned(), BOOKING_MIND.to_owned());
+    let host = Arc::new(ScriptHost::from_sources(&sources, &pack)?);
+    let game = Game::new(World::new(Arc::clone(&pack), 7), None, clock.clone());
+    let torin = EntityId::from("torin");
+    let mind: Arc<dyn Mind> =
+        Arc::new(ScriptedMind::from_cast(&pack.cast).with_scripts(host, Arc::clone(&game), 7));
+    let sup = Supervisor::new(
+        Arc::clone(&game),
+        Gate::new(Arc::clone(&game), 7, 0.0),
+        HashMap::from([(torin.clone(), mind)]),
+        Arc::new(FallbackMind::from_cast(&pack.cast)),
+        SupervisorConfig {
+            first_macro_tick_secs: [86_400, 86_400],
+            ..SupervisorConfig::default()
+        },
+    );
+    ensure!(
+        sup.can_book(&torin),
+        "torin, a Persistent agent, may not book"
+    );
+    let mut obs = sup.subscribe();
+    let mut rig = Rig {
+        sup,
+        clock,
+        rx: game.subscribe(),
+    };
+    rig.sup.fire_macro_tick(&torin);
+    rig.run_for(2_000).await?;
+    let pending = rig.sup.wakes().pending(&torin);
+    ensure!(
+        pending.len() == 1 && pending[0].note == "see to the forge",
+        "torin's mind did not book its wake: {pending:?}"
+    );
+    rig.run_for(70_000).await?;
+    ensure!(
+        rig.sup.wakes().pending(&torin).is_empty(),
+        "the booked wake never came"
+    );
+    let said = game.events(&torin, Seq(0), 200)["events"]
+        .as_array()
+        .is_some_and(|evs| {
+            evs.iter().any(|e| {
+                e["actor"]["id"] == "torin"
+                    && e["untrusted_text"] == "back at the forge, as promised"
+            })
+        });
+    ensure!(said, "torin did not act in his booked wake");
+    let (mut booked, mut fired, mut woke) = (false, false, false);
+    while let Ok(e) = obs.try_recv() {
+        match &*e {
+            ObserverEvent::Booking { action, .. } => {
+                booked |= *action == mud_supervisor::wakes::BookingAction::Booked;
+                fired |= *action == mud_supervisor::wakes::BookingAction::Fired;
+            }
+            ObserverEvent::WakeStarted { priority, .. } => {
+                woke |= *priority == mud_supervisor::router::Priority::Booked;
+            }
+            _ => {}
+        }
+    }
+    ensure!(
+        booked && fired && woke,
+        "the feed did not show the booking: booked {booked}, fired {fired}, woke {woke}"
+    );
+    Ok("booking drill: torin booked a wake on his scripted mind, and it came a minute later; he acted in it".to_owned())
+}
+
 /// What the drill's first process spends for torin before the kill: past
 /// 80% of the default 400 000 tokens, so the budget is soft.
 const DRILL_SPEND: mud_supervisor::mind::Usage = mud_supervisor::mind::Usage {
@@ -542,6 +641,11 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("resumed at line 2 of 5, 1 BOUNTY")),
             "the restart drill ran: {:?}",
+            t.lines
+        );
+        assert!(
+            t.lines.iter().any(|l| l.starts_with("booking drill:")),
+            "the booking drill ran: {:?}",
             t.lines
         );
     }

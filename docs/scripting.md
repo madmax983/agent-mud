@@ -247,7 +247,9 @@ gate like any mind's. `memory` holds plain data only (bools, integers,
 strings of at most 200 chars, lists and maps of at most 64 entries, three
 levels, 8 KiB as JSON) and persists across restarts. `wake_me` books a
 wake through `mud_wake_me` (1 to 10080 minutes, a note of at most 280
-chars). The memory, the booking and the lines are one decision: the memory
+chars, at most 5 waiting and 24 a day), for a Persistent or Turing entity
+only: an ambient NPC's booking is refused (`no_wakes`, logged), and its
+lines still run (ADR 0008). The memory, the booking and the lines are one decision: the memory
 and the booking are stored with the first line that takes effect (or when
 the wake ends), never without it. If the server dies before that, the wake
 comes back and your script decides again from the memory it had before

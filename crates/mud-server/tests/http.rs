@@ -1104,3 +1104,61 @@ async fn the_feed_shows_a_timed_out_wakes_late_spend() {
         "after the wake's line"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn booking_events_are_escaped() {
+    use mud_mcp::WakeBooker as _;
+    let (addr, built) = boot().await;
+    let token = built.mud.admin_token.clone();
+    let js = http()
+        .get(format!("http://{addr}/static/mud/observer.js"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        js.contains("k==='booking'") && js.contains("'booking'].forEach"),
+        "the page listens for booking lines"
+    );
+    assert!(
+        js.contains("d.textContent=") && !js.contains("innerHTML"),
+        "rows are text, never markup"
+    );
+    let mut resp = http()
+        .get(format!("http://{addr}/observer/feed?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let torin = mud_world::EntityId::from("torin");
+    let wakes = mud_server::SupervisorWakes(Arc::clone(&built.mud.sup));
+    let note = "<script>alert('zq-note')</script>";
+    let r = wakes.wake_me(&torin, 30, note);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["booked"]["untrusted_text"], note, "data for the agent");
+    let id = r["booked"]["id"].as_u64().unwrap();
+    assert_eq!(wakes.cancel_wake(&torin, id)["ok"], true);
+    let guard = mud_world::EntityId::from("guard_01");
+    assert_eq!(wakes.wake_me(&guard, 5, "x")["error_code"], "no_wakes");
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !seen.contains("\"action\":\"cancelled\"") {
+        let chunk = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .expect("the booking lines never came")
+            .unwrap()
+            .unwrap();
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(seen.contains("event: booking"), "{seen}");
+    assert!(seen.contains("\"action\":\"booked\""), "{seen}");
+    assert!(seen.contains("\"entity\":\"torin\""), "{seen}");
+    assert!(!seen.contains("zq-note"), "the note stays out of the feed");
+    assert!(!seen.contains("<script"), "no markup in the feed: {seen}");
+    assert!(
+        !seen.contains("guard_01"),
+        "a refused booking is no booking"
+    );
+}

@@ -10,6 +10,15 @@ littleguy's client speaks) at `/mcp`, merged into the autumn-web app.
 - Six tools only: `mud_look`, `mud_sheet`, `mud_events(since_seq?,
   limit?)`, `mud_command(cmd)`, and `mud_wake_me(minutes, note)` /
   `mud_cancel_wake(id)` (ADR 0008). No tool takes an entity argument.
+- The wake tools need a supervised Persistent or Turing entity with a
+  mind (`Supervisor::can_book`). `tools/list` stays six tools (a
+  littleguy agent is Persistent or Turing), and any other token (an
+  ambient NPC, a mob, a human, an entity no mind plays) is answered
+  `{"ok":false,"error_code":"no_wakes"}`, in words that name no tier.
+  In-process minds follow the same rule: `tool_specs()` is the four world
+  tools, `wake_tool_specs()` the two wake tools, and only Persistent and
+  Turing minds (harvest, littleguy, scripted) get the second set; ambient
+  minds (plugin-agent, and harvest for an ambient NPC) get four tools.
 - An axum layer resolves `Authorization: Bearer <token>` to an entity on
   every request and returns 401 otherwise. The handler reads the caller
   from the request parts rmcp forwards, so a session opened with one token

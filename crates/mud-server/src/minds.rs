@@ -190,6 +190,7 @@ pub fn build(
                                 persona: c.persona.clone(),
                                 goal: c.goal.clone(),
                                 body: body.clone(),
+                                wakes: matches!(c.mind.tier, Tier::Persistent | Tier::Turing),
                             },
                         )
                     })

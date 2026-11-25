@@ -17,6 +17,7 @@ and decides, per recipient agent, whether and when to wake it.
 | Immediate | attacked, a tell, a self-control nudge, speech naming it, a trade or attempt aimed at it | 0–500 ms, no cooldown, no AFK hold |
 | RoomBatch | any player action in the room | rolling 2 s window, capped at 4 s from the first |
 | Ambient   | NPC or world activity | 5–10 s, plus the entity's cooldown |
+| Booked    | a wake the agent booked for itself (`mud_wake_me`, ADR 0008) | when due, if the agent is ready (see below) |
 | MacroTick | the slow timer (2–6 h, jittered) | only when no player is in the room |
 
 A **player** is any player character (`kind = player`), whoever plays it:
@@ -107,3 +108,18 @@ boot derives them from the reloaded event log (`Router::replay`, called by
 - An empty world costs nothing but macro-ticks.
 - The observer dashboard shows every routing decision and why a wake was
   dropped.
+
+## Amended by the autonomy work: booked wakes and the chatter hold
+
+A booked wake (ADR 0008) sits between the macro tick and everything a
+player causes. Delivering one never steps a room's chatter counter: it is
+neither a human nor a macro tick, so it cannot reset a quiet room. Two
+agents could still chat all night by booking wakes for each other, so a
+due booking waits while its agent is **chatter-held**: its room's
+agent-only turns are spent (`agent_only_turns >= max_agent_only_turns`),
+another agent is in the room, and no player but the agent itself is
+there. A lone agent is never held by it. The hold ends with the next
+reset (a human's act or a macro tick) or when a player arrives, and the
+booking fires then; the observer shows `booking ... held` once per hold.
+A booking also waits while its agent is away for a spell (`afk_until`),
+offline, out cold or at its hard cap.

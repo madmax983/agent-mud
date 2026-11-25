@@ -192,11 +192,12 @@ function fmt(k,m){
   }
   if(k==='roll')return `roll    ${m.entity}  ${m.trait_name}(${m.roll.target_number}) rolled ${m.roll.total} → ${m.nudged?'FAILED, nudged':'resisted'}`;
   if(k==='script')return `script  ${m.text}`;
+  if(k==='booking')return `booking ${m.entity}  #${m.id} ${m.action} · due ${new Date(m.due_ms).toLocaleString()}`;
   if(k==='session')return m.kind==='afk'?`afk     ${m.entity}  until ${new Date(m.until_ms).toLocaleTimeString()}`:`session ${m.entity}  ${m.online?'logged in':'logged out'}`;
   return `world   [${m.room||'-'}] ${m.who}${m.human?' (human)':''}: ${m.text}`;
 }
 function cls(k,m){if(k==='roll')return 'soft';if(k==='world')return m.kind==='tell'?'tell':'muted';return '';}
-['route','wake','roll','world','session','script'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
+['route','wake','roll','world','session','script','booking'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
 ";
 
 /// The page scripts are files, not inline: the app's CSP allows
@@ -915,6 +916,7 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
                 | ObserverEvent::BookingDropped { .. }
                 | ObserverEvent::PlanAbandoned { .. } => "wake",
                 ObserverEvent::Session { .. } | ObserverEvent::Afk { .. } => "session",
+                ObserverEvent::Booking { .. } => "booking",
             };
             Some(sse(name, &serde_json::to_value(&*e).ok()?))
         });

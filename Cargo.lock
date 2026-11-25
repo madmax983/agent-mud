@@ -2210,6 +2210,7 @@ dependencies = [
  "axum",
  "futures",
  "getrandom 0.4.3",
+ "mud-supervisor",
  "mud-world",
  "reqwest 0.13.5",
  "rmcp",

@@ -170,6 +170,188 @@ mod http {
         task.abort();
     }
 
+    /// The supervisor as the server's booker: `mud_wake_me` books in its
+    /// wake book, for an entity that may book, as the server's
+    /// `SupervisorWakes` does.
+    struct SupWakes(Arc<mud_supervisor::runtime::Supervisor>);
+
+    impl mud_mcp::WakeBooker for SupWakes {
+        fn wake_me(&self, entity: &EntityId, minutes: u32, note: &str) -> Value {
+            self.0.book_wake(entity, minutes, note)
+        }
+
+        fn cancel_wake(&self, entity: &EntityId, id: u64) -> Value {
+            self.0.cancel_wake(entity, id)
+        }
+    }
+
+    /// A server whose wakes book in a real supervisor, every agent of the
+    /// crypt on a scripted mind.
+    async fn supervised() -> (Server, Arc<mud_supervisor::runtime::Supervisor>) {
+        use mud_supervisor::mind::Mind;
+        use mud_supervisor::runtime::{Supervisor, SupervisorConfig};
+        use mud_supervisor::scripted::{FallbackMind, ScriptedMind};
+        use mud_world::pack::Tier;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let game = game();
+        let pack = game.read(|w| Arc::clone(w.pack()));
+        let scripted: Arc<dyn Mind> = Arc::new(ScriptedMind::from_cast(&pack.cast));
+        let minds = pack
+            .cast
+            .iter()
+            .filter(|(_, c)| matches!(c.mind.tier, Tier::Ambient | Tier::Persistent | Tier::Turing))
+            .map(|(id, _)| (id.clone(), Arc::clone(&scripted)))
+            .collect();
+        let sup = Supervisor::new(
+            Arc::clone(&game),
+            mud_supervisor::gate::Gate::new(Arc::clone(&game), 7, 0.0),
+            minds,
+            Arc::new(FallbackMind::from_cast(&pack.cast)),
+            SupervisorConfig::default(),
+        );
+        let tokens = Arc::new(TokenRegistry::new());
+        let app: axum::Router = mud_mcp::router_full(
+            Arc::clone(&game),
+            Arc::clone(&tokens),
+            direct(Arc::clone(&game)),
+            Arc::new(SupWakes(Arc::clone(&sup))),
+            mud_mcp::default_config(),
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let server = Server {
+            url: format!("http://{addr}/mcp"),
+            game,
+            tokens,
+            task,
+        };
+        (server, sup)
+    }
+
+    #[tokio::test]
+    async fn mud_wake_me_books_as_the_bearer_entity() {
+        let (server, sup) = supervised().await;
+        let torin = EntityId::from("torin");
+        let client = server.client(&server.issue(&torin)).await;
+        let booked = call(
+            &client,
+            "mud_wake_me",
+            json!({ "minutes": 25, "note": "check the board" }),
+        )
+        .await;
+        assert_eq!(booked["booked"]["in_minutes"], 25);
+        assert_eq!(booked["booked"]["untrusted_text"], "check the board");
+        assert_eq!(booked["pending"][0]["untrusted_text"], "check the board");
+        let pending = sup.wakes().pending(&torin);
+        assert_eq!(pending.len(), 1, "booked for torin, the token's entity");
+        assert_eq!(pending[0].due_ms, 1_000 + 25 * 60_000, "on the game clock");
+        assert_eq!(sup.wakes().all().len(), 1, "and for nobody else");
+        let id = booked["booked"]["id"].as_u64().unwrap();
+        // Another persistent agent cannot cancel torin's booking.
+        let marta = server.client(&server.issue(&EntityId::from("marta"))).await;
+        let other = call_raw(&marta, "mud_cancel_wake", json!({ "id": id })).await;
+        assert_eq!(other.is_error, Some(true));
+        assert_eq!(sup.wakes().pending(&torin).len(), 1);
+        let gone = call(&client, "mud_cancel_wake", json!({ "id": id })).await;
+        assert_eq!(gone["ok"], true);
+        assert_eq!(sup.wakes().pending(&torin), Vec::new());
+        client.cancel().await.unwrap();
+        marta.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_non_persistent_token_gets_no_wakes() {
+        let (server, sup) = supervised().await;
+        let ada = server.game.login("ada").unwrap();
+        for who in [
+            EntityId::from("guard_01"),
+            EntityId::from("giant_rat_1"),
+            ada,
+        ] {
+            let client = server.client(&server.issue(&who)).await;
+            for (tool, args) in [
+                ("mud_wake_me", json!({ "minutes": 5, "note": "x" })),
+                ("mud_cancel_wake", json!({ "id": 1 })),
+            ] {
+                let r = call_raw(&client, tool, args).await;
+                assert_eq!(r.is_error, Some(true), "{who} {tool}");
+                let v = r.structured_content.unwrap();
+                assert_eq!(v["error_code"], "no_wakes", "{who} {tool}: {v}");
+            }
+            assert!(sup.wakes().pending(&who).is_empty(), "{who}");
+            client.cancel().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_results_never_leak_tiers() {
+        let (server, _sup) = supervised().await;
+        let mut answers = Vec::new();
+        for who in ["torin", "pc_kestrel", "guard_01", "giant_rat_1"] {
+            let client = server.client(&server.issue(&EntityId::from(who))).await;
+            for (tool, args) in [
+                ("mud_wake_me", json!({ "minutes": 5, "note": "x" })),
+                ("mud_wake_me", json!({ "minutes": 0, "note": "x" })),
+                ("mud_cancel_wake", json!({ "id": 999 })),
+            ] {
+                let r = call_raw(&client, tool, args).await;
+                answers.push((who, r.structured_content.unwrap_or(Value::Null)));
+            }
+            client.cancel().await.unwrap();
+        }
+        for (who, a) in answers {
+            let text = a.to_string().to_lowercase();
+            for leak in [
+                "tier",
+                "ambient",
+                "persistent",
+                "turing",
+                "human",
+                "mob",
+                "mind",
+                "littleguy",
+            ] {
+                assert!(!text.contains(leak), "{who}: {leak} in {a}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_25th_booking_is_daily_cap() {
+        let (server, sup) = supervised().await;
+        let torin = EntityId::from("torin");
+        let client = server.client(&server.issue(&torin)).await;
+        for i in 0..24 {
+            let b = call(
+                &client,
+                "mud_wake_me",
+                json!({ "minutes": 5, "note": format!("n{i}") }),
+            )
+            .await;
+            let id = b["booked"]["id"].as_u64().unwrap();
+            assert_eq!(
+                call(&client, "mud_cancel_wake", json!({ "id": id })).await["ok"],
+                true
+            );
+        }
+        let r = call_raw(
+            &client,
+            "mud_wake_me",
+            json!({ "minutes": 5, "note": "25th" }),
+        )
+        .await;
+        assert_eq!(r.is_error, Some(true));
+        let v = r.structured_content.unwrap();
+        assert_eq!(v["error_code"], "daily_cap", "{v}");
+        assert!(sup.wakes().pending(&torin).is_empty(), "nothing booked");
+        client.cancel().await.unwrap();
+    }
+
     #[tokio::test]
     async fn without_a_supervisor_booking_says_it_is_off() {
         let server = start(game(), direct).await;

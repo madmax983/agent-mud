@@ -620,7 +620,7 @@ async fn hard_budget_requeue_keeps_booking_rows() {
     let mut r = start(&disk, T0, cfg, only(&torin(), &m));
     let b = r.sup.wakes().book(&torin(), T0, 1, "x").unwrap();
     // Taken while within budget, then the budget runs out before it runs.
-    for (e, list) in r.sup.wakes().take_due(b.due_ms, |_| true) {
+    for (e, list) in r.sup.wakes().take_due(b.due_ms, u64::MAX, |_| true).taken {
         let note = lock(&r.sup.router).deliver_booked(&e, list, b.due_ms);
         drop(note);
     }
@@ -1408,7 +1408,7 @@ async fn a_turing_logout_gives_its_taken_booking_back() {
     );
     let b = r.sup.wakes().book(&kestrel, T0, 1, "x").unwrap();
     // Taken and waiting for its wake when the session ends.
-    for (e, list) in r.sup.wakes().take_due(b.due_ms, |_| true) {
+    for (e, list) in r.sup.wakes().take_due(b.due_ms, u64::MAX, |_| true).taken {
         drop(lock(&r.sup.router).deliver_booked(&e, list, b.due_ms));
     }
     assert!(r.sup.wakes().in_flight(b.id));
@@ -1437,7 +1437,7 @@ async fn a_wake_whose_entity_left_before_it_ran_gives_its_booking_back() {
     let m = probe(&["say on it"], false);
     let mut r = start(&disk, T0, quiet(), only(&torin(), &m));
     let b = r.sup.wakes().book(&torin(), T0, 1, "x").unwrap();
-    for (e, list) in r.sup.wakes().take_due(b.due_ms, |_| true) {
+    for (e, list) in r.sup.wakes().take_due(b.due_ms, u64::MAX, |_| true).taken {
         drop(lock(&r.sup.router).deliver_booked(&e, list, b.due_ms));
     }
     r.clock.set(b.due_ms);

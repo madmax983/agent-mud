@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, oneshot};
 use crate::ledger::LedgerMeter;
 use crate::mind::{
     BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, SpendSource, Usage,
-    UsageSink, WakeContext, system_prompt, wake_message,
+    UsageSink, WakeContext, persistent_habits, system_prompt, wake_message,
 };
 
 /// How long a daemon's reply is still read after its wake was given up.
@@ -105,7 +105,14 @@ pub fn render_config(cfg: &LittleguyConfig, p: &Persona, ui_port: u16) -> String
     root.insert("owner".into(), "mud".into());
     root.insert(
         "system".into(),
-        system_prompt(&p.name, &p.persona, &p.goal, &p.body).into(),
+        // A littleguy agent is a Persistent or Turing entity: it books its
+        // own wakes (an ambient one would be answered `no_wakes`).
+        format!(
+            "{}{}",
+            system_prompt(&p.name, &p.persona, &p.goal, &p.body),
+            persistent_habits()
+        )
+        .into(),
     );
     root.insert("window".into(), 30.into());
     if cfg.max_steps > 0 {
