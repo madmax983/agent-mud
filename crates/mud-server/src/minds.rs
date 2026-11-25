@@ -15,7 +15,7 @@ use mud_supervisor::littleguy::{LittleguyConfig, LittleguyMind, Persona};
 use mud_supervisor::mind::Mind;
 use mud_supervisor::scripted::ScriptedMind;
 use mud_world::pack::{CastDef, Tier};
-use mud_world::{EntityId, Game, WorldPack};
+use mud_world::{EntityId, Game, Seq, WorldPack};
 
 use crate::config::{ModelConfig, MudConfig, Runtime};
 
@@ -53,6 +53,7 @@ fn littleguy_mind(
     alias: &str,
     members: &[(&EntityId, &CastDef)],
     tokens: &TokenRegistry,
+    cursor: &dyn Fn(&EntityId) -> Seq,
 ) -> anyhow::Result<LittleguyMind> {
     let lg = &cfg.littleguy;
     let config = LittleguyConfig {
@@ -72,7 +73,7 @@ fn littleguy_mind(
     let mut personas = HashMap::new();
     for (id, c) in members {
         let token = tokens
-            .issue((*id).clone())
+            .issue_at((*id).clone(), cursor(id))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         personas.insert(
             (*id).clone(),
@@ -122,7 +123,9 @@ fn effective_runtime(
 
 /// Builds every mind.
 ///
-/// Littleguy entities get a fresh MCP token each. With
+/// Littleguy entities get a fresh MCP token each, whose `mud_events`
+/// cursor starts at `cursor(entity)`: after a restart, the entity's replay
+/// floor (ADR 0011, [`mud_supervisor::replay::boot_floor`]). With
 /// scripts, the scripted mind runs Rhai mind scripts too, and an entity
 /// whose binding asks for `runtime = "rhai"` runs on it whatever its tier.
 ///
@@ -132,6 +135,7 @@ pub fn build(
     cfg: &MudConfig,
     pack: &WorldPack,
     tokens: &TokenRegistry,
+    cursor: &dyn Fn(&EntityId) -> Seq,
     scripts: Option<MindScripts<'_>>,
 ) -> anyhow::Result<Minds> {
     let mut mind = ScriptedMind::from_cast(&pack.cast);
@@ -209,7 +213,7 @@ pub fn build(
                 Arc::new(AmbientMind::new(client, cards))
             }
             Runtime::Littleguy => {
-                let m = Arc::new(littleguy_mind(cfg, &alias, &members, tokens)?);
+                let m = Arc::new(littleguy_mind(cfg, &alias, &members, tokens, cursor)?);
                 littleguy.push(Arc::clone(&m));
                 m
             }
@@ -251,10 +255,10 @@ mod tests {
             host: &host,
             game: &game,
         };
-        let m = build(&cfg, &pack, &TokenRegistry::new(), Some(s)).unwrap();
+        let m = build(&cfg, &pack, &TokenRegistry::new(), &|_| Seq(0), Some(s)).unwrap();
         assert_eq!(m.by_entity[&EntityId::from("guard_01")].kind(), "scripted");
         assert!(
-            build(&cfg, &pack, &TokenRegistry::new(), None).is_err(),
+            build(&cfg, &pack, &TokenRegistry::new(), &|_| Seq(0), None).is_err(),
             "without scripts Hale needs a model"
         );
     }
@@ -291,7 +295,7 @@ mod tests {
     fn defaults_script_every_agent_and_issue_no_tokens() {
         let pack = WorldPack::crypt_v01().unwrap();
         let tokens = TokenRegistry::new();
-        let m = build(&MudConfig::default(), &pack, &tokens, None).unwrap();
+        let m = build(&MudConfig::default(), &pack, &tokens, &|_| Seq(0), None).unwrap();
         let mut ids: Vec<&str> = m.by_entity.keys().map(EntityId::as_str).collect();
         ids.sort_unstable();
         assert_eq!(ids, ["guard_01", "marta", "pc_kestrel", "torin", "vich"]);
@@ -305,8 +309,12 @@ mod tests {
         let tokens = TokenRegistry::new();
         let mut cfg = MudConfig::default();
         cfg.minds.persistent = Runtime::Littleguy;
-        let m = build(&cfg, &pack, &tokens, None).unwrap();
+        let torin = EntityId::from("torin");
+        let cursor = |e: &EntityId| if *e == torin { Seq(9) } else { Seq(2) };
+        let m = build(&cfg, &pack, &tokens, &cursor, None).unwrap();
         assert_eq!(tokens.len(), 3, "marta, torin, vich");
+        assert_eq!(tokens.cursors_of(&torin), [Seq(9)], "issued at its floor");
+        assert_eq!(tokens.cursors_of(&EntityId::from("marta")), [Seq(2)]);
         assert_eq!(m.by_entity[&EntityId::from("torin")].kind(), "littleguy");
         assert_eq!(
             m.by_entity[&EntityId::from("pc_kestrel")].kind(),
@@ -320,9 +328,9 @@ mod tests {
         let pack = WorldPack::crypt_v01().unwrap();
         let mut cfg = MudConfig::default();
         cfg.minds.persistent = Runtime::Harvest;
-        let e = build(&cfg, &pack, &TokenRegistry::new(), None).unwrap_err();
+        let e = build(&cfg, &pack, &TokenRegistry::new(), &|_| Seq(0), None).unwrap_err();
         assert!(e.to_string().contains("[models.flash]"), "{e}");
         cfg.minds.persistent = Runtime::PluginAgent;
-        assert!(build(&cfg, &pack, &TokenRegistry::new(), None).is_err());
+        assert!(build(&cfg, &pack, &TokenRegistry::new(), &|_| Seq(0), None).is_err());
     }
 }

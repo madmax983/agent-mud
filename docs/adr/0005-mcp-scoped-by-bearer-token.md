@@ -17,7 +17,12 @@ littleguy's client speaks) at `/mcp`, merged into the autumn-web app.
   another entity.
 - Tokens are 256-bit random hex, never logged, revocable per token or per
   entity.
-- `mud_events` without `since_seq` reads a cursor kept per token.
+- `mud_events` without `since_seq` reads a cursor kept per token. Tokens
+  live in memory, so a restart issues new ones; each starts at its agent's
+  replay floor (ADR 0011, phase 4): the last event a committed wake of the
+  agent consumed. So after a restart `mud_events` hands out nothing that
+  wake consumed and skips nothing after it, while what the agent read but
+  no wake committed comes again.
 - `mud_command` runs through a `CommandGate`; the server passes the Turing
   typing gate, so remote agents get the same latency as in-process ones.
 

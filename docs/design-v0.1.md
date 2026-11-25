@@ -140,7 +140,11 @@ before they are trimmed. After a restart, bookings, the macro schedule and
 the scripted rule counters come back, and a scripted plan resumes at its
 cursor (an errand after any outage, a reactive plan within 120 s), so each
 of its effectful lines takes effect once: torin posts one BOUNTY however
-the server dies.
+the server dies. What changes at event rate is derived at boot from the
+reloaded log: a tell, an attack or a mention by name that no committed
+wake of its agent consumed, at most 120 s old, is replayed once as an
+Immediate wake; the anti-chatter counters are folded from the log; each
+agent's MCP cursor starts at the last event its committed wakes consumed.
 
 ## 7. Starter world: `worlds/crypt-v01/`
 

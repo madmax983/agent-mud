@@ -14,7 +14,11 @@ kill-and-restart test. **Phase 3 (budgets) is built:** the day's spend
 split into `local` and `lg` tallies and stored with every close, a
 forward-only roll, littleguy meters primed from the ledger at boot, the
 harvest token mark, HarvestMind continue-as-new and retention, and their
-proved kernels. Phase 4 (boot derivations) is not built yet.
+proved kernels. **Phase 4 (boot derivations) is built:** the router's
+waiting wakes are replayed from the reloaded event log (Immediate only,
+within `replay_max_age_ms`), the chatter counters are folded from it, and
+each agent's MCP cursor starts at its replay floor, with their proved
+kernels. All four phases have shipped.
 
 ## Context
 
@@ -296,11 +300,61 @@ fresh ids through the normal, ready-gated paths.
   sink late) stores it with the tallies, and `restore_tokens_seen` hands it
   back at boot, so the first job after a crash charges the tokens the store
   missed, once, to the boot day.
-- **Phase 4.** Addressed events (a tell, an attack, a mention by name)
-  newer than `replay_max_age_ms` and after the recipient's `seen_seq` are
-  replayed as Immediate wakes only; older ones are skipped. The chatter
-  counters are folded from the event tail through `chatter_step`; MCP
-  cursors start at `seen_seq`.
+- **Phase 4 (built).** What changes at event rate is derived from the
+  reloaded log (`World::logged`, the last `EVENT_LOG_CAP` events), not
+  stored. Kernels in `crates/mud-supervisor/src/replay.rs`, proved in
+  `formal/verus/src/replay.rs` (ADR 0006).
+  - **The replay floor.** Each agent's floor is its stored `seen_seq`,
+    the last event a committed wake of it consumed (the `Consume` commits
+    with the wake's first effectful command, or at its close), never above
+    the world's last seq; an agent with no stored row (a version 0 file,
+    an agent new to the pack) starts at the last seq, since nothing says
+    whether the events before it were answered (`replay_floor`). The boot
+    stores a row at that floor for such an agent (`SeenSeq`, through
+    `persist`), so the next boot reads the same floor.
+  - **Router pending.** `Supervisor::open` asks `Router::replay` to run
+    every logged event through the same routing rules as a live one, for
+    the recipients `replay_due` accepts: after the recipient's floor and at
+    most `replay_max_age_ms` old (`at_ms + max_age >= now`). Only an
+    Immediate wake is queued (a tell, an attack on it, speech naming it):
+    no room batch, no ambient wake, so a restart sets off no storm. The
+    anti-chatter rule drops what it dropped before. A replayed wake's
+    reason reads `replayed tell by …`; its routing decisions are logged
+    and kept in the boot report. A tell that arrived just before a crash
+    is answered **once**: its answer commits the floor past it in the
+    answer's own transaction, so a boot after that replays nothing; a crash
+    before the answer committed leaves it above the floor, so a boot within
+    the window queues it again (`lemma_a_tell_is_answered_at_most_once`,
+    `lemma_a_fresh_tell_is_not_lost`). A tell older than the window is not
+    replayed at all; a mind that wants it reads it with `mud_events`.
+  - **Chatter.** The same pass folds every logged event, oldest first,
+    through `chatter_step`. A reloaded event reads whether a player saw it
+    from its recipients (at boot no human is online, so the world would
+    show none). A macro-tick reset is not an event, and a player who was
+    there without perceiving the event is not counted, so the fold can only
+    hold more: `lemma_fold_holds_at_least` proves that inputs which each
+    count at least as much, from a start that holds at least as much, end
+    holding at least as much and allow only what the live counter allowed.
+    When the log does not reach the world's first event, a room's count
+    before its first logged event is unknown, so that room, and every room
+    the log never shows, starts held at the bound until a human or a
+    macro-tick resets it.
+  - **MCP cursors.** Tokens are issued at boot. The server takes the side
+    rows before it builds the minds and issues each littleguy agent's
+    token with `TokenRegistry::issue_at(entity, boot_floor(..))`, the same
+    floor the supervisor replays above. So `mud_events` after a restart
+    hands out nothing a committed wake consumed and skips nothing after it
+    (`lemma_floor_never_skips`); what an agent read during a wake that never
+    committed comes again, as its replayed wake does.
+  - **Deviation from the design draft.** The draft also raised the floor
+    of a recipient whose events were too old to replay (`SeenSeq{last}`).
+    The floor is now also the MCP cursor, so that raise would hide those
+    events from `mud_events` at the next boot; it buys nothing, because an
+    event too old at one boot stays too old at every later one
+    (`lemma_too_old_stays_old`). Only an agent with no row gets one. The
+    draft's fold started every room at 0; with a log that does not reach
+    the world's start that can count less than the live counter did, so a
+    room of unknown history starts held instead.
 
 ### Retention and continue-as-new
 
@@ -373,7 +427,9 @@ fresh ids through the normal, ready-gated paths.
 `[world]` (phase 1): `events_keep_days` (7; 0 to 36500), `events_keep_min`
 (10000; below 10000 acts as 10000), `retention_every_ms` (3600000),
 `retention_batch` (5000), `archive_dir` (unset: `archive/` beside `db`).
-`[supervisor]` (phase 2): `replay_max_age_ms` (120000; 0 to one day),
+`[supervisor]` (phase 2): `replay_max_age_ms` (120000; 0 to one day; a
+reactive plan older than this is abandoned, and from phase 4 an addressed
+event older than this is not replayed),
 `booking_max_late_ms` (86400000; 0 to 30 days), `catchup_spread_ms`
 (120000; 0 to one hour). `[minds.harvest]` (phase 3): `ops_per_run` (32;
 1 to 10000), `keep_days` (3; 0 keeps every run, at most 36500),
@@ -412,6 +468,14 @@ wakes with fresh ids. A crash after the first effectful command loses the
 rest of the turn: **effect at most once beyond the first act.** torin under
 `runtime = "littleguy"` has no script: its bounty is the model's choice.
 
+**Addressed events (phase 4).** A tell, an attack on an agent or speech
+naming it is consumed with the first effectful command of a wake that
+carried it, or at that wake's close. A crash before either, followed by a
+boot within `replay_max_age_ms` of the event, queues it again as an
+Immediate wake: it is answered once, not twice and not never. Past the
+window it is not replayed. Nothing else the router held is replayed: a
+room batch or an ambient wake lost to a crash stays lost.
+
 **Process crash.** The guarantees above hold.
 `crates/mud-supervisor/tests/kill_restart.rs` (unix) checks them on a real
 process: the test runs itself again as a child that stops for good at an
@@ -427,7 +491,15 @@ never killed); and in the middle of retention (the table and the archive
 are contiguous, with no line twice, and a re-run finishes). Each case
 also checks `user_version = 1`, a bumped boot and that no wake id of the
 child is used again. The budget case (phase 3): a spend stored before the
-kill comes back with the same tallies and the same breaker level.
+kill comes back with the same tallies and the same breaker level. The tell cases (phase 4): a
+child is killed after a human's tell and before torin's wake was taken, as
+the wake opens, and once its answer committed; after the restart the tell
+is answered exactly once (replayed in the first two cases, not in the
+third), and a third process replays nothing.
+`runtime/replay_tests.rs` plays the same in one process, in the middle of
+an exchange (the first tell answered, the second killed before its wake,
+before its answer committed, or after), checks that a tell past the window
+is not replayed, and the smoke drill replays one tell once.
 
 **OS crash.** With WAL and `synchronous = NORMAL` the last world commits
 may be lost, and their `Consume` and `PlanCursor` ops with them: durable
@@ -446,6 +518,10 @@ OS crash rolled back.
   admin rollback ([roadmap](../roadmap.md)); the archive is its basis.
 - mud-world defines plain side rows; the supervisor gives them meaning.
 - A redelivered turn may be paid twice when the first turn made no effect.
+- A replayed tell may cost a second paid turn for the same reason; past
+  `replay_max_age_ms` it costs nothing and is not answered.
+- After a long-running world restarts, a room the log does not cover is
+  held for agent-only chatter until a human or a macro-tick resets it.
 - HarvestMind retention uses the real clock; a crash's harvest spend is
   charged to the boot day.
 - A process that opens `world.db` (the account CLI included) bumps the boot

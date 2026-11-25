@@ -663,9 +663,11 @@ pub struct SupervisorSection {
     pub first_macro_tick_secs: [u64; 2],
     /// How often the supervisor steps, in ms.
     pub step_ms: u64,
-    /// A reactive plan older than this at boot is abandoned (0 to 1 day).
-    /// An errand (a plan of a macro tick, a booking or a login) resumes
-    /// however long the server was down.
+    /// A reactive plan older than this at boot is abandoned, and an
+    /// addressed event (a tell, an attack, a mention by name) older than
+    /// this is not replayed (0 to 1 day). An errand (a plan of a macro
+    /// tick, a booking or a login) resumes however long the server was
+    /// down.
     pub replay_max_age_ms: u64,
     /// A booking overdue by more than this at boot is dropped (0 to 30
     /// days).

@@ -674,6 +674,14 @@ impl World {
             .collect()
     }
 
+    /// Every event of the in-memory log, oldest first: what a restart
+    /// reloaded and what happened since. The supervisor folds it at boot
+    /// (ADR 0011, phase 4). Raw events carry their recipients: never hand
+    /// one to an entity; [`Event::view_for`] is the entity's view.
+    pub fn logged(&self) -> impl Iterator<Item = &Event> + '_ {
+        self.log.iter()
+    }
+
     /// The seq of the oldest event the in-memory log still holds.
     #[must_use]
     pub fn oldest_logged(&self) -> Option<Seq> {

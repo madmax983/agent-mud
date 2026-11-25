@@ -15,6 +15,7 @@ pub mod hooks;
 pub mod injury;
 pub mod login_route;
 pub mod persist;
+pub mod replay;
 pub mod rewards;
 pub mod schedule;
 pub mod side;

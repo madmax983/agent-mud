@@ -50,7 +50,7 @@ cargo run -p mud-server --bin mud -- smoke
 #22   [rusty_flagon_taproom] wanderer arrives from the west.
 #25   [rusty_flagon_taproom] kestrel says something. "yo wanderer you going down the cellar? need a 2nd blade for the ossuary, split 50/50"
 restart drill: reopened at boot 2, resumed at line 2 of 5, 1 BOUNTY on the board
-smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty and one budget across a restart)
+smoke: PASS (bounty posted, board read, human recruited, account kept, hidden PC guarded, the alley answered, one bounty, one budget and one answered tell across a restart)
 ```
 
 ## Persistence
@@ -77,6 +77,16 @@ macro tick fires once within `catchup_spread_ms` of boot, and a booking
 overdue by more than `booking_max_late_ms` (a day) is dropped. `cargo test
 -p mud-supervisor --test kill_restart` kills a real process at each of
 these points and checks it.
+
+What changes with every event is not stored; the boot derives it from the
+reloaded event log. A tell, an attack or a mention by name that no
+committed wake of its agent consumed, and that is at most
+`replay_max_age_ms` (120 s) old, is replayed as an Immediate wake: a tell
+that arrived just before a crash is answered once, not twice and not
+never, and an older one is not answered at all. Room chatter and ambient
+wakes are never replayed, so a restart sets off no storm. The anti-chatter
+counters are folded from the log, and each agent's MCP token starts its
+`mud_events` cursor at the last event its committed wakes consumed.
 
 Budgets survive a restart too. Each wake's close stores the day's spend,
 split into what the supervisor metered and what littleguy's ledger
