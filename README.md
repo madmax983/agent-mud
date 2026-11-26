@@ -213,7 +213,11 @@ in crypt-v01 (ADR 0017): the bandage or the draught works, then each
 hostile strikes you once, as after `attack` or `defend`. A saved world
 picks up a pack's new fixtures, shop rooms and cast starting gear when it
 loads: Torin gets his broadsword and jerkin once, and gear lost in play
-does not come back.
+does not come back. It does not pick up new attrs or skills: a cast
+entity keeps the ones it was saved with, and a player keeps the skills
+the template gave at creation. So crypt-v01's fight balance (design-v0.1
+section 7) holds for a fresh world; a world saved before it keeps the
+harder fights until you start a new database.
 
 What changes with every event is not stored; the boot derives it from the
 reloaded event log. A tell, an attack or a mention by name that no

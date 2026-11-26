@@ -157,6 +157,13 @@ odds the study measured held for the first spawn only.
 
 - A second warden fights with its blade, so the study's warden odds hold
   for every spawn. Each kill of the warden leaves a blade to loot.
+- A kit with a price is money that comes back each respawn, and the
+  keepers' purses are finite. A party that farms a mob and sells its kit
+  empties the purses that pay for every other piece of loot. crypt-v01
+  gives the grave-blade value 0, so no keeper buys it: it is Hale's
+  proof and a poor weapon, not a trophy to sell
+  (`respawn_tests::farming_the_warden_leaves_the_loot_buyers_their_purses`).
+  A pack that gives a respawning mob a priced kit takes on that loop.
 - This step does not fix Hale's bounty. Its proof (`report` in the
   square) is any warden blade, and the report does not take the blade.
   Before this step only one blade existed, so at most one player could

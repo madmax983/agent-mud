@@ -5,7 +5,14 @@
 //! resolves every strike. A row plays one seeded world per seed, so a row
 //! is deterministic. The fast test plays a few hundred seeds per row and
 //! checks wide bands, so a pack edit that breaks the balance fails here.
-//! The ignored test plays more seeds and prints the table:
+//! It also checks that each heal in a run works, and the orderings with a
+//! margin each (a heal between the rats helps, a bigger party wins more,
+//! a broadsword beats a shortsword over the party sizes summed, the
+//! dagger beats the grave-blade).
+//! The ignored test plays more seeds, prints the table, and checks the
+//! targets themselves (the win rate, and for one rat the share of wins
+//! that end wounded) and the orderings with the margins the targets ask
+//! for. It prints a `MISS` line for each one that fails:
 //!
 //! ```text
 //! cargo test -p mud-world --lib balance_table -- --ignored --nocapture
@@ -31,11 +38,19 @@
 //!   once per round and takes its own strike on entering.
 //! - A "respawned" warden row first kills the warden and ticks the world
 //!   past its respawn, so the party meets the warden that comes back.
+//! - A "saved" row makes its world, and logs the party in, under the pack
+//!   as it stood before the balance step. It then loads that state under
+//!   the pack as it is now, as a server that restarts on an edited pack
+//!   does. Reconcile does not refresh a cast entity's attrs or skills, or
+//!   a player's template skills, so these rows measure what an old world
+//!   meets. They have bands but no targets: the targets hold for a fresh
+//!   world.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use super::*;
+use crate::ids::SkillId;
 use crate::pack::Slot;
 
 const NAMES: [&str; 3] = ["ada", "bob", "cyd"];
@@ -69,6 +84,21 @@ enum Scenario {
     RatRun(Heal),
 }
 
+impl Scenario {
+    /// How many players the scenario logs in.
+    const fn party(self) -> usize {
+        match self {
+            Self::Duel { party, .. } => party,
+            Self::RatRun(_) => 1,
+        }
+    }
+
+    /// Whether the scenario heals between the rats.
+    const fn heals(self) -> bool {
+        !matches!(self, Self::RatRun(Heal::None) | Self::Duel { .. })
+    }
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 struct Stats {
     trials: u64,
@@ -80,6 +110,9 @@ struct Stats {
     hp_left: i64,
     winners: u64,
     wounded: u64,
+    /// Heals used between the rats, and the HP they gave back.
+    heals: u64,
+    healed: i64,
 }
 
 impl Stats {
@@ -93,6 +126,8 @@ impl Stats {
         self.hp_left += o.hp_left;
         self.winners += o.winners;
         self.wounded += o.wounded;
+        self.heals += o.heals;
+        self.healed += o.healed;
     }
 
     /// The win rate in tenths of a percent.
@@ -220,8 +255,23 @@ fn respawn(w: &mut World, mob: &str, now: u64) -> u64 {
     due
 }
 
-fn trial(pack: &Arc<WorldPack>, sc: Scenario, seed: u64) -> Stats {
-    let mut w = World::new(Arc::clone(pack), seed);
+/// A world made under `old` with the party logged in, then saved and
+/// loaded under `pack`. Loading reconciles the state with `pack`, as a
+/// server that restarts on an edited pack does. Nothing rolls before the
+/// save, so the fight rolls the dice a fresh world would.
+fn saved_world(old: &Arc<WorldPack>, pack: &Arc<WorldPack>, sc: Scenario, seed: u64) -> World {
+    let mut o = World::new(Arc::clone(old), seed);
+    for nm in &NAMES[..sc.party()] {
+        o.login(nm, START_MS).unwrap();
+    }
+    World::from_state(Arc::clone(pack), o.snapshot(), Vec::new())
+}
+
+fn trial(pack: &Arc<WorldPack>, saved: Option<&Arc<WorldPack>>, sc: Scenario, seed: u64) -> Stats {
+    let mut w = saved.map_or_else(
+        || World::new(Arc::clone(pack), seed),
+        |old| saved_world(old, pack, sc, seed),
+    );
     let mut now = START_MS;
     let mut s = Stats {
         trials: 1,
@@ -272,8 +322,17 @@ fn trial(pack: &Arc<WorldPack>, sc: Scenario, seed: u64) -> Stats {
                     Heal::Draught => Some("use draught"),
                 };
                 if let Some(line) = line {
-                    // Refused when unhurt: then the bandage stays.
-                    let _ = w.execute(&ada, line, now);
+                    // A heal on someone unhurt is refused, and the item
+                    // stays. A hurt player's heal must work.
+                    let before = w.state.entities[&ada].pools;
+                    let r = w.execute(&ada, line, now);
+                    assert_eq!(r.ok, before.hp < before.hp_max, "{line:?}: {r:?}");
+                    if r.ok {
+                        let hp = w.state.entities[&ada].pools.hp;
+                        assert!(hp >= before.hp, "{line:?} took HP: {r:?}");
+                        s.heals += 1;
+                        s.healed += i64::from(hp - before.hp);
+                    }
                 }
                 now += STEP_MS;
                 assert!(w.execute(&ada, "w", now).ok, "into the warren");
@@ -308,7 +367,13 @@ fn trial(pack: &Arc<WorldPack>, sc: Scenario, seed: u64) -> Stats {
 }
 
 /// Plays seeds `first..first + n`, split over a few threads.
-fn run(pack: &Arc<WorldPack>, sc: Scenario, first: u64, n: u64) -> Stats {
+fn run(
+    pack: &Arc<WorldPack>,
+    saved: Option<&Arc<WorldPack>>,
+    sc: Scenario,
+    first: u64,
+    n: u64,
+) -> Stats {
     const THREADS: u64 = 4;
     let parts: Vec<Stats> = std::thread::scope(|scope| {
         #[expect(
@@ -318,11 +383,12 @@ fn run(pack: &Arc<WorldPack>, sc: Scenario, first: u64, n: u64) -> Stats {
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
                 let pack = Arc::clone(pack);
+                let saved = saved.map(Arc::clone);
                 scope.spawn(move || {
                     let mut acc = Stats::default();
                     let mut seed = first + t;
                     while seed < first + n {
-                        acc.add(&trial(&pack, sc, seed));
+                        acc.add(&trial(&pack, saved.as_ref(), sc, seed));
                         seed += THREADS;
                     }
                     acc
@@ -350,10 +416,13 @@ fn with_draught(p: &mut WorldPack) {
         .push(ProtoId::from("healing_draught"));
 }
 
-/// The template's weapon swapped for `weapon`, and a leather jerkin worn.
-fn geared(p: &mut WorldPack, weapon: &str) {
+/// The template's weapon swapped for `weapon`, and `armor` worn when
+/// there is one.
+fn armed(p: &mut WorldPack, weapon: &str, armor: Option<&str>) {
     let is_weapon = |x: &ProtoId| p.items.get(x).is_some_and(|d| d.slot == Some(Slot::Weapon));
-    let mut inv: Vec<ProtoId> = vec![ProtoId::from(weapon), ProtoId::from("leather_jerkin")];
+    let mut gear: Vec<ProtoId> = vec![ProtoId::from(weapon)];
+    gear.extend(armor.map(ProtoId::from));
+    let mut inv = gear.clone();
     inv.extend(
         p.player_template
             .inventory
@@ -361,7 +430,7 @@ fn geared(p: &mut WorldPack, weapon: &str) {
             .filter(|x| !is_weapon(x))
             .cloned(),
     );
-    let mut equip: Vec<ProtoId> = vec![ProtoId::from(weapon), ProtoId::from("leather_jerkin")];
+    let mut equip = gear;
     equip.extend(
         p.player_template
             .equip
@@ -374,11 +443,39 @@ fn geared(p: &mut WorldPack, weapon: &str) {
 }
 
 fn sword(p: &mut WorldPack) {
-    geared(p, "shortsword");
+    armed(p, "shortsword", Some("leather_jerkin"));
 }
 
 fn broad(p: &mut WorldPack) {
-    geared(p, "broadsword");
+    armed(p, "broadsword", Some("leather_jerkin"));
+}
+
+/// The template wields the warden's grave-blade, as a player who loots
+/// it might.
+fn grave_blade(p: &mut WorldPack) {
+    armed(p, "warden_blade", None);
+}
+
+/// The mobs and the template as they stood before the balance step:
+/// brawling-12 rats, the warren rat at HT 12, a broadsword-12 HT-12
+/// warden, and no broadsword skill in the template. Item damage is read
+/// from the pack at each strike, so it needs no entry here.
+fn before_balance(p: &mut WorldPack) {
+    let skill = |p: &mut WorldPack, who: &str, name: &str, level: i32| {
+        p.cast
+            .get_mut(&eid(who))
+            .unwrap()
+            .skills
+            .insert(SkillId::from(name), level);
+    };
+    skill(p, "giant_rat_1", "brawling", 12);
+    skill(p, "giant_rat_2", "brawling", 12);
+    skill(p, "skeletal_warden", "broadsword", 12);
+    p.cast.get_mut(&eid("giant_rat_2")).unwrap().attrs.ht = 12;
+    p.cast.get_mut(&eid("skeletal_warden")).unwrap().attrs.ht = 12;
+    p.player_template
+        .skills
+        .remove(&SkillId::from("broadsword"));
 }
 
 /// The template plays kestrel, the cast's agent PC.
@@ -443,21 +540,46 @@ const fn warden(party: usize, respawned: bool) -> Scenario {
     }
 }
 
-/// One row of the table, with the band the fast test holds it to, in
-/// percent.
+/// A bound on a rate, in percent: `(low, high)`, both inclusive.
+type Bound = (u64, u64);
+
+/// One row of the table.
 struct Row {
     label: String,
     build: Build,
     scenario: Scenario,
-    band: Option<(u64, u64)>,
+    /// The pack the world is saved under before the row plays it, made
+    /// from the row's own pack. `None` plays a fresh world.
+    saved: Option<Build>,
+    /// The band the fast test holds the win rate to.
+    band: Option<Bound>,
+    /// The target the long run holds the win rate to.
+    target: Option<Bound>,
+    /// The target the long run holds the share of wounded wins to.
+    wounded: Option<Bound>,
 }
 
-fn row(label: &str, build: Build, scenario: Scenario, band: (u64, u64)) -> Row {
+impl Row {
+    const fn target(mut self, lo: u64, hi: u64) -> Self {
+        self.target = Some((lo, hi));
+        self
+    }
+
+    const fn wounded(mut self, lo: u64, hi: u64) -> Self {
+        self.wounded = Some((lo, hi));
+        self
+    }
+
+    const fn saved(mut self, under: Build) -> Self {
+        self.saved = Some(under);
+        self
+    }
+}
+
+fn row(label: &str, build: Build, scenario: Scenario, band: Bound) -> Row {
     Row {
-        label: label.to_owned(),
-        build,
-        scenario,
         band: Some(band),
+        ..info(label, build, scenario)
     }
 }
 
@@ -466,23 +588,32 @@ fn info(label: &str, build: Build, scenario: Scenario) -> Row {
         label: label.to_owned(),
         build,
         scenario,
+        saved: None,
         band: None,
+        target: None,
+        wounded: None,
     }
 }
 
-/// The rows with a target. The bands are wider than the targets, so the
-/// few seeds of the fast test and small pack edits stay inside them; the
-/// long run checks the targets themselves.
+/// The checked rows. Each band is wider than its target, so the few seeds
+/// of the fast test and small pack edits stay inside it. The long run
+/// checks the targets (design-v0.1 section 7). The "saved" rows have
+/// bands only, so the gap an old world meets cannot widen unseen.
 fn targets() -> Vec<Row> {
     let mut rows = vec![
-        row("fresh vs rat1", fresh, rat1(), (62, 88)),
-        row("fresh vs rat2", no_rat1, rat2(), (55, 85)),
+        row("fresh vs rat1", fresh, rat1(), (62, 88))
+            .target(70, 80)
+            .wounded(35, 65),
+        row("fresh vs rat2", no_rat1, rat2(), (55, 85))
+            .target(70, 80)
+            .wounded(35, 65),
         row(
             "fresh run, no heal",
             fresh,
             Scenario::RatRun(Heal::None),
             (25, 55),
-        ),
+        )
+        .target(35, 50),
         row(
             "fresh run, bandage between",
             fresh,
@@ -495,6 +626,7 @@ fn targets() -> Vec<Row> {
             Scenario::RatRun(Heal::Draught),
             (35, 68),
         ),
+        row("grave-blade vs rat1", grave_blade, rat1(), (0, 80)),
     ];
     for respawned in [false, true] {
         let w = if respawned {
@@ -504,15 +636,33 @@ fn targets() -> Vec<Row> {
         };
         let at = |s: &str| format!("{s} vs {w}");
         rows.extend([
-            row(&at("fresh"), fresh, warden(1, respawned), (0, 12)),
-            row(&at("sword x1"), sword, warden(1, respawned), (14, 42)),
-            row(&at("sword x2"), sword, warden(2, respawned), (52, 82)),
-            row(&at("sword x3"), sword, warden(3, respawned), (78, 100)),
+            row(&at("fresh"), fresh, warden(1, respawned), (0, 12)).target(0, 10),
+            row(&at("sword x1"), sword, warden(1, respawned), (14, 42)).target(20, 35),
+            row(&at("sword x2"), sword, warden(2, respawned), (52, 82)).target(60, 75),
+            row(&at("sword x3"), sword, warden(3, respawned), (78, 100)).target(85, 100),
             row(&at("broad x1"), broad, warden(1, respawned), (18, 48)),
             row(&at("broad x2"), broad, warden(2, respawned), (56, 88)),
             row(&at("broad x3"), broad, warden(3, respawned), (82, 100)),
         ]);
     }
+    rows.extend([
+        row("saved: fresh vs rat1", fresh, rat1(), (48, 75)).saved(before_balance),
+        row(
+            "saved: fresh run, no heal",
+            fresh,
+            Scenario::RatRun(Heal::None),
+            (6, 28),
+        )
+        .saved(before_balance),
+        row(
+            "saved: sword x3 vs warden",
+            sword,
+            warden(3, false),
+            (36, 68),
+        )
+        .saved(before_balance),
+        row("saved: broad x3 vs warden", broad, warden(3, false), (0, 8)).saved(before_balance),
+    ]);
     rows
 }
 
@@ -553,19 +703,24 @@ fn measure(base: &WorldPack, rows: &[Row], first: u64, n: u64) -> Vec<Stats> {
         .map(|r| {
             let mut p = base.clone();
             (r.build)(&mut p);
-            run(&Arc::new(p), r.scenario, first, n)
+            let saved = r.saved.map(|under| {
+                let mut old = p.clone();
+                under(&mut old);
+                Arc::new(old)
+            });
+            run(&Arc::new(p), saved.as_ref(), r.scenario, first, n)
         })
         .collect()
 }
 
 fn table(rows: &[Row], stats: &[Stats]) -> String {
     let mut out = String::from(
-        "| matchup | win % | escaped % | mean rounds | mean HP left (winners) | wounded on win % | collapsed % | dead % |\n|---|---|---|---|---|---|---|---|\n",
+        "| matchup | win % | escaped % | mean rounds | mean HP left (winners) | wounded on win % | collapsed % | dead % | heals | mean HP per heal |\n|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for (r, s) in rows.iter().zip(stats) {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.label,
             pct(s.wins, s.trials),
             pct(s.escaped, s.trials),
@@ -574,27 +729,38 @@ fn table(rows: &[Row], stats: &[Stats]) -> String {
             pct(s.wounded, s.wins),
             pct(s.collapsed, s.trials),
             pct(s.dead, s.trials),
+            s.heals,
+            decimal(s.healed, s.heals, 2),
         );
     }
     out
 }
 
-/// The rows outside their band, as lines.
-fn misses(rows: &[Row], stats: &[Stats]) -> Vec<String> {
-    rows.iter()
-        .zip(stats)
-        .filter_map(|(r, s)| {
-            let (lo, hi) = r.band?;
-            let got = s.win_permille();
-            (got < lo * 10 || got > hi * 10).then(|| {
-                format!(
-                    "{}: {}% is outside {lo}-{hi}%",
-                    r.label,
-                    pct(s.wins, s.trials)
-                )
-            })
-        })
-        .collect()
+fn outside(label: &str, what: &str, (lo, hi): Bound, a: u64, b: u64) -> Option<String> {
+    let got = permille(a, b);
+    (got < lo * 10 || got > hi * 10)
+        .then(|| format!("{label}: {what} {}% is outside {lo}-{hi}%", pct(a, b)))
+}
+
+/// The rows that miss a bound, as lines. Every run checks the bands and
+/// that each heal row healed; the long run (`long`) also checks the
+/// targets.
+fn misses(rows: &[Row], stats: &[Stats], long: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for (r, s) in rows.iter().zip(stats) {
+        let mut check = |what: &str, bound: Option<Bound>, a: u64, b: u64| {
+            out.extend(bound.and_then(|bd| outside(&r.label, what, bd, a, b)));
+        };
+        check("win", r.band, s.wins, s.trials);
+        if long {
+            check("win (target)", r.target, s.wins, s.trials);
+            check("wounded on win (target)", r.wounded, s.wounded, s.wins);
+        }
+        if r.scenario.heals() && (s.heals == 0 || s.healed <= 0) {
+            out.push(format!("{}: no heal worked", r.label));
+        }
+    }
+    out
 }
 
 fn win(rows: &[Row], stats: &[Stats], label: &str) -> u64 {
@@ -605,50 +771,117 @@ fn win(rows: &[Row], stats: &[Stats], label: &str) -> u64 {
         .unwrap()
 }
 
-/// The orderings the targets ask for: a heal between the rats helps, a
-/// bigger party wins more, and the broadsword is the upper tier. `slack`
-/// is in tenths of a percent: a row may fall that far short of the row it
-/// should beat. The long run uses none; the fast test, with its few
-/// seeds, allows for their noise.
-fn order_misses(rows: &[Row], stats: &[Stats], slack: u64) -> Vec<String> {
-    let w = |l: &str| win(rows, stats, l);
-    let mut out = Vec::new();
-    let mut beats = |better: &str, worse: &str| {
-        if w(better) + slack <= w(worse) {
-            out.push(format!("{better} should beat {worse}"));
-        }
-    };
-    beats("fresh run, bandage between", "fresh run, no heal");
-    beats("fresh run, draught between", "fresh run, no heal");
+/// One ordering: the rows of `better` win, summed, at least a margin
+/// more than the rows of `worse`, in tenths of a percent. `fast` is the
+/// margin of the fast test and `long` the one of the long run; `None`
+/// leaves the ordering out of that run. Rows share their seeds, so their
+/// noise is correlated, but a few hundred seeds still blur a gap of a few
+/// points. So the fast test sums the broadsword rows over the party sizes,
+/// and the long run checks each size.
+struct Order {
+    better: Vec<String>,
+    worse: Vec<String>,
+    fast: Option<u64>,
+    long: Option<u64>,
+}
+
+fn order(better: &str, worse: &str, fast: u64, long: u64) -> Order {
+    Order {
+        better: vec![better.to_owned()],
+        worse: vec![worse.to_owned()],
+        fast: Some(fast),
+        long: Some(long),
+    }
+}
+
+/// The orderings the targets ask for.
+/// - A heal between the rats helps clearly: a bandage by 5 points or more,
+///   a draught by 10 or more, and a draught by 2 more than a bandage.
+/// - A bigger party wins more: 20 points from one to two, 10 from two to
+///   three.
+/// - A broadsword beats a shortsword by a point or more at each size.
+/// - The starting dagger beats the grave-blade by 10 points or more. The
+///   blade is worth nothing (items.toml), and this keeps its price true.
+fn orders() -> Vec<Order> {
+    let (bandage, draught, none) = (
+        "fresh run, bandage between",
+        "fresh run, draught between",
+        "fresh run, no heal",
+    );
+    let mut out = vec![
+        order(bandage, none, 10, 50),
+        order(draught, none, 60, 100),
+        order(draught, bandage, 10, 20),
+        order("fresh vs rat1", "grave-blade vs rat1", 100, 100),
+    ];
     for foe in ["warden", "respawned warden"] {
         for arm in ["sword", "broad"] {
-            beats(&format!("{arm} x2 vs {foe}"), &format!("{arm} x1 vs {foe}"));
-            beats(&format!("{arm} x3 vs {foe}"), &format!("{arm} x2 vs {foe}"));
+            out.push(order(
+                &format!("{arm} x2 vs {foe}"),
+                &format!("{arm} x1 vs {foe}"),
+                100,
+                200,
+            ));
+            out.push(order(
+                &format!("{arm} x3 vs {foe}"),
+                &format!("{arm} x2 vs {foe}"),
+                50,
+                100,
+            ));
         }
+        let at = |arm: &str, n: &str| format!("{arm} {n} vs {foe}");
         for n in ["x1", "x2", "x3"] {
-            beats(
-                &format!("broad {n} vs {foe}"),
-                &format!("sword {n} vs {foe}"),
-            );
+            out.push(Order {
+                fast: None,
+                ..order(&at("broad", n), &at("sword", n), 0, 10)
+            });
         }
+        let sizes = ["x1", "x2", "x3"];
+        out.push(Order {
+            better: sizes.iter().map(|n| at("broad", n)).collect(),
+            worse: sizes.iter().map(|n| at("sword", n)).collect(),
+            fast: Some(30),
+            long: None,
+        });
     }
     out
+}
+
+/// The orderings that fail, as lines, with the fast margins or the long
+/// ones (`long`).
+fn order_misses(rows: &[Row], stats: &[Stats], long: bool) -> Vec<String> {
+    let sum = |labels: &[String]| labels.iter().map(|l| win(rows, stats, l)).sum::<u64>();
+    let show = |permille: u64| decimal(i64::try_from(permille).unwrap(), 10, 1);
+    orders()
+        .into_iter()
+        .filter_map(|o| {
+            let margin = if long { o.long } else { o.fast }?;
+            let (b, w) = (sum(&o.better), sum(&o.worse));
+            (b < w + margin).then(|| {
+                format!(
+                    "{} ({}) should beat {} ({}) by {}",
+                    o.better.join(" + "),
+                    show(b),
+                    o.worse.join(" + "),
+                    show(w),
+                    show(margin),
+                )
+            })
+        })
+        .collect()
 }
 
 /// The seeds per row of the fast test: enough to catch a broken balance,
 /// few enough for a normal test run.
 const FAST_N: u64 = 400;
-/// How far, in tenths of a percent, one row of the fast test may fall
-/// short of a row it should beat.
-const FAST_SLACK: u64 = 40;
 
 #[test]
 fn crypt_v01_holds_its_balance() {
     let pack = WorldPack::crypt_v01().unwrap();
     let rows = targets();
     let stats = measure(&pack, &rows, 1, FAST_N);
-    let mut bad = misses(&rows, &stats);
-    bad.extend(order_misses(&rows, &stats, FAST_SLACK));
+    let mut bad = misses(&rows, &stats, false);
+    bad.extend(order_misses(&rows, &stats, false));
     assert!(
         bad.is_empty(),
         "crypt-v01 is out of balance:\n{}\n{}",
@@ -702,9 +935,9 @@ fn balance_table() {
         "\nN={n} seeds per row, from seed {first}\n\n{}",
         table(&rows, &stats)
     );
-    let mut bad = misses(&rows, &stats);
+    let mut bad = misses(&rows, &stats, true);
     if only.is_none() {
-        bad.extend(order_misses(&rows, &stats, 0));
+        bad.extend(order_misses(&rows, &stats, true));
     }
     for line in &bad {
         println!("MISS {line}");

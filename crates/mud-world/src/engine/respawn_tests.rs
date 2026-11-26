@@ -414,3 +414,55 @@ fn a_pack_edit_to_respawn_minutes_reaches_a_saved_mob() {
     assert_eq!(carried(&w, "giant_rat_2", "rat_tail").len(), 1);
     assert_eq!(w.state.check(), Vec::<String>::new());
 }
+
+#[test]
+fn farming_the_warden_leaves_the_loot_buyers_their_purses() {
+    // Each kill drops a grave-blade and each respawn makes one. The blade
+    // is worth nothing, so no keeper buys it, and a party that puts the
+    // warden down every two hours never empties the purse that pays for
+    // the town's other loot.
+    let (mut w, ada) = killed(crypt(), "skeletal_warden", "ossuary_crypt");
+    let mut now = KILLED_AT;
+    for _ in 0..4 {
+        let back = due(&w, "skeletal_warden");
+        w.tick(back);
+        now = back + MINUTE;
+        kill(&mut w, &ada, "skeletal_warden", "ossuary_crypt", now);
+    }
+    assert_eq!(on_floor(&w, "ossuary_crypt", "warden_blade").len(), 5);
+    for _ in 0..5 {
+        now += 1_000;
+        let r = w.execute(&ada, "get blade", now);
+        assert!(r.ok, "{r:?}");
+    }
+    assert_eq!(carried(&w, ada.as_str(), "warden_blade").len(), 5);
+    for (keeper, room) in [
+        ("vich", "fence_backroom"),
+        ("marta", "rusty_flagon_taproom"),
+    ] {
+        w.state.entities.get_mut(&ada).unwrap().room = RoomId::from(room);
+        let purse = w.entity(&id(keeper)).unwrap().currency;
+        for _ in 0..5 {
+            now += 1_000;
+            let r = w.execute(&ada, "sell blade", now);
+            assert_eq!(r.error_code, Some(ErrorCode::NotBuying), "{r:?}");
+        }
+        assert_eq!(w.entity(&id(keeper)).unwrap().currency, purse);
+        let ring = w.state.new_item(&ProtoId::from("silver_ring"), &w.pack);
+        w.state.attach(
+            ring,
+            &Holder::Entity {
+                entity: ada.clone(),
+            },
+        );
+        now += 1_000;
+        let r = w.execute(&ada, "sell ring", now);
+        assert!(r.ok, "{keeper} still pays for a ring: {r:?}");
+    }
+    assert_eq!(
+        carried(&w, ada.as_str(), "warden_blade").len(),
+        5,
+        "the proof stays"
+    );
+    assert_eq!(w.state.check(), Vec::<String>::new());
+}

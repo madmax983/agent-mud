@@ -256,7 +256,16 @@ do = ["say 50/50 or nothing"]
 # a group fight: a fresh player almost never wins alone, and with a
 # shortsword and a jerkin one, two and three players win about 30%, 70%
 # and 90%. A broadsword does a little better. A respawned warden fights
-# the same. Run the ignored `balance_table` test after an edit here.
+# the same. design-v0.1 section 7 lists the targets. Run the ignored
+# `balance_table` test after an edit here: it checks them.
+#
+# The balance holds for a world made under this file. A saved world keeps
+# the attrs and skills its mobs and players had when it was saved, because
+# reconcile copies only new gear and `respawn_minutes` into it. A world
+# saved before the balance step keeps brawling-12 rats and a
+# broadsword-12, HT-12 warden, and its players have no broadsword skill,
+# so the fights there are much harder (the "saved" rows of the test
+# measure them). Start a fresh world to get this balance.
 [cast.giant_rat_1]
 name = "giant rat"
 aliases = ["rat"]
