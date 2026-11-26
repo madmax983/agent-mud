@@ -82,9 +82,8 @@ lands.
   before it writes an `lg.toml`. An `lg` built before littleguy #108
   exited at start on `[compaction]`, and every wake of its agent failed.
   The MUD now reads lg's `unknown field` message from `lg.log`, leaves an
-  optional part out (`compaction`, `max_request_bytes`,
-  `heartbeat.research`) and warns, and fails with the minimum commit for
-  any other part (`mud_supervisor::littleguy::compat`). The ask: `lg
+  optional part out (`compaction`, `max_request_bytes`) and warns, and
+  fails with the minimum commit for any other part (`mud_supervisor::littleguy::compat`). The ask: `lg
   --version` with the commit and the cargo features of the build, or an
   `lg features` command that lists the config sections and keys the
   build reads. Then the MUD checks before it writes a config, and drops

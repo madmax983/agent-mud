@@ -87,16 +87,19 @@ key_env = "OPENROUTER_API_KEY"   # the variable that holds its key
 #   part of lg.toml       turned off with           first read by
 #   [compaction]          compaction = false        littleguy #108
 #   max_request_bytes     max_request_bytes = 0     littleguy #108
-#   [heartbeat]           heartbeat_minutes = 0     (it holds heartbeat.research)
+#   [heartbeat]           heartbeat_minutes = 0     littleguy #41, with heartbeat.research
 #   [refine]              refine = "off"            an lg with the refine feature
-# An older lg that refuses compaction, max_request_bytes or
-# heartbeat.research still starts: the MUD leaves that part out for that
-# binary until it restarts, and warns once in its log and on the observer.
-# An lg that refuses anything else does not start, and the wake's error
-# names the commit above.
+# An older lg that refuses compaction or max_request_bytes still starts:
+# the MUD leaves that part out for that binary until it restarts, and
+# warns once in its log and on the observer. An lg that refuses anything
+# else does not start, and the wake's error names the commit above.
 # ==========================================================================
 bin = "lg"                       # the lg binary: a path, or a name looked up on PATH
 data_dir = "data/agents"         # each agent's lg.toml, lg.db, lg.sock and lg.log
+# lg reads its model key from the MUD's environment, by provider: claude
+# needs ANTHROPIC_API_KEY, openai needs OPENAI_API_KEY, openrouter needs
+# OPENROUTER_API_KEY, and offline needs none (its model only echoes). The
+# MUD passes only these three to lg (README.md#run-littleguy-minds).
 provider = "openrouter"          # offline | claude | openai | openrouter
 # base_url = "http://127.0.0.1:8080/v1" # --base-url, for an OpenAI-compatible server
 max_steps = 64                   # tool rounds per wake (0: no bound; the daily budget still caps spend)

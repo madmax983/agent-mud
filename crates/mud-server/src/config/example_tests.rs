@@ -279,25 +279,44 @@ fn one_minimum_littleguy_commit_everywhere() {
 }
 
 /// The example says which lg.toml parts the MUD writes, and how to turn
-/// off each optional one.
+/// off each optional one: a row of its table holds the part, its off key
+/// and the littleguy pull request that first reads it. The README's
+/// Install littleguy section lists exactly the optional parts.
 #[test]
 fn the_example_lists_the_optional_lg_parts() {
     use mud_supervisor::littleguy::compat::Optional;
     for part in Optional::ALL {
+        let pr = part.since().split(" (").next().unwrap_or_default();
         assert!(
-            EXAMPLE.contains(part.path()),
-            "{} in mud.toml.example",
-            part.path()
-        );
-        assert!(
-            EXAMPLE.contains(part.off_key()),
-            "{} in mud.toml.example",
-            part.off_key()
-        );
-        assert!(
-            README.contains(part.path()),
-            "{} in the README",
-            part.path()
+            EXAMPLE.lines().any(|l| {
+                l.starts_with('#')
+                    && l.split_whitespace()
+                        .nth(1)
+                        .map(|w| w.trim_matches(['[', ']']))
+                        == Some(part.path())
+                    && l.contains(part.off_key())
+                    && l.contains(pr)
+            }),
+            "a table row for {} with {} and {pr} in mud.toml.example",
+            part.path(),
+            part.off_key(),
         );
     }
+    let names: Vec<String> = Optional::ALL
+        .iter()
+        .map(|p| format!("`{}`", p.path()))
+        .collect();
+    let list = match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    let start = README.find("\n## Install littleguy\n").unwrap();
+    let section = &README[start + 1..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    let flat = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&format!("as an extra ({list})")),
+        "the README lists the optional parts as {list}"
+    );
 }

@@ -324,15 +324,16 @@ pub fn render_config_without(
         .into(),
     );
     if cfg.heartbeat_minutes > 0 && !quiet {
-        let mut heartbeat = table([
-            ("every_minutes", i64::from(cfg.heartbeat_minutes).into()),
-            ("prompt", heartbeat_prompt(names, notes).into()),
-        ]);
-        if !lacks.contains(&Optional::HeartbeatResearch) {
-            // Researches open ideas; not lg's [research] sweep tool.
-            heartbeat.insert("research".into(), cfg.research.into());
-        }
-        root.insert("heartbeat".into(), heartbeat.into());
+        root.insert(
+            "heartbeat".into(),
+            table([
+                ("every_minutes", i64::from(cfg.heartbeat_minutes).into()),
+                ("prompt", heartbeat_prompt(names, notes).into()),
+                // Researches open ideas; not lg's [research] sweep tool.
+                ("research", cfg.research.into()),
+            ])
+            .into(),
+        );
     }
     if let Some(c) = cfg
         .compaction
@@ -644,24 +645,47 @@ fn is_loopback_link(link: &str) -> bool {
 }
 
 /// The error of a start that failed because the `lg` at `bin` is older
-/// than the MUD needs: it refused `path`, which the MUD cannot leave out,
-/// or it still exited after the MUD left out what it refused.
+/// than the MUD needs: it refused `path`, which the MUD cannot leave out.
 fn older_lg(
     entity: &EntityId,
     status: std::process::ExitStatus,
     bin: &Path,
-    path: Option<&str>,
+    path: &str,
     log: &Path,
 ) -> MindError {
-    let why = path.map_or_else(
-        || "it still exits after the MUD left out what it does not read".to_owned(),
-        |p| format!("it does not read `{p}` in lg.toml, which the MUD needs"),
-    );
     MindError::Unavailable(format!(
-        "lg serve for {entity} exited ({status}): the lg at {} is older than the MUD needs, as {why}. \
+        "lg serve for {entity} exited ({status}): the lg at {} is older than the MUD needs, \
+         as it does not read `{path}` in lg.toml, which the MUD needs. \
          Build lg at littleguy {LG_MIN_COMMIT} or later ({README_INSTALL}); see {}",
         bin.display(),
         log.display()
+    ))
+}
+
+/// The error of a start whose log holds no refusal. The cause is in the
+/// log, not in the parts the MUD left out, so it is the plain crash error.
+/// When the `lg` at `bin` was found to lack parts, it says so too, so a
+/// later start of that binary gives the same error.
+fn exited(
+    entity: &EntityId,
+    status: std::process::ExitStatus,
+    bin: &Path,
+    lacks: &BTreeSet<Optional>,
+    log: &Path,
+) -> MindError {
+    let plain = format!(
+        "lg serve for {entity} exited ({status}); see {}",
+        log.display()
+    );
+    if lacks.is_empty() {
+        return MindError::Unavailable(plain);
+    }
+    let parts: Vec<String> = lacks.iter().map(|p| format!("`{}`", p.path())).collect();
+    MindError::Unavailable(format!(
+        "{plain}. The lg at {} also lacks {} in lg.toml, which the MUD leaves out; \
+         littleguy {LG_MIN_COMMIT} or later reads all of it ({README_INSTALL})",
+        bin.display(),
+        parts.join(", ")
     ))
 }
 
@@ -895,16 +919,10 @@ impl LittleguyMind {
                     self.lacks_part(entity, &bin, part);
                 }
                 Some((path, _)) => {
-                    return Err(older_lg(entity, status, &bin, Some(path), &log));
-                }
-                None if !dropped.is_empty() => {
-                    return Err(older_lg(entity, status, &bin, None, &log));
+                    return Err(older_lg(entity, status, &bin, path, &log));
                 }
                 None => {
-                    return Err(MindError::Unavailable(format!(
-                        "lg serve for {entity} exited ({status}); see {}",
-                        log.display()
-                    )));
+                    return Err(exited(entity, status, &bin, &compat::lacks(&bin), &log));
                 }
             }
         }

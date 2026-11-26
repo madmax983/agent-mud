@@ -12,6 +12,8 @@
 //! for that binary, for the life of the process, and the daemon starts
 //! again; each drop is warned once per binary. Any other refused key fails
 //! the start with an error that names [`LG_MIN_COMMIT`] and the README.
+//! A later exit with no refusal fails as any crash does, and its error
+//! adds what the binary lacks.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -33,23 +35,22 @@ const LOG_TAIL_BYTES: u64 = 16 * 1024;
 
 /// A part of `lg.toml` the MUD writes as an extra: an agent still plays
 /// without it. An older `lg` that refuses one runs without it.
+///
+/// A part is optional only when some `lg` reads all the rest of what the
+/// MUD writes but not that part. `research` in `[heartbeat]` is not one:
+/// littleguy #41 (09df4df) added `[heartbeat]` and `research` together,
+/// so an lg that refuses `research` also refuses `[heartbeat]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Optional {
     /// `[compaction]`: a long op saves notes and starts over.
     Compaction,
     /// The top-level `max_request_bytes`: the request cap.
     MaxRequestBytes,
-    /// `research` in `[heartbeat]`: a tick researches open ideas.
-    HeartbeatResearch,
 }
 
 impl Optional {
     /// Every optional part, in the order `render_config` writes them.
-    pub const ALL: [Self; 3] = [
-        Self::MaxRequestBytes,
-        Self::HeartbeatResearch,
-        Self::Compaction,
-    ];
+    pub const ALL: [Self; 2] = [Self::MaxRequestBytes, Self::Compaction];
 
     /// Its dotted path in `lg.toml`.
     #[must_use]
@@ -57,7 +58,6 @@ impl Optional {
         match self {
             Self::Compaction => "compaction",
             Self::MaxRequestBytes => "max_request_bytes",
-            Self::HeartbeatResearch => "heartbeat.research",
         }
     }
 
@@ -66,7 +66,6 @@ impl Optional {
     pub const fn since(self) -> &'static str {
         match self {
             Self::Compaction | Self::MaxRequestBytes => "littleguy #108 (86309bf)",
-            Self::HeartbeatResearch => "littleguy #65 (610a484)",
         }
     }
 
@@ -76,7 +75,6 @@ impl Optional {
         match self {
             Self::Compaction => "compaction = false",
             Self::MaxRequestBytes => "max_request_bytes = 0",
-            Self::HeartbeatResearch => "heartbeat_minutes = 0",
         }
     }
 
@@ -317,7 +315,8 @@ mod tests {
         );
         assert_eq!(
             Optional::from_path("heartbeat.research"),
-            Some(Optional::HeartbeatResearch)
+            None,
+            "every lg that reads [heartbeat] reads research (littleguy #41)"
         );
         assert_eq!(
             Optional::from_path("research"),

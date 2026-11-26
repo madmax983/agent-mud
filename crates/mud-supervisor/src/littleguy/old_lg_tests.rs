@@ -36,6 +36,15 @@ const MAX_REQUEST_BYTES: Refuse = Refuse {
     carets: "^^^^^^^^^^^^^^^^^",
 };
 
+/// `research` in `[heartbeat]`: every lg that reads `[heartbeat]` reads
+/// it too (littleguy #41 added both), so the MUD never leaves it out.
+const RESEARCH: Refuse = Refuse {
+    pattern: "^research = ",
+    field: "research",
+    column: 1,
+    carets: "^^^^^^^^",
+};
+
 /// `[ui]` holds the pages' port: the MUD cannot leave it out.
 const UI: Refuse = Refuse {
     pattern: r"^\[ui\]$",
@@ -334,27 +343,74 @@ async fn a_crash_with_no_refusal_fails_without_a_retry() {
     assert_eq!(mind.take_notices(), Vec::new());
 }
 
-/// When the start after a drop still fails, the error says the lg is
-/// older than the MUD needs, and no third start is made.
+/// A refused `heartbeat.research` is no optional part: no lg reads
+/// `[heartbeat]` without it, so the start fails and names it.
 #[tokio::test]
-async fn a_second_failed_start_names_the_older_lg() {
+async fn an_lg_that_refuses_heartbeat_research_fails_and_says_why() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = old_lg(dir.path(), &[COMPACTION], CRASHES);
+    let bin = old_lg(dir.path(), &[RESEARCH], RUNS);
     let mind = mind(dir.path(), bin.clone());
     let torin = EntityId::from("torin");
     let Err(MindError::Unavailable(e)) = mind.ensure(&torin).await else {
         panic!("the start fails");
     };
-    assert_eq!(starts(&mind, &torin), 2, "one re-render, no loop");
     for part in [
         "older than the MUD needs",
-        "still exits",
+        "`heartbeat.research`",
         LG_MIN_COMMIT,
         README_INSTALL,
     ] {
         assert!(e.contains(part), "{part} in {e}");
     }
+    assert_eq!(starts(&mind, &torin), 1, "no second start");
+    assert!(compat::lacks(&bin).is_empty());
+    assert_eq!(mind.take_notices(), Vec::new());
+    let v = config_of(&mind, &torin);
+    assert_eq!(
+        v["heartbeat"]["research"].as_bool(),
+        Some(true),
+        "never dropped"
+    );
+    assert!(v["heartbeat"]["every_minutes"].as_integer().is_some());
+}
+
+/// A start that fails after a drop, with no refusal in its log, is not
+/// blamed on the drop: the error is the plain crash error, and it adds
+/// that the lg also lacks the dropped part. The next try says the same,
+/// and no start loops.
+#[tokio::test]
+async fn a_crash_after_a_drop_is_not_blamed_on_the_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = old_lg(dir.path(), &[COMPACTION], CRASHES);
+    let mind = mind(dir.path(), bin.clone());
+    let torin = EntityId::from("torin");
+    let Err(MindError::Unavailable(first)) = mind.ensure(&torin).await else {
+        panic!("the start fails");
+    };
+    assert_eq!(starts(&mind, &torin), 2, "one re-render, no loop");
+    for part in [
+        "lg serve for torin exited (exit status: 2); see",
+        "`compaction`",
+        &bin.display().to_string(),
+        LG_MIN_COMMIT,
+        README_INSTALL,
+    ] {
+        assert!(first.contains(part), "{part} in {first}");
+    }
+    for blame in ["older than the MUD needs", "still exits"] {
+        assert!(!first.contains(blame), "{blame} in {first}");
+    }
     assert_eq!(mind.take_notices().len(), 1, "the drop was still warned");
+    let Err(MindError::Unavailable(second)) = mind.ensure(&torin).await else {
+        panic!("the start fails again");
+    };
+    assert_eq!(
+        starts(&mind, &torin),
+        3,
+        "one start, compaction already out"
+    );
+    assert_eq!(second, first, "the same failure, the same cause");
+    assert!(mind.take_notices().is_empty(), "warned once");
 }
 
 /// The incident on a real `lg serve` when `LG_BIN` names one: behind a

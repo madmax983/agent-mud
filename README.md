@@ -35,11 +35,20 @@ Then do one of these:
 - put it on your `PATH`, and keep `[littleguy] bin = "lg"`:
 
   ```sh
+  mkdir -p ~/.local/bin
   install -m 755 target/release/lg ~/.local/bin/lg
   command -v lg   # must print the lg you just installed
   ```
 
-- or point `[littleguy] bin` at the build:
+  `~/.local/bin` must come before any other directory on your `PATH` that
+  holds an `lg`. If it is not on your `PATH` at all, add
+  `export PATH="$HOME/.local/bin:$PATH"` to your shell profile and open a
+  new shell. When `command -v lg` prints another path, such as
+  `~/.cargo/bin/lg` from an earlier `cargo install`, the MUD runs that
+  older `lg` instead: remove it (`cargo uninstall littleguy`), or use the
+  next option.
+
+- or point `[littleguy] bin` at the build, an absolute path:
 
   ```toml
   [littleguy]
@@ -59,14 +68,41 @@ know: an `lg` built before littleguy #108 exits at start with
 wake of its agent fails.
 
 The MUD reads that message. When the refused part is one it writes only
-as an extra (`compaction`, `max_request_bytes` or `heartbeat.research`),
-it leaves the part out for that binary until the MUD restarts, starts the
-daemon again, and warns once per binary and part: a `WARN` line in the
-MUD's log and a `NOTICE` line on the observer, each naming the part, the
-binary and the commit above. The agent then plays without that part. Any
-other refused part, or a start that still fails after the MUD left a part
-out, fails the wake with an error that says the `lg` is older than the
-MUD needs and points here. Rebuild `lg` as above to get every part back.
+as an extra (`max_request_bytes` or `compaction`), it leaves the part out
+for that binary until the MUD restarts, starts the daemon again, and warns
+once per binary and part: a `WARN` line in the MUD's log and a `NOTICE`
+line on the observer, each naming the part, the binary and the commit
+above. The agent then plays without that part. Any other refused part
+fails the wake with an error that says the `lg` is older than the MUD
+needs and points here. A start that fails for another reason fails the
+wake with the usual "see lg.log" error, which also names any part the
+binary lacks. Rebuild `lg` as above to get every part back.
+
+### Run littleguy minds
+
+`lg` reads its model key from the MUD's environment. The MUD passes only
+the three variables below to each `lg serve`. `[littleguy] provider`
+picks the one it needs:
+
+| `provider` | Variable |
+|---|---|
+| `openrouter` (the example's) | `OPENROUTER_API_KEY` |
+| `claude` | `ANTHROPIC_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+| `offline` | none |
+
+The example's `[models.flash]` and `[models.council]` (the harvest and
+plugin-agent runtimes, and the Steward's council) read
+`OPENROUTER_API_KEY` too. Then:
+
+1. `cp mud.toml.example mud.toml`
+2. `export OPENROUTER_API_KEY=...` (the key of your provider, above)
+3. `cargo run -p mud-server --bin mud -- serve`
+
+Without the key, every daemon exits at start, and its
+`data/agents/<id>/lg.log` names the variable. Set `provider = "offline"`
+to try `lg` without a key: its model echoes the last message and plays no real
+turn.
 
 ## Try it
 
@@ -242,7 +278,8 @@ per tier:
 | `plugin-agent` | an autumn-plugin-agent loop (ambient NPCs) | `[models.<alias>]` and its key |
 
 With littleguy, install `lg` first: [Install littleguy](#install-littleguy)
-gives the commit, the features and the `[littleguy] bin` to set. The
+gives the commit, the features and the `[littleguy] bin` to set, and
+[Run littleguy minds](#run-littleguy-minds) the model key to export. The
 commit is littleguy #122, whose `overlay_activate` refuses a move from a
 pointer that moved since the Steward read it.
 
