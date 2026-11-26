@@ -24,7 +24,7 @@ sell_markup = 1.0
 [shops.torin]
 keeper = "torin"
 fixture = "smithy_rack"
-stock = ["broadsword", "shortsword", "dagger", "leather_jerkin", "lantern", "spear"]
+stock = ["broadsword", "shortsword", "dagger", "leather_jerkin", "lantern", "spear", "hatchet", "hatchet", "miners_pick", "miners_pick", "miners_pick"]
 buys = ["iron_ore"]
 buy_rate = 0.5
 sell_markup = 1.0
@@ -49,4 +49,41 @@ sell_markup = 1.0
 [rewards.warden_bounty]
 currency = 60
 items = { healing_draught = 3 }
+per = "day"
+
+# What the fallen leave (scripts/rooms/loot.rhai, `search`). The first
+# searcher of each death rolls once on that mob's table in scripts.toml,
+# and these pools pay it. Rats, pups and the crawler share the vermin
+# pool; the warden has its own, so pup farming never empties it. A pick
+# turns up rarely on the crawler, so a world with no pick left on
+# Torin's rack can still mine.
+[rewards.vermin_loot]
+currency = 40
+items = { rat_tail = 6, bandage = 4, torch = 2, miners_pick = 1 }
+per = "day"
+
+[rewards.warden_hoard]
+currency = 30
+items = { healing_draught = 2, silver_ring = 1, bone_charm = 1 }
+per = "day"
+
+# The rumor of the day (scripts/rooms/rumor.rhai): one cache a day, in a
+# room and a spot that the day picks. `eavesdrop` at the Flagon hints at
+# the room, `case` in Vich's backroom at the spot, and the first `dig` in
+# the right place pays.
+[rewards.rumor_cache]
+currency = 15
+items = { healing_draught = 1 }
+per = "day"
+
+# The old dwarf drift (scripts/rooms/drift.rhai, `mine`): four chunks of
+# ore a day, at most one a day to each miner. Torin pays 15s a chunk, so
+# the seam can cost him 60s a day, half the purse he starts with. His
+# picks (3 x 20s) and his other stock win some of it back, and Vich pays
+# only 6s. So ore keeps coming back, and his bounty keeps its worth: a
+# chunk a day is a fair wage, and the seam cannot empty his purse in a
+# day. The four chunks in the ossuary stay a one-off find.
+[rewards.drift_ore]
+currency = 0
+items = { iron_ore = 4 }
 per = "day"

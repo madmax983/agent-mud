@@ -1603,15 +1603,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_shipped_pack_loads_and_has_eleven_rooms() {
+    fn the_shipped_pack_loads_and_has_thirteen_rooms() {
         let pack = WorldPack::crypt_v01().unwrap();
-        assert_eq!(pack.rooms.len(), 11);
-        assert_eq!(pack.cast.len(), 8);
-        assert!(
-            pack.rooms[&RoomId::from("dark_alley")]
-                .locks
-                .contains_key(&Direction::D)
-        );
+        assert_eq!(pack.rooms.len(), 13);
+        assert_eq!(pack.cast.len(), 11);
+        for room in ["dark_alley", "ossuary_crypt"] {
+            assert!(
+                pack.rooms[&RoomId::from(room)]
+                    .locks
+                    .contains_key(&Direction::D),
+                "{room}"
+            );
+        }
     }
 
     #[test]

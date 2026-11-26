@@ -666,8 +666,8 @@ fn an_older_save_gives_the_existing_cast_its_new_starting_gear() {
     let rack = w.state.shop_fixtures[&ShopId::from("torin")];
     assert_eq!(
         w.state.items[&rack].contents.len(),
-        6,
-        "the rack keeps all six"
+        11,
+        "the rack keeps all eleven"
     );
     let kestrel = id("pc_kestrel");
     assert_eq!(

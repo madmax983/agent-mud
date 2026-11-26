@@ -1,4 +1,4 @@
-# crypt-v01: a small town over a flooded crypt. Eleven rooms.
+# crypt-v01: a small town over a flooded crypt. Thirteen rooms.
 [world]
 name = "crypt-v01"
 title = "The Crypt Under Harrow's Rest"
@@ -93,9 +93,18 @@ exits = { w = "dark_alley" }
 [[rooms]]
 id = "cellar_landing"
 title = "Cellar Landing"
-description = "Slick stone steps end at a landing. Passages run west, where it smells of old wine, and east, toward the sound of dripping water. The grate is overhead."
+description = "Slick stone steps end at a landing. Passages run west, where it smells of old wine, and east, toward the sound of dripping water. A low arch to the south breathes out the smell of rot and earth. The grate is overhead."
 dark = true
-exits = { u = "dark_alley", w = "wine_vault", e = "flooded_cistern" }
+exits = { u = "dark_alley", w = "wine_vault", e = "flooded_cistern", s = "root_cellar" }
+
+# The way in for a new delver: two rat pups a fresh player can beat alone
+# (cast.toml, balance_tests.rs).
+[[rooms]]
+id = "root_cellar"
+title = "Root Cellar"
+description = "Shelves of rotted turnips and sprouting potatoes sag along the walls. In the corner, a nest of chewed sacking stirs. The landing is back north."
+dark = true
+exits = { n = "cellar_landing" }
 
 [[rooms]]
 id = "wine_vault"
@@ -123,7 +132,21 @@ items = [{ proto = "rusted_lockbox", contents = ["silver_ring", "old_coin_pouch"
 [[rooms]]
 id = "ossuary_crypt"
 title = "Ossuary Crypt"
-description = "Skulls stacked to the vault of the ceiling. A cracked sarcophagus, and beside it a cache of dark ore under a rotted tarp. Passages lead northwest and northeast."
+description = "Skulls stacked to the vault of the ceiling. A cracked sarcophagus, and beside it a cache of dark ore under a rotted tarp. Behind the sarcophagus, a spill of rubble half-buries a dwarf-cut stair going down. Passages lead northwest and northeast."
 dark = true
-exits = { nw = "wine_vault", ne = "flooded_cistern" }
+exits = { nw = "wine_vault", ne = "flooded_cistern", d = "collapsed_drift" }
 items = ["iron_ore", "iron_ore", "iron_ore", "iron_ore", "bone_charm"]
+# The rubble is a lock with no key. `clear` (scripts/rooms/drift.rhai)
+# opens it with a strength roll while the warden is down, and it slides
+# back an hour later. From below, the way up is never blocked.
+locks = { d = { lock = "rubble", pick = -10, describe = "Fallen rubble chokes the old stair. Someone strong could clear it, with nothing standing over them.", relock_minutes = 60 } }
+
+# The old dwarf drift: a seam of iron ore that a miner with a pick can
+# work once a day (`mine`), four chunks a day in all (economy.toml
+# `drift_ore`). A cave crawler guards it.
+[[rooms]]
+id = "collapsed_drift"
+title = "Collapsed Drift"
+description = "A dwarf-cut tunnel, shored with black timbers, runs a few yards and ends in fallen stone. A seam of dark ore glints in the left wall. The stair climbs back up."
+dark = true
+exits = { u = "ossuary_crypt" }

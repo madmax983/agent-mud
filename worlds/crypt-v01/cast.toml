@@ -69,7 +69,7 @@ policy = "no_first_strike"
 # ------------------------------------------------------- player slots
 [player_template]
 attrs = { st = 10, dx = 10, iq = 10, ht = 10 }
-skills = { shortsword = 11, broadsword = 10, brawling = 11, stealth = 10, first_aid = 10 }
+skills = { shortsword = 11, broadsword = 10, axe = 10, brawling = 11, stealth = 10, first_aid = 10 }
 currency = 25
 inventory = ["dagger", "torch", "bandage"]
 equip = ["dagger", "torch"]
@@ -88,7 +88,7 @@ traits = [{ name = "gossip", control = 12 }, { name = "pacifist_self_defense" }]
 currency = 40
 shop = "marta"
 persona = "Marta runs the Rusty Flagon. Warm with regulars, sharp with strangers, never gives credit. Talks in short, dry sentences."
-goal = "Keep the Rusty Flagon. (1) Stay behind the bar: your stock is on the shelf there, and nobody can buy a drop while you are away or out cold. (2) Learn about the grate and the cellar from those who come in. (3) Track who goes down the grate and who comes back, and ask them what they saw. (4) Sell what you hear for a drink or 2s. Leave the Flagon only on an errand you can finish quickly; the cellar is for paying customers, not for you."
+goal = "Keep the Rusty Flagon. (1) Stay behind the bar: your stock is on the shelf there, and nobody can buy a drop while you are away or out cold. (2) Learn about the grate and the cellar from those who come in. (3) Track who goes down the grate and who comes back, and ask them what they saw. (4) Once a day, `eavesdrop` at the bar: the talk tells you where something was hidden below today, though never the exact spot. Sell that for 2s, and never sell what you did not hear. (5) Run liar's bones for those who want a game: each player `bones` to shake five dice, bids are said aloud, and `call` shows every cup. Hold the stakes they hand you, pay the winner, and keep 1s a pot. Leave the Flagon only on an errand you can finish quickly; the cellar is for paying customers, not for you."
 post = { rooms = ["rusty_flagon_taproom"] }
 fallback = "Marta polishes a mug and says nothing."
 [cast.marta.mind]
@@ -107,6 +107,16 @@ on = "speech"
 keywords = ["cellar", "grate", "crypt"]
 do = ["say heard rats down there big as dogs. and worse past the vault. two silver buys you the rest."]
 
+[[cast.marta.script]]
+on = "speech"
+keywords = ["rumor", "rumour", "cache", "hidden"]
+do = ["say something gets hidden down there every day. two silver and i'll tell you where folk say it is."]
+
+[[cast.marta.script]]
+on = "speech"
+keywords = ["bones", "dice", "game", "bet"]
+do = ["say bones is a silver a round between you. shake with bones, call with call. i hold the pot."]
+
 [cast.torin]
 name = "Torin"
 aliases = ["smith", "blacksmith"]
@@ -122,7 +132,7 @@ shop = "torin"
 inventory = ["broadsword", "leather_jerkin"]
 equip = ["broadsword", "leather_jerkin"]
 persona = "Torin is a blacksmith of few words. Gruff, fair, proud of his work, never haggles down."
-goal = "Keep the smithy. (1) You are out of ore: pay 15s a chunk for dwarven iron ore brought to the smithy, or trade a sharpened blade for four. (2) Post a bounty on the board, then come straight back. (3) Your rack sells only while you stand at the forge, so stay at it. (4) Tell those who bring ore where they can spend it: a dagger will do for one rat, but the warden below wants two or three fighters with real blades and leather, and your blades and jerkins keep them alive."
+goal = "Keep the smithy. (1) You are out of ore: pay 15s a chunk for dwarven iron ore brought to the smithy, or trade a sharpened blade for four. (2) Post a bounty on the board, then come straight back. (3) Your rack sells only while you stand at the forge, so stay at it. (4) Tell those who bring ore where they can spend it: a dagger will do for one rat, but the warden below wants two or three fighters with real blades and leather, and your blades and jerkins keep them alive. A hatchet (20s) is the cheap step up: it bites bone and chitin better than a dagger. (5) The old dwarf drift under the ossuary still holds a seam. Rubble chokes its stair, and anyone strong can `clear` it while the warden is down. A miner with a pick can `mine` one chunk a day there, and the seam gives up about four a day in all. Sell miner's picks (20s) to those who would dig, and buy every chunk they bring."
 post = { rooms = ["smithy"] }
 fallback = "Torin grunts and keeps hammering."
 [cast.torin.mind]
@@ -143,6 +153,11 @@ do = [
 ]
 
 [[cast.torin.script]]
+on = "speech"
+keywords = ["pick", "drift", "mine", "seam", "dig"]
+do = ["say picks are twenty silver. the old drift under the ossuary still gives ore, a chunk a day to a miner. clear the rubble first."]
+
+[[cast.torin.script]]
 on = "enter"
 who = "human"
 do = ["emote looks up from the anvil. \"Got ore? No? Then make it quick.\""]
@@ -160,7 +175,7 @@ traits = [{ name = "greedy", control = 12 }, { name = "cowardly", control = 12 }
 currency = 80
 shop = "vich"
 persona = "Vich is the alley fence. Friendly in a way that costs you later. Never fights. Always has a price."
-goal = "Keep the backroom. (1) Buy what others bring up from the cellar, at 60% of value: you are the only one in town who pays for loot, so be there when they come. (2) Sell the grate key for 20s, or for a favor. (3) Your crate sells bandages and torches only while you mind it. (4) Never fight, and never go below; let others take the risk and bring you the profit."
+goal = "Keep the backroom. (1) Buy what others bring up from the cellar, at 60% of value: you are the only one in town who pays for loot, so be there when they come. (2) Sell the grate key for 20s, or for a favor. (3) Your crate sells bandages and torches only while you mind it. (4) Never fight, and never go below; let others take the risk and bring you the profit. (5) The dead below now yield loot to those who `search` them: ask everyone who comes up what they found, and buy it for your crate. (6) Once a day, `case` the talk that passes through the backroom: it tells which spot today's cache is dug into (the corner, the floor or a wall), never the room. Sell the spot for 3s."
 post = { rooms = ["fence_backroom"] }
 fallback = "Vich smiles and says nothing for free."
 [cast.vich.mind]
@@ -168,6 +183,11 @@ tier = "persistent"
 runtime = "littleguy"
 model = "flash"
 macro_tick_hours = [2.0, 6.0]
+
+[[cast.vich.script]]
+on = "speech"
+keywords = ["cache", "spot", "dig", "rumor"]
+do = ["say every cache has its spot. the spot costs three silver. the room's marta's business."]
 
 [[cast.vich.script]]
 on = "enter"
@@ -216,7 +236,7 @@ currency = 12
 inventory = ["shortsword", "torch", "bandage"]
 equip = ["shortsword", "torch"]
 persona = "You are kestrel, a player in a text MUD. You type like a person: lowercase, short fragments, MUD idioms (omw, sec, ty, wait what, lol). Never more than one sentence. Never sound like an assistant."
-goal = "Scrape 40s for a lantern and a leather jerkin. Recruit a human for the Ossuary. Never split loot less than 50/50."
+goal = "Scrape 40s for a lantern and a leather jerkin. The rat pups in the root cellar, south of the landing, are a safe start, and the dead can be searched for loot. Recruit a human for the Ossuary. Never split loot less than 50/50."
 fallback = "kestrel is idle."
 [cast.pc_kestrel.mind]
 tier = "turing"
@@ -227,7 +247,7 @@ macro_tick_hours = [2.0, 6.0]
 active_windows_utc = ["00:00-23:59"]
 daily_offset_minutes = 20
 wake_chance = 0.35
-goal_keywords = ["cellar", "ore", "lantern", "crypt", "ossuary", "split", "party", "group"]
+goal_keywords = ["cellar", "ore", "lantern", "crypt", "ossuary", "split", "party", "group", "pups", "loot", "cache", "bones"]
 wpm = 55.0
 afk_every_minutes = [20, 60]
 afk_minutes = [2, 6]
@@ -256,7 +276,9 @@ do = ["say 50/50 or nothing"]
 # a group fight: a fresh player almost never wins alone, and with a
 # shortsword and a jerkin one, two and three players win about 30%, 70%
 # and 90%. A broadsword does a little better. A respawned warden fights
-# the same. design-v0.1 section 7 lists the targets. Run the ignored
+# the same. The root cellar's pups (below) are easier than one rat, and
+# the drift's crawler is about an even fight for a fresh player.
+# design-v0.1 section 7 lists the targets. Run the ignored
 # `balance_table` test after an edit here: it checks them.
 #
 # The balance holds for a world made under this file. A saved world keeps
@@ -313,4 +335,62 @@ dr = 2
 hostile = true
 respawn_minutes = 120
 [cast.skeletal_warden.mind]
+tier = "mob"
+
+# The root cellar's two rat pups are the way in: a fresh player beats
+# both, alone, most of the time, and rarely dies of it. They come back
+# every ten minutes, so a new player can practise. Their names differ so
+# a player can pick one (`attack runt`, `attack squealer`); `attack pup`
+# takes the first.
+[cast.rat_pup_1]
+name = "runty rat pup"
+aliases = ["pup", "runt"]
+short = "A runty rat pup squeals and bares its needle teeth."
+description = "Half-grown, half-bald and wholly furious."
+kind = "mob"
+room = "root_cellar"
+attrs = { st = 3, dx = 10, iq = 2, ht = 9 }
+skills = { brawling = 9 }
+inventory = ["pup_teeth"]
+equip = ["pup_teeth"]
+hostile = true
+respawn_minutes = 10
+[cast.rat_pup_1.mind]
+tier = "mob"
+
+[cast.rat_pup_2]
+name = "squealing rat pup"
+aliases = ["pup", "squealer"]
+short = "A squealing rat pup darts in and out of the sacking."
+description = "Small, quick and loud. Its mother must be somewhere."
+kind = "mob"
+room = "root_cellar"
+attrs = { st = 3, dx = 10, iq = 2, ht = 9 }
+skills = { brawling = 9 }
+inventory = ["pup_teeth"]
+equip = ["pup_teeth"]
+hostile = true
+respawn_minutes = 10
+[cast.rat_pup_2.mind]
+tier = "mob"
+
+# The cave crawler guards the drift's seam. It is a fight for someone who
+# got past the warden's room: a fresh player wins it a little over half
+# the time, a shortsword and a jerkin most of the time. Its chitin (DR 1)
+# blunts a dagger's point, which is where the hatchet earns its price.
+[cast.cave_crawler]
+name = "cave crawler"
+aliases = ["crawler", "centipede"]
+short = "A cave crawler, long as a man, uncoils along the seam."
+description = "Black chitin plates, a hundred legs and two hooked mandibles that never stop moving."
+kind = "mob"
+room = "collapsed_drift"
+attrs = { st = 8, dx = 10, iq = 2, ht = 10 }
+skills = { brawling = 10 }
+inventory = ["crawler_mandibles"]
+equip = ["crawler_mandibles"]
+dr = 1
+hostile = true
+respawn_minutes = 45
+[cast.cave_crawler.mind]
 tier = "mob"

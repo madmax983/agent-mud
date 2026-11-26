@@ -95,7 +95,8 @@ statements, `let` or `const` are refused, so constants go in `config`.
 `kind` is `player`, `npc` or `mob`: a human and an agent PC are both
 `player`, and nothing tells them apart. Views are read-only, and reading a
 key that does not exist faults (`no property "x"`), so a dry run catches
-typos. Test with `"key" in view`.
+typos. Test with `"key" in view`. `for x in view` walks a list's
+elements, or a map's keys (`for k in ctx.flags`); a view has no `keys()`.
 
 ## What a hook returns
 
@@ -310,25 +311,60 @@ running when you reset does not save its memory over the reset.
 
 ```sh
 cargo run -p mud-server --bin mud -- check worlds/crypt-v01
-# crypt-v01: 11 rooms, 23 items, 14 skills, 8 cast, 3 shops, 1 reward pool — ok
-# scripts rhai-… (7 files: 1 mind, 2 rooms, 2 items, 3 verbs) — ok
+# crypt-v01: 13 rooms, 27 items, 15 skills, 11 cast, 3 shops, 5 reward pools — ok
+# scripts rhai-… (11 files: 1 mind, 2 rooms, 2 items, 11 verbs) — ok
 ```
 
 It compiles, validates and dry-runs every hook once and every mind twice on
 probe inputs, and lists every problem. `mud serve` does the same and will
 not start on a problem.
 
+## Patterns
+
+These come from crypt-v01's scripts, and each one keeps a rule above.
+
+- **Once per kill.** A world flag holds the death a reward paid for
+  (`ctx.cast.<mob>.deaths`), and the reward checks it. A respawned mob
+  that dies again has a new count, so it pays again. `report` and
+  `search` do this.
+- **One try each.** A mark on the player holds the death, the day or
+  the count it already used. `search` marks the body a player searched,
+  so a failed roll is not tried again, and the next player can try.
+- **A count a day.** A mark that holds `day * 100 + n` counts up to `n`
+  today and starts at 0 the next day, in one mark (`count_today` and
+  `count_mark` in crypt-v01's `lib.rhai`).
+- **State that others read.** A hook writes marks on its actor only, and
+  `ctx.room.present` shows no marks. So state that a later hook reads for
+  someone else goes in a world flag named for that player, such as
+  `bones.<id>`. Ids are lowercase words, so the name is valid. Give such a
+  flag a day in its value, and sweep stale ones as you go, so the 256
+  flags last.
+- **Content of the day.** `day_utc(ctx.now_ms)` through a small hash picks
+  the day's room and spot. Every player and every mind sees the same pick
+  all day, it changes at midnight of the game clock, and no wall clock
+  or new dice are used.
+- **Tables in config.** A loot table is data: nested tables under
+  `[verbs.config]` in `scripts.toml`. When several bindings share one
+  table, it is a function in one file instead, because each binding has
+  its own config.
+- **Pay what the pool can.** Read `ctx.pools.<pool>` before you ask, and
+  say so in a `msg` when the day's budget is spent, as `search`, `dig` and
+  `mine` do. The guard flags and marks go in the same list as the reward.
+
 ## crypt-v01, walked through
 
-- `lib.rhai`: `warden_here(ctx)`, `done_today(marks, key, now_ms)` and
-  `carries(actor, proto)`.
+- `lib.rhai`: `warden_here(ctx)`, `done_today(marks, key, now_ms)`,
+  `carries(actor, proto)`, `hostile_here(ctx)` (a mob that can fight is
+  here), `dark_mod(ctx, dark)` (the darkness modifier of a roll) and the
+  counting marks `count_today` and `count_mark`.
 - `rooms/ossuary.rhai`: the first visitor is remembered in a flag and the
   room narrates dust falling; the warden turns its head (or scrapes in the
   dark). `pray` heals once a day (a mark holds the day), never while the
   warden stands (`refuse`), and a critical failure hurts.
 - `rooms/alley.rhai`: saying "vich" or "fence" in the Dark Alley twitches
   the fence's curtain, without repeating a word; `listen` on the alley or
-  the cellar stair hears the rats and the warden until they die.
+  the cellar stair hears the rats, the pups, the warden and the crawler
+  until they die.
 - `rooms/square.rhai`: the watch's bounty. Put the skeletal warden down,
   bring its notched grave-blade to Hale in the square, and `report`: while
   the ossuary is quiet he pays 20s and a healing draught from the
@@ -337,6 +373,27 @@ not start on a problem.
 - `items/iron_ore.rhai`: taking ore under the warden's eye can cost blood.
 - `items/bone_charm.rhai`: the charm, loot with no use until now, hums near
   the warden and answers `use charm on warden`.
+- `rooms/loot.rhai`: `search` in the vault, the warren, the root cellar,
+  the ossuary and the drift. The first good searcher of each death (an
+  IQ roll, -3 in the dark) rolls once on the mob's loot table and is paid
+  from a per-day pool: `vermin_loot` for the rats, the pups and the
+  crawler, `warden_hoard` for the warden. A failed roll leaves the body
+  for the next player. When the pool is spent, the body yields nothing.
+- `rooms/flagon.rhai`: liar's bones in the taproom. `bones` shakes five
+  dice that only the shaker sees, eight rounds a day; `call` shows every
+  cup at the table, with a tally of each face, and clears them. Bids are
+  `say` and stakes are `give`.
+- `rooms/rumor.rhai`: the rumor of the day. The day picks one of five
+  rooms and one of three spots. `eavesdrop` in the taproom (IQ, once a
+  day) hints at the room, and a critical failure hints at a wrong one.
+  `case` in the backroom (Streetwise, or IQ-1; once a day, with Vich
+  there) names the spot. `dig <corner|floor|wall>`, two tries a day, pays
+  the first finder 15s and a draught from `rumor_cache`.
+- `rooms/drift.rhai`: the old dwarf drift. `clear` in the ossuary (ST,
+  with nothing standing there) unlocks the rubble on the stair, which
+  locks itself again an hour later. `mine` in the drift needs a miner's
+  pick and the crawler down: one HT roll a day per player, and a success
+  mints one chunk of ore from `drift_ore`, four a day in all.
 - `minds/hale.rhai`: Hale (on Rhai through `runtime = "rhai"`) warns
   players off the alley, by night by name, remembers who he warned today,
   and answers talk of the grate. He says it is locked only when he stands

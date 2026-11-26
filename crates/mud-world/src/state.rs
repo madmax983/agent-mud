@@ -1145,7 +1145,7 @@ mod tests {
                 room: RoomId::from("smithy")
             })
         );
-        assert_eq!(s.items[&rack].contents.len(), 6);
+        assert_eq!(s.items[&rack].contents.len(), 11);
         assert!(s.items[&rack].contents.iter().all(|i| s.items[i].stock));
         let kestrel = &s.entities[&EntityId::from("pc_kestrel")];
         assert!(!kestrel.online, "a turing PC starts logged out");

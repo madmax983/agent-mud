@@ -8,7 +8,8 @@
 //! It also checks that each heal in a run works, and the orderings with a
 //! margin each (a heal between the rats helps, a bigger party wins more,
 //! a broadsword beats a shortsword over the party sizes summed, the
-//! dagger beats the grave-blade).
+//! dagger beats the grave-blade, the pups are easier than a rat, and the
+//! hatchet beats the dagger against the crawler).
 //! The ignored test plays more seeds, prints the table, and checks the
 //! targets themselves (the win rate, and for one rat the share of wins
 //! that end wounded) and the orderings with the margins the targets ask
@@ -38,6 +39,12 @@
 //!   once per round and takes its own strike on entering.
 //! - A "respawned" warden row first kills the warden and ticks the world
 //!   past its respawn, so the party meets the warden that comes back.
+//! - The pups row walks one player from the landing into the root cellar,
+//!   where both pups strike on entering. It fights the runt, then the
+//!   squealer, and each pup still standing strikes after every action.
+//! - A crawler row walks down the dwarf stair from the ossuary, with the
+//!   stair open and the warden out of the way, so it measures the
+//!   crawler alone. "hatchet" swaps the dagger for a hatchet, no armor.
 //! - A "saved" row makes its world, and logs the party in, under the pack
 //!   as it stood before the balance step. It then loads that state under
 //!   the pack as it is now, as a server that restarts on an edited pack
@@ -82,6 +89,13 @@ enum Scenario {
         respawned: bool,
     },
     RatRun(Heal),
+    /// One player walks into a room of several mobs and fights them in
+    /// turn, each by its own word, while every one still standing strikes.
+    Den {
+        mobs: &'static [(&'static str, &'static str)],
+        from: &'static str,
+        dir: &'static str,
+    },
 }
 
 impl Scenario {
@@ -89,13 +103,16 @@ impl Scenario {
     const fn party(self) -> usize {
         match self {
             Self::Duel { party, .. } => party,
-            Self::RatRun(_) => 1,
+            Self::RatRun(_) | Self::Den { .. } => 1,
         }
     }
 
     /// Whether the scenario heals between the rats.
     const fn heals(self) -> bool {
-        !matches!(self, Self::RatRun(Heal::None) | Self::Duel { .. })
+        !matches!(
+            self,
+            Self::RatRun(Heal::None) | Self::Duel { .. } | Self::Den { .. }
+        )
     }
 }
 
@@ -267,6 +284,38 @@ fn saved_world(old: &Arc<WorldPack>, pack: &Arc<WorldPack>, sc: Scenario, seed: 
     World::from_state(Arc::clone(pack), o.snapshot(), Vec::new())
 }
 
+/// One player walks from `from` through `dir` into a room of `mobs` and
+/// fights them in turn, each by its word, until one fight is lost.
+fn den(
+    w: &mut World,
+    mobs: &[(&str, &str)],
+    from: &str,
+    dir: &str,
+    now: &mut u64,
+) -> (Vec<EntityId>, EntityId, Outcome) {
+    let ada = w.login("ada", *now).unwrap();
+    w.state.entities.get_mut(&ada).unwrap().room = RoomId::from(from);
+    let party = vec![ada.clone()];
+    *now += STEP_MS;
+    let r = w.execute(&ada, dir, *now);
+    assert!(r.ok, "{dir:?} failed: {r:?}");
+    let mut rounds = 0;
+    let mut last = None;
+    for (mob, word) in mobs {
+        let mob = eid(mob);
+        let mut o = fight(w, &party, &mob, word, None, now);
+        rounds += o.rounds;
+        o.rounds = rounds;
+        let won = o.won;
+        last = Some((mob, o));
+        if !won {
+            break;
+        }
+    }
+    let (mob, outcome) = last.unwrap();
+    (party, mob, outcome)
+}
+
 fn trial(pack: &Arc<WorldPack>, saved: Option<&Arc<WorldPack>>, sc: Scenario, seed: u64) -> Stats {
     let mut w = saved.map_or_else(
         || World::new(Arc::clone(pack), seed),
@@ -306,6 +355,7 @@ fn trial(pack: &Arc<WorldPack>, saved: Option<&Arc<WorldPack>>, sc: Scenario, se
             let outcome = fight(&mut w, &party, &mob, word, retreat_at, &mut now);
             (party, mob, outcome)
         }
+        Scenario::Den { mobs, from, dir } => den(&mut w, mobs, from, dir, &mut now),
         Scenario::RatRun(heal) => {
             let ada = w.login("ada", now).unwrap();
             w.state.entities.get_mut(&ada).unwrap().room = RoomId::from("cellar_landing");
@@ -492,6 +542,36 @@ fn kestrel_jerkin(p: &mut WorldPack) {
     sword(p);
 }
 
+/// The template wields a hatchet, with no armor.
+fn hatchet(p: &mut WorldPack) {
+    armed(p, "hatchet", None);
+}
+
+/// The dwarf stair stands open and the warden waits in the smithy, so a
+/// row can walk from the ossuary straight down to the crawler.
+fn drift_open(p: &mut WorldPack) {
+    p.rooms
+        .get_mut(&RoomId::from("ossuary_crypt"))
+        .unwrap()
+        .locks
+        .clear();
+    p.cast.get_mut(&eid("skeletal_warden")).unwrap().room = RoomId::from("smithy");
+}
+
+fn fresh_drift(p: &mut WorldPack) {
+    drift_open(p);
+}
+
+fn sword_drift(p: &mut WorldPack) {
+    sword(p);
+    drift_open(p);
+}
+
+fn hatchet_drift(p: &mut WorldPack) {
+    hatchet(p);
+    drift_open(p);
+}
+
 /// The first rat waits in the smithy, out of the second rat's fight.
 fn no_rat1(p: &mut WorldPack) {
     p.cast.get_mut(&eid("giant_rat_1")).unwrap().room = RoomId::from("smithy");
@@ -537,6 +617,27 @@ const fn warden(party: usize, respawned: bool) -> Scenario {
         party,
         retreat_at: None,
         respawned,
+    }
+}
+
+/// Both rat pups of the root cellar, the runt first.
+const fn pups() -> Scenario {
+    Scenario::Den {
+        mobs: &[("rat_pup_1", "runt"), ("rat_pup_2", "squealer")],
+        from: "cellar_landing",
+        dir: "s",
+    }
+}
+
+const fn crawler(party: usize) -> Scenario {
+    Scenario::Duel {
+        mob: "cave_crawler",
+        word: "crawler",
+        from: "ossuary_crypt",
+        dir: "d",
+        party,
+        retreat_at: None,
+        respawned: false,
     }
 }
 
@@ -627,6 +728,10 @@ fn targets() -> Vec<Row> {
             (35, 68),
         ),
         row("grave-blade vs rat1", grave_blade, rat1(), (0, 80)),
+        row("fresh vs the pups", fresh, pups(), (80, 97)).target(85, 95),
+        row("fresh vs crawler", fresh_drift, crawler(1), (40, 66)).target(45, 60),
+        row("hatchet vs crawler", hatchet_drift, crawler(1), (50, 78)),
+        row("sword vs crawler", sword_drift, crawler(1), (82, 100)).target(85, 100),
     ];
     for respawned in [false, true] {
         let w = if respawned {
@@ -680,6 +785,7 @@ fn reference() -> Vec<Row> {
     vec![
         info("fresh vs rat1, retreat at HP<=3", fresh, retreat),
         info("sword vs rat1", sword, rat1()),
+        info("hatchet vs rat1", hatchet, rat1()),
         info("sword vs rat2", sword_no_rat1, rat2()),
         info("sword run, no heal", sword, Scenario::RatRun(Heal::None)),
         info("kestrel vs rat1", kestrel, rat1()),
@@ -802,6 +908,11 @@ fn order(better: &str, worse: &str, fast: u64, long: u64) -> Order {
 /// - A broadsword beats a shortsword by a point or more at each size.
 /// - The starting dagger beats the grave-blade by 10 points or more. The
 ///   blade is worth nothing (items.toml), and this keeps its price true.
+/// - The root cellar is the way in: a fresh player beats both pups 10
+///   points more often than one giant rat.
+/// - Against the crawler's chitin, the hatchet beats the dagger by 8
+///   points or more, and a shortsword with a jerkin beats the hatchet by
+///   20 or more. So the hatchet earns its price, and a sword still pays.
 fn orders() -> Vec<Order> {
     let (bandage, draught, none) = (
         "fresh run, bandage between",
@@ -813,6 +924,9 @@ fn orders() -> Vec<Order> {
         order(draught, none, 60, 100),
         order(draught, bandage, 10, 20),
         order("fresh vs rat1", "grave-blade vs rat1", 100, 100),
+        order("fresh vs the pups", "fresh vs rat1", 50, 100),
+        order("hatchet vs crawler", "fresh vs crawler", 40, 80),
+        order("sword vs crawler", "hatchet vs crawler", 150, 200),
     ];
     for foe in ["warden", "respawned warden"] {
         for arm in ["sword", "broad"] {

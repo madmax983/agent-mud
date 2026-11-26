@@ -217,7 +217,10 @@ does not come back. It does not pick up new attrs or skills: a cast
 entity keeps the ones it was saved with, and a player keeps the skills
 the template gave at creation. So crypt-v01's fight balance (design-v0.1
 section 7) holds for a fresh world; a world saved before it keeps the
-harder fights until you start a new database.
+harder fights until you start a new database. A saved world also gets new
+rooms, mobs and verbs, but no new stock in a shop it already has: a world
+saved before the dwarf drift has no miner's pick on Torin's rack, and
+finds one only as rare loot on the drift's crawler.
 
 What changes with every event is not stored; the boot derives it from the
 reloaded event log. A tell, an attack or a mention by name that no
@@ -356,7 +359,7 @@ flowchart LR
 | `mud-script` | Sandboxed Rhai world scripts ([docs/scripting.md](docs/scripting.md), ADR 0010): room, item and verb hooks that return effects the engine admits and applies, and mind scripts that return command lines. The only crate with rhai. |
 | `mud-supervisor` | The attention router, anti-chatter, budgets, Turing friction, the typing gate, and the minds: scripted (TOML rules and Rhai mind scripts), fallback, littleguy, harvest, plugin-agent. |
 | `mud-server` | The `mud` binary: autumn-web terminal and observer, telnet, `/mcp`, config, smoke. |
-| `worlds/crypt-v01` | The starter pack: 11 rooms, 8 cast, 3 shops with their stock in shop fixtures (ADR 0013), a reward pool, the trait library, and its scripts (`pray`, `listen`, `report` for Hale's ledgered bounty, the ossuary, the charm, Hale's mind). |
+| `worlds/crypt-v01` | The starter pack: 13 rooms, 11 cast, 3 shops with their stock in shop fixtures (ADR 0013), 5 reward pools, the trait library, and its scripts (`pray`, `listen`, `report` for Hale's ledgered bounty, `search` the fallen, liar's `bones` and `call`, the rumor of the day's `eavesdrop`, `case` and `dig`, the dwarf drift's `clear` and `mine`, the ossuary, the charm, Hale's mind). |
 | `formal/verus` | Verus proofs of the kernels. |
 
 ## The invariants, and where they hold

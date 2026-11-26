@@ -63,3 +63,137 @@ rooms = ["town_square"]
 file = "rooms/square.rhai"
 fn = "on_report"
 config = { silver = 20 }
+
+# `search` the fallen (scripts/rooms/loot.rhai). Each death of a mob pays
+# its first good searcher once: an IQ roll, then one roll of 0-99 on the
+# mob's table, paid from the table's per-day pool in economy.toml. An
+# entry with no coin and no item finds nothing.
+[[verbs]]
+name = "search"
+usage = "search"
+rooms = ["wine_vault", "rat_warren", "root_cellar", "ossuary_crypt", "collapsed_drift"]
+file = "rooms/loot.rhai"
+fn = "on_search"
+
+[verbs.config]
+modifier = 0
+# The roll in a dark room with no light: [world] darkness_penalty.
+dark = -3
+
+# The mobs whose bodies each room holds.
+[verbs.config.rooms]
+wine_vault = ["giant_rat_1"]
+rat_warren = ["giant_rat_2"]
+root_cellar = ["rat_pup_1", "rat_pup_2"]
+ossuary_crypt = ["skeletal_warden"]
+collapsed_drift = ["cave_crawler"]
+
+# The loot table of each mob.
+[verbs.config.mobs]
+giant_rat_1 = "rat"
+giant_rat_2 = "rat"
+rat_pup_1 = "pup"
+rat_pup_2 = "pup"
+cave_crawler = "crawler"
+skeletal_warden = "warden"
+
+[verbs.config.tables.pup]
+pool = "vermin_loot"
+rolls = [{ weight = 55 }, { weight = 30, coin = 1 }, { weight = 15, item = "rat_tail" }]
+
+[verbs.config.tables.rat]
+pool = "vermin_loot"
+rolls = [
+  { weight = 30 },
+  { weight = 25, coin = 2 },
+  { weight = 15, coin = 4 },
+  { weight = 15, item = "rat_tail" },
+  { weight = 10, item = "bandage" },
+  { weight = 5, coin = 6 },
+]
+
+[verbs.config.tables.crawler]
+pool = "vermin_loot"
+rolls = [
+  { weight = 25 },
+  { weight = 25, coin = 3 },
+  { weight = 20, coin = 5 },
+  { weight = 15, item = "bandage" },
+  { weight = 10, item = "torch" },
+  { weight = 5, item = "miners_pick" },
+]
+
+[verbs.config.tables.warden]
+pool = "warden_hoard"
+rolls = [
+  { weight = 30, coin = 4 },
+  { weight = 25, coin = 8 },
+  { weight = 25, item = "healing_draught" },
+  { weight = 12, item = "silver_ring" },
+  { weight = 8, item = "bone_charm" },
+]
+
+# Liar's bones at the Flagon (scripts/rooms/flagon.rhai). A cup is a world
+# flag, bones.<id>; `call` lifts every cup at the table.
+[[verbs]]
+name = "bones"
+usage = "bones"
+rooms = ["rusty_flagon_taproom"]
+file = "rooms/flagon.rhai"
+fn = "on_bones"
+# max_effects is [limits] max_effects: a shake sweeps stale cups up to it.
+config = { rounds_per_day = 8, max_effects = 8 }
+
+[[verbs]]
+name = "call"
+usage = "call"
+rooms = ["rusty_flagon_taproom"]
+file = "rooms/flagon.rhai"
+fn = "on_call"
+config = { max_effects = 8 }
+
+# The rumor of the day (scripts/rooms/rumor.rhai): `eavesdrop` hints at
+# the room, `case` at the spot, and `dig <spot>` in the right room pays
+# from the `rumor_cache` pool.
+[[verbs]]
+name = "eavesdrop"
+usage = "eavesdrop"
+rooms = ["rusty_flagon_taproom"]
+file = "rooms/rumor.rhai"
+fn = "on_eavesdrop"
+config = { modifier = 0 }
+
+[[verbs]]
+name = "case"
+usage = "case"
+rooms = ["fence_backroom"]
+file = "rooms/rumor.rhai"
+fn = "on_case"
+# A player without Streetwise rolls IQ with this modifier.
+config = { modifier = -1 }
+
+[[verbs]]
+name = "dig"
+usage = "dig <corner|floor|wall>"
+rooms = ["flooded_cistern", "wine_vault", "ossuary_crypt", "root_cellar", "collapsed_drift"]
+file = "rooms/rumor.rhai"
+fn = "on_dig"
+config = { tries = 2, silver = 15 }
+
+# The old dwarf drift (scripts/rooms/drift.rhai): `clear` the rubble on
+# the ossuary's stair, then `mine` the seam with a miner's pick.
+[[verbs]]
+name = "clear"
+usage = "clear"
+rooms = ["ossuary_crypt"]
+file = "rooms/drift.rhai"
+fn = "on_clear"
+config = { dir = "d", modifier = 0 }
+
+[[verbs]]
+name = "mine"
+usage = "mine"
+rooms = ["collapsed_drift"]
+file = "rooms/drift.rhai"
+fn = "on_mine"
+config = { modifier = 0, dark = -3 }
