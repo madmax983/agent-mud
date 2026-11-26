@@ -35,6 +35,9 @@ pub enum StoreError {
     /// A row did not decode.
     #[error("decoding a stored row: {0}")]
     Decode(#[from] serde_json::Error),
+    /// The store was closed ([`Store::close`]): the server is stopping.
+    #[error("the world store is closed")]
+    Closed,
     /// The file was written by a newer server.
     #[error(
         "the world database has schema version {found}; this server knows versions up to {SCHEMA_VERSION}: run a newer server, or restore a backup"
@@ -105,7 +108,8 @@ pub struct Trimmed {
 /// The world database.
 #[derive(Debug)]
 pub struct Store {
-    conn: Connection,
+    /// The connection; `None` once [`Store::close`] ran.
+    conn: Option<Connection>,
     epoch: u64,
     boot: u64,
 }
@@ -284,10 +288,49 @@ impl Store {
         tx.commit()?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self {
-            conn,
+            conn: Some(conn),
             epoch: unbits(epoch),
             boot: uint(boot),
         })
+    }
+
+    fn conn(&self) -> Result<&Connection, StoreError> {
+        self.conn.as_ref().ok_or(StoreError::Closed)
+    }
+
+    fn conn_mut(&mut self) -> Result<&mut Connection, StoreError> {
+        self.conn.as_mut().ok_or(StoreError::Closed)
+    }
+
+    /// Closes the file: moves every page of the write-ahead log into the
+    /// main file (`PRAGMA wal_checkpoint(TRUNCATE)`), then closes the
+    /// connection, which removes the log. After it every call fails with
+    /// [`StoreError::Closed`]; a second close does nothing.
+    ///
+    /// A server that stops without it leaves the main file as old as the
+    /// last automatic checkpoint, and the newest state only in
+    /// `world.db-wal` (the owner's run of 2026-11-26).
+    ///
+    /// # Errors
+    /// The checkpoint or the close failed. The connection is dropped all
+    /// the same: SQLite finishes the log at the next open.
+    pub fn close(&mut self) -> Result<(), StoreError> {
+        let Some(conn) = self.conn.take() else {
+            return Ok(());
+        };
+        let checkpoint = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(StoreError::from);
+        let closed = conn.close().map_err(|(_, e)| StoreError::from(e));
+        checkpoint.and(closed).map(drop)
+    }
+
+    /// Whether [`Store::close`] ran.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.conn.is_none()
     }
 
     /// This file's epoch: minted once, when the file was made.
@@ -307,7 +350,7 @@ impl Store {
     /// # Errors
     /// SQLite fails.
     pub fn user_version(&self) -> Result<u32, StoreError> {
-        Self::version(&self.conn)
+        Self::version(self.conn()?)
     }
 
     /// Makes every later write fail, as a full or broken disk would
@@ -317,7 +360,7 @@ impl Store {
     /// # Errors
     /// SQLite fails.
     pub fn refuse_writes(&self, on: bool) -> Result<(), StoreError> {
-        self.conn.pragma_update(None, "query_only", on)?;
+        self.conn()?.pragma_update(None, "query_only", on)?;
         Ok(())
     }
 
@@ -328,10 +371,10 @@ impl Store {
     pub fn commit(&mut self, c: &Commit<'_>) -> Result<(), StoreError> {
         let full = c.fsync == Fsync::Full;
         if full {
-            self.conn.pragma_update(None, "synchronous", "FULL")?;
+            self.conn()?.pragma_update(None, "synchronous", "FULL")?;
         }
         let out = self.commit_inner(c);
-        if full && let Err(e) = self.conn.pragma_update(None, "synchronous", "NORMAL") {
+        if full && let Err(e) = self.conn()?.pragma_update(None, "synchronous", "NORMAL") {
             // The commit's own result stands: it is on the disk, or not.
             tracing::warn!(error = %e, "restoring synchronous = NORMAL failed");
         }
@@ -343,7 +386,7 @@ impl Store {
             .snapshot
             .map(|(_, s)| serde_json::to_string(s))
             .transpose()?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn_mut()?.transaction()?;
         if let (Some((pack, _)), Some(state)) = (c.snapshot, &state_json) {
             tx.execute(
                 "INSERT INTO snapshot (id, pack, state, saved_ms) VALUES (1, ?1, ?2, ?3)
@@ -430,7 +473,7 @@ impl Store {
     /// SQLite fails or a row does not decode.
     pub fn load(&self, recent: usize) -> Result<Option<Loaded>, StoreError> {
         let row: Option<(String, String)> = self
-            .conn
+            .conn()?
             .query_row("SELECT pack, state FROM snapshot WHERE id = 1", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
@@ -454,7 +497,7 @@ impl Store {
     /// # Errors
     /// SQLite fails or a row does not decode.
     pub fn load_side(&self) -> Result<SideState, StoreError> {
-        side::load_sql(&self.conn)
+        side::load_sql(self.conn()?)
     }
 
     /// The stored plan of `entity`, if any.
@@ -462,12 +505,12 @@ impl Store {
     /// # Errors
     /// SQLite fails or the plan does not decode.
     pub fn plan(&self, entity: &EntityId) -> Result<Option<side::PlanRow>, StoreError> {
-        side::load_plan(&self.conn, entity)
+        side::load_plan(self.conn()?, entity)
     }
 
     fn tail(&self, n: usize) -> Result<Vec<Event>, StoreError> {
         let mut q = self
-            .conn
+            .conn()?
             .prepare("SELECT body FROM events ORDER BY seq DESC LIMIT ?1")?;
         let rows = q.query_map([i64::try_from(n).unwrap_or(i64::MAX)], |r| {
             r.get::<_, String>(0)
@@ -485,7 +528,7 @@ impl Store {
     /// SQLite fails or a row does not decode.
     pub fn events_after(&self, seq: u64, limit: usize) -> Result<Vec<Event>, StoreError> {
         let mut q = self
-            .conn
+            .conn()?
             .prepare("SELECT body FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
         let rows = q.query_map(
             params![int(seq), i64::try_from(limit).unwrap_or(i64::MAX)],
@@ -522,8 +565,9 @@ impl Store {
         if cutoff == 0 || batch == 0 {
             return Ok(Trimmed::default());
         }
+        let epoch = self.epoch;
         let tx = self
-            .conn
+            .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // The newest row that may go: below the newest `keep_min` rows.
         let bound: Option<i64> = tx
@@ -555,7 +599,7 @@ impl Store {
         let Some(last) = rows.last().map(|r| r.seq) else {
             return Ok(Trimmed::default());
         };
-        let archived = archive::append(archive_dir, self.epoch, &rows)?;
+        let archived = archive::append(archive_dir, epoch, &rows)?;
         // Exactly the rows selected: every row up to `last`, all archived.
         tx.execute("DELETE FROM events WHERE seq <= ?1", params![int(last)])?;
         tx.commit()?;
@@ -571,7 +615,9 @@ impl Store {
     /// # Errors
     /// SQLite fails or a row does not decode.
     pub fn mints(&self) -> Result<Vec<MintRecord>, StoreError> {
-        let mut q = self.conn.prepare("SELECT body FROM mints ORDER BY seq")?;
+        let mut q = self
+            .conn()?
+            .prepare("SELECT body FROM mints ORDER BY seq")?;
         let rows = q.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -586,7 +632,7 @@ impl Store {
     /// SQLite fails or a row does not decode.
     pub fn load_script_memory(&self) -> Result<ScriptMemory, StoreError> {
         let mut q = self
-            .conn
+            .conn()?
             .prepare("SELECT entity, schema, body FROM script_memory ORDER BY entity")?;
         let rows = q.query_map([], |r| {
             Ok((
@@ -620,7 +666,7 @@ impl Store {
         body: &serde_json::Value,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn()?.execute(
             "INSERT INTO script_memory (entity, schema, body, saved_ms) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (entity) DO UPDATE SET schema = ?2, body = ?3, saved_ms = ?4",
             params![
@@ -638,7 +684,7 @@ impl Store {
     /// # Errors
     /// SQLite fails.
     pub fn clear_script_memory(&mut self, entity: &EntityId) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.conn()?.execute(
             "DELETE FROM script_memory WHERE entity = ?1",
             params![entity.as_str()],
         )?;
@@ -651,7 +697,7 @@ impl Store {
     /// SQLite fails.
     pub fn event_count(&self) -> Result<u64, StoreError> {
         let n: i64 = self
-            .conn
+            .conn()?
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
         Ok(uint(n))
     }
@@ -662,7 +708,7 @@ impl Store {
     /// SQLite fails.
     pub fn event_range(&self) -> Result<Option<(u64, u64)>, StoreError> {
         let r: (Option<i64>, Option<i64>) =
-            self.conn
+            self.conn()?
                 .query_row("SELECT min(seq), max(seq) FROM events", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;

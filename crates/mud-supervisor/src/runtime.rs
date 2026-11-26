@@ -49,12 +49,13 @@ use crate::admit::wake_expired;
 use crate::budget::{Budget, BudgetLevel, DAY_MS, SpendSource};
 use crate::gate::Gate;
 use crate::held::{assert_none_held, lock};
-use crate::mind::{Mind, MindReply, MudTools, Usage, UsageSink, WakeContext};
+use crate::mind::{Mind, MindError, MindReply, MudTools, Usage, UsageSink, WakeContext};
 use crate::persist::{DaySpend, macro_open, plan_resume, restore_macro, wake_id_key};
 use crate::replay::replay_floor;
 use crate::router::{EntityRuntime, Priority, Resume, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::{FallbackMind, PlanMind};
 use crate::steward::{AutonomyView, GoalLine, StewardEvent, StewardNote};
+use crate::ticks::{TICK_RETRY_FIRST_MS, tick_retry_ms};
 use crate::turing::{Afk, in_session, mix, pick};
 use crate::wakes::WakeBook;
 
@@ -284,6 +285,10 @@ struct EntityState {
     /// boot delivers it, under its number, without queuing another.
     owed_at_boot: bool,
     next_macro_ms: u64,
+    /// The delay of the last retry of a lost macro tick, while its wakes
+    /// keep failing before they reach the mind ([`tick_retry_ms`]); 0
+    /// once a wake reaches it.
+    tick_retry_ms: u64,
     /// The replay floor at boot ([`replay_floor`]), then the last event
     /// seq a wake of this process carried.
     seen_seq: u64,
@@ -1063,7 +1068,9 @@ impl Supervisor {
             let (lo_ms, hi_ms) = (self.hours_ms(lo), self.hours_ms(hi));
             let wait = match note {
                 RouteNote::Queued { .. } => pick(h, lo_ms, hi_ms),
-                // A human was there: try again in a few minutes.
+                // A player acted there just now: try again in a few
+                // minutes. A wake that loses the tick comes back sooner
+                // (`after_tick`).
                 RouteNote::Dropped { .. } => pick(h, 120_000, 600_000),
             };
             let next_ms = now.saturating_add(wait.max(1));
@@ -1404,6 +1411,11 @@ impl Supervisor {
         // failure, littleguy's `no_answer` or a timeout is not one, unless
         // the op answered once read late (checked when it settles).
         let answered = matches!(&res, Some(Ok(r)) if !r.unanswered);
+        // Whether the wake never reached the mind: it was unavailable (lg
+        // did not start, or exited), or it failed before any spend. A
+        // timeout is not: the mind was running.
+        let unavailable = matches!(&res, Some(Err(MindError::Unavailable(_))));
+        let failed = matches!(&res, Some(Err(_)));
         let (ok, reply) = match res {
             Some(Ok(r)) => (true, r),
             Some(Err(e)) => (
@@ -1431,6 +1443,7 @@ impl Supervisor {
         // The reply's spend, plus what the mind could not put in a reply: a
         // failed wake, or one dropped by the timeout above.
         let usage = reply.usage.plus(self.usage.take(&wake.entity));
+        let lost = unavailable || (failed && usage.is_zero());
         let source = self.source(&wake.entity);
         let budget = {
             let mut st = lock(&self.state);
@@ -1452,6 +1465,59 @@ impl Supervisor {
         mind.settled(&wake.entity).await;
         let late = self.usage.take_answered_late(&wake.entity);
         self.close_wake(&wake.entity, &turn, answered || late);
+        let carried = wake.macro_tick && wake.resume.is_none();
+        self.after_tick(&wake.entity, carried, lost, self.game.now_ms());
+    }
+
+    /// After a wake ends: a macro tick it carried but lost (the wake never
+    /// reached the mind) comes again soon, and each loss in a row waits
+    /// twice as long, up to the entity's shortest normal interval
+    /// ([`tick_retry_ms`]). A wake that reached the mind ends the run of
+    /// losses; the schedule it fired under stays.
+    ///
+    /// Regression (the owner's run of 2026-11-26): kestrel's one tick
+    /// fired at boot while lg was too old to start, and the next came 2 to
+    /// 6 hours later.
+    fn after_tick(&self, entity: &EntityId, carried: bool, lost: bool, now: u64) {
+        if !lost {
+            if let Some(s) = lock(&self.state).get_mut(entity) {
+                s.tick_retry_ms = 0;
+            }
+            return;
+        }
+        if !carried {
+            return;
+        }
+        let [lo, _] = self
+            .game
+            .read(|w| {
+                w.pack()
+                    .cast
+                    .get(entity)
+                    .and_then(|c| c.mind.macro_tick_hours)
+            })
+            .unwrap_or([2.0, 6.0]);
+        let cap = self.hours_ms(lo).max(1);
+        let h = mix(
+            self.cfg.seed,
+            &[
+                entity.as_str().as_bytes(),
+                &now.to_le_bytes(),
+                b"macro-retry",
+            ],
+        );
+        let mut st = lock(&self.state);
+        let Some(s) = st.get_mut(entity) else { return };
+        let delay = tick_retry_ms(s.tick_retry_ms, TICK_RETRY_FIRST_MS, cap);
+        s.tick_retry_ms = delay;
+        let wait = pick(h, delay - delay / 4, delay).max(1);
+        s.next_macro_ms = s.next_macro_ms.min(now.saturating_add(wait));
+        let next_ms = s.next_macro_ms;
+        drop(st);
+        self.game.persist(vec![SideOp::MacroSchedule {
+            entity: entity.clone(),
+            next_ms,
+        }]);
     }
 
     /// Closes a wake whose mind has really finished ([`Mind::settled`]):
@@ -1549,6 +1615,23 @@ impl Supervisor {
                 out = &mut fut => return Some(out),
                 () = tokio::time::sleep(Duration::from_millis(left)) => {}
             }
+        }
+    }
+
+    /// Closes every mind ([`Mind::close`]) at shutdown, once the
+    /// supervisor's tasks are stopped: a harvest mind's workers end and
+    /// close their databases. Each mind is closed once, however many
+    /// entities share it.
+    pub async fn close_minds(&self) {
+        let fallback: Arc<dyn Mind> = Arc::clone(&self.fallback) as Arc<dyn Mind>;
+        let mut once: Vec<Arc<dyn Mind>> = Vec::new();
+        for mind in self.minds.values().chain(std::iter::once(&fallback)) {
+            if !once.iter().any(|m| Arc::ptr_eq(m, mind)) {
+                once.push(Arc::clone(mind));
+            }
+        }
+        for mind in once {
+            mind.close().await;
         }
     }
 
@@ -1789,3 +1872,5 @@ mod persist_tests;
 mod replay_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tick_tests;

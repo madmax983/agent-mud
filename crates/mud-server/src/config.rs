@@ -943,6 +943,10 @@ pub struct SupervisorSection {
     pub macro_tick_scale: f64,
     /// The first macro-tick after start, in seconds.
     pub first_macro_tick_secs: [u64; 2],
+    /// A player who acted in an agent's room within this many ms defers
+    /// the agent's macro tick; an idle player does not (0 to 1 day; 0
+    /// never defers). Human and agent PCs count alike.
+    pub macro_defer_ms: u64,
     /// How often the supervisor steps, in ms.
     pub step_ms: u64,
     /// The bound on one wake, in ms (1 s to 1 h). The time a hidden PC
@@ -974,6 +978,7 @@ impl Default for SupervisorSection {
             typing_scale: 1.0,
             macro_tick_scale: 1.0,
             first_macro_tick_secs: [30, 120],
+            macro_defer_ms: d.router.macro_defer_ms,
             step_ms: 250,
             wake_timeout_ms: d.wake_timeout_ms,
             wake_timeout_ms_by_tier: d.wake_timeout_ms_by_tier,
@@ -1005,6 +1010,11 @@ impl SupervisorSection {
             self.catchup_spread_ms <= 3_600_000,
             "[supervisor] catchup_spread_ms must be 0 to 3600000, not {}",
             self.catchup_spread_ms
+        );
+        ensure!(
+            self.macro_defer_ms <= 86_400_000,
+            "[supervisor] macro_defer_ms must be 0 to 86400000, not {}",
+            self.macro_defer_ms
         );
         let t = &self.wake_timeout_ms_by_tier;
         for (key, ms) in [
@@ -1702,6 +1712,18 @@ mod tests {
             bad(&|s| s.booking_max_late_ms = 30 * 86_400_000 + 1).contains("booking_max_late_ms")
         );
         assert!(bad(&|s| s.catchup_spread_ms = 3_600_001).contains("catchup_spread_ms"));
+        assert!(bad(&|s| s.macro_defer_ms = 86_400_001).contains("macro_defer_ms"));
+    }
+
+    #[test]
+    fn the_macro_defer_window_defaults_to_ten_minutes() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        let d = SupervisorSection::default();
+        assert_eq!(d.macro_defer_ms, 600_000);
+        assert_eq!(ex.supervisor.macro_defer_ms, d.macro_defer_ms);
+        // An old mud.toml without the key keeps working, at the default.
+        let old: MudConfig = toml::from_str("[supervisor]\nmacro_tick_scale = 1.0\n").unwrap();
+        assert_eq!(old.supervisor.macro_defer_ms, 600_000);
     }
 
     #[test]

@@ -172,7 +172,8 @@ pub struct AccountSummary {
 /// The account database.
 #[derive(Debug, Clone)]
 pub struct AccountStore {
-    conn: Arc<Mutex<Connection>>,
+    /// The connection; `None` once [`AccountStore::close`] ran.
+    conn: Arc<Mutex<Option<Connection>>>,
 }
 
 /// Creates `path` readable by its owner only.
@@ -223,7 +224,7 @@ impl AccountStore {
         init(&conn, busy_timeout_ms)?;
         Ok((
             Self {
-                conn: Arc::new(Mutex::new(conn)),
+                conn: Arc::new(Mutex::new(Some(conn))),
             },
             created,
         ))
@@ -237,7 +238,7 @@ impl AccountStore {
         let conn = Connection::open_in_memory()?;
         init(&conn, 0)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(Some(conn))),
         })
     }
 
@@ -252,7 +253,33 @@ impl AccountStore {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
             let mut c = conn.lock().unwrap_or_else(PoisonError::into_inner);
-            f(&mut c)
+            c.as_mut().map_or(Err(AccountError::Closed), f)
+        })
+        .await?
+    }
+
+    /// Closes the file at shutdown: checkpoints the write-ahead log into
+    /// `accounts.db` (`PRAGMA wal_checkpoint(TRUNCATE)`) and closes the
+    /// connection, which removes the log. Later calls fail with
+    /// [`AccountError::Closed`]; a second close does nothing.
+    ///
+    /// # Errors
+    /// The checkpoint or the close failed; the connection is dropped all
+    /// the same.
+    pub async fn close(&self) -> Result<(), AccountError> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let taken = conn.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let Some(c) = taken else {
+                return Ok(());
+            };
+            let checkpoint = c
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map_err(AccountError::from);
+            let closed = c.close().map_err(|(_, e)| AccountError::from(e));
+            checkpoint.and(closed).map(drop)
         })
         .await?
     }

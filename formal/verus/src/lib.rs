@@ -24,6 +24,7 @@ pub mod schedule;
 pub mod side;
 pub mod steward;
 pub mod throttle;
+pub mod ticks;
 pub mod typing;
 pub mod wounds;
 

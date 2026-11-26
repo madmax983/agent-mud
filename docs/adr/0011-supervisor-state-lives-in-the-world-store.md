@@ -573,3 +573,28 @@ game-clock drives.
   `kill_after_accept_intent_before_decide` and
   `kill_after_decide_before_its_answer` end in exactly one `decide accept`,
   one `accepted` event and one live accept.
+
+## Amended 2026-11-26: the server closes its stores when it stops
+
+In the owner's run of 2026-11-26, after Ctrl+C `world.db` still held
+yesterday's pages and a 4 MB `world.db-wal` held all of today's state.
+Nothing was lost, since SQLite replays the log at the next open, but a
+copy or a backup of the main file alone was a day old. The store was never
+checkpointed or closed: the process ended with the connection still open.
+
+`serve` now ends with `close_stores`, after the HTTP server has drained
+and `stop_on` has stopped the supervisor, the Steward and every daemon:
+
+- `Supervisor::close_minds` calls `Mind::close` once per mind. A harvest
+  mind closes each worker's queue, gives the job in flight 5 s, and ends
+  the task that owns the agent's `harvest.db`, which closes the file.
+- `Game::close_store` writes what the backlog still holds with a
+  snapshot, drops the open turns (the next boot owes them again, as after
+  a crash), runs `PRAGMA wal_checkpoint(TRUNCATE)` and closes the
+  connection (`Store::close`), which removes the log.
+- `Accounts::close` does the same for `accounts.db`.
+
+A failure is logged, never a panic. A write after the close fails with
+`StoreError::Closed` (or `AccountError::Closed`) and is counted and
+logged like any failed write. The littleguy ledger is read through a
+handle opened per read, so it holds nothing open.

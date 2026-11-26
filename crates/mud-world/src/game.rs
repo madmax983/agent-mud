@@ -489,6 +489,39 @@ impl Game {
             .map_or(Ok(()), |cell| lock(cell).store.refuse_writes(on))
     }
 
+    /// Closes the store at shutdown: writes what the backlog still holds,
+    /// with a snapshot, then checkpoints the write-ahead log into the main
+    /// file and closes it ([`Store::close`]). Call it once nothing else
+    /// runs a command; a later write fails with [`StoreError::Closed`],
+    /// is counted and logged, and is lost as a crash would lose it. A
+    /// turn still open is dropped the same way: the next boot owes its
+    /// obligations again. No-op without a store, or a second time.
+    ///
+    /// # Errors
+    /// The backlog, the checkpoint or the close failed. The store is
+    /// closed all the same.
+    pub fn close_store(&self) -> Result<(), StoreError> {
+        let Some(cell) = &self.store else {
+            return Ok(());
+        };
+        let now = self.now_ms();
+        let w = lock(&self.world);
+        let mut c = lock(cell);
+        if c.store.is_closed() {
+            return Ok(());
+        }
+        let flushed = if c.pending.is_empty() {
+            Ok(())
+        } else {
+            c.act(&w.pack().world.name, || w.snapshot(), &[], now)
+        };
+        drop(w);
+        c.turns.clear();
+        let closed = c.store.close();
+        drop(c);
+        flushed.and(closed)
+    }
+
     /// Reads the world.
     pub fn read<R>(&self, f: impl FnOnce(&World) -> R) -> R {
         f(&lock(&self.world))
@@ -1053,6 +1086,50 @@ mod tests {
         drop(game);
         let again = Game::open(pack(), Some(&db), 7, clock).unwrap();
         assert_eq!(again.script_memory(&hale, 1)["n"], 9, "the store agrees");
+    }
+
+    #[test]
+    fn closing_the_store_writes_the_backlog_and_empties_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("world.db");
+        let wal = dir.path().join("world.db-wal");
+        let clock = Arc::new(ManualClock::new(1_000));
+        let game = Game::open(pack(), Some(&db), 7, clock).unwrap();
+        let ada = game.login("ada").unwrap();
+        // A full disk: the command waits in the backlog.
+        game.refuse_store_writes(true).unwrap();
+        assert!(game.execute(&ada, "say kept for later").ok);
+        game.refuse_store_writes(false).unwrap();
+        assert!(std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0));
+        game.close_store().unwrap();
+        assert!(std::fs::metadata(&wal).map_or(true, |m| m.len() == 0));
+        game.close_store().unwrap();
+        // Writes after the close are counted, not written.
+        let errors = game.store_errors();
+        assert!(game.execute(&ada, "say too late").ok);
+        assert!(game.store_errors() > errors);
+        assert!(matches!(
+            game.refuse_store_writes(true),
+            Err(StoreError::Closed)
+        ));
+        // The main file alone holds the backlog's line.
+        let copy = tempfile::tempdir().unwrap();
+        std::fs::copy(&db, copy.path().join("world.db")).unwrap();
+        let s = Store::open(&copy.path().join("world.db"), 7, 0).unwrap();
+        let said: Vec<_> = s
+            .load(10)
+            .unwrap()
+            .unwrap()
+            .recent
+            .into_iter()
+            .filter_map(|e| e.untrusted_text)
+            .collect();
+        assert_eq!(said, ["kept for later"]);
+        assert!(
+            Game::new(World::new(pack(), 1), None, Arc::new(SystemClock))
+                .close_store()
+                .is_ok()
+        );
     }
 
     #[test]

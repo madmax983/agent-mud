@@ -9,7 +9,7 @@
 //! | Immediate | attack on it, a tell, a nudge, speech naming it | 0–500 ms |
 //! | `RoomBatch` | human speech, emotes, arrivals, drops | 2–4 s rolling |
 //! | Ambient   | agent activity while a human is present | 5–10 s + cooldown |
-//! | `MacroTick` | the slow timer, only with no other player in the room | none |
+//! | `MacroTick` | the slow timer, unless another player acted in the room within `macro_defer_ms` | none |
 //!
 //! It also runs the per-room anti-chatter counter, the budget breakers,
 //! the Turing attention filter and distracted spells.
@@ -33,6 +33,7 @@ use crate::admit::{Admit, CAME_TO, wake_admit};
 use crate::budget::BudgetLevel;
 use crate::chatter::{ChatterInput, MAX_AGENT_ONLY_TURNS, RoomChatter, chatter_input_for};
 use crate::replay::replay_due;
+use crate::ticks::tick_deferred;
 use crate::turing::{Salience, has_keyword, mix, notices, pick};
 
 /// How urgent a wake is. Higher wins when wakes merge.
@@ -66,6 +67,18 @@ pub struct RouterConfig {
     pub max_agent_only_turns: u8,
     /// The seed of every jitter.
     pub seed: u64,
+    /// A player other than the entity who acted in its room within this
+    /// many game-clock ms defers its macro tick ([`tick_deferred`]). An
+    /// idle player does not: after the window the tick fires as if the
+    /// entity were alone.
+    #[serde(default = "default_macro_defer_ms")]
+    pub macro_defer_ms: u64,
+}
+
+/// The default of [`RouterConfig::macro_defer_ms`]: 10 minutes.
+#[must_use]
+pub const fn default_macro_defer_ms() -> u64 {
+    600_000
 }
 
 impl Default for RouterConfig {
@@ -77,6 +90,7 @@ impl Default for RouterConfig {
             cooldown_ms: [3_000, 8_000],
             max_agent_only_turns: MAX_AGENT_ONLY_TURNS,
             seed: 0x006d_7564,
+            macro_defer_ms: default_macro_defer_ms(),
         }
     }
 }
@@ -744,9 +758,11 @@ impl Router {
         notes
     }
 
-    /// A macro-tick for `entity`. It fires only with no player in its room
-    /// but the entity itself: a hidden PC is a player, and alone it still
-    /// gets its quiet wakes.
+    /// A macro-tick for `entity`. It waits while a player other than the
+    /// entity acted in its room within `macro_defer_ms` ([`tick_deferred`]):
+    /// that player's acts wake the entity anyway. An idle player, human or
+    /// agent, does not hold it back past the window. A hidden PC is a
+    /// player, and alone it still gets its quiet wakes.
     pub fn macro_tick(&mut self, entity: &EntityId, world: &World, now: u64) -> RouteNote {
         let seq = world.last_seq();
         let Some(e) = world.entity(entity) else {
@@ -756,11 +772,13 @@ impl Router {
                 why: "unknown entity".into(),
             };
         };
-        if world.player_present_except(&e.room, entity) {
+        let window = self.cfg.macro_defer_ms;
+        let last = world.last_player_act(&e.room, entity, now.saturating_sub(window));
+        if tick_deferred(last, now, window) {
             return RouteNote::Dropped {
                 entity: entity.clone(),
                 seq,
-                why: "macro-tick deferred: a player is present".into(),
+                why: "macro-tick deferred: a player acted here recently".into(),
             };
         }
         let max = self.cfg.max_agent_only_turns;

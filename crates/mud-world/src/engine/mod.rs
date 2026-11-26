@@ -701,6 +701,29 @@ impl World {
         })
     }
 
+    /// When a player character other than `except` last acted in `room`,
+    /// at or after `since_ms`: the newest logged event of the room whose
+    /// actor is a player present there now. `None` when no such player
+    /// acted since then. A human and an agent-played PC count alike.
+    #[must_use]
+    pub fn last_player_act(&self, room: &RoomId, except: &EntityId, since_ms: u64) -> Option<u64> {
+        self.log
+            .iter()
+            .rev()
+            .take_while(|ev| ev.at_ms >= since_ms)
+            .find(|ev| {
+                ev.player_actor
+                    && ev.room.as_ref() == Some(room)
+                    && ev.actor.as_ref().is_some_and(|a| {
+                        &a.id != except
+                            && self.state.entities.get(&a.id).is_some_and(|e| {
+                                e.kind == EntityKind::Player && e.present() && &e.room == room
+                            })
+                    })
+            })
+            .map(|ev| ev.at_ms)
+    }
+
     /// The entities present in `room`.
     pub fn present_in<'a>(&'a self, room: &'a RoomId) -> impl Iterator<Item = &'a Entity> + 'a {
         self.state

@@ -183,6 +183,13 @@ daily_token_budget = 400000      # per agent per UTC day; 0 is unlimited
 typing_scale = 1.0               # Turing PC typing holds; 0 for demos
 macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
 first_macro_tick_secs = [30, 120] # the first macro tick, this many seconds after start
+# A player (human or agent PC) who acted in an agent's room within this many
+# ms defers the agent's macro tick: that player's acts wake it anyway. An idle
+# player does not; after the window the tick fires as if the agent were alone
+# (0..=1 day; 0 never defers). A tick whose wake never reached the mind (lg
+# did not start) comes again in about 3 minutes, doubling up to the cast's
+# shortest interval.
+macro_defer_ms = 600000          # an idle player stops deferring ticks after this
 step_ms = 250                    # how often the supervisor steps, in ms
 # The bound on one wake (1 s..=1 h). Time a hidden PC spends typing a line does
 # not count, so a long notice never times a wake out. A tier can have its own.

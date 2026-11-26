@@ -39,6 +39,9 @@ pub enum AccountError {
     /// The name is not a human character.
     #[error("{0} is not a human character; only human characters have accounts")]
     NotHuman(String),
+    /// `accounts.db` was closed: the server is stopping.
+    #[error("the account store is closed")]
+    Closed,
     /// No account has that name.
     #[error("there is no account named {0}")]
     NoAccount(String),

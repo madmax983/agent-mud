@@ -569,7 +569,8 @@ fn a_side_op_commits_with_the_events_or_not_at_all() {
     };
     // A bad op (a plan's JSON cannot fail, so: a failing table) rolls
     // the whole commit back.
-    s.conn
+    s.conn()
+        .unwrap()
         .execute_batch(
             "CREATE TEMP TRIGGER no_seen BEFORE UPDATE OF seen_seq ON sup_entity
              BEGIN SELECT RAISE(ABORT, 'refused'); END;",
@@ -586,7 +587,10 @@ fn a_side_op_commits_with_the_events_or_not_at_all() {
     assert!(s.commit(&c).is_err());
     assert_eq!(s.event_count().unwrap(), 0, "no event without its op");
     assert!(s.load(10).unwrap().is_none(), "no snapshot either");
-    s.conn.execute_batch("DROP TRIGGER no_seen;").unwrap();
+    s.conn()
+        .unwrap()
+        .execute_batch("DROP TRIGGER no_seen;")
+        .unwrap();
     s.commit(&c).unwrap();
     assert_eq!(s.event_count().unwrap(), 3);
     assert_eq!(s.load_side().unwrap().entities[&ada()].seen_seq, 9);
@@ -839,7 +843,8 @@ fn a_crash_between_archive_and_delete_archives_each_event_once() {
     // commit.
     let rows: Vec<ArchiveRow> = {
         let mut q = s
-            .conn
+            .conn()
+            .unwrap()
             .prepare("SELECT seq, at_ms, body FROM events ORDER BY seq LIMIT 4")
             .unwrap();
         q.query_map([], |r| {
