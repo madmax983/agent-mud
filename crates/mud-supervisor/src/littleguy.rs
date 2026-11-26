@@ -119,8 +119,10 @@ pub enum RefineMode {
     /// menu items from it as evidence (the code default).
     #[default]
     Menu,
-    /// Council-approved free text (ADR 0016). Until that phase ships it
-    /// behaves as `Menu`.
+    /// Council-approved free text (ADR 0016): the guardrails lines lg's
+    /// proposer wrote, after the deterministic guard and a unanimous
+    /// council of at least three. A Turing-tier entity still uses the
+    /// menu.
     Free,
 }
 

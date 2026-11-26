@@ -129,8 +129,9 @@ publishes `no_judge`, and goals wait until the TTL declines them. No model
 id is written in Rust.
 
 **Refine** (phase 4). `[littleguy] refine` is `off`, `menu` (the code
-default) or `free` (ADR 0016; until it ships it runs as `menu`, with a
-start-up warning). With it on, lg's config gains `[refine]` (the pinned
+default) or `free` (ADR 0016: council-approved model text in the
+guardrails, with its own guards and controls; a Turing-tier agent still
+uses the menu). With it on, lg's config gains `[refine]` (the pinned
 CI `lg` is built with the `refine` feature) and the Steward owns the
 agent's overlays. lg's `overlay_activate` takes no expected version: lg
 compares with its own pointer, read inside the request. So the Steward

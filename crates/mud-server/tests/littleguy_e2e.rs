@@ -646,6 +646,165 @@ async fn a_real_refine_propose_reaches_a_menu_activation() {
     s.stop().await;
 }
 
+/// lg's version `active` holds exactly the guardrails `want` and no other
+/// part, and no sentinel of the proposal.
+#[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
+async fn lg_holds_only_guardrails(socket: &Path, active: u64, want: &str) {
+    use mud_supervisor::littleguy::owner::{OwnerRequest, OwnerResponse, request};
+    let shown = request(
+        socket,
+        &OwnerRequest::OverlayShow { version: active },
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let OwnerResponse::Overlay { overlay, .. } = shown else {
+        panic!("{shown:?}");
+    };
+    let v: Value = serde_json::from_str(&overlay).unwrap();
+    assert_eq!(v["guardrails"], want, "{overlay}");
+    assert!(!overlay.contains("SENTINEL"), "{overlay}");
+    for (k, part) in v.as_object().unwrap() {
+        assert!(
+            k == "guardrails"
+                || part.is_null()
+                || part.as_array().is_some_and(Vec::is_empty)
+                || part.as_object().is_some_and(serde_json::Map::is_empty),
+            "only guardrails: {overlay}"
+        );
+    }
+}
+
+/// Whether the request is a free-text ballot of the Steward's council.
+fn is_overlay_ballot(req: &Value) -> bool {
+    model_stub::offered_tools(req).is_empty()
+        && req["messages"][0]["role"] == "system"
+        && model_stub::content_text(&req["messages"][0])
+            .starts_with("You review one standing habit")
+}
+
+/// The model stub of the free-text test: lg's proposer writes a
+/// guardrails line beside parts the Steward must drop, the council
+/// approves, and every tick files an idea.
+fn free_reply(req: &Value) -> Reply {
+    if is_proposer(req) {
+        Reply::Text(
+            r#"{"system":"SENTINEL","guardrails":"Keep trades short.","max_steps":3}"#.into(),
+        )
+    } else if is_overlay_ballot(req) {
+        Reply::Text(r#"{"approve": true, "reason": "a habit of trade"}"#.into())
+    } else if model_stub::after_tools(req) {
+        Reply::Text("noted".into())
+    } else {
+        Reply::Calls(vec![(
+            "add_idea".into(),
+            json!({ "title": "Ore prices", "body": "Ask who sells ore." }),
+        )])
+    }
+}
+
+/// At least three free-text ballots were cast, each on exactly
+/// `candidate`, and none holds a sentinel of the proposal.
+#[expect(clippy::expect_used, reason = "a test helper fails loudly")]
+fn council_saw_only(requests: &[Value], candidate: &str) {
+    let ballots: Vec<&Value> = requests.iter().filter(|r| is_overlay_ballot(r)).collect();
+    assert!(ballots.len() >= 3, "{ballots:?}");
+    for b in ballots {
+        let user: Value =
+            serde_json::from_str(&model_stub::last_user_text(b)).expect("a JSON ballot");
+        assert_eq!(user["candidate"]["untrusted_text"], candidate);
+        assert!(!user.to_string().contains("SENTINEL"), "{user}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_refine_propose_reaches_overlay_put_as_guardrails_only() {
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real free-text refine check");
+        return;
+    };
+    let stub = ModelStub::start(Arc::new(free_reply)).await.unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let lg = lg_on_stub(&bin, bins.path());
+    let mut s = serve(&lg, |cfg| {
+        on_stub(cfg, &stub);
+        cfg.littleguy.refine = mud_supervisor::littleguy::RefineMode::Free;
+        cfg.littleguy.steward.every_secs = 1;
+        cfg.littleguy.steward.refine_min_wakes = 1;
+        cfg.models.insert(
+            "council".into(),
+            mud_server::config::ModelConfig {
+                base_url: stub.base_url(),
+                model: "stub".into(),
+                key_env: "PATH".into(),
+            },
+        );
+    })
+    .await;
+    let steward = s.built.steward.clone().expect("the Steward runs");
+    let torin = EntityId::from("torin");
+    let mut obs = s.built.mud.sup.subscribe();
+    s.tasks.extend(steward.spawn());
+    s.built.mud.sup.fire_macro_tick(&torin);
+    let mut seen = Vec::new();
+    let activated = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match obs.recv().await {
+                Ok(ev) => {
+                    if let ObserverEvent::Steward(e) = &*ev
+                        && e.entity == torin
+                        && e.item == "overlay"
+                    {
+                        seen.push(format!("{} {}", e.action, e.code));
+                        if e.action == "activated" && e.code == "text" {
+                            return e.clone();
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no free text was activated: {seen:?}\n{:#?}\n{}",
+            stub.requests(),
+            s.log("torin")
+        )
+    });
+    assert!(
+        seen.iter().any(|l| l == "proposed free"),
+        "lg's proposer answered proposed, not kept or error: {seen:?}"
+    );
+    assert!(seen.iter().any(|l| l == "voted free"), "{seen:?}");
+    let want = mud_supervisor::steward::vet::render_free(&["Keep trades short.".to_owned()]);
+    assert!(
+        activated
+            .text
+            .as_deref()
+            .is_some_and(|t| t.ends_with(&want)),
+        "{activated:?}"
+    );
+    council_saw_only(&stub.requests(), "Keep trades short.");
+    let socket = s.built.littleguy[0]
+        .running_socket(&torin)
+        .await
+        .expect("torin's daemon runs");
+    let active = lg_runs_the_menu_text(&socket, &want).await;
+    lg_holds_only_guardrails(&socket, active, &want).await;
+    let row = steward.row(&torin).await.unwrap();
+    assert_eq!(row.overlay.pointer, Some(active));
+    assert_eq!(
+        row.overlay
+            .active
+            .and_then(|a| a.source.free_lines().map(<[String]>::to_vec)),
+        Some(vec!["Keep trades short.".to_owned()])
+    );
+    s.stop().await;
+}
+
 /// The observer links to torin's littleguy pages with a fresh sign-in.
 #[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
 async fn observer_links_to_torins_pages(addr: std::net::SocketAddr, token: &str) {

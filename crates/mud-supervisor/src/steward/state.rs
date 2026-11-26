@@ -141,6 +141,8 @@ impl Ballots {
 pub enum DeclinedKind {
     /// A goal title.
     Goal,
+    /// A free-text overlay the council declined (ADR 0016).
+    Overlay,
 }
 
 /// A declined text, by digest.
@@ -163,6 +165,12 @@ pub enum OverlaySource {
         /// The items.
         ids: Vec<String>,
     },
+    /// Free-text lines a unanimous council approved (ADR 0016), without
+    /// the preamble: what a later candidate is compared with.
+    Free {
+        /// The approved lines.
+        lines: Vec<String>,
+    },
 }
 
 impl OverlaySource {
@@ -172,12 +180,23 @@ impl OverlaySource {
         !matches!(self, Self::Baseline)
     }
 
-    /// A short line for the observer: the menu ids, or `baseline`.
+    /// A short line for the observer: the menu ids, `free`, or
+    /// `baseline`.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
             Self::Baseline => "baseline".to_owned(),
             Self::Menu { ids } => ids.join(", "),
+            Self::Free { .. } => "free".to_owned(),
+        }
+    }
+
+    /// The approved lines, when it is a free text.
+    #[must_use]
+    pub fn free_lines(&self) -> Option<&[String]> {
+        match self {
+            Self::Free { lines } => Some(lines),
+            Self::Baseline | Self::Menu { .. } => None,
         }
     }
 }
@@ -524,13 +543,33 @@ impl StewardRow {
 
     /// Adds a declined title; the oldest go past [`DECLINED_CAP`].
     pub fn decline(&mut self, digest: u64) {
-        if self.was_declined(digest) {
+        self.push_declined(digest, DeclinedKind::Goal);
+    }
+
+    /// Whether the council declined a free text of `digest`.
+    #[must_use]
+    pub fn overlay_declined(&self, digest: u64) -> bool {
+        self.declined
+            .iter()
+            .any(|d| d.digest == digest && d.kind == DeclinedKind::Overlay)
+    }
+
+    /// Adds a free text the council declined; the oldest go past
+    /// [`DECLINED_CAP`]. A vetoed text is kept apart ([`Self::veto`]), so
+    /// no stream of declines pushes it out.
+    pub fn decline_overlay(&mut self, digest: u64) {
+        self.push_declined(digest, DeclinedKind::Overlay);
+    }
+
+    fn push_declined(&mut self, digest: u64, kind: DeclinedKind) {
+        if self
+            .declined
+            .iter()
+            .any(|d| d.digest == digest && d.kind == kind)
+        {
             return;
         }
-        self.declined.push(Declined {
-            digest,
-            kind: DeclinedKind::Goal,
-        });
+        self.declined.push(Declined { digest, kind });
         let over = self.declined.len().saturating_sub(DECLINED_CAP);
         self.declined.drain(..over);
     }
@@ -655,6 +694,22 @@ mod tests {
         assert_eq!(row.vetoed, [7]);
         assert!(row.is_vetoed(7) && !row.is_vetoed(8));
         assert_eq!(OverlaySource::Baseline.label(), "baseline");
+        let free = OverlaySource::Free {
+            lines: vec!["Keep trades short.".into()],
+        };
+        assert_eq!(free.label(), "free");
+        assert!(free.is_text());
+        assert_eq!(
+            free.free_lines(),
+            Some(&["Keep trades short.".to_owned()][..])
+        );
+        assert_eq!(OverlaySource::Baseline.free_lines(), None);
+        row.decline_overlay(9);
+        row.decline_overlay(9);
+        row.decline(9);
+        assert!(row.overlay_declined(9) && row.was_declined(9));
+        assert!(!row.overlay_declined(7));
+        assert_eq!(row.declined.len(), 2, "one per kind");
         assert_eq!(menu(2).source.label(), "brevity");
         assert_eq!(
             [
@@ -744,6 +799,61 @@ mod tests {
             assert_eq!(a.name(), name);
             assert!(a.is_overlay());
         }
+    }
+
+    #[test]
+    fn a_free_text_row_round_trips() {
+        let free = OverlaySource::Free {
+            lines: vec!["Keep trades short.".into(), "Count coins.".into()],
+        };
+        let text = Authored {
+            version: 3,
+            digest: 11,
+            source: free.clone(),
+            text: "habits\n- Keep trades short.\n- Count coins.".into(),
+        };
+        let mut row = StewardRow::default();
+        row.overlay.baseline = Some(1);
+        row.overlay.pointer = Some(3);
+        row.overlay.authored = vec![text.clone()];
+        row.overlay.active = Some(text.clone());
+        row.overlay.pending = Some(Authored {
+            version: 4,
+            ..text.clone()
+        });
+        row.decline_overlay(12);
+        row.decline(12);
+        row.veto(13);
+        row.open(
+            IntentAction::Activate {
+                version: 4,
+                expected_previous: Some(1),
+                purpose: Purpose::Text {
+                    digest: 11,
+                    source: free.clone(),
+                    text: text.text,
+                },
+            },
+            5,
+        );
+        let body = row.body();
+        assert_eq!(body["overlay"]["active"]["source"]["kind"], "free");
+        assert_eq!(
+            body["overlay"]["active"]["source"]["lines"][1],
+            "Count coins."
+        );
+        let back = StewardRow::from_body(ROW_SCHEMA, &body).unwrap();
+        assert_eq!(back, row);
+        assert!(back.overlay_declined(12) && back.was_declined(12));
+        assert_eq!(back.declined.len(), 2, "both kinds come back");
+        row.open(
+            IntentAction::Put {
+                digest: 11,
+                source: free,
+            },
+            6,
+        );
+        assert_eq!(StewardRow::from_body(ROW_SCHEMA, &row.body()), Some(row));
     }
 
     #[test]

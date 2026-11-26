@@ -658,9 +658,11 @@ pub struct LittleguySection {
     /// Turns of transcript the agent sees (at least 1).
     pub window: u32,
     /// Refine: `off`, `menu` (the default: the council picks operator menu
-    /// items, using lg's proposer as evidence) or `free` (ADR 0016; until
-    /// it ships it behaves as `menu`, with a warning). Needs an `lg` built
-    /// with the `refine` feature unless `off`.
+    /// items, using lg's proposer as evidence) or `free` (ADR 0016: the
+    /// guardrails lines lg's proposer wrote, after the deterministic guard
+    /// and a unanimous council of at least three; a Turing-tier agent still
+    /// uses the menu). Needs an `lg` built with the `refine` feature
+    /// unless `off`.
     pub refine: mud_supervisor::littleguy::RefineMode,
     /// `[littleguy.steward]`: the MUD as each daemon's owner (ADR 0015).
     pub steward: mud_supervisor::steward::StewardConfig,
@@ -819,6 +821,42 @@ impl LittleguySection {
                 g.id
             );
         }
+        ensure!(
+            (100..=2000).contains(&s.refine_max_chars),
+            "[littleguy.steward] refine_max_chars must be 100 to 2000, not {}",
+            s.refine_max_chars
+        );
+        ensure!(
+            (1..=12).contains(&s.refine_max_lines),
+            "[littleguy.steward] refine_max_lines must be 1 to 12, not {}",
+            s.refine_max_lines
+        );
+        ensure!(
+            (20..=300).contains(&s.refine_line_chars),
+            "[littleguy.steward] refine_line_chars must be 20 to 300, not {}",
+            s.refine_line_chars
+        );
+        for (key, list) in [
+            ("refine_deny_words", &s.refine_deny_words),
+            ("refine_deny_stems", &s.refine_deny_stems),
+        ] {
+            for w in list {
+                // A deny entry matches a token, which holds only ASCII
+                // letters and digits: anything else would match nothing.
+                ensure!(
+                    !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "[littleguy.steward] {key} entries must be non-empty ASCII letters and digits, not {w:?}"
+                );
+            }
+        }
+        if self.refine == mud_supervisor::littleguy::RefineMode::Free {
+            ensure!(
+                s.council_members >= mud_supervisor::steward::vet::FREE_MIN_MEMBERS,
+                "[littleguy] refine = \"free\" needs [littleguy.steward] council_members of at least {} (ADR 0016), not {}",
+                mud_supervisor::steward::vet::FREE_MIN_MEMBERS,
+                s.council_members
+            );
+        }
         for e in &s.resume_refine {
             ensure!(
                 !e.trim().is_empty(),
@@ -851,9 +889,10 @@ impl LittleguySection {
         }
     }
 
-    /// What to warn about at start when littleguy runs.
+    /// What to warn about at start when littleguy runs. `models` are the
+    /// `[models]` aliases the council may name.
     #[must_use]
-    pub fn warnings(&self) -> Vec<String> {
+    pub fn warnings(&self, models: &BTreeMap<String, ModelConfig>) -> Vec<String> {
         let mut out = Vec::new();
         if self.compaction && self.max_request_bytes == 0 {
             out.push(
@@ -861,13 +900,32 @@ impl LittleguySection {
                     .to_owned(),
             );
         }
-        if self.refine == mud_supervisor::littleguy::RefineMode::Free {
+        if self.refine == mud_supervisor::littleguy::RefineMode::Free
+            && self.council_is_one_model(models)
+        {
             out.push(
-                "[littleguy] refine = \"free\" is not available yet (ADR 0016): it runs as \"menu\", and the council picks only operator menu items"
+                "[littleguy] refine = \"free\": council members are samples of one model, so their votes on a habit text are correlated (ADR 0016); name more aliases in [littleguy.steward] council_models to make them differ"
                     .to_owned(),
             );
         }
         out
+    }
+
+    /// Whether every council member asks one model: the aliases members
+    /// cycle (`council_model`, then `council_models`) name one model at
+    /// one server. With no alias there is no council at all.
+    #[must_use]
+    pub fn council_is_one_model(&self, models: &BTreeMap<String, ModelConfig>) -> bool {
+        let Some(first) = self.council_alias(models) else {
+            return false;
+        };
+        let distinct: std::collections::BTreeSet<(&str, &str)> = std::iter::once(&first)
+            .chain(&self.steward.council_models)
+            .take(usize::try_from(self.steward.council_members).unwrap_or(usize::MAX))
+            .filter_map(|a| models.get(a))
+            .map(|m| (m.base_url.as_str(), m.model.as_str()))
+            .collect();
+        distinct.len() <= 1
     }
 }
 
@@ -1045,9 +1103,15 @@ mod tests {
         );
         assert_eq!(lg.max_request_bytes, 240_000);
         assert_eq!(lg.window, 30);
-        assert_eq!(lg.refine, mud_supervisor::littleguy::RefineMode::Menu);
+        assert_eq!(
+            lg.refine,
+            mud_supervisor::littleguy::RefineMode::Free,
+            "the example opts in to ADR 0016"
+        );
         assert!(lg.check().is_ok());
-        assert_eq!(lg.warnings(), Vec::<String>::new());
+        let w = lg.warnings(&ex.models);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("samples of one model"), "{w:?}");
         assert!(
             toml::from_str::<MudConfig>("[littleguy]\nnotez = true").is_err(),
             "an unknown key is refused"
@@ -1208,15 +1272,104 @@ mod tests {
         );
     }
 
+    fn model(name: &str) -> ModelConfig {
+        ModelConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: name.into(),
+            key_env: "K".into(),
+        }
+    }
+
     #[test]
-    fn free_refine_warns_that_it_runs_as_menu() {
-        let s = LittleguySection {
+    fn a_one_alias_council_warns_at_start() {
+        let models = BTreeMap::from([
+            ("council".to_owned(), model("m")),
+            ("same".to_owned(), model("m")),
+            ("other".to_owned(), model("n")),
+        ]);
+        let free = |extra: &[&str]| LittleguySection {
             refine: mud_supervisor::littleguy::RefineMode::Free,
+            steward: mud_supervisor::steward::StewardConfig {
+                council_models: extra.iter().map(|a| (*a).to_owned()).collect(),
+                ..mud_supervisor::steward::StewardConfig::default()
+            },
             ..LittleguySection::default()
         };
-        let w = s.warnings();
+        let w = free(&[]).warnings(&models);
         assert_eq!(w.len(), 1);
-        assert!(w[0].contains("runs as \"menu\""), "{w:?}");
+        assert!(w[0].contains("samples of one model"), "{w:?}");
+        assert!(w[0].contains("ADR 0016"));
+        assert_eq!(
+            free(&["same"]).warnings(&models).len(),
+            1,
+            "two aliases of one model are one model"
+        );
+        let none = Vec::<String>::new();
+        assert_eq!(free(&["other"]).warnings(&models), none);
+        assert_eq!(
+            free(&[]).warnings(&BTreeMap::new()),
+            none,
+            "no council: nothing votes"
+        );
+        let menu = LittleguySection::default();
+        assert_eq!(menu.warnings(&models), none, "menu text is the operator's");
+    }
+
+    #[test]
+    fn free_refine_needs_three_members_and_bounded_keys() {
+        let models = BTreeMap::from([("council".to_owned(), model("m"))]);
+        let bad = |edit: &dyn Fn(&mut LittleguySection)| {
+            let mut s = LittleguySection {
+                refine: mud_supervisor::littleguy::RefineMode::Free,
+                ..LittleguySection::default()
+            };
+            edit(&mut s);
+            s.check_steward(&models).unwrap_err().to_string()
+        };
+        assert!(
+            bad(&|s| {
+                s.steward.council_members = 1;
+                s.steward.council_temperature = 0.0;
+            })
+            .contains("council_members of at least 3"),
+            "free needs three members"
+        );
+        assert!(bad(&|s| s.steward.refine_max_chars = 99).contains("refine_max_chars"));
+        assert!(bad(&|s| s.steward.refine_max_chars = 2001).contains("refine_max_chars"));
+        assert!(bad(&|s| s.steward.refine_max_lines = 0).contains("refine_max_lines"));
+        assert!(bad(&|s| s.steward.refine_max_lines = 13).contains("refine_max_lines"));
+        assert!(bad(&|s| s.steward.refine_line_chars = 19).contains("refine_line_chars"));
+        assert!(bad(&|s| s.steward.refine_line_chars = 301).contains("refine_line_chars"));
+        assert!(
+            bad(&|s| s.steward.refine_deny_words = vec![String::new()])
+                .contains("refine_deny_words")
+        );
+        assert!(
+            bad(&|s| s.steward.refine_deny_stems = vec!["\u{e9}t\u{e9}".into()])
+                .contains("refine_deny_stems")
+        );
+        let ok = LittleguySection {
+            refine: mud_supervisor::littleguy::RefineMode::Free,
+            steward: mud_supervisor::steward::StewardConfig {
+                refine_deny_words: vec!["Kale".into()],
+                refine_deny_stems: vec!["hagg".into()],
+                ..mud_supervisor::steward::StewardConfig::default()
+            },
+            ..LittleguySection::default()
+        };
+        assert!(ok.check_steward(&models).is_ok());
+        let menu_one = LittleguySection {
+            steward: mud_supervisor::steward::StewardConfig {
+                council_members: 1,
+                council_temperature: 0.0,
+                ..mud_supervisor::steward::StewardConfig::default()
+            },
+            ..LittleguySection::default()
+        };
+        assert!(
+            menu_one.check_steward(&models).is_ok(),
+            "the menu takes one member"
+        );
     }
 
     #[test]
@@ -1311,12 +1464,12 @@ mod tests {
             ..LittleguySection::default()
         };
         assert_eq!(off.compaction(), None);
-        assert_eq!(off.warnings(), Vec::<String>::new());
+        assert_eq!(off.warnings(&BTreeMap::new()), Vec::<String>::new());
         let unbounded = LittleguySection {
             max_request_bytes: 0,
             ..LittleguySection::default()
         };
-        let w = unbounded.warnings();
+        let w = unbounded.warnings(&BTreeMap::new());
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("max_request_bytes is 0"), "{w:?}");
     }

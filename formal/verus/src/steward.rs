@@ -23,6 +23,11 @@
 //! - `pointer_verdict` (phase 4): `Same` exactly when lg's version is the
 //!   expected one; `OwnLate` only for a version the Steward gave up on;
 //!   every other move is a human's (`lemma_every_foreign_move_is_human`).
+//! - `overlay_verdict` (phase 5, ADR 0016): a free text activates only
+//!   with the guard passed, a unanimous council of at least `min_members`
+//!   (at least one), no pause and a normal budget; a pause blocks every
+//!   activation, one no vote never activates, and with `FREE_MIN_MEMBERS`
+//!   (3, a mirrored constant) fewer than three members never activate.
 //!
 //! No overflow: comparisons, and subtractions under their guards.
 
@@ -362,6 +367,128 @@ pub proof fn lemma_every_foreign_move_is_human(lg: Option<u64>, expected: Option
         lg != expected,
     ensures
         spec_pointer_verdict(lg, expected, false) is Human,
+{
+}
+
+// mirror-begin steward_consts
+/// The fewest council members that may approve a free text (ADR 0016).
+/// The Steward passes it as `min_members`, so "at least three" is in the
+/// proof, not only in the start-up check.
+pub const FREE_MIN_MEMBERS: u32 = 3;
+// mirror-end steward_consts
+
+// mirror-begin overlay_verdict_enum
+/// What the Steward does with a free-text candidate after the council
+/// voted.
+pub enum OverlayVerdict {
+    /// Put it and activate it.
+    Activate,
+    /// Decline it; it is never voted on again.
+    Decline,
+    /// Neither: refine is paused, or the budget is below normal.
+    Hold,
+}
+// mirror-end overlay_verdict_enum
+
+pub open spec fn spec_overlay_verdict(
+    text_ok: bool,
+    yes: u32,
+    members: u32,
+    min_members: u32,
+    paused: bool,
+    level_normal: bool,
+) -> OverlayVerdict {
+    if paused || !level_normal {
+        OverlayVerdict::Hold
+    } else if text_ok && min_members >= 1 && members >= min_members && yes == members {
+        OverlayVerdict::Activate
+    } else {
+        OverlayVerdict::Decline
+    }
+}
+
+// mirror-begin overlay_verdict
+/// The verdict on a free-text candidate.
+///
+/// It activates only when the text guard passed, at least `min_members`
+/// (and at least one) voted and every one approved, refine is not paused
+/// and the budget is normal. A pause or a budget below normal holds it.
+#[must_use]
+pub const fn overlay_verdict(
+    text_ok: bool,
+    yes: u32,
+    members: u32,
+    min_members: u32,
+    paused: bool,
+    level_normal: bool,
+) -> (r: OverlayVerdict)
+    ensures
+        r == spec_overlay_verdict(text_ok, yes, members, min_members, paused, level_normal),
+        (r is Activate) ==> text_ok && min_members >= 1 && members >= min_members && yes
+            == members && !paused && level_normal,
+        paused ==> !(r is Activate),
+        yes < members ==> !(r is Activate),
+{
+    if paused || !level_normal {
+        OverlayVerdict::Hold
+    } else if text_ok && min_members >= 1 && members >= min_members && yes == members {
+        OverlayVerdict::Activate
+    } else {
+        OverlayVerdict::Decline
+    }
+}
+// mirror-end overlay_verdict
+
+/// A pause blocks every activation, whatever the guard and the votes say.
+pub proof fn lemma_a_pause_blocks_every_activation(
+    text_ok: bool,
+    yes: u32,
+    members: u32,
+    min_members: u32,
+    level_normal: bool,
+)
+    ensures
+        !(spec_overlay_verdict(text_ok, yes, members, min_members, true, level_normal) is Activate),
+{
+}
+
+/// One no vote never activates.
+pub proof fn lemma_one_no_never_activates(
+    text_ok: bool,
+    yes: u32,
+    members: u32,
+    min_members: u32,
+    paused: bool,
+    level_normal: bool,
+)
+    requires
+        yes < members,
+    ensures
+        !(spec_overlay_verdict(text_ok, yes, members, min_members, paused, level_normal) is Activate),
+{
+}
+
+/// With `min_members = FREE_MIN_MEMBERS`, a council of fewer than three
+/// never activates, and an activation always had three yes votes or more.
+pub proof fn lemma_fewer_than_three_never_activate(
+    text_ok: bool,
+    yes: u32,
+    members: u32,
+    paused: bool,
+    level_normal: bool,
+)
+    ensures
+        FREE_MIN_MEMBERS == 3,
+        members < 3 ==> !(spec_overlay_verdict(
+            text_ok,
+            yes,
+            members,
+            FREE_MIN_MEMBERS,
+            paused,
+            level_normal,
+        ) is Activate),
+        (spec_overlay_verdict(text_ok, yes, members, FREE_MIN_MEMBERS, paused, level_normal) is Activate)
+            ==> yes >= 3,
 {
 }
 

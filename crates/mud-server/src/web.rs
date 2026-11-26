@@ -774,8 +774,9 @@ fn autonomy_cell(a: &Value) -> Markup {
 }
 
 /// The Steward's overlays of one agent (ADR 0015): lg's active version,
-/// the pause, what lg's Roll back would do, and the Steward's own versions
-/// with the text each holds, newest first. The text is escaped by maud.
+/// the pause, the active free-text lines (ADR 0016), what lg's Roll back
+/// would do, and the Steward's own versions with the text each holds,
+/// newest first. The text is escaped by maud.
 /// lg's own Roll back button, on the page the littleguy link opens, is
 /// the veto.
 fn overlay_lines(o: &Value) -> Markup {
@@ -787,6 +788,13 @@ fn overlay_lines(o: &Value) -> Markup {
         br; span { "refine (" (o["mode"].as_str().unwrap_or("menu")) "): lg runs " (version(&o["pointer"])) }
         @if let Some(src) = o["source"].as_str() { span.muted { " · " (src) } }
         @if let Some(code) = o["paused"].as_str() { br; span.hard { "refine paused: " (code) } }
+        // Free text (ADR 0016): model lines a unanimous council approved,
+        // in the agent's instructions now. Escaped by maud.
+        @let lines = o["lines"].as_array().map(Vec::as_slice).unwrap_or_default();
+        @if !lines.is_empty() {
+            br; span.soft { "free-text habits in its instructions (ADR 0016):" }
+            @for l in lines { br; span { "- " (l.as_str().unwrap_or("")) } }
+        }
         @if let Some(b) = o["baseline"].as_u64() {
             br;
             // lg's Roll back reverses lg's last move, which is not always

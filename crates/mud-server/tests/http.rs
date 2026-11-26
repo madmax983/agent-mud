@@ -1277,6 +1277,7 @@ async fn the_autonomy_panel_shows_the_overlay_chain_escaped() {
                 pointer: Some(1),
                 baseline: Some(1),
                 source: None,
+                lines: Vec::new(),
                 paused: Some("rolled_back".into()),
                 rollback_to: Some(1),
                 chain: vec![
@@ -1352,4 +1353,52 @@ async fn the_autonomy_panel_shows_the_overlay_chain_escaped() {
         assert!(html.contains(want), "{html}");
         assert!(!html.contains("returns to the empty baseline"), "{html}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_autonomy_panel_shows_free_text_lines_escaped() {
+    let (addr, built) = boot().await;
+    let token = built.mud.admin_token.clone();
+    let torin = mud_world::EntityId::from("torin");
+    let text = mud_supervisor::steward::vet::render_free(&["Keep <i>trades</i> short.".to_owned()]);
+    built.mud.sup.set_autonomy(
+        &torin,
+        mud_supervisor::steward::AutonomyView {
+            overlay: Some(mud_supervisor::steward::OverlayView {
+                mode: "free".into(),
+                pointer: Some(2),
+                baseline: Some(1),
+                source: Some("free".into()),
+                lines: vec!["Keep <i>trades</i> short.".into()],
+                rollback_to: Some(1),
+                chain: vec![mud_supervisor::steward::ChainEntry {
+                    version: 2,
+                    label: "free".into(),
+                    text,
+                    active: true,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let html = http()
+        .get(format!("http://{addr}/observer/entities?token={token}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("refine (free): lg runs v2"), "{html}");
+    assert!(html.contains("free-text habits in its instructions (ADR 0016):"));
+    assert!(
+        html.contains("- Keep &lt;i&gt;trades&lt;/i&gt; short."),
+        "{html}"
+    );
+    assert!(
+        html.contains("v2 free: These are habits you settled into"),
+        "{html}"
+    );
+    assert!(!html.contains("<i>trades"));
 }
