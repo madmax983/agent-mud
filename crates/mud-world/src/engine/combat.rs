@@ -484,6 +484,37 @@ impl World {
             .map(|(d, _)| *d)
     }
 
+    /// The hostiles in `room` that remember fighting `who`, under
+    /// `[combat] foe_memory_minutes`: a hostile `who` struck, or the last
+    /// one that struck `who`, within the window before `now`.
+    fn foes_that_remember(&self, room: &RoomId, who: &EntityId, now: u64) -> Vec<EntityId> {
+        let Some(minutes) = self.pack.combat.foe_memory_minutes else {
+            return Vec::new();
+        };
+        let window = u64::from(minutes) * 60_000;
+        let fought = |by: Option<&(EntityId, u64)>, foe: &EntityId| {
+            by.is_some_and(|(e, at)| e == foe && now.saturating_sub(*at) < window)
+        };
+        let struck_by = self
+            .state
+            .entities
+            .get(who)
+            .and_then(|e| e.last_attacked_by.as_ref());
+        self.hostiles(room, who)
+            .into_iter()
+            .filter(|m| {
+                fought(struck_by, m)
+                    || fought(
+                        self.state
+                            .entities
+                            .get(m)
+                            .and_then(|e| e.last_attacked_by.as_ref()),
+                        who,
+                    )
+            })
+            .collect()
+    }
+
     /// Each hostile mob in the victim's room attacks it once.
     pub(crate) fn mob_round(&mut self, ctx: &mut Ctx, victim: &EntityId) -> Vec<Value> {
         let Some(v) = self.state.entities.get(victim) else {
@@ -584,27 +615,56 @@ impl World {
             from: me.room.clone(),
             to: to.clone(),
         });
-        if !me.hidden {
-            let from_dir = dir.opposite();
-            let spec = Emit::new(
-                EventKind::Enter,
-                Some(to),
-                format!("{} {}.", me.name, from_dir.arriving_from()),
-            )
-            .actor(actor, if fleeing { "flee" } else { "move" })
-            .data(json!({ "from": from_dir.short() }));
-            self.emit(ctx, spec);
-        }
-        let ambush = if me.hidden {
-            Vec::new()
-        } else {
-            self.mob_round(ctx, actor)
-        };
+        let (ambush, seen) = self.arrive(ctx, &me, &to, dir, fleeing);
         let (mut text, view) = self.look(actor);
+        if let Some(name) = seen {
+            text = format!("The {name} saw you go and knows you are back.\n{text}");
+        }
         if let Some(d) = opened {
             text = format!("You unlock the way {} with your key.\n{text}", d.name());
         }
         Ok((text, json!({ "look": view, "ambush": ambush })))
+    }
+
+    /// The arrival of `me` in `to`: the room sees it come in, and each
+    /// hostile there strikes it once, unless it is hidden. A hostile that
+    /// fought it in the `[combat] foe_memory_minutes` window sees through
+    /// the hiding. Returns the strikes and the name of the hostile that
+    /// saw through it, if one did.
+    fn arrive(
+        &mut self,
+        ctx: &mut Ctx,
+        me: &Entity,
+        to: &RoomId,
+        dir: Direction,
+        fleeing: bool,
+    ) -> (Vec<Value>, Option<String>) {
+        let actor = &me.id;
+        let seen_by = if me.hidden {
+            self.foes_that_remember(to, actor, ctx.now)
+        } else {
+            Vec::new()
+        };
+        if me.hidden && seen_by.is_empty() {
+            return (Vec::new(), None);
+        }
+        if let Some(e) = self.state.entities.get_mut(actor) {
+            e.hidden = false;
+        }
+        let from_dir = dir.opposite();
+        let spec = Emit::new(
+            EventKind::Enter,
+            Some(to.clone()),
+            format!("{} {}.", me.name, from_dir.arriving_from()),
+        )
+        .actor(actor, if fleeing { "flee" } else { "move" })
+        .data(json!({ "from": from_dir.short() }));
+        self.emit(ctx, spec);
+        let seen = seen_by
+            .first()
+            .and_then(|m| self.state.entities.get(m))
+            .map(|e| e.name.clone());
+        (self.mob_round(ctx, actor), seen)
     }
 
     pub(crate) fn flee(&mut self, ctx: &mut Ctx, actor: &EntityId, dir: Option<Direction>) -> Done {
@@ -745,9 +805,32 @@ impl World {
     /// The turn a `use` that acted takes in a fight, when the pack sets
     /// `[combat] use_draws_strike`: each hostile in the room strikes the
     /// user once, after the item worked. A refused use takes no turn.
-    pub(crate) fn use_turn(&mut self, ctx: &mut Ctx, actor: &EntityId, done: Done) -> Done {
+    ///
+    /// `room` is where the user stood when the use began. A use that
+    /// killed its user, or left it in another room, ends the turn there:
+    /// no hostile strikes a body that just woke at the respawn point.
+    pub(crate) fn use_turn(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        room: &RoomId,
+        done: Done,
+    ) -> Done {
         let (mut text, mut v) = done?;
         if !self.pack.combat.use_draws_strike {
+            return Ok((text, v));
+        }
+        // A use never moves its user, so a move in this command is the
+        // respawn after a death, as the script runner reads it too.
+        let gone = self.state.entities.get(actor).is_none_or(|e| &e.room != room)
+            || ctx.changes.iter().any(|c| {
+                matches!(c, StateChange::Status { entity, status, value: true } if entity == actor && status == "dead")
+                    || matches!(c, StateChange::Moved { entity, .. } if entity == actor)
+            });
+        if gone {
+            if let Some(o) = v.as_object_mut() {
+                o.insert("attacks".to_owned(), Value::Array(Vec::new()));
+            }
             return Ok((text, v));
         }
         let attacks = self.mob_round(ctx, actor);

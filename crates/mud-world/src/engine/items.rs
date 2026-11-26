@@ -656,7 +656,7 @@ impl World {
         // A key opens a lock on an exit or a container.
         if let Some(lock_id) = &def.key {
             let done = self.use_key(ctx, actor, lock_id, on);
-            return self.use_turn(ctx, actor, done);
+            return self.use_turn(ctx, actor, &me.room, done);
         }
         // A container shows what it holds. It is a look, so it takes no
         // turn in a fight.
@@ -711,12 +711,23 @@ impl World {
         // Money sealed in an item.
         if let Some(n) = sealed {
             let done = self.empty_purse(ctx, &me, item, &def, n);
-            return self.use_turn(ctx, actor, Ok(done));
+            return self.use_turn(ctx, actor, &me.room, Ok(done));
         }
         // Healing.
         if let Some(dice) = def.heal_dice() {
-            let done = self.heal_with(ctx, &me, item, &def, dice, on);
-            return self.use_turn(ctx, actor, done);
+            let target = match on {
+                None => actor.clone(),
+                Some(w) => self.find_here(actor, w).ok_or_else(|| {
+                    Fail::new(ErrorCode::NoSuchTarget, format!("you see no {w:?} here"))
+                })?,
+            };
+            let done = self.heal_with(ctx, &me, item, &def, dice, &target);
+            let (text, mut v) = self.use_turn(ctx, actor, &me.room, done)?;
+            // The turn may wound the one healed: `hp` is its HP after it.
+            if let (Some(t), Some(o)) = (self.state.entities.get(&target), v.as_object_mut()) {
+                o.insert("hp".to_owned(), json!(t.pools.hp));
+            }
+            return Ok((text, v));
         }
         // Gear: `use` is `equip`, and follows its rule.
         if def.slot.is_some() {
@@ -724,7 +735,7 @@ impl World {
         }
         // A world script may give an item with no engine use one.
         if let Some(done) = self.use_hook(ctx, actor, item, on) {
-            return self.use_turn(ctx, actor, done);
+            return self.use_turn(ctx, actor, &me.room, done);
         }
         Err(Fail::new(
             ErrorCode::CannotUse,
@@ -770,15 +781,26 @@ impl World {
         item: ItemId,
         def: &crate::pack::ItemDef,
         dice: mud_rules::DamageDice,
-        on: Option<&str>,
+        target: &EntityId,
     ) -> Done {
         let actor = &me.id;
-        let target = match on {
-            None => actor.clone(),
-            Some(w) => self.find_here(actor, w).ok_or_else(|| {
-                Fail::new(ErrorCode::NoSuchTarget, format!("you see no {w:?} here"))
-            })?,
-        };
+        // A heal on someone unhurt would waste the item and, in a fight,
+        // the turn. It is refused before it rolls, so it costs nothing.
+        if let Some(t) = self.state.entities.get(target)
+            && t.pools.hp >= t.pools.hp_max
+            && !t.unconscious
+        {
+            let who = if target == actor {
+                "you are".to_owned()
+            } else {
+                format!("{} is", t.name)
+            };
+            return Err(Fail::new(
+                ErrorCode::CannotUse,
+                format!("{who} not hurt; the {} would be wasted", def.name),
+            ));
+        }
+        let target = target.clone();
         let mut amount = dice
             .roll(&mut self.dice, mud_rules::DamageType::Crushing)
             .max(0);

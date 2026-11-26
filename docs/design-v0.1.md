@@ -172,8 +172,13 @@ came when no hostile waits there, else to a room with no hostile, else
 back the way you came. A turn in a fight (ADR 0017, pack `[combat]`):
 `attack` and `defend` draw a round in which each hostile strikes once,
 and with `use_draws_strike` (crypt-v01) so does a `use` that acts (a
-heal, a pouch, a key, a scripted use), after the item works. Mobs strike
-only a body that still acts. Attack → Dodge/Parry/Block (bypassed on a
+heal, a pouch, a key, a scripted use), after the item works. A heal on
+someone unhurt is refused and keeps the item. A use that kills its user
+ends the turn: no hostile strikes the body where it wakes. With
+`foe_memory_minutes` (crypt-v01: 5) a hostile remembers a body it fought
+for that long, and sees it walk back in hidden: it enters as if not
+hidden and draws the strike on entering. Mobs strike only a body that
+still acts. Attack → Dodge/Parry/Block (bypassed on a
 critical) → `(raw − DR).max(0) × multiplier` (crushing and
 burn ×1, cutting ×1.5, impaling ×2). Traits with self-control numbers
 (greedy 12, cowardly 12, impatient 12) roll when a trigger reaches the

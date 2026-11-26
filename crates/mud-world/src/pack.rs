@@ -374,6 +374,14 @@ pub struct CombatRules {
     /// a pack that does not say keeps a free `use`.
     #[serde(default)]
     pub use_draws_strike: bool,
+    /// Minutes a hostile remembers a body it fought: one it struck, or one
+    /// that struck it. A remembered body that walks into its room hidden is
+    /// seen. It enters as if it were not hidden, and each hostile there
+    /// strikes it once. So a retreat to heal and a hidden return still
+    /// cost the strike on entering. Unset: hiding always slips past the
+    /// strike on entering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foe_memory_minutes: Option<u32>,
 }
 
 impl CombatRules {
@@ -391,15 +399,22 @@ impl CombatRules {
              strikes you if it fails. A bare flee runs back the way you came when no hostile \
              waits there, else to a room with no hostile in it."
         };
+        let mut rule = leave.to_owned();
         if self.use_draws_strike {
-            format!(
-                "{leave} With a hostile in the room, use takes your turn as attack and defend \
-                 do: the item works, then each hostile strikes you once. Looking into a \
-                 container or putting on gear stays free."
-            )
-        } else {
-            leave.to_owned()
+            rule.push_str(
+                " With a hostile in the room, use takes your turn as attack and defend do: the \
+                 item works, then each hostile strikes you once. Looking into a container or \
+                 putting on gear stays free.",
+            );
         }
+        if let Some(minutes) = self.foe_memory_minutes {
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            rule = format!(
+                "{rule} Hiding does not shake a hostile you fought in the last {minutes} \
+                 {unit}: walk back in hidden and it sees you and strikes."
+            );
+        }
+        rule
     }
 }
 
