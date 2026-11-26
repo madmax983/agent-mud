@@ -691,6 +691,7 @@ proptest! {
         let bo = w.login("bo", 1).unwrap();
         let actors = [ada, bo, id("vich")];
         let money = w.state.total_currency(&w.pack);
+        let mut ledger = Vec::new();
         let mut now = 1_000;
         let mut last_seq = Seq(0);
         for (line, who) in steps {
@@ -701,17 +702,61 @@ proptest! {
                 last_seq = *s;
             }
             w.tick(now);
-            let bad = w.state.check();
-            prop_assert!(bad.is_empty(), "{:?} after {}", bad, LINES[line]);
-            prop_assert_eq!(
-                w.state.total_currency(&w.pack),
-                money + w.state.minted_currency(),
-                "money is conserved except for ledgered mints"
-            );
-            prop_assert!(w.fresh_mints().is_empty(), "no scripts, no mints");
-            prop_assert!(w.state.minted.is_empty());
+            ledger.extend(w.drain_mints());
+            keeps_every_invariant(&w, money, &ledger, LINES[line])?;
         }
+        // A fresh player puts the warden down, if it still stands, and the
+        // clock runs past its respawn: its kit is made new under the same
+        // invariants as random play.
+        let cy = w.login("cy", now).unwrap();
+        // A new player brings the template's purse.
+        let money = money + w.entity(&cy).unwrap().currency;
+        let warden = id("skeletal_warden");
+        if w.entity(&warden).unwrap().dead_until_ms.is_none() {
+            let room = w.entity(&warden).unwrap().room.clone();
+            w.state.entities.get_mut(&cy).unwrap().room = room;
+            let e = w.state.entities.get_mut(&warden).unwrap();
+            e.pools.hp = -6 * e.pools.hp_max;
+            w.fix_dice([1, 1, 1, 6, 6, 6]);
+            now += 7_000;
+            prop_assert!(w.execute(&cy, "attack warden", now).ok);
+        }
+        prop_assert!(w.entity(&warden).unwrap().dead_until_ms.is_some());
+        w.tick(now + 121 * 60_000);
+        ledger.extend(w.drain_mints());
+        keeps_every_invariant(&w, money, &ledger, "a long tick")?;
+        prop_assert!(w.entity(&warden).unwrap().can_act(), "the warden is back");
+        prop_assert!(
+            ledger.iter().any(|m| m.entity == warden),
+            "with its kit, ledgered"
+        );
     }
+}
+
+/// The invariants random play keeps after each step. No script runs, so
+/// the only mints are the engine's respawn kits.
+fn keeps_every_invariant(
+    w: &World,
+    money: i64,
+    ledger: &[MintRecord],
+    after: &str,
+) -> Result<(), TestCaseError> {
+    let bad = w.state.check();
+    prop_assert!(bad.is_empty(), "{:?} after {}", bad, after);
+    prop_assert_eq!(
+        w.state.total_currency(&w.pack),
+        money + w.state.minted_currency(),
+        "money is conserved except for ledgered mints"
+    );
+    let respawn = PoolId::from(crate::rewards::RESPAWN_POOL);
+    prop_assert!(
+        ledger.iter().all(|m| m.pool == respawn),
+        "no scripts, so only respawn kits mint"
+    );
+    prop_assert!(w.state.minted.keys().all(|p| *p == respawn));
+    let bad = w.state.check_rewards(&w.pack, ledger);
+    prop_assert!(bad.is_empty(), "{:?} after {}", bad, after);
+    Ok(())
 }
 
 #[test]

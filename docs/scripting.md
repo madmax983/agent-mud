@@ -184,11 +184,19 @@ receive 20s and a healing draught.` (in the command's narrative and as a
 - `state_changes`: `currency`, an `item` change from nowhere, and `minted`.
 
 The observer's feed shows a `minted` row, and the Scripts panel lists each
-pool with what is left and its running totals. Money in the world is
+pack pool with what is left and its running totals. Money in the world is
 always the start plus the ledger's currency, and every item made after the
 start is a new player's kit or named by the ledger. The property tests
 check exactly that. A reward is not a sale: shops and `POLICY_TRADE_REQUIRED` are
 unchanged.
+
+The engine writes to the same ledger without a script: a respawned mob's
+kit (`[cast.x] respawn_kit`, ADR 0012) is one row in the pool `@respawn`
+(`rewards::RESPAWN_POOL`), with hook `respawn`, period 0, currency 0 and
+no budget. No pack can declare that pool, because `@` is not in a pool
+id. Its rows reach the `mints` table, `WorldState.minted`, `state_changes`
+and the feed as a script's do, and `check_rewards` checks them. The
+Scripts panel shows pack pools only, so `@respawn` is not in it.
 
 ## Natives
 

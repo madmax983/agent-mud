@@ -246,7 +246,8 @@ pub enum StateChange {
         /// The event.
         seq: Seq,
     },
-    /// A script's reward was minted from a pack pool and recorded in the
+    /// A script's reward from a pack pool, or a respawned mob's kit
+    /// ([`crate::rewards::RESPAWN_POOL`]), was minted and recorded in the
     /// ledger. The money and the new items also appear as `currency` and
     /// `item` changes (an item from nowhere).
     Minted {
@@ -390,9 +391,11 @@ pub enum Audit {
         /// When.
         at_ms: u64,
     },
-    /// A world hook's reward was minted and recorded in the ledger.
+    /// A world hook's reward, or a respawned mob's kit
+    /// ([`crate::rewards::RESPAWN_POOL`]), was minted and recorded in the
+    /// ledger.
     Minted {
-        /// The hook key.
+        /// The hook key, or `respawn` for a respawned mob's kit.
         hook: String,
         /// Who received it.
         entity: EntityId,

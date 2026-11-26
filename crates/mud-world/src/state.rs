@@ -461,6 +461,9 @@ impl WorldState {
     /// - A cast entry the save lacks is spawned fresh. One the save has
     ///   gets the starting gear the pack added to its entry since the save
     ///   (see [`WorldState::cast_gear`]); nothing it carries is taken.
+    ///   It also takes the entry's `respawn_minutes`, so the pack decides
+    ///   whether a saved mob respawns. A mob dead at load keeps the timer
+    ///   it died with; its next death uses the new one.
     ///
     /// Humans are never retired. Renaming a cast id therefore makes a new
     /// character, not a moved one.
@@ -538,7 +541,10 @@ impl WorldState {
         // stock made new in its fixture, not on its body.
         self.build_fixtures(pack);
         for (id, def) in &pack.cast {
-            if self.entities.contains_key(id) {
+            if let Some(e) = self.entities.get_mut(id) {
+                // The pack decides whether a mob respawns. A mob dead now
+                // keeps the timer it died with; its next death uses this.
+                e.respawn_minutes = def.respawn_minutes;
                 self.add_cast_gear(id, def, pack);
             } else {
                 let e = self.entity_from_cast(id, def, pack);

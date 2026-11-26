@@ -105,8 +105,7 @@ warden fights with its grave-blade only once per world. When a mob dies,
 `World::tick` restored HP and the home room, but not the kit. So every
 later warden fought bare-handed (brawling at its DX default, thr-1
 crushing), and every later warren rat came back without its tail. The
-odds the study measured held for the first spawn only, and one blade
-ever existed for the bounty that asks for it.
+odds the study measured held for the first spawn only.
 
 ### Decision
 
@@ -125,6 +124,14 @@ ever existed for the bounty that asks for it.
   named relic). The pack check refuses `respawn_kit` on an entry that is
   not a mob with `respawn_minutes`, because it would mean nothing there.
   The switch is pack data, so the engine names no mob and no item.
+- **The saved mob decides whether it respawns; the pack decides what
+  it gets.** `kill` and `World::tick` read the entity's own
+  `respawn_minutes`, and reconcile copies it from the cast entry at each
+  load, so a pack edit reaches a saved mob. A mob that is dead at load
+  keeps the timer it died with, and its next death uses the new one. A
+  mob that comes back always gets its kit, unless its entry sets
+  `respawn_kit = false`, even when the pack has since dropped its
+  `respawn_minutes`.
 - **The old kit stays where it fell, as loot.** Each death drops one kit
   and each respawn makes one. Loot accrues once per kill, and the mob's
   respawn timer bounds how often that happens (the warden: one blade per
@@ -150,6 +157,16 @@ ever existed for the bounty that asks for it.
 
 - A second warden fights with its blade, so the study's warden odds hold
   for every spawn. Each kill of the warden leaves a blade to loot.
+- This step does not fix Hale's bounty. Its proof (`report` in the
+  square) is any warden blade, and the report does not take the blade.
+  Before this step only one blade existed, so at most one player could
+  claim a kill someone else made. Now every past killer holds a blade
+  and can claim each later death, once a day, before the real killer
+  walks back. The payouts do not grow: each death still pays once, and
+  the pool caps the day. Making the proof single-use (the report takes
+  the blade, or only the killer is paid) needs a script effect that
+  crypt-v01 does not have yet. It belongs to a later balance or content
+  step.
 - giant_rat_2 comes back with a tail, so tails come back every 30
   minutes, one per kill.
 - The ledger grows by one row per respawn that makes something, as it

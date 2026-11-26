@@ -290,9 +290,14 @@ impl World {
     /// engine's own pool ([`RESPAWN_POOL`]), announced by the respawn line
     /// `seq`, so items stay conserved except for ledgered mints. A mob
     /// whose entry sets `respawn_kit = false` gets nothing back.
+    ///
+    /// The caller has just respawned the mob, so the saved entity decides
+    /// whether it respawns (`respawn_minutes`, which reconcile keeps in
+    /// line with the pack). Only the switch comes from the entry here, so
+    /// a mob that comes back always comes back with its kit.
     pub(super) fn restore_kit(&mut self, ctx: &mut Ctx, id: &EntityId, seq: Seq) {
         let pack = Arc::clone(&self.pack);
-        let Some(def) = pack.cast.get(id).filter(|d| d.respawns_with_kit()) else {
+        let Some(def) = pack.cast.get(id).filter(|d| d.respawn_kit != Some(false)) else {
             return;
         };
         let Some(e) = self.state.entities.get(id) else {

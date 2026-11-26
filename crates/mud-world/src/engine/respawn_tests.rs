@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::ids::ShopId;
 use crate::rewards::RESPAWN_POOL;
 
 const MINUTE: u64 = 60_000;
@@ -48,12 +49,18 @@ fn on_floor(w: &World, room: &str, proto: &str) -> Vec<ItemId> {
 fn killed(pack: WorldPack, mob: &str, room: &str) -> (World, EntityId) {
     let mut w = World::new(Arc::new(pack), 42);
     let ada = w.login("ada", 1).unwrap();
-    w.state.entities.get_mut(&ada).unwrap().room = RoomId::from(room);
+    kill(&mut w, &ada, mob, room, KILLED_AT);
+    (w, ada)
+}
+
+/// `who` walks into `room` and kills `mob` there at `now`.
+fn kill(w: &mut World, who: &EntityId, mob: &str, room: &str, now: u64) {
+    w.state.entities.get_mut(who).unwrap().room = RoomId::from(room);
     let m = w.state.entities.get_mut(&id(mob)).unwrap();
     m.pools.hp = -6 * m.pools.hp_max;
     let name = m.aliases.first().cloned().unwrap_or_else(|| m.name.clone());
     w.fix_dice([1, 1, 1, 6, 6, 6]);
-    let r = w.execute(&ada, &format!("attack {name}"), KILLED_AT);
+    let r = w.execute(who, &format!("attack {name}"), now);
     assert!(r.ok, "{r:?}");
     assert!(
         w.entity(&id(mob)).unwrap().dead_until_ms.is_some(),
@@ -61,7 +68,18 @@ fn killed(pack: WorldPack, mob: &str, room: &str) -> (World, EntityId) {
     );
     w.drain_fresh();
     w.drain_audit();
-    (w, ada)
+}
+
+/// The world `w` saved and loaded again under `pack`, with its humans
+/// back online.
+fn reload(w: &World, pack: WorldPack) -> World {
+    let json = serde_json::to_string(&w.snapshot()).unwrap();
+    let saved: WorldState = serde_json::from_str(&json).unwrap();
+    let mut back = World::from_state(Arc::new(pack), saved, Vec::new());
+    for e in back.state.entities.values_mut().filter(|e| e.human) {
+        e.online = true;
+    }
+    back
 }
 
 /// The time just after `mob` is due back.
@@ -292,4 +310,107 @@ fn a_restart_between_death_and_respawn_mints_the_same_kit() {
         serde_json::from_str(&serde_json::to_string(&back.snapshot()).unwrap()).unwrap();
     assert_eq!(again.minted[&PoolId::from(RESPAWN_POOL)].mints, 1);
     assert_eq!(again.check(), Vec::<String>::new());
+}
+
+#[test]
+fn a_kit_never_makes_money_and_stock_is_not_part_of_it() {
+    // A pack lists a purse in the warden's kit: a respawn never makes it.
+    let mut pack = crypt();
+    pack.cast
+        .get_mut(&id("skeletal_warden"))
+        .unwrap()
+        .inventory
+        .push(ProtoId::from("old_coin_pouch"));
+    let (mut w, _) = killed(pack, "skeletal_warden", "ossuary_crypt");
+    // The warden keeps a shop, and a blade it carries as merchandise is
+    // not its own blade.
+    w.state
+        .entities
+        .get_mut(&id("skeletal_warden"))
+        .unwrap()
+        .shop = Some(ShopId::from("vich"));
+    let stock = w.state.new_item(&ProtoId::from("warden_blade"), &w.pack);
+    w.state.attach(
+        stock,
+        &Holder::Entity {
+            entity: id("skeletal_warden"),
+        },
+    );
+    w.state.items.get_mut(&stock).unwrap().stock = true;
+    let money = w.state.total_currency(&w.pack);
+    let next = w.state.next_item;
+    w.tick(due(&w, "skeletal_warden"));
+    assert!(
+        carried(&w, "skeletal_warden", "old_coin_pouch").is_empty(),
+        "no purse is made"
+    );
+    let blades = carried(&w, "skeletal_warden", "warden_blade");
+    assert_eq!(blades.len(), 2, "its stock and a blade made new");
+    let made: Vec<ItemId> = blades.iter().copied().filter(|b| *b != stock).collect();
+    assert_eq!(made.len(), 1);
+    let warden = w.entity(&id("skeletal_warden")).unwrap();
+    assert_eq!(
+        warden.equipped.get(&Slot::Weapon),
+        Some(&made[0]),
+        "it wields its own blade, not its stock"
+    );
+    assert_eq!(w.state.next_item, next + 1, "one item is made");
+    let rows = w.fresh_mints().to_vec();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].items.len(), 1);
+    assert_eq!(rows[0].items[0].proto, ProtoId::from("warden_blade"));
+    assert_eq!(w.state.total_currency(&w.pack), money, "no money is made");
+    assert_eq!(w.state.check(), Vec::<String>::new());
+    assert_eq!(w.state.check_rewards(&w.pack, &rows), Vec::<String>::new());
+}
+
+#[test]
+fn a_pack_edit_to_respawn_minutes_reaches_a_saved_mob() {
+    // The pack drops the rat's respawn while it lies dead: it comes back
+    // on the timer it died with, with its kit, and stays dead next time.
+    let (w, ada) = killed(crypt(), "giant_rat_2", "rat_warren");
+    let back = due(&w, "giant_rat_2");
+    let mut pack = crypt();
+    pack.cast
+        .get_mut(&id("giant_rat_2"))
+        .unwrap()
+        .respawn_minutes = None;
+    let mut w = reload(&w, pack);
+    assert_eq!(w.entity(&id("giant_rat_2")).unwrap().respawn_minutes, None);
+    w.tick(back);
+    assert!(w.entity(&id("giant_rat_2")).unwrap().can_act());
+    assert_eq!(
+        carried(&w, "giant_rat_2", "rat_tail").len(),
+        1,
+        "it comes back with its kit"
+    );
+    kill(&mut w, &ada, "giant_rat_2", "rat_warren", back + MINUTE);
+    assert_eq!(
+        w.entity(&id("giant_rat_2")).unwrap().dead_until_ms,
+        Some(u64::MAX),
+        "the pack says it does not respawn"
+    );
+    assert_eq!(w.state.check(), Vec::<String>::new());
+
+    // A save from a pack where the rat did not respawn, loaded under one
+    // where it does: the rat respawns, with its kit.
+    let mut w = World::new(Arc::new(crypt()), 42);
+    let ada = w.login("ada", 1).unwrap();
+    w.state
+        .entities
+        .get_mut(&id("giant_rat_2"))
+        .unwrap()
+        .respawn_minutes = None;
+    let mut w = reload(&w, crypt());
+    assert_eq!(
+        w.entity(&id("giant_rat_2")).unwrap().respawn_minutes,
+        Some(30)
+    );
+    kill(&mut w, &ada, "giant_rat_2", "rat_warren", KILLED_AT);
+    let until = w.entity(&id("giant_rat_2")).unwrap().dead_until_ms;
+    assert_eq!(until, Some(KILLED_AT + 30 * MINUTE));
+    w.tick(due(&w, "giant_rat_2"));
+    assert!(w.entity(&id("giant_rat_2")).unwrap().can_act());
+    assert_eq!(carried(&w, "giant_rat_2", "rat_tail").len(), 1);
+    assert_eq!(w.state.check(), Vec::<String>::new());
 }
