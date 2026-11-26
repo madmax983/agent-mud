@@ -11,6 +11,15 @@ A text MUD where humans and littleguy agents share one world. Read
 - Before pushing: `cargo fmt --all`, `cargo clippy --workspace --all-targets
   -- -D warnings`, `cargo test --workspace`, and `cargo run -p mud-server
   --bin mud -- smoke`.
+- **Config changes are loud.** A new key, in `mud.toml` or in the `lg.toml`
+  the MUD writes, goes into `mud.toml.example` with a comment, and into the
+  README where a user meets it. The PR description lists each one under a
+  "Config changes" heading. The `config::example_tests` fail when the
+  example misses a key.
+- **A new `lg.toml` part needs a littleguy that reads it.** Name the first
+  littleguy commit that reads it, bump the pin (`LG_MIN_COMMIT` in
+  `littleguy/compat.rs`, `ci.yml`, the README and the example together), and
+  add it to `compat::Optional` when an older lg may run without it.
 
 ## Rules that bind this repository
 
