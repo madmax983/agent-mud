@@ -57,6 +57,10 @@ fn = "on_pray"                      # default on_<name>
 config = { modifier = -2 }
 ```
 
+An `on_use` that succeeds is a `use` that acts. With `[combat]
+use_draws_strike` in `world.toml`, it takes the user's turn beside a
+hostile, after the script's lines (ADR 0017). A `refuse` takes no turn.
+
 Rules the loader checks, all reported at once: known cast ids, rooms and
 items; a binding declares at least one hook; `on_use` only for items that
 are not a key, container, coin pouch, healing item or gear; a verb never

@@ -1125,6 +1125,50 @@ fn on_use_runs_only_for_carried_items_without_an_engine_use() {
     assert_eq!(h.calls(), 1);
 }
 
+/// With `[combat] use_draws_strike` (crypt-v01), a scripted use beside
+/// the rat takes Ada's turn, after the script's text. A refused one does
+/// not.
+#[test]
+fn a_scripted_use_beside_a_hostile_takes_a_turn_and_a_refused_one_does_not() {
+    let combat = |w: &World, r: &CommandResult| {
+        w.logged()
+            .filter(|e| r.events.contains(&e.seq))
+            .filter(|e| e.kind == crate::event::EventKind::Combat)
+            .count()
+    };
+    for (fx, struck) in [
+        (ScriptEffect::Msg("It hums.".into()), 1),
+        (ScriptEffect::Refuse("Not here.".into()), 0),
+    ] {
+        let h = Arc::new(FakeHooks::new(
+            vec![HookId::Use(ProtoId::from("bone_charm"))],
+            effects(vec![fx]),
+        ));
+        let mut w = world_with(&h);
+        let ada = w.login("ada", 1).unwrap();
+        w.state.entities.get_mut(&ada).unwrap().room = RoomId::from("wine_vault");
+        let pack = Arc::clone(&w.pack);
+        let charm = w.state.new_item(&ProtoId::from("bone_charm"), &pack);
+        w.state.attach(
+            charm,
+            &Holder::Entity {
+                entity: ada.clone(),
+            },
+        );
+        w.fix_dice([6, 6, 6]);
+        let r = run(&mut w, &ada, "use charm");
+        assert_eq!(h.calls(), 1);
+        assert_eq!(combat(&w, &r), struck, "{r:?}");
+        if struck == 1 {
+            assert!(r.narrative.starts_with("It hums.\n"), "{}", r.narrative);
+            assert_eq!(r.resolution["script"], "items.bone_charm.on_use");
+            assert_eq!(r.resolution["attacks"].as_array().map(Vec::len), Some(1));
+        } else {
+            assert_eq!(r.error_code, Some(ErrorCode::Refused));
+        }
+    }
+}
+
 #[test]
 fn use_on_passes_a_resolved_target_and_refuses_an_unknown_one() {
     let h = Arc::new(FakeHooks::new(

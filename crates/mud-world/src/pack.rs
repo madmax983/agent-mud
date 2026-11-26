@@ -351,11 +351,12 @@ impl DeathRules {
     }
 }
 
-/// `[combat]` in `world.toml`: how a fight lets go of you.
+/// `[combat]` in `world.toml`: how a fight lets go of you, and what takes
+/// a turn in one.
 ///
 /// A pack without the table keeps the strict rule: with a hostile in the
-/// room, every way out needs `flee`. A key the table does not know fails
-/// the pack, as for `[recovery]`.
+/// room, every way out needs `flee`, and `use` is free. A key the table
+/// does not know fails the pack, as for `[recovery]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CombatRules {
@@ -365,14 +366,22 @@ pub struct CombatRules {
     /// stays.
     #[serde(default)]
     pub retreat_free: bool,
+    /// Whether a `use` that acts takes the user's turn in a fight: each
+    /// hostile in the room that can act strikes the user once after the
+    /// item works, as after `attack` or `defend`. A heal, a purse, a key
+    /// and a scripted use act. Looking into a container and putting gear
+    /// on (`use` on a worn item is `equip`) do not. Unset means false, so
+    /// a pack that does not say keeps a free `use`.
+    #[serde(default)]
+    pub use_draws_strike: bool,
 }
 
 impl CombatRules {
-    /// How to leave a fight, in two sentences, as `help` and an agent's
-    /// system prompt say it.
+    /// How to leave a fight, and what using an item in one costs, in a few
+    /// sentences, as `help` and an agent's system prompt say it.
     #[must_use]
-    pub const fn rule(&self) -> &'static str {
-        if self.retreat_free {
+    pub fn rule(&self) -> String {
+        let leave = if self.retreat_free {
             "With a hostile in the room, you may walk back out the way you came in; any other \
              way needs flee, a DX check, and each hostile strikes you if it fails. A bare flee \
              runs back the way you came when no hostile waits there, else to a room with no \
@@ -381,6 +390,15 @@ impl CombatRules {
             "With a hostile in the room, every way out needs flee, a DX check, and each hostile \
              strikes you if it fails. A bare flee runs back the way you came when no hostile \
              waits there, else to a room with no hostile in it."
+        };
+        if self.use_draws_strike {
+            format!(
+                "{leave} With a hostile in the room, use takes your turn as attack and defend \
+                 do: the item works, then each hostile strikes you once. Looking into a \
+                 container or putting on gear stays free."
+            )
+        } else {
+            leave.to_owned()
         }
     }
 }

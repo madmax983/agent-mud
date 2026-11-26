@@ -196,7 +196,7 @@ impl World {
         help.push(' ');
         help.push_str(&self.death_rule());
         help.push_str("\nfighting: ");
-        help.push_str(self.pack.combat.rule());
+        help.push_str(&self.pack.combat.rule());
         let here = self.verbs_here(actor);
         if let Some(h) = &self.hooks
             && !here.is_empty()

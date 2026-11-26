@@ -742,6 +742,25 @@ impl World {
         (text, json!({ "attacks": attacks }))
     }
 
+    /// The turn a `use` that acted takes in a fight, when the pack sets
+    /// `[combat] use_draws_strike`: each hostile in the room strikes the
+    /// user once, after the item worked. A refused use takes no turn.
+    pub(crate) fn use_turn(&mut self, ctx: &mut Ctx, actor: &EntityId, done: Done) -> Done {
+        let (mut text, mut v) = done?;
+        if !self.pack.combat.use_draws_strike {
+            return Ok((text, v));
+        }
+        let attacks = self.mob_round(ctx, actor);
+        let more = self.combat_text(ctx);
+        if !more.is_empty() {
+            text = format!("{text}\n{more}");
+        }
+        if let Some(o) = v.as_object_mut() {
+            o.insert("attacks".to_owned(), Value::Array(attacks));
+        }
+        Ok((text, v))
+    }
+
     /// The narratives of the combat events of this command, in order.
     fn combat_text(&self, ctx: &Ctx) -> String {
         self.log

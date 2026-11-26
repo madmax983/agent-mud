@@ -1549,3 +1549,6 @@ mod retreat_tests;
 
 #[cfg(test)]
 mod respawn_tests;
+
+#[cfg(test)]
+mod use_turn_tests;
