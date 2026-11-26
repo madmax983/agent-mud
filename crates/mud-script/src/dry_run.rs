@@ -59,10 +59,14 @@ impl Compiled {
             }
         }
         for id in self.minds.keys() {
-            let me = world.actor_facts(id).map_or(Value::Null, |mut f| {
+            let mut me = world.actor_facts(id).map_or(Value::Null, |mut f| {
                 f.marks = None;
                 serde_json::to_value(f).unwrap_or(Value::Null)
             });
+            // As the supervisor gives it: the mind's own soft post.
+            if let Some(obj) = me.as_object_mut() {
+                obj.insert("post".into(), world.post_view(id));
+            }
             let here = world.look_view(id);
             let room = here["room_id"].as_str().map(str::to_owned);
             let who = EventActor {

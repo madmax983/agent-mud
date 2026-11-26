@@ -22,6 +22,12 @@ respawn_hp_frac = 0.34
 drop_purse = true
 purse_item = "dropped_purse"
 
+# Leaving a fight: with a hostile in the room, walking back out the way
+# you came in is a normal move, with no flee roll and no strike. Any other
+# way needs `flee`. The strike on entering a lair stays.
+[combat]
+retreat_free = true
+
 # ------------------------------------------------------------------ town
 [[rooms]]
 id = "notice_market"
@@ -58,7 +64,9 @@ title = "Dark Alley"
 description = "A slot between leaning houses. Runoff gurgles through an iron grate set in the cobbles. A curtained door leads east; the square is north."
 safe = true
 exits = { n = "town_square", e = "fence_backroom", d = "cellar_landing" }
-locks = { d = { lock = "alley_grate", pick = -2, describe = "An iron grate, locked with a heavy padlock." } }
+# The grate swings shut and locks itself again half an hour after it is
+# opened. From below, the way up is never locked.
+locks = { d = { lock = "alley_grate", pick = -2, describe = "An iron grate, locked with a heavy padlock.", relock_minutes = 30 } }
 
 [[rooms]]
 id = "fence_backroom"

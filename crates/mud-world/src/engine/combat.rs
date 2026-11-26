@@ -218,6 +218,13 @@ impl World {
                     .and_then(|p| self.pack.items.get(&p))
                     .is_some_and(|d| d.hidden);
                 if !hidden {
+                    // A mob keeper's stock is loot once it falls: only a
+                    // fixture or a keeper's body holds merchandise, and
+                    // nobody may take merchandise from the floor.
+                    if let Some(it) = self.state.items.get_mut(&item) {
+                        it.stock = false;
+                        it.paid = None;
+                    }
                     self.relocate_item(
                         ctx,
                         item,
@@ -249,6 +256,7 @@ impl World {
             e.pools.hp = frac.respawn_hp(e.pools.hp_max);
             e.unconscious = false;
             e.room = to.clone();
+            e.came_from = None;
             ctx.changes.push(StateChange::Hp {
                 entity: victim.clone(),
                 delta: e.pools.hp - v.pools.hp,
@@ -318,6 +326,53 @@ impl World {
         self.emit(ctx, spec);
     }
 
+    /// Whether walking from where `me` stands to `to` is a retreat: the
+    /// pack sets `[combat] retreat_free`, and `to` is the room `me` came in
+    /// from. A retreat is a normal move, with no flee roll and no strike.
+    fn is_retreat(&self, me: &Entity, to: &RoomId) -> bool {
+        self.pack.combat.retreat_free && me.came_from.as_ref() == Some(to)
+    }
+
+    /// The way a bare `flee` runs: back to the room `me` came in from
+    /// when no hostile is there, else to a room with no hostile in it,
+    /// else back the way it came, else the first open exit. A locked exit
+    /// is never a way out. The way back is not first when it leads into a
+    /// lair: a retreat into a lair records that lair as the way back, and
+    /// a bare flee would otherwise bounce between two lairs, drawing a
+    /// strike on every arrival.
+    fn flee_way(&self, me: &Entity) -> Option<Direction> {
+        let def = self.pack.rooms.get(&me.room)?;
+        let open: Vec<(Direction, &RoomId)> = def
+            .exits
+            .iter()
+            .filter(|(d, _)| !self.exit_is_locked(&me.room, **d))
+            .map(|(d, r)| (*d, r))
+            .collect();
+        let back = open.iter().find(|(_, r)| me.came_from.as_ref() == Some(*r));
+        let clear = |(_, r): &&(Direction, &RoomId)| self.hostiles(r, &me.id).is_empty();
+        back.filter(clear)
+            .or_else(|| open.iter().find(clear))
+            .or(back)
+            .or_else(|| open.first())
+            .map(|(d, _)| *d)
+    }
+
+    /// The way back the way `me` came, when `[combat] retreat_free` makes
+    /// it a walk, the exit is open, and no hostile waits there: the hint a
+    /// refused walk gives. A way back into a lair is not offered.
+    fn safe_way_back(&self, me: &Entity) -> Option<Direction> {
+        if !self.pack.combat.retreat_free {
+            return None;
+        }
+        let back = me.came_from.as_ref()?;
+        let def = self.pack.rooms.get(&me.room)?;
+        def.exits
+            .iter()
+            .find(|(d, r)| *r == back && !self.exit_is_locked(&me.room, **d))
+            .filter(|(_, r)| self.hostiles(r, &me.id).is_empty())
+            .map(|(d, _)| *d)
+    }
+
     /// Each hostile mob in the victim's room attacks it once.
     pub(crate) fn mob_round(&mut self, ctx: &mut Ctx, victim: &EntityId) -> Vec<Value> {
         let Some(v) = self.state.entities.get(victim) else {
@@ -329,11 +384,13 @@ impl World {
         let room = v.room.clone();
         let mut out = Vec::new();
         for mob in self.hostiles(&room, victim) {
+            // A body that collapsed to an earlier mob of this round is
+            // left alone: mobs strike only what still acts.
             let still_here = self
                 .state
                 .entities
                 .get(victim)
-                .is_some_and(|v| v.present() && v.room == room && v.dead_until_ms.is_none());
+                .is_some_and(|v| v.can_act() && v.room == room);
             if !still_here {
                 break;
             }
@@ -359,10 +416,17 @@ impl World {
             def.exits.get(&dir).cloned().ok_or_else(|| {
                 Fail::new(ErrorCode::NoExit, format!("you cannot go {}", dir.name()))
             })?;
-        if !fleeing && me.kind != EntityKind::Mob && !self.hostiles(&me.room, actor).is_empty() {
+        if !fleeing
+            && me.kind != EntityKind::Mob
+            && !self.is_retreat(&me, &to)
+            && !self.hostiles(&me.room, actor).is_empty()
+        {
+            let back = self.safe_way_back(&me).map_or_else(String::new, |d| {
+                format!(" (or go back {}, the way you came)", d.name())
+            });
             return Err(Fail::new(
                 ErrorCode::InCombat,
-                "something hostile blocks you; flee instead",
+                format!("something hostile blocks you; flee instead{back}"),
             ));
         }
         let opened = if self.exit_is_locked(&me.room, dir) {
@@ -402,6 +466,7 @@ impl World {
         }
         if let Some(e) = self.state.entities.get_mut(actor) {
             e.room = to.clone();
+            e.came_from = Some(me.room.clone());
         }
         ctx.changes.push(StateChange::Moved {
             entity: actor.clone(),
@@ -433,21 +498,24 @@ impl World {
 
     pub(crate) fn flee(&mut self, ctx: &mut Ctx, actor: &EntityId, dir: Option<Direction>) -> Done {
         let me = self.me(actor)?.clone();
-        let def = self.pack.rooms.get(&me.room).cloned();
         let dir = match dir {
             Some(d) => d,
-            None => def
-                .as_ref()
-                .and_then(|d| {
-                    d.exits
-                        .keys()
-                        .copied()
-                        .find(|x| !self.exit_is_locked(&me.room, *x))
-                })
+            None => self
+                .flee_way(&me)
                 .ok_or_else(|| Fail::new(ErrorCode::NoExit, "there is nowhere to run"))?,
         };
+        let to = self
+            .pack
+            .rooms
+            .get(&me.room)
+            .and_then(|d| d.exits.get(&dir))
+            .cloned();
         if self.hostiles(&me.room, actor).is_empty() {
             return self.walk(ctx, actor, dir, true);
+        }
+        if to.as_ref().is_some_and(|t| self.is_retreat(&me, t)) {
+            let (text, v) = self.walk(ctx, actor, dir, true)?;
+            return Ok((format!("You fall back the way you came.\n{text}"), v));
         }
         let level = me.attrs.dx
             + if self.lit(&me.room) {

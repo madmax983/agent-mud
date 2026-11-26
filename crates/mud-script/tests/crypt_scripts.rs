@@ -134,9 +134,15 @@ fn the_bundled_script_list_matches_the_pack_folder() {
 
 #[test]
 fn the_ossuary_marks_its_first_visitor_once() {
+    // Both put their torches away: the warden waits in the dark.
     let (mut w, ids) = world_with(
         &[("ada", "flooded_cistern"), ("bo", "flooded_cistern")],
-        |_, _| {},
+        |state, _| {
+            for e in state.entities.values_mut().filter(|e| e.human) {
+                e.equipped
+                    .retain(|slot, _| *slot != mud_world::pack::Slot::Light);
+            }
+        },
     );
     let (ada, bo) = (&ids[0], &ids[1]);
     w.fix_dice([6; 60]);

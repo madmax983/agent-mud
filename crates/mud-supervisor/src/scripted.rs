@@ -205,6 +205,19 @@ fn script_event(w: &World, me: &EntityId, ev: &Event) -> ScriptEvent {
     }
 }
 
+/// What a mind script sees of itself (`ctx.me`): its facts without its
+/// marks, and its own soft post, as its sheet shows it.
+fn mind_facts(w: &World, e: &EntityId) -> serde_json::Value {
+    let mut me = w.actor_facts(e).map_or(serde_json::Value::Null, |mut f| {
+        f.marks = None;
+        serde_json::to_value(f).unwrap_or(serde_json::Value::Null)
+    });
+    if let Some(obj) = me.as_object_mut() {
+        obj.insert("post".into(), w.post_view(e));
+    }
+    me
+}
+
 impl Scripts {
     async fn decide(&self, ctx: &WakeContext, toml_plan: &[String], tools: &MudTools) -> Decision {
         let e = &ctx.entity;
@@ -218,10 +231,7 @@ impl Scripts {
         let schema = self.host.mind_memory_schema(e);
         let (resets, memory) = self.game.script_memory_at(e, schema);
         let (me, here, events) = self.game.read(|w| {
-            let me = w.actor_facts(e).map_or(serde_json::Value::Null, |mut f| {
-                f.marks = None;
-                serde_json::to_value(f).unwrap_or(serde_json::Value::Null)
-            });
+            let me = mind_facts(w, e);
             let events: Vec<ScriptEvent> =
                 ctx.events.iter().map(|ev| script_event(w, e, ev)).collect();
             (me, w.look_view(e), events)

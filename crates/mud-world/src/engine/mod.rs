@@ -1338,6 +1338,38 @@ impl World {
         }
     }
 
+    /// Locks again each opened exit whose lock has `relock_minutes` and
+    /// whose time is up, on both sides, and tells the room. An exit open
+    /// with no time on record (a save from before) starts its clock now.
+    fn relock(&mut self, ctx: &mut Ctx) {
+        let pack = Arc::clone(&self.pack);
+        for (rid, def) in &pack.rooms {
+            for (dir, lock) in &def.locks {
+                let Some(minutes) = lock.relock_minutes else {
+                    continue;
+                };
+                let Some(rs) = self.state.rooms.get_mut(rid) else {
+                    continue;
+                };
+                if !rs.unlocked.contains(dir) {
+                    continue;
+                }
+                let at = *rs.unlocked_at.entry(*dir).or_insert(ctx.now);
+                if ctx.now.saturating_sub(at) < u64::from(minutes) * 60_000 {
+                    continue;
+                }
+                self.set_exit_lock(ctx, rid, *dir, true);
+                let spec = Emit::new(
+                    EventKind::System,
+                    Some(rid.clone()),
+                    format!("The way {} swings shut, and its lock catches.", dir.name()),
+                )
+                .tags(["relock".to_owned()]);
+                self.emit(ctx, spec);
+            }
+        }
+    }
+
     /// Advances world time: respawns mobs, and runs a recovery step for
     /// every entity in the world each `[recovery] every_secs` (a minute
     /// by default).
@@ -1359,6 +1391,7 @@ impl World {
                 e.unconscious = false;
                 e.pools = mud_rules::Pools::full(&e.attrs);
                 e.room = e.home.clone();
+                e.came_from = None;
                 let (room, name) = (e.room.clone(), e.name.clone());
                 let spec = Emit::new(
                     EventKind::Enter,
@@ -1373,6 +1406,7 @@ impl World {
             self.state.last_regen_ms = now;
             self.recover(&mut ctx);
         }
+        self.relock(&mut ctx);
         TickOutcome {
             seqs: ctx.events,
             came_to: ctx.came_to,
@@ -1431,3 +1465,9 @@ mod downed_tests;
 
 #[cfg(test)]
 mod script_tests;
+
+#[cfg(test)]
+mod shops_tests;
+
+#[cfg(test)]
+mod retreat_tests;

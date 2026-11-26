@@ -350,7 +350,69 @@ impl World {
         if let (Some(shop), Some(obj)) = (self.shop_view(me), v.as_object_mut()) {
             obj.insert("shop".into(), shop);
         }
+        let post = self.post_view(&me.id);
+        if let (false, Some(obj)) = (post.is_null(), v.as_object_mut()) {
+            obj.insert("post".into(), post);
+        }
         v
+    }
+
+    /// An entity's soft post (`post` in cast.toml), as it sees it on its
+    /// own sheet: the rooms, whether it stands at its post, and, away from
+    /// it, the room it goes back to and the way there. `null` for an
+    /// entity with no post.
+    #[must_use]
+    pub fn post_view(&self, id: &EntityId) -> Value {
+        let (Some(me), Some(post)) = (
+            self.state.entities.get(id),
+            self.pack.cast.get(id).and_then(|c| c.post.as_ref()),
+        ) else {
+            return Value::Null;
+        };
+        let at_post = post.rooms.contains(&me.room);
+        let mut v = json!({ "rooms": post.rooms, "at_post": at_post });
+        if !at_post
+            && let Some((room, way)) = self.way_to(&me.room, &post.rooms)
+            && let Some(obj) = v.as_object_mut()
+        {
+            let title = self.pack.rooms.get(&room).map(|r| r.title.clone());
+            obj.insert("return_to".into(), json!(room));
+            obj.insert("return_title".into(), json!(title));
+            obj.insert(
+                "way".into(),
+                json!(way.iter().map(|d| d.short()).collect::<Vec<_>>()),
+            );
+        }
+        v
+    }
+
+    /// The nearest of `targets` from `from` by the pack's exits, and the
+    /// shortest way there, first exit first (breadth first, exits in
+    /// display order, so the answer is the same every time). Locks are
+    /// not counted: the way is a direction, not a promise. `None` when no
+    /// target can be reached; an empty way when `from` is one.
+    #[must_use]
+    pub fn way_to(&self, from: &RoomId, targets: &[RoomId]) -> Option<(RoomId, Vec<Direction>)> {
+        let mut seen = std::collections::BTreeSet::from([from.clone()]);
+        let mut queue = std::collections::VecDeque::from([(from.clone(), Vec::new())]);
+        while let Some((room, way)) = queue.pop_front() {
+            if targets.contains(&room) {
+                return Some((room, way));
+            }
+            let Some(def) = self.pack.rooms.get(&room) else {
+                continue;
+            };
+            for d in Direction::ALL {
+                if let Some(next) = def.exits.get(&d)
+                    && seen.insert(next.clone())
+                {
+                    let mut w = way.clone();
+                    w.push(d);
+                    queue.push_back((next.clone(), w));
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn sheet(&self, viewer: &EntityId) -> (String, Value) {

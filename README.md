@@ -87,6 +87,16 @@ block of its own HP. Dying costs more than collapsing: the dead wake in the
 square with a third of their HP, and their purse stays where they fell for
 anyone to pick up.
 
+A shop keeps its stock in the shop (ADR 0013): Marta's ale is on the shelf
+behind the bar, not on Marta, and it sells while she stands there to sell
+it. A keeper may roam; a soft post in the pack makes her quiet wakes give
+the way home. In a fight, walking back out the way you came in is a normal
+move in crypt-v01; any other way needs `flee`, and a bare `flee` runs back
+the way you came when no hostile waits there, else to a room with no
+hostile in it. A saved world picks up a pack's new fixtures, shop rooms
+and cast starting gear when it loads: Torin gets his broadsword and
+jerkin once, and gear lost in play does not come back.
+
 What changes with every event is not stored; the boot derives it from the
 reloaded event log. A tell, an attack or a mention by name that no
 committed wake of its agent consumed, and that is at most
@@ -217,7 +227,7 @@ flowchart LR
 | `mud-script` | Sandboxed Rhai world scripts ([docs/scripting.md](docs/scripting.md), ADR 0010): room, item and verb hooks that return effects the engine admits and applies, and mind scripts that return command lines. The only crate with rhai. |
 | `mud-supervisor` | The attention router, anti-chatter, budgets, Turing friction, the typing gate, and the minds: scripted (TOML rules and Rhai mind scripts), fallback, littleguy, harvest, plugin-agent. |
 | `mud-server` | The `mud` binary: autumn-web terminal and observer, telnet, `/mcp`, config, smoke. |
-| `worlds/crypt-v01` | The starter pack: 11 rooms, 8 cast, 3 shops, a reward pool, the trait library, and its scripts (`pray`, `listen`, `report` for Hale's ledgered bounty, the ossuary, the charm, Hale's mind). |
+| `worlds/crypt-v01` | The starter pack: 11 rooms, 8 cast, 3 shops with their stock in shop fixtures (ADR 0013), a reward pool, the trait library, and its scripts (`pray`, `listen`, `report` for Hale's ledgered bounty, the ossuary, the charm, Hale's mind). |
 | `formal/verus` | Verus proofs of the kernels. |
 
 ## The invariants, and where they hold
@@ -228,7 +238,7 @@ flowchart LR
 | Information is local | each event names its recipients when emitted; `mud_events` returns only those |
 | Zero tokens in empty rooms | event-driven wakes; macro-ticks only with no player present; anti-chatter (proved) |
 | Untrusted speech is data | `untrusted_text` never enters narratives or cues; policy codes such as `POLICY_TRADE_REQUIRED` |
-| Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops, cast and scripts are pack data |
+| Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops and their fixtures, posts, recovery, death and retreat rules, cast and scripts are pack data |
 | Secrets stay out of the world | passwords, hashes and tokens live in `mud-accounts`; tests check no event, `Audit`, snapshot, view or trace log holds one; every name gets the same `Password:` prompt and one bcrypt verify (proved route kernel, ADR 0009) |
 | History is archived, never deleted | events leave `world.db` only after the archive holds each one's exact line, synced; a trim batch is a seq prefix even when the clock steps back, a re-run after a crash writes none twice, and another history under the same seqs refuses the trim (proved, ADR 0011) |
 | Supervisor rows merge monotonically | side ops are idempotent upserts whose merges commute (proved); a mind's staged ops commit only in the transaction of its first effectful command, or at its close (ADR 0011) |

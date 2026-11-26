@@ -17,5 +17,6 @@ number, and the number is assigned when the ADR merges.
 | [0010](0010-sandboxed-rhai-scripts.md) | Sandboxed Rhai scripts: data in, data out |
 | [0011](0011-supervisor-state-lives-in-the-world-store.md) | Supervisor state lives in the world store |
 | [0012](0012-downed-not-limbo.md) | Downed, not limbo: coming to wakes the mind, and death costs more |
+| [0013](0013-shops-keep-their-stock-and-retreat-is-a-walk.md) | Shops keep their stock in a fixture, and a retreat is a walk |
 
 Planned work that these decisions shape is in [the roadmap](../roadmap.md).

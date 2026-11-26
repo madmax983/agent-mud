@@ -132,6 +132,33 @@ description = "A purse someone dropped when they fell. It is heavy with coin."
 value = 0
 currency = 0
 
+# Shop fixtures (`fixture` in economy.toml). A shop's stock lives in its
+# fixture, in the shop room, so it stays in the shop when the keeper walks
+# off. Nobody can take from one: its wares leave only through a sale.
+[items.flagon_shelf]
+name = "shelf behind the bar"
+aliases = ["shelf", "bar"]
+description = "A sagging shelf behind the long bar, within Marta's reach and nobody else's."
+value = 0
+fixed = true
+container = true
+
+[items.smithy_rack]
+name = "weapon rack"
+aliases = ["rack", "weapons"]
+description = "An iron rack by the forge, hung with Torin's finished work."
+value = 0
+fixed = true
+container = true
+
+[items.fence_crate]
+name = "crate of oddments"
+aliases = ["crate", "oddments"]
+description = "An open crate at Vich's elbow. He knows where every last thing in it came from, and will not say."
+value = 0
+fixed = true
+container = true
+
 [items.rat_tail]
 name = "rat tail"
 aliases = ["tail"]

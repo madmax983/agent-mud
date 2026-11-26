@@ -195,6 +195,8 @@ impl World {
         help.push_str(&self.recovery_rule());
         help.push(' ');
         help.push_str(&self.death_rule());
+        help.push_str("\nfighting: ");
+        help.push_str(self.pack.combat.rule());
         let here = self.verbs_here(actor);
         if let Some(h) = &self.hooks
             && !here.is_empty()
@@ -417,6 +419,7 @@ impl World {
             hidden: false,
             last_attacked_by: None,
             haggle_with: None,
+            came_from: None,
             marks: BTreeMap::new(),
             deaths: 0,
         };
@@ -887,7 +890,13 @@ impl World {
     }
 
     /// Locks or unlocks an exit and its far side.
-    fn set_exit_lock(&mut self, ctx: &mut Ctx, room: &RoomId, dir: Direction, locked: bool) {
+    pub(super) fn set_exit_lock(
+        &mut self,
+        ctx: &mut Ctx,
+        room: &RoomId,
+        dir: Direction,
+        locked: bool,
+    ) {
         let far = self
             .pack
             .rooms
@@ -902,8 +911,10 @@ impl World {
             if let Some(rs) = self.state.rooms.get_mut(&r) {
                 if locked {
                     rs.unlocked.remove(&d);
+                    rs.unlocked_at.remove(&d);
                 } else {
                     rs.unlocked.insert(d);
+                    rs.unlocked_at.insert(d, ctx.now);
                 }
             }
         }

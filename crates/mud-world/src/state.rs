@@ -91,6 +91,11 @@ pub struct Entity {
     /// the next by it (`ctx.cast.<id>.deaths`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub deaths: u64,
+    /// The room it last walked in from: a retreat that way is a walk, and
+    /// a bare `flee` tries it first. A room, not a direction, because exits
+    /// are not always symmetric. No view shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub came_from: Option<RoomId>,
 }
 
 #[expect(
@@ -215,6 +220,10 @@ pub struct RoomState {
     pub unlocked: BTreeSet<Direction>,
     /// Board posts, oldest first.
     pub board: Vec<BoardPost>,
+    /// When each opened exit with a `relock_minutes` lock was opened, so
+    /// the tick can lock it again on time.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unlocked_at: BTreeMap<Direction, u64>,
 }
 
 /// The whole changing state.
@@ -257,6 +266,20 @@ pub struct WorldState {
     /// them. Money and items are conserved except for ledgered mints.
     #[serde(default)]
     pub minted: BTreeMap<PoolId, MintTotals>,
+    /// The fixture item of each shop that has one (`[shops.x] fixture`):
+    /// a fixed container in the shop room that holds the stock. A save
+    /// from before fixtures has none; [`WorldState::reconcile`] builds
+    /// them and moves the stock off the keepers.
+    #[serde(default)]
+    pub shop_fixtures: BTreeMap<ShopId, ItemId>,
+    /// The starting gear (the cast entry's `inventory`) each cast entity
+    /// last got from the pack. [`WorldState::reconcile`] gives an entity
+    /// already in the save only the pieces a pack edit added since, so a
+    /// new loadout reaches a saved world once, and gear lost in play does
+    /// not come back on the next load. A save from before this field has
+    /// none; its cast gets the pieces it does not carry.
+    #[serde(default)]
+    pub cast_gear: BTreeMap<EntityId, Vec<ProtoId>>,
 }
 
 mod pairs {
@@ -393,10 +416,13 @@ impl WorldState {
             scripts_version: None,
             pool_spent: BTreeMap::new(),
             minted: BTreeMap::new(),
+            shop_fixtures: BTreeMap::new(),
+            cast_gear: BTreeMap::new(),
         };
         for (rid, def) in &pack.rooms {
             s.place_room_items(rid, def, pack);
         }
+        s.build_fixtures(pack);
         for (id, def) in &pack.cast {
             let e = s.entity_from_cast(id, def, pack);
             s.entities.insert(id.clone(), e);
@@ -432,7 +458,9 @@ impl WorldState {
     ///   cast id) retires: it has no mind behind it, so it would be a ghost.
     ///   Its gear falls to the floor as plain goods, and every reference to
     ///   it is cleared.
-    /// - A cast entry the save lacks is spawned fresh.
+    /// - A cast entry the save lacks is spawned fresh. One the save has
+    ///   gets the starting gear the pack added to its entry since the save
+    ///   (see [`WorldState::cast_gear`]); nothing it carries is taken.
     ///
     /// Humans are never retired. Renaming a cast id therefore makes a new
     /// character, not a moved one.
@@ -460,6 +488,13 @@ impl WorldState {
         for e in self.entities.values_mut() {
             if !pack.rooms.contains_key(&e.room) {
                 e.room.clone_from(&start);
+                e.came_from = None;
+            }
+            if e.came_from
+                .as_ref()
+                .is_some_and(|r| !pack.rooms.contains_key(r))
+            {
+                e.came_from = None;
             }
             if !pack.rooms.contains_key(&e.home) {
                 e.home.clone_from(&start);
@@ -499,16 +534,170 @@ impl WorldState {
             }
             self.nudge_rolled_ms.retain(|(e, _), _| !stale.contains(e));
         }
+        // Before new cast entries spawn: a keeper the save lacks gets its
+        // stock made new in its fixture, not on its body.
+        self.build_fixtures(pack);
         for (id, def) in &pack.cast {
-            if !self.entities.contains_key(id) {
+            if self.entities.contains_key(id) {
+                self.add_cast_gear(id, def, pack);
+            } else {
                 let e = self.entity_from_cast(id, def, pack);
                 self.entities.insert(id.clone(), e);
             }
         }
+        self.cast_gear.retain(|id, _| pack.cast.contains_key(id));
         // A pool the pack dropped gives nothing more; its totals and the
         // ledger keep what it gave.
         self.pool_spent
             .retain(|p, _| pack.economy.rewards.contains_key(p));
+    }
+
+    /// Gives a cast entity already in the save the starting gear the pack
+    /// added to its entry since the save, and equips each new piece its
+    /// entry equips into a free slot. The pieces it last got are in
+    /// `cast_gear`; a save from before that field counts what the entity
+    /// carries, stock aside. An item that holds money is never made here,
+    /// so money stays conserved. A human is never given anything.
+    fn add_cast_gear(&mut self, id: &EntityId, def: &CastDef, pack: &WorldPack) {
+        let Some(e) = self.entities.get(id).filter(|e| !e.human) else {
+            return;
+        };
+        let mut had: Vec<ProtoId> = self.cast_gear.get(id).cloned().unwrap_or_else(|| {
+            e.inventory
+                .iter()
+                .filter_map(|i| self.items.get(i))
+                .filter(|i| !i.stock)
+                .map(|i| i.proto.clone())
+                .collect()
+        });
+        let mut new = Vec::new();
+        for p in &def.inventory {
+            if let Some(pos) = had.iter().position(|h| h == p) {
+                had.remove(pos);
+            } else {
+                new.push(p);
+            }
+        }
+        self.cast_gear.insert(id.clone(), def.inventory.clone());
+        for p in new {
+            let Some(item_def) = pack.items.get(p).filter(|d| d.currency.is_none()) else {
+                continue;
+            };
+            let slot = item_def.slot.filter(|_| def.equip.contains(p));
+            let item = self.new_item(p, pack);
+            if let Some(e) = self.entities.get_mut(id) {
+                e.inventory.push(item);
+                if let Some(slot) = slot {
+                    e.equipped.entry(slot).or_insert(item);
+                }
+            }
+        }
+    }
+
+    /// Brings the shop fixtures in line with the pack. No item is made or
+    /// lost on the way, except the stock of a shop whose keeper does not
+    /// exist yet, which is made new as the pack lists it.
+    ///
+    /// - A shop with a `fixture` has one in its shop room. A fixture the
+    ///   save has in another room (the pack moved the shop) moves there,
+    ///   with its stock inside. A new fixture's stock is
+    ///   what the keeper carries as stock (a save from before fixtures),
+    ///   or the stock of the fixture it had before; a keeper not in the
+    ///   world yet gets the pack's stock made new.
+    /// - A fixture the pack no longer names (its shop is gone, has no
+    ///   fixture, or names another prototype) goes. Its stock moves to the
+    ///   shop's new fixture, or back onto the keeper's body; the stock of a
+    ///   shop that is gone stays on the floor as plain goods.
+    fn build_fixtures(&mut self, pack: &WorldPack) {
+        let stale: Vec<(ShopId, ItemId)> = self
+            .shop_fixtures
+            .iter()
+            .filter(|(sid, item)| {
+                let want = pack
+                    .economy
+                    .shops
+                    .get(*sid)
+                    .and_then(|s| s.fixture.as_ref());
+                want.is_none() || self.items.get(*item).map(|i| &i.proto) != want
+            })
+            .map(|(s, i)| (s.clone(), *i))
+            .collect();
+        let mut loose: BTreeMap<ShopId, (Option<RoomId>, Vec<ItemId>)> = BTreeMap::new();
+        for (sid, fixture) in stale {
+            self.shop_fixtures.remove(&sid);
+            let room = match self.detach(fixture) {
+                Some(Holder::Room { room }) => Some(room),
+                _ => None,
+            };
+            let contents = self
+                .items
+                .remove(&fixture)
+                .map(|i| i.contents)
+                .unwrap_or_default();
+            loose.insert(sid, (room, contents));
+        }
+        for (sid, shop) in &pack.economy.shops {
+            let (_, mut stock) = loose.remove(sid).unwrap_or_default();
+            let Some((proto, room)) = shop.fixture.as_ref().zip(pack.shop_room(sid)) else {
+                // No fixture: the stock goes back onto the keeper's body.
+                if let Some(k) = self.entities.get_mut(&shop.keeper) {
+                    k.inventory.extend(stock);
+                } else {
+                    let room = pack.cast.get(&shop.keeper).map(|k| k.room.clone());
+                    loose.insert(sid.clone(), (room, stock));
+                }
+                continue;
+            };
+            if let Some(fixture) = self.shop_fixtures.get(sid).copied() {
+                let at = Holder::Room { room: room.clone() };
+                if self.holder_of(fixture).as_ref() != Some(&at) {
+                    self.move_item(fixture, &at);
+                }
+                continue;
+            }
+            if let Some(k) = self.entities.get_mut(&shop.keeper) {
+                let items = &self.items;
+                let carried: Vec<ItemId> = k
+                    .inventory
+                    .iter()
+                    .copied()
+                    .filter(|i| items.get(i).is_some_and(|it| it.stock))
+                    .collect();
+                k.inventory.retain(|i| !carried.contains(i));
+                k.equipped.retain(|_, i| !carried.contains(i));
+                stock.extend(carried);
+            } else if stock.is_empty() {
+                stock = shop.stock.iter().map(|p| self.new_item(p, pack)).collect();
+            }
+            let fixture = self.new_item(proto, pack);
+            for i in &stock {
+                if let Some(it) = self.items.get_mut(i) {
+                    it.stock = true;
+                }
+            }
+            if let Some(f) = self.items.get_mut(&fixture) {
+                f.contents = stock;
+            }
+            if let Some(r) = self.rooms.get_mut(room) {
+                r.items.push(fixture);
+            }
+            self.shop_fixtures.insert(sid.clone(), fixture);
+        }
+        // The stock of a shop the pack dropped: plain goods where it stood.
+        for (room, items) in loose.into_values() {
+            let room = room
+                .filter(|r| self.rooms.contains_key(r))
+                .unwrap_or_else(|| pack.world.start_room.clone());
+            for i in &items {
+                if let Some(it) = self.items.get_mut(i) {
+                    it.stock = false;
+                    it.paid = None;
+                }
+            }
+            if let Some(r) = self.rooms.get_mut(&room) {
+                r.items.extend(items);
+            }
+        }
     }
 
     /// Removes an item and everything inside it from the world.
@@ -541,6 +730,7 @@ impl WorldState {
     }
 
     fn entity_from_cast(&mut self, id: &EntityId, def: &CastDef, pack: &WorldPack) -> Entity {
+        self.cast_gear.insert(id.clone(), def.inventory.clone());
         let mut inventory = Vec::new();
         let mut equipped = BTreeMap::new();
         let mut pending_equip: Vec<&ProtoId> = def.equip.iter().collect();
@@ -554,7 +744,12 @@ impl WorldState {
                 equipped.insert(slot, item);
             }
         }
-        if let Some(shop) = def.shop.as_ref().and_then(|s| pack.economy.shops.get(s)) {
+        let body_shop = def
+            .shop
+            .as_ref()
+            .and_then(|s| pack.economy.shops.get(s))
+            .filter(|s| s.fixture.is_none());
+        if let Some(shop) = body_shop {
             for p in &shop.stock {
                 let item = self.new_item(p, pack);
                 if let Some(it) = self.items.get_mut(&item) {
@@ -597,6 +792,7 @@ impl WorldState {
             haggle_with: None,
             marks: BTreeMap::new(),
             deaths: 0,
+            came_from: None,
         }
     }
 
@@ -653,6 +849,7 @@ impl WorldState {
             haggle_with: None,
             marks: BTreeMap::new(),
             deaths: 0,
+            came_from: None,
         };
         self.entities.insert(id.clone(), e);
         &self.entities[id]
@@ -833,6 +1030,8 @@ impl WorldState {
     /// - Every equipped item is carried by the entity that equips it.
     /// - Every entity stands in a known room.
     /// - No entity has negative money.
+    /// - Every shop fixture is on a floor, and stock lies only in a
+    ///   fixture or on a keeper's body.
     #[must_use]
     pub fn check(&self) -> Vec<String> {
         let mut seen: BTreeMap<ItemId, usize> = BTreeMap::new();
@@ -859,6 +1058,32 @@ impl WorldState {
         for id in seen.keys() {
             if !self.items.contains_key(id) {
                 bad.push(format!("{id} is held but does not exist"));
+            }
+        }
+        for (shop, fixture) in &self.shop_fixtures {
+            if !matches!(self.holder_of(*fixture), Some(Holder::Room { .. })) {
+                bad.push(format!(
+                    "the fixture {fixture} of shop {shop} is not on a floor"
+                ));
+            }
+        }
+        // Merchandise lies only in a fixture or on a keeper's body: nobody
+        // may take stock, so stock anywhere else is stuck for good.
+        let in_shop: BTreeSet<ItemId> = self
+            .shop_fixtures
+            .values()
+            .filter_map(|f| self.items.get(f))
+            .flat_map(|f| f.contents.iter().copied())
+            .chain(
+                self.entities
+                    .values()
+                    .filter(|e| e.shop.is_some())
+                    .flat_map(|e| e.inventory.iter().copied()),
+            )
+            .collect();
+        for it in self.items.values().filter(|i| i.stock) {
+            if !in_shop.contains(&it.id) {
+                bad.push(format!("{} is stock outside a shop", it.id));
             }
         }
         for e in self.entities.values() {
@@ -904,12 +1129,22 @@ mod tests {
         let s = WorldState::from_pack(&pack, 1);
         assert_eq!(s.check(), Vec::<String>::new());
         let torin = &s.entities[&EntityId::from("torin")];
-        assert_eq!(torin.inventory.len(), 6);
-        assert!(torin.inventory.iter().all(|i| s.items[i].stock));
+        assert_eq!(torin.inventory.len(), 2, "his own blade and jerkin");
+        assert_eq!(torin.equipped.len(), 2);
+        assert!(torin.inventory.iter().all(|i| !s.items[i].stock));
+        let rack = s.shop_fixtures[&ShopId::from("torin")];
+        assert_eq!(
+            s.holder_of(rack),
+            Some(Holder::Room {
+                room: RoomId::from("smithy")
+            })
+        );
+        assert_eq!(s.items[&rack].contents.len(), 6);
+        assert!(s.items[&rack].contents.iter().all(|i| s.items[i].stock));
         let kestrel = &s.entities[&EntityId::from("pc_kestrel")];
         assert!(!kestrel.online, "a turing PC starts logged out");
         assert_eq!(kestrel.kind, EntityKind::Player);
-        assert_eq!(kestrel.equipped.len(), 1);
+        assert_eq!(kestrel.equipped.len(), 2, "a blade and a torch");
         let cistern = &s.rooms[&RoomId::from("flooded_cistern")];
         let lockbox = &s.items[&cistern.items[0]];
         assert!(lockbox.locked);
@@ -962,7 +1197,7 @@ mod tests {
         );
         assert!(p.human);
         assert_eq!(p.currency, 25);
-        assert_eq!(p.equipped.len(), 1);
+        assert_eq!(p.equipped.len(), 2, "the dagger and the torch");
         assert_eq!(s.check(), Vec::<String>::new());
         let round: WorldState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(round, s);

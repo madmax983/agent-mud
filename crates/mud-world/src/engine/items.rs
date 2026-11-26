@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::{Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
 use crate::event::EventKind;
-use crate::ids::{EntityId, ItemId};
+use crate::ids::{EntityId, ItemId, ShopId};
 use crate::pack::{Direction, ShopDef};
 use crate::state::Holder;
 
@@ -79,6 +79,12 @@ impl World {
             .is_some_and(|d| d.fixed)
         {
             return Err(Fail::new(ErrorCode::CannotTake, "it will not budge"));
+        }
+        if self.state.items.get(&item).is_some_and(|i| i.stock) {
+            return Err(Fail::new(
+                ErrorCode::PolicyTradeRequired,
+                "that is merchandise; it leaves the shop only through a sale (list, buy)",
+            ));
         }
         self.relocate_item(
             ctx,
@@ -219,26 +225,96 @@ impl World {
         ))
     }
 
-    /// The keeper here named `word`, or the only one here.
-    fn keeper(&self, actor: &EntityId, word: Option<&str>) -> Result<(EntityId, ShopDef), Fail> {
+    /// The shop `actor` trades with here: the one named `word` (its
+    /// keeper or its fixture), or the only one here.
+    ///
+    /// A shop with a fixture trades in its shop room, while its keeper
+    /// can act there; an `unattended` one also sells (`selling`) with
+    /// nobody minding it. A shop with no fixture trades wherever its
+    /// keeper stands and can act. Nobody trades with its own shop.
+    fn shop_here(
+        &self,
+        actor: &EntityId,
+        word: Option<&str>,
+        selling: bool,
+    ) -> Result<ShopHere, Fail> {
         let me = self.me(actor)?;
-        let candidates: Vec<&crate::state::Entity> = self
-            .present_in(&me.room)
-            .filter(|e| &e.id != actor && e.shop.is_some() && e.can_act())
-            .filter(|e| word.is_none_or(|w| e.matches(w)))
-            .collect();
-        let k = match candidates.as_slice() {
-            [one] => *one,
-            [] => return Err(Fail::new(ErrorCode::NoKeeper, "nobody here is selling")),
-            _ => return Err(Fail::new(ErrorCode::BadArgs, "name the shopkeeper")),
-        };
-        let shop = k
-            .shop
-            .as_ref()
-            .and_then(|s| self.pack.economy.shops.get(s))
-            .cloned()
-            .ok_or_else(|| Fail::new(ErrorCode::NoKeeper, "nobody here is selling"))?;
-        Ok((k.id.clone(), shop))
+        let mut open = Vec::new();
+        let mut closed = None;
+        for (sid, def) in &self.pack.economy.shops {
+            if &def.keeper == actor {
+                continue;
+            }
+            let keeper = self.state.entities.get(&def.keeper);
+            let minded = keeper.is_some_and(|k| k.can_act() && k.room == me.room);
+            let fixture = self.state.shop_fixtures.get(sid).copied();
+            let named = |w: &str| {
+                keeper.is_some_and(|k| k.matches(w))
+                    || fixture.is_some_and(|f| self.find_item(&[f], w).is_some())
+            };
+            if word.is_some_and(|w| !named(w)) {
+                continue;
+            }
+            let here = match fixture {
+                Some(_) => self.pack.shop_room(sid) == Some(&me.room),
+                None => minded,
+            };
+            if !here {
+                continue;
+            }
+            let shop = ShopHere {
+                id: sid.clone(),
+                def: def.clone(),
+                keeper: def.keeper.clone(),
+                fixture,
+                minded,
+            };
+            if minded || (selling && def.unattended) {
+                open.push(shop);
+            } else {
+                closed = Some(shop);
+            }
+        }
+        match open.len() {
+            1 => Ok(open.remove(0)),
+            0 => Err(closed.map_or_else(
+                || Fail::new(ErrorCode::NoKeeper, "nobody here is selling"),
+                |c| {
+                    let what = c.fixture.map(|f| self.item_name(f)).unwrap_or_default();
+                    Fail::new(
+                        ErrorCode::NoKeeper,
+                        format!("nobody is minding the {what} right now"),
+                    )
+                },
+            )),
+            _ => Err(Fail::new(ErrorCode::BadArgs, "name the shopkeeper")),
+        }
+    }
+
+    /// The stock of a shop: what its fixture holds as stock, or, with no
+    /// fixture, what its keeper carries as stock.
+    pub(crate) fn shop_stock(&self, shop: &ShopId) -> Vec<ItemId> {
+        let held = self.state.shop_fixtures.get(shop).map_or_else(
+            || {
+                self.pack
+                    .economy
+                    .shops
+                    .get(shop)
+                    .and_then(|d| self.state.entities.get(&d.keeper))
+                    .map(|k| k.inventory.clone())
+                    .unwrap_or_default()
+            },
+            |f| {
+                self.state
+                    .items
+                    .get(f)
+                    .map(|i| i.contents.clone())
+                    .unwrap_or_default()
+            },
+        );
+        held.into_iter()
+            .filter(|i| self.state.items.get(i).is_some_and(|it| it.stock))
+            .collect()
     }
 
     /// What `buyer` pays for `item`: its value at the markup, less a
@@ -277,20 +353,26 @@ impl World {
     /// how much (the same prices `list` and `buy` use), and what it buys.
     /// `None` for an entity that keeps no shop.
     pub(crate) fn shop_view(&self, keeper: &crate::state::Entity) -> Option<Value> {
-        let shop = keeper
-            .shop
-            .as_ref()
-            .and_then(|s| self.pack.economy.shops.get(s))?;
+        let sid = keeper.shop.as_ref()?;
+        let shop = self.pack.economy.shops.get(sid)?;
         let mut sells: std::collections::BTreeMap<String, (i64, u32)> =
             std::collections::BTreeMap::new();
-        for i in &keeper.inventory {
-            if self.state.items.get(i).is_some_and(|it| it.stock) {
-                let price = self.price_of(shop, *i, false);
-                sells.entry(self.item_name(*i)).or_insert((price, 0)).1 += 1;
-            }
+        for i in self.shop_stock(sid) {
+            let price = self.price_of(shop, i, false);
+            sells.entry(self.item_name(i)).or_insert((price, 0)).1 += 1;
         }
         let cur = &self.pack.economy.currency;
+        let counter = self.state.shop_fixtures.get(sid).map(|f| {
+            let room = self.pack.shop_room(sid);
+            json!({
+                "fixture": self.item_name(*f),
+                "room": room,
+                "room_title": room.and_then(|r| self.pack.rooms.get(r)).map(|r| r.title.clone()),
+                "unattended": shop.unattended,
+            })
+        });
         Some(json!({
+            "counter": counter,
             "currency": cur.name,
             "short": cur.short,
             "sells": sells
@@ -326,18 +408,16 @@ impl World {
     }
 
     pub(crate) fn list(&self, actor: &EntityId, keeper: Option<&str>) -> Done {
-        let (kid, shop) = self.keeper(actor, keeper)?;
-        let k = &self.state.entities[&kid];
+        let here = self.shop_here(actor, keeper, true)?;
+        let (kid, shop) = (&here.keeper, &here.def);
         let cur = &self.pack.economy.currency;
         let mut seen = std::collections::BTreeMap::new();
-        for i in &k.inventory {
-            if self.state.items.get(i).is_some_and(|it| it.stock) {
-                let name = self.item_name(*i);
-                let price = self.sale_price(&shop, *i, actor, &kid);
-                seen.entry(name).or_insert((price, 0)).1 += 1;
-            }
+        for i in self.shop_stock(&here.id) {
+            let name = self.item_name(i);
+            let price = self.sale_price(shop, i, actor, kid);
+            seen.entry(name).or_insert((price, 0)).1 += 1;
         }
-        let mut out = format!("{} sells:", k.name);
+        let mut out = format!("{} sells:", self.seller_name(&here));
         if seen.is_empty() {
             out.push_str(" nothing right now.");
         }
@@ -352,9 +432,15 @@ impl World {
         if !shop.buys.is_empty() {
             let _ = write!(out, "\nBuys: {}.", shop.buys.join(", "));
         }
+        if !here.minded {
+            let _ = write!(
+                out,
+                "\nNobody minds it: leave the price and take what you buy."
+            );
+        }
         Ok((
             out,
-            json!({ "keeper": kid, "wares": rows, "buys": shop.buys }),
+            json!({ "keeper": kid, "wares": rows, "buys": shop.buys, "minded": here.minded }),
         ))
     }
 
@@ -365,14 +451,10 @@ impl World {
         word: &str,
         from: Option<&str>,
     ) -> Done {
-        let (kid, shop) = self.keeper(actor, from)?;
-        let stock: Vec<ItemId> = self.state.entities[&kid]
-            .inventory
-            .iter()
-            .copied()
-            .filter(|i| self.state.items.get(i).is_some_and(|it| it.stock))
-            .collect();
-        let kname = self.state.entities[&kid].name.clone();
+        let here = self.shop_here(actor, from, true)?;
+        let (kid, shop) = (here.keeper.clone(), here.def.clone());
+        let stock = self.shop_stock(&here.id);
+        let kname = self.seller_name(&here);
         let item = self.find_item(&stock, word).ok_or_else(|| {
             Fail::new(
                 ErrorCode::NotForSale,
@@ -410,18 +492,27 @@ impl World {
             b.haggle_with = None;
         }
         let name = self.item_name(item);
-        let spec = Emit::new(
+        let mut spec = Emit::new(
             EventKind::Trade,
             Some(me.room.clone()),
-            format!(
-                "{} buys the {name} from {kname} for {price}{}.",
-                me.name, cur.short
-            ),
+            if here.minded {
+                format!(
+                    "{} buys the {name} from {kname} for {price}{}.",
+                    me.name, cur.short
+                )
+            } else {
+                format!(
+                    "{} takes the {name} from the {kname} and leaves {price}{} for it.",
+                    me.name, cur.short
+                )
+            },
         )
         .actor(actor, "buy")
-        .target(&kid)
-        .tags(["trade".to_owned(), "coin".to_owned()])
-        .data(json!({ "item": { "id": item, "name": name }, "price": price }));
+        .tags(["trade".to_owned(), "coin".to_owned()]);
+        if here.minded {
+            spec = spec.target(&kid);
+        }
+        let spec = spec.data(json!({ "item": { "id": item, "name": name }, "price": price }));
         self.emit(ctx, spec);
         Ok((
             format!("You buy the {name} for {price}{}.", cur.short),
@@ -437,8 +528,9 @@ impl World {
         to: Option<&str>,
     ) -> Done {
         let item = self.carried(actor, word)?;
-        let (kid, shop) = self.keeper(actor, to)?;
-        let kname = self.state.entities[&kid].name.clone();
+        let here = self.shop_here(actor, to, false)?;
+        let (kid, shop) = (here.keeper.clone(), here.def.clone());
+        let kname = self.seller_name(&here);
         let name = self.item_name(item);
         let price = self.buy_price(&shop, item).ok_or_else(|| {
             Fail::new(ErrorCode::NotBuying, format!("{kname} does not buy {name}"))
@@ -452,13 +544,13 @@ impl World {
         }
         self.change_currency(ctx, &kid, -price);
         self.change_currency(ctx, actor, price);
-        self.relocate_item(
-            ctx,
-            item,
-            Holder::Entity {
+        let to = here.fixture.map_or_else(
+            || Holder::Entity {
                 entity: kid.clone(),
             },
+            |f| Holder::Container { item: f },
         );
+        self.relocate_item(ctx, item, to);
         if let Some(it) = self.state.items.get_mut(&item) {
             it.stock = true;
             it.paid = Some(price);
@@ -575,7 +667,18 @@ impl World {
                 ));
             }
             let names: Vec<String> = it.contents.iter().map(|i| self.item_name(*i)).collect();
-            let text = if names.is_empty() {
+            let wares = self.state.shop_fixtures.values().any(|f| *f == item);
+            let text = if wares {
+                if names.is_empty() {
+                    format!("The {} stands empty: the shop is sold out.", def.name)
+                } else {
+                    format!(
+                        "The {} holds wares for sale: {}. (list, buy <item>)",
+                        def.name,
+                        names.join(", ")
+                    )
+                }
+            } else if names.is_empty() {
                 format!("The {} is empty.", def.name)
             } else {
                 format!(
@@ -740,6 +843,7 @@ impl World {
     ) {
         if let Some(r) = self.state.rooms.get_mut(room) {
             r.unlocked.insert(dir);
+            r.unlocked_at.insert(dir, ctx.now);
         }
         // The far side opens with it.
         if let Some(to) = self
@@ -751,6 +855,7 @@ impl World {
             && let Some(r) = self.state.rooms.get_mut(&to)
         {
             r.unlocked.insert(dir.opposite());
+            r.unlocked_at.insert(dir.opposite(), ctx.now);
         }
         ctx.changes.push(StateChange::Unlocked {
             room: room.clone(),
@@ -809,6 +914,36 @@ impl World {
             .map(|i| self.item_name(*i))
             .collect();
         json!({ "contents": names })
+    }
+}
+
+/// A shop a customer can trade with where it stands.
+#[derive(Debug, Clone)]
+struct ShopHere {
+    /// The shop.
+    id: ShopId,
+    /// Its pack entry.
+    def: ShopDef,
+    /// Its keeper, who takes the money.
+    keeper: EntityId,
+    /// The fixture that holds its stock; `None`: the keeper's body.
+    fixture: Option<ItemId>,
+    /// Whether the keeper can act here.
+    minded: bool,
+}
+
+impl World {
+    /// Who a customer deals with: the keeper, or, with nobody minding the
+    /// shop, its fixture.
+    fn seller_name(&self, shop: &ShopHere) -> String {
+        match (shop.minded, shop.fixture) {
+            (false, Some(f)) => self.item_name(f),
+            _ => self
+                .state
+                .entities
+                .get(&shop.keeper)
+                .map_or_else(String::new, |k| k.name.clone()),
+        }
     }
 }
 

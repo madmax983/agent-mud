@@ -653,7 +653,11 @@ pub fn system_prompt(name: &str, persona: &str, goal: &str, body: &str) -> Strin
          - A self_control_nudge event is your own character's impulse: lean into it, in character.\n\
          - Money is only the currency on your sheet (currency_name). If you keep a shop, your \
            prices are in your sheet's `shop`, and `list` shows them: quote those, never invent \
-           a price or a coin.\n\
+           a price or a coin. A shop with a `counter` keeps its wares there, in its room: \
+           customers can buy only from you in your shop, while you are there and awake \
+           (unless it is `unattended`).\n\
+         - If your sheet has a `post`, those rooms are where you belong. You may leave them; \
+           when you are away, your quiet wakes tell you the way back.\n\
          - To come back to something later, book a wake with mud_wake_me (minutes, and a note \
            to yourself). Nothing else wakes you for it, and no other reminder tool can act in \
            the world.\n\
@@ -671,14 +675,41 @@ pub fn system_prompt(name: &str, persona: &str, goal: &str, body: &str) -> Strin
 #[must_use]
 pub fn you_view(sheet: &Value) -> Value {
     let pools = &sheet["pools"];
-    json!({
+    let mut v = json!({
         "hp": pools["hp"],
         "hp_max": pools["hp_max"],
         "fp": pools["fp"],
         "fp_max": pools["fp_max"],
         "wound_state": sheet["wound_state"],
         "unconscious": sheet["unconscious"],
-    })
+    });
+    if let (Some(post), Some(obj)) = (sheet.get("post"), v.as_object_mut()) {
+        obj.insert("post".into(), post.clone());
+    }
+    v
+}
+
+/// The macro-tick cue: advance your goals, and first, away from a soft
+/// post (`you.post`), go back to it. The room title and the way are pack
+/// data, never player text.
+fn goals_cue(you: &Value) -> String {
+    let post = &you["post"];
+    if post["at_post"] != Value::Bool(false) {
+        return "Advance your goals.".to_owned();
+    }
+    let title = post["return_title"].as_str().unwrap_or("your post");
+    let way: Vec<&str> = post["way"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let way = if way.is_empty() {
+        String::new()
+    } else {
+        format!(" (the way: {})", way.join(", "))
+    };
+    format!("You are away from your post; return to {title}{way}. Then advance your goals.")
 }
 
 /// The message that wakes an agent: why, and what happened, as data.
@@ -702,13 +733,16 @@ pub fn wake_message(ctx: &WakeContext) -> String {
         "You come to: you were out cold, and what happened meanwhile is below.".to_owned()
     } else if ctx.macro_tick && ctx.priority == Priority::MacroTick {
         format!(
-            "Time passes (macro-tick {}). No player is near. Advance your goals.",
-            ctx.macro_ticks
+            "Time passes (macro-tick {}). No player is near. {}",
+            ctx.macro_ticks,
+            goals_cue(&ctx.you)
         )
     } else if ctx.macro_tick {
         format!(
-            "Something happened ({}), and time passes (macro-tick {}). Advance your goals.",
-            ctx.reason, ctx.macro_ticks
+            "Something happened ({}), and time passes (macro-tick {}). {}",
+            ctx.reason,
+            ctx.macro_ticks,
+            goals_cue(&ctx.you)
         )
     } else {
         format!("Something happened ({}).", ctx.reason)
@@ -844,7 +878,7 @@ mod tests {
         let ctx = live_ctx(&w, "marta", crate::admit::CAME_TO);
         let m = wake_message(&ctx);
         assert!(
-            m.contains(r#"you: {"fp":11,"fp_max":11,"hp":-3,"hp_max":10,"unconscious":true,"wound_state":"reeling"}"#),
+            m.contains(r#"you: {"fp":11,"fp_max":11,"hp":-3,"hp_max":10,"post":{"at_post":true,"rooms":["rusty_flagon_taproom"]},"unconscious":true,"wound_state":"reeling"}"#),
             "{m}"
         );
         assert!(m.contains("You come to"), "{m}");
@@ -864,6 +898,59 @@ mod tests {
                     .to_vec()
             )
         );
+    }
+
+    #[test]
+    fn a_macro_tick_away_from_the_post_says_the_way_home() {
+        use mud_world::{World, WorldPack};
+        let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+        let w = World::new(Arc::clone(&pack), 1);
+        let tick = |w: &World, who: &str, priority: Priority| {
+            let mut c = live_ctx(w, who, "macro_tick");
+            c.priority = priority;
+            c.macro_tick = true;
+            c.macro_ticks = 2;
+            wake_message(&c)
+        };
+        let home = tick(&w, "marta", Priority::MacroTick);
+        assert!(
+            home.contains("No player is near. Advance your goals."),
+            "{home}"
+        );
+        assert!(!home.contains("away from your post"), "{home}");
+        // Marta walks down to the wine vault.
+        let mut snap = w.snapshot();
+        snap.entities
+            .get_mut(&EntityId::from("marta"))
+            .unwrap()
+            .room = mud_world::RoomId::from("wine_vault");
+        let w = World::from_state(Arc::clone(&pack), snap, Vec::new());
+        let away = tick(&w, "marta", Priority::MacroTick);
+        assert!(
+            away.contains(
+                "You are away from your post; return to The Rusty Flagon \
+                 (the way: e, u, n, e). Then advance your goals."
+            ),
+            "{away}"
+        );
+        let merged = tick(&w, "marta", Priority::RoomBatch);
+        assert!(merged.contains("away from your post"), "{merged}");
+        // No post, no cue: a player is free.
+        let k = tick(&w, "pc_kestrel", Priority::MacroTick);
+        assert!(
+            k.contains("Advance your goals.") && !k.contains("post"),
+            "{k}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_says_a_counter_shop_sells_only_with_its_keeper_there() {
+        let p = system_prompt("Marta", "A barkeep.", "Keep the bar.", "Body.");
+        assert!(
+            p.contains("customers can buy only from you in your shop"),
+            "{p}"
+        );
+        assert!(p.contains("If your sheet has a `post`"), "{p}");
     }
 
     #[test]
