@@ -34,6 +34,15 @@ fn the_config_points_littleguy_at_the_mud() {
             .contains("You regain 1 HP every 5 minutes"),
         "the pack's body rule, not one of the prompt's own"
     );
+    // A littleguy agent books its own wakes: its prompt carries the habit.
+    assert!(
+        v["system"]
+            .as_str()
+            .unwrap()
+            .ends_with(&persistent_habits()),
+        "the wake habit"
+    );
+    assert!(v["system"].as_str().unwrap().contains("mud_wake_me"));
     let server = &v["mcp"]["server"][0];
     assert_eq!(server["url"].as_str(), Some("http://127.0.0.1:3000/mcp"));
     assert_eq!(server["bearer_env"].as_str(), Some(TOKEN_ENV));

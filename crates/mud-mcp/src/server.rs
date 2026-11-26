@@ -192,8 +192,10 @@ fn wake_tools() -> [Tool; 2] {
                  if nothing happens, and handed `note`, your own reminder of what to do then. \
                  You can act in that wake. Use it whenever you mean to come back to something \
                  later: nothing else wakes you for it, and no other reminder tool can act in \
-                 the world. At most 5 at once. Returns the booking and every wake you have \
-                 booked. A note may quote what others said: {UNTRUSTED}"
+                 the world. At most 5 at once and 24 a day. Returns the booking and every wake \
+                 you have booked, each note as `untrusted_text`. Only a character that books \
+                 its own wakes may use it; any other is answered `no_wakes`. A note may quote \
+                 what others said: {UNTRUSTED}"
             ),
             object(json!({
                 "type": "object",

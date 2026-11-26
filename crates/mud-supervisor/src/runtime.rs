@@ -234,6 +234,18 @@ pub enum ObserverEvent {
         /// When it was due.
         due_ms: u64,
     },
+    /// What happened to a booked wake: booked, fired, held, dropped,
+    /// cancelled or requeued. The note stays out of the feed.
+    Booking {
+        /// Whose.
+        entity: EntityId,
+        /// The booking id.
+        id: u64,
+        /// What happened.
+        action: crate::wakes::BookingAction,
+        /// When it is (or was) due.
+        due_ms: u64,
+    },
     /// A reactive plan found at boot was older than `replay_max_age_ms`
     /// and was abandoned, not resumed.
     PlanAbandoned {
@@ -371,7 +383,8 @@ impl Supervisor {
             );
         }
         let (observer, _) = broadcast::channel(4_096);
-        let wakes = Arc::new(WakeBook::persisted(Arc::clone(&game)));
+        let wakes =
+            Arc::new(WakeBook::persisted(Arc::clone(&game)).with_observer(observer.clone()));
         Arc::new(Self {
             router: Mutex::new(Router::new(cfg.router.clone())),
             game,
@@ -522,7 +535,7 @@ impl Supervisor {
             }
             drop(st);
         }
-        self.reconcile_bookings(bookings.into_values(), next_booking_id, now, &mut ops);
+        self.reconcile_bookings(&entities, bookings, next_booking_id, now, &mut ops);
         self.reconcile_plans(plans, now, &mut ops);
         self.replay(&entities, now, &mut ops);
         if !ops.is_empty() {
@@ -595,21 +608,27 @@ impl Supervisor {
 
     /// Restores the bookings: each waits, fires when its entity is ready,
     /// or is dropped (deleted, logged and reported) when it is too late.
+    /// Each entity's day count comes back from its row first.
     fn reconcile_bookings(
         &self,
-        bookings: impl IntoIterator<Item = BookingRow>,
+        entities: &BTreeMap<EntityId, EntityRow>,
+        bookings: BTreeMap<u64, BookingRow>,
         next_booking_id: u64,
         now: u64,
         ops: &mut Vec<SideOp>,
     ) {
-        let dropped =
-            self.wakes
-                .restore(bookings, next_booking_id, now, self.cfg.booking_max_late_ms);
-        if !dropped.is_empty() {
-            ops.push(SideOp::BookingDelete {
-                ids: dropped.iter().map(|b| b.id).collect(),
-            });
-        }
+        self.wakes.restore_days(
+            entities
+                .iter()
+                .map(|(e, r)| (e.clone(), r.booked_day, r.booked_today)),
+        );
+        let (dropped, delete) = self.wakes.restore(
+            bookings.into_values(),
+            next_booking_id,
+            now,
+            self.cfg.booking_max_late_ms,
+        );
+        ops.extend(delete);
         for b in dropped {
             // The note is the agent's own text: it stays out of the log.
             tracing::warn!(
@@ -687,6 +706,38 @@ impl Supervisor {
         &self.wakes
     }
 
+    /// Whether `entity` may book wakes (`mud_wake_me`): only a Persistent
+    /// or Turing entity that has a mind here. An ambient NPC, a mob, a
+    /// human and an entity no mind plays are answered `no_wakes`.
+    #[must_use]
+    pub fn can_book(&self, entity: &EntityId) -> bool {
+        self.minds.contains_key(entity)
+            && self.game.read(|w| {
+                w.entity(entity)
+                    .is_some_and(|e| !e.human && matches!(e.tier, Tier::Persistent | Tier::Turing))
+            })
+    }
+
+    /// `mud_wake_me` for `entity`, on the game clock, as an MCP caller
+    /// asks it: `no_wakes` unless [`Supervisor::can_book`].
+    #[must_use]
+    pub fn book_wake(&self, entity: &EntityId, minutes: u32, note: &str) -> Value {
+        if !self.can_book(entity) {
+            return crate::mind::no_wakes();
+        }
+        crate::mind::book_wake(&self.wakes, entity, self.game.now_ms(), minutes, note)
+    }
+
+    /// `mud_cancel_wake` for `entity`: `no_wakes` unless
+    /// [`Supervisor::can_book`].
+    #[must_use]
+    pub fn cancel_wake(&self, entity: &EntityId, id: u64) -> Value {
+        if !self.can_book(entity) {
+            return crate::mind::no_wakes();
+        }
+        crate::mind::cancel_wake(&self.wakes, entity, id)
+    }
+
     /// The agents that are in the world.
     fn online(&self) -> HashSet<EntityId> {
         self.game.read(|w| {
@@ -711,18 +762,76 @@ impl Supervisor {
         })
     }
 
+    /// The agents whose booked wakes the anti-chatter rule holds: in a
+    /// room whose agent-only turns are spent, with another agent there and
+    /// no player but itself. Two agents that book wakes for each other
+    /// cannot chat all night through them; a human or a macro tick resets
+    /// the room and lets them go. A lone agent is never held by it.
+    fn chatter_held(&self) -> HashSet<EntityId> {
+        self.game.read(|w| {
+            let router = lock(&self.router);
+            let max = router.config().max_agent_only_turns;
+            let held = self
+                .minds
+                .keys()
+                .filter(|id| {
+                    let Some(e) = w.entity(id) else {
+                        return false;
+                    };
+                    let other_agent = w.present_in(&e.room).any(|o| {
+                        &o.id != *id
+                            && !o.human
+                            && matches!(o.tier, Tier::Ambient | Tier::Persistent | Tier::Turing)
+                    });
+                    other_agent
+                        && !w.player_present_except(&e.room, id)
+                        && router.agent_only_turns(&e.room) >= max
+                })
+                .cloned()
+                .collect();
+            drop(router);
+            held
+        })
+    }
+
     /// Queues each booked wake that came due, for an agent that is ready:
-    /// in the world, able to act, and not stopped by its budget. One that
-    /// is not (a Turing PC between sessions, an agent out cold, an agent
-    /// at its hard cap) keeps its booking, stored, until it is ready: an
-    /// agent out cold gets it with the wake it has when it comes to.
+    /// in the world, able to act, not stopped by its budget, not away for
+    /// a spell, and not held by the anti-chatter rule. One that is not (a
+    /// Turing PC between sessions, an agent out cold, at its hard cap, away
+    /// or chatter-held) keeps its booking, stored, until it is ready: an
+    /// agent out cold gets it with the wake it has when it comes to. A
+    /// booking overdue past `booking_max_late_ms` is dropped, held or not,
+    /// as at boot.
+    /// Readiness is read before the wake book's lock is taken.
     fn booked_wakes(&self, now: u64, online: &HashSet<EntityId>, held: &HashSet<EntityId>) {
-        let stopped: HashSet<EntityId> = lock(&self.state)
-            .iter_mut()
-            .filter_map(|(id, s)| (s.budget.level(now) == BudgetLevel::Hard).then(|| id.clone()))
-            .collect();
-        let ready = |e: &EntityId| online.contains(e) && !held.contains(e) && !stopped.contains(e);
-        for (entity, bookings) in self.wakes.take_due(now, ready) {
+        let (stopped, away): (HashSet<EntityId>, HashSet<EntityId>) = {
+            let mut st = lock(&self.state);
+            let stopped = st
+                .iter_mut()
+                .filter_map(|(id, s)| {
+                    (s.budget.level(now) == BudgetLevel::Hard).then(|| id.clone())
+                })
+                .collect();
+            let away = st
+                .iter()
+                .filter(|(_, s)| s.afk_until.is_some_and(|u| u > now))
+                .map(|(id, _)| id.clone())
+                .collect();
+            drop(st);
+            (stopped, away)
+        };
+        let chatter = self.chatter_held();
+        let ready = |e: &EntityId| {
+            online.contains(e)
+                && !held.contains(e)
+                && !stopped.contains(e)
+                && !away.contains(e)
+                && !chatter.contains(e)
+        };
+        let pass = self
+            .wakes
+            .take_due(now, self.cfg.booking_max_late_ms, ready);
+        for (entity, bookings) in pass.taken {
             let note = lock(&self.router).deliver_booked(&entity, bookings, now);
             self.publish(ObserverEvent::Route(note));
         }
@@ -1220,13 +1329,15 @@ impl Supervisor {
         let (turn, macro_ticks) = self.open_wake(&wake, &wake_id, &booked);
         let mut ctx = self.context(&wake, wake_id, macro_ticks);
         ctx.booked = booked;
-        let tools = MudTools::new(
+        let mut tools = MudTools::new(
             Arc::clone(&self.game),
             Arc::clone(&self.gate),
             wake.entity.clone(),
         )
-        .with_usage_sink(Arc::clone(&self.usage))
-        .with_wakes(Arc::clone(&self.wakes));
+        .with_usage_sink(Arc::clone(&self.usage));
+        if self.can_book(&wake.entity) {
+            tools = tools.with_wakes(Arc::clone(&self.wakes));
+        }
         let res = self
             .bounded(
                 &wake.entity,
@@ -1524,6 +1635,8 @@ fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>
     }
 }
 
+#[cfg(test)]
+mod booking_tests;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]

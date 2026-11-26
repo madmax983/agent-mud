@@ -12,6 +12,16 @@
 //! flight*, not deleted: its row goes in the transaction of the first
 //! effectful command of the wake that carries it, or at that wake's close.
 //! A restart restores every row, with ids that never repeat.
+//!
+//! The limits are a proved kernel (`formal/verus/src/bookings.rs`): the
+//! constants and [`book_verdict`] between the mirror markers. A booking is
+//! made only within one minute to a week, with fewer than [`MAX_PENDING`]
+//! waiting and fewer than [`MAX_PER_DAY`] made on the same game-clock day.
+//! The day's count commits with the booking (`SideOp::Booked`, joined in
+//! the store by the proved `dated_max`), survives a restart, and a cancel
+//! never lowers it. Only a Persistent or Turing entity with a mind may
+//! book (`Supervisor::can_book`); every other caller is answered
+//! `no_wakes`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,15 +30,55 @@ use mud_world::side::{BookingRow, MetaKey};
 use mud_world::{EntityId, Game, SideOp};
 use serde::{Deserialize, Serialize};
 
+use tokio::sync::broadcast;
+
 use crate::held::{Held, assert_none_held};
 use crate::persist::{BookingDisposition, booking_disposition, next_booking_id};
+use crate::runtime::ObserverEvent;
 
-/// The most wakes one entity may have booked at once.
-pub const MAX_PENDING: usize = 5;
-/// The shortest delay, in minutes.
+// mirror-begin book_consts
+/// The shortest booking delay, in minutes.
 pub const MIN_MINUTES: u32 = 1;
-/// The longest delay, in minutes (seven days).
+/// The longest booking delay, in minutes (a week).
 pub const MAX_MINUTES: u32 = 7 * 24 * 60;
+/// Bookings one entity may hold at once.
+pub const MAX_PENDING: u32 = 5;
+/// Bookings one entity may make in one game-clock day.
+pub const MAX_PER_DAY: u32 = 24;
+// mirror-end book_consts
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// mirror-begin book_verdict_enum
+/// Whether a booking may be made, and if not, why.
+pub enum BookVerdict {
+    /// It may.
+    Ok,
+    /// The delay is out of range.
+    BadMinutes,
+    /// `MAX_PENDING` bookings wait already.
+    Full,
+    /// `MAX_PER_DAY` bookings were made today already.
+    DailyCap,
+}
+// mirror-end book_verdict_enum
+
+// mirror-begin book_verdict
+/// Whether an entity with `pending` bookings waiting, that made
+/// `booked_today` bookings today, may book one `minutes` ahead.
+#[must_use]
+pub const fn book_verdict(minutes: u32, pending: u32, booked_today: u32) -> BookVerdict {
+    if minutes < MIN_MINUTES || minutes > MAX_MINUTES {
+        BookVerdict::BadMinutes
+    } else if pending >= MAX_PENDING {
+        BookVerdict::Full
+    } else if booked_today >= MAX_PER_DAY {
+        BookVerdict::DailyCap
+    } else {
+        BookVerdict::Ok
+    }
+}
+// mirror-end book_verdict
+
 /// The longest note, in characters.
 pub const MAX_NOTE_CHARS: usize = 280;
 
@@ -44,6 +94,29 @@ pub struct Booking {
     pub note: String,
 }
 
+/// What happened to a booking, for the observer feed
+/// ([`crate::runtime::ObserverEvent::Booking`]). The note never goes with
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookingAction {
+    /// It was booked.
+    Booked,
+    /// It came due and a wake carries it: its mind sees the note.
+    Fired,
+    /// It came due, but its entity is not ready (offline, out cold, at its
+    /// hard cap, away for a spell, or held by the anti-chatter rule). It
+    /// stays, and fires when the entity is ready. Reported once per hold.
+    Held,
+    /// It was overdue by more than `booking_max_late_ms` and was dropped.
+    Dropped,
+    /// Its agent cancelled it.
+    Cancelled,
+    /// A wake took it but never showed it to a mind (its entity went
+    /// offline, or the budget fallback ran): it comes due again.
+    Requeued,
+}
+
 /// Why a wake was not booked, or not cancelled.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BookError {
@@ -53,6 +126,13 @@ pub enum BookError {
     /// Too many wakes wait already.
     #[error("you already have {MAX_PENDING} wakes booked; cancel one first")]
     Full,
+    /// The entity booked its share of wakes for today.
+    #[error("you have booked {MAX_PER_DAY} wakes today; book again tomorrow")]
+    DailyCap,
+    /// The entity may not book wakes at all. The text names no reason: a
+    /// reason would tell the agent what kind of entity it is.
+    #[error("booking wakes is not open to you")]
+    NoWakes,
     /// The world store failed: nothing was booked or cancelled.
     #[error("the world store failed; nothing changed, try again later")]
     Store,
@@ -65,9 +145,28 @@ impl BookError {
         match self {
             Self::Minutes => "minutes",
             Self::Full => "full",
+            Self::DailyCap => "daily_cap",
+            Self::NoWakes => "no_wakes",
             Self::Store => "store",
         }
     }
+}
+
+/// What one pass of [`WakeBook::take_due`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DuePass {
+    /// The bookings taken, in flight now, by entity, soonest first.
+    pub taken: Vec<(EntityId, Vec<Booking>)>,
+    /// The due bookings of entities that are not ready, newly held in this
+    /// pass (each is reported once per hold).
+    pub held: Vec<(EntityId, Booking)>,
+    /// The bookings dropped as too late.
+    pub dropped: Vec<(EntityId, Booking)>,
+}
+
+/// The UTC day of `now_ms` on the game clock.
+const fn day_of(now_ms: u64) -> u64 {
+    now_ms / crate::budget::DAY_MS
 }
 
 #[derive(Debug)]
@@ -77,6 +176,11 @@ struct Inner {
     by_entity: BTreeMap<EntityId, Vec<Booking>>,
     /// Bookings taken by a wake that has not consumed them yet.
     in_flight: BTreeSet<u64>,
+    /// Each entity's bookings on its latest day: `(day, count)`. Restored
+    /// from the store at boot; a cancel never lowers it.
+    today: BTreeMap<EntityId, (u64, u32)>,
+    /// Held bookings already reported in their current hold.
+    held_reported: BTreeSet<u64>,
 }
 
 impl Default for Inner {
@@ -85,6 +189,8 @@ impl Default for Inner {
             next_id: 1,
             by_entity: BTreeMap::new(),
             in_flight: BTreeSet::new(),
+            today: BTreeMap::new(),
+            held_reported: BTreeSet::new(),
         }
     }
 }
@@ -95,6 +201,10 @@ impl Default for Inner {
 /// through [`Game::act`], which takes the world lock), so it is never taken
 /// inside a world closure; `inner` is a supervisor lock, taken one at a
 /// time and never held across a `Game` call.
+///
+/// The book is the only place that writes a booking row (`BookingInsert`,
+/// `BookingDelete`) or a day count (`Booked`): no other module builds
+/// those ops.
 #[derive(Debug, Default)]
 pub struct WakeBook {
     inner: Mutex<Inner>,
@@ -102,6 +212,8 @@ pub struct WakeBook {
     writer: Mutex<()>,
     /// Where bookings persist; `None` keeps them in memory only.
     game: Option<Arc<Game>>,
+    /// Where each booking's fate is published.
+    observer: Option<broadcast::Sender<Arc<ObserverEvent>>>,
 }
 
 /// The note kept: control characters gone, at most [`MAX_NOTE_CHARS`].
@@ -140,6 +252,13 @@ impl WakeBook {
         }
     }
 
+    /// The same book, publishing each booking's fate on `observer`.
+    #[must_use]
+    pub fn with_observer(mut self, observer: broadcast::Sender<Arc<ObserverEvent>>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     fn lock(&self) -> Held<'_, Inner> {
         crate::held::lock(&self.inner)
     }
@@ -151,12 +270,24 @@ impl WakeBook {
             .map_or(Ok(()), |g| g.act(ops).map_err(|_| BookError::Store))
     }
 
+    fn publish(&self, entity: &EntityId, b: &Booking, action: BookingAction) {
+        if let Some(tx) = &self.observer {
+            let _ = tx.send(Arc::new(ObserverEvent::Booking {
+                entity: entity.clone(),
+                id: b.id,
+                action,
+                due_ms: b.due_ms,
+            }));
+        }
+    }
+
     /// Books a wake for `entity`, `minutes` after `now_ms`. The booking is
     /// in the store, durably, when this returns `Ok`.
     ///
     /// # Errors
-    /// The delay is out of range, [`MAX_PENDING`] wakes wait already, or
-    /// the store failed (nothing is kept).
+    /// The delay is out of range, [`MAX_PENDING`] wakes wait already,
+    /// [`MAX_PER_DAY`] were booked today already, or the store failed
+    /// (nothing is kept).
     pub fn book(
         &self,
         entity: &EntityId,
@@ -197,22 +328,32 @@ impl WakeBook {
         minutes: u32,
         note: &str,
     ) -> Result<Booking, BookError> {
-        if !(MIN_MINUTES..=MAX_MINUTES).contains(&minutes) {
-            return Err(BookError::Minutes);
-        }
         let _writing = lock(&self.writer);
-        let id = {
+        let day = day_of(now_ms);
+        let (id, day, count) = {
             let inner = self.lock();
-            if inner.by_entity.get(entity).map_or(0, Vec::len) >= MAX_PENDING {
-                return Err(BookError::Full);
+            let pending = inner.by_entity.get(entity).map_or(0, Vec::len);
+            // A day stored ahead of the clock (a clock set back) counts as
+            // today: the cap never reopens by moving the clock.
+            let (day, count) = match inner.today.get(entity) {
+                Some((d, c)) if *d >= day => (*d, *c),
+                _ => (day, 0),
+            };
+            match book_verdict(minutes, u32::try_from(pending).unwrap_or(u32::MAX), count) {
+                BookVerdict::Ok => {}
+                BookVerdict::BadMinutes => return Err(BookError::Minutes),
+                BookVerdict::Full => return Err(BookError::Full),
+                BookVerdict::DailyCap => return Err(BookError::DailyCap),
             }
-            inner.next_id
+            (inner.next_id, day, count.saturating_add(1))
         };
         let booking = Booking {
             id,
             due_ms: now_ms.saturating_add(u64::from(minutes) * 60_000),
             note: clean(note),
         };
+        // The day count goes with the booking, in the same write: a
+        // booking the store kept is always counted.
         let ops = vec![
             SideOp::BookingInsert {
                 row: BookingRow {
@@ -226,6 +367,11 @@ impl WakeBook {
             SideOp::MetaMax {
                 key: MetaKey::NextBookingId,
                 value: id,
+            },
+            SideOp::Booked {
+                entity: entity.clone(),
+                day,
+                count,
             },
         ];
         if let (Lane::Turn(_), Some(game)) = (lane, &self.game) {
@@ -246,14 +392,29 @@ impl WakeBook {
         }
         let mut inner = self.lock();
         inner.next_id = inner.next_id.max(id.saturating_add(1));
+        inner.today.insert(entity.clone(), (day, count));
         let list = inner.by_entity.entry(entity.clone()).or_default();
         list.push(booking.clone());
         list.sort_by_key(|b| (b.due_ms, b.id));
         drop(inner);
+        self.publish(entity, &booking, BookingAction::Booked);
         Ok(booking)
     }
 
-    /// Cancels `entity`'s booking `id`. Whether there was one.
+    /// The bookings `entity` made on the day of `now_ms` (a cancel does
+    /// not lower it).
+    #[must_use]
+    pub fn booked_today(&self, entity: &EntityId, now_ms: u64) -> u32 {
+        let day = day_of(now_ms);
+        self.lock()
+            .today
+            .get(entity)
+            .filter(|(d, _)| *d >= day)
+            .map_or(0, |(_, c)| *c)
+    }
+
+    /// Cancels `entity`'s booking `id`. Whether there was one. The day's
+    /// count stays: a cancel does not give a booking back.
     ///
     /// # Errors
     /// The store failed: the booking stays.
@@ -263,26 +424,39 @@ impl WakeBook {
             .lock()
             .by_entity
             .get(entity)
-            .is_some_and(|list| list.iter().any(|b| b.id == id));
-        if !held {
+            .and_then(|list| list.iter().find(|b| b.id == id).cloned());
+        let Some(booking) = held else {
             return Ok(false);
-        }
+        };
         self.write(&[SideOp::BookingDelete { ids: vec![id] }])?;
         self.remove(entity, &[id]);
+        self.publish(entity, &booking, BookingAction::Cancelled);
         Ok(true)
     }
 
-    fn remove(&self, entity: &EntityId, ids: &[u64]) {
+    /// Removes `ids` of `entity` from memory and returns the bookings
+    /// removed.
+    fn remove(&self, entity: &EntityId, ids: &[u64]) -> Vec<Booking> {
         let mut inner = self.lock();
         for id in ids {
             inner.in_flight.remove(id);
+            inner.held_reported.remove(id);
         }
+        let mut gone = Vec::new();
         if let Some(list) = inner.by_entity.get_mut(entity) {
-            list.retain(|b| !ids.contains(&b.id));
+            list.retain(|b| {
+                let keep = !ids.contains(&b.id);
+                if !keep {
+                    gone.push(b.clone());
+                }
+                keep
+            });
             if list.is_empty() {
                 inner.by_entity.remove(entity);
             }
         }
+        drop(inner);
+        gone
     }
 
     /// `entity`'s bookings, soonest first (in flight included).
@@ -308,37 +482,83 @@ impl WakeBook {
         self.lock().in_flight.contains(&id)
     }
 
-    /// Takes the bookings due by `now_ms` of each entity that `ready`
-    /// accepts (online, and not hard-stopped), and marks them in flight:
-    /// they stay booked until a wake consumes them ([`WakeBook::consumed`])
-    /// or gives them back ([`WakeBook::requeue`]). A booking of an entity
-    /// that is not ready stays, and comes due again at its next chance.
+    /// One pass over the due bookings at `now_ms`.
+    ///
+    /// A booking overdue by more than `max_late_ms` is dropped
+    /// ([`booking_disposition`] says `Drop`), as the boot drops it
+    /// ([`WakeBook::restore`]), so a live server and a restarted one agree:
+    /// its row is deleted through [`Game::persist`] (a lost delete is
+    /// redone at the next boot). The bookings due of each entity that
+    /// `ready` accepts are taken and marked in flight: they stay booked
+    /// until a wake consumes them ([`WakeBook::consumed`]) or gives them
+    /// back ([`WakeBook::requeue`]). A due booking of an entity that is not
+    /// ready stays, and comes due again at its next chance; it is reported
+    /// held once per hold, until it is taken.
     pub fn take_due(
         &self,
         now_ms: u64,
+        max_late_ms: u64,
         ready: impl Fn(&EntityId) -> bool,
-    ) -> Vec<(EntityId, Vec<Booking>)> {
+    ) -> DuePass {
+        let mut pass = DuePass::default();
         let mut inner = self.lock();
         let Inner {
             by_entity,
             in_flight,
+            held_reported,
             ..
         } = &mut *inner;
-        let mut out = Vec::new();
-        for (entity, list) in by_entity.iter() {
+        for (entity, list) in by_entity.iter_mut() {
+            list.retain(|b| {
+                let late = !in_flight.contains(&b.id)
+                    && booking_disposition(b.due_ms, now_ms, max_late_ms)
+                        == BookingDisposition::Drop;
+                if late {
+                    held_reported.remove(&b.id);
+                    pass.dropped.push((entity.clone(), b.clone()));
+                }
+                !late
+            });
             let due: Vec<Booking> = list
                 .iter()
                 .filter(|b| b.due_ms <= now_ms && !in_flight.contains(&b.id))
                 .cloned()
                 .collect();
-            if due.is_empty() || !ready(entity) {
+            if due.is_empty() {
                 continue;
             }
-            in_flight.extend(due.iter().map(|b| b.id));
-            out.push((entity.clone(), due));
+            if !ready(entity) {
+                for b in due {
+                    if held_reported.insert(b.id) {
+                        pass.held.push((entity.clone(), b));
+                    }
+                }
+                continue;
+            }
+            for b in &due {
+                in_flight.insert(b.id);
+                held_reported.remove(&b.id);
+            }
+            pass.taken.push((entity.clone(), due));
         }
+        by_entity.retain(|_, list| !list.is_empty());
         drop(inner);
-        out
+        if !pass.dropped.is_empty()
+            && let Some(game) = &self.game
+        {
+            game.persist(vec![SideOp::BookingDelete {
+                ids: pass.dropped.iter().map(|(_, b)| b.id).collect(),
+            }]);
+        }
+        for (e, b) in &pass.dropped {
+            // The note is the agent's own text: it stays out of the log.
+            tracing::info!(entity = %e, id = b.id, due_ms = b.due_ms, now_ms, "a booked wake was too late and was dropped");
+            self.publish(e, b, BookingAction::Dropped);
+        }
+        for (e, b) in &pass.held {
+            self.publish(e, b, BookingAction::Held);
+        }
+        pass
     }
 
     /// Gives taken bookings back: their wake never ran (the entity went
@@ -346,14 +566,33 @@ impl WakeBook {
     /// They come due again at the next chance.
     pub fn requeue(&self, ids: &[u64]) {
         let mut inner = self.lock();
+        let mut back = Vec::new();
         for id in ids {
-            inner.in_flight.remove(id);
+            if inner.in_flight.remove(id) {
+                back.push(*id);
+            }
+        }
+        let found: Vec<(EntityId, Booking)> = inner
+            .by_entity
+            .iter()
+            .flat_map(|(e, list)| {
+                list.iter()
+                    .filter(|b| back.contains(&b.id))
+                    .map(move |b| (e.clone(), b.clone()))
+            })
+            .collect();
+        drop(inner);
+        for (e, b) in &found {
+            self.publish(e, b, BookingAction::Requeued);
         }
     }
 
-    /// Forgets bookings a wake carried: its turn consumes their rows.
+    /// Forgets bookings a wake carried: its turn consumes their rows, and
+    /// its mind sees their notes (they fired).
     pub fn consumed(&self, entity: &EntityId, ids: &[u64]) {
-        self.remove(entity, ids);
+        for b in self.remove(entity, ids) {
+            self.publish(entity, &b, BookingAction::Fired);
+        }
     }
 
     /// Drops every booking of `entity` in memory (it left the world for
@@ -363,8 +602,25 @@ impl WakeBook {
         if let Some(list) = inner.by_entity.remove(entity) {
             for b in list {
                 inner.in_flight.remove(&b.id);
+                inner.held_reported.remove(&b.id);
             }
         }
+    }
+
+    /// Restores each entity's day count at boot, from its stored
+    /// `(booked_day, booked_today)`, joined with what memory holds (the
+    /// later day wins; on one day the larger count).
+    pub fn restore_days(&self, days: impl IntoIterator<Item = (EntityId, u64, u32)>) {
+        let mut inner = self.lock();
+        for (entity, day, count) in days {
+            let slot = inner.today.entry(entity).or_insert((day, count));
+            *slot = match slot.0.cmp(&day) {
+                std::cmp::Ordering::Less => (day, count),
+                std::cmp::Ordering::Equal => (day, slot.1.max(count)),
+                std::cmp::Ordering::Greater => *slot,
+            };
+        }
+        drop(inner);
     }
 
     /// Restores the stored bookings at boot, with nothing in flight, and
@@ -373,14 +629,15 @@ impl WakeBook {
     /// booking not due yet waits (its due time clamped to [`MAX_MINUTES`]
     /// from now, if the clock went back); a due one fires when its entity
     /// is ready; one overdue by more than `max_late_ms` is dropped and
-    /// returned, for the caller to delete and report.
+    /// returned, for the caller to report, with the op that deletes the
+    /// dropped rows (`None` when nothing was dropped).
     pub fn restore(
         &self,
         rows: impl IntoIterator<Item = BookingRow>,
         meta: u64,
         now_ms: u64,
         max_late_ms: u64,
-    ) -> Vec<BookingRow> {
+    ) -> (Vec<BookingRow>, Option<SideOp>) {
         let mut inner = self.lock();
         let mut dropped = Vec::new();
         let mut max_id = 0;
@@ -405,9 +662,13 @@ impl WakeBook {
             list.sort_by_key(|b| (b.due_ms, b.id));
         }
         inner.in_flight.clear();
+        inner.held_reported.clear();
         inner.next_id = inner.next_id.max(next_booking_id(meta, max_id));
         drop(inner);
-        dropped
+        let op = (!dropped.is_empty()).then(|| SideOp::BookingDelete {
+            ids: dropped.iter().map(|b| b.id).collect(),
+        });
+        (dropped, op)
     }
 }
 

@@ -676,3 +676,58 @@ async fn a_reset_during_the_wake_wins_over_its_staged_memory() {
     let again = Game::open(pack(), Some(&db), 1, clock).unwrap();
     assert_eq!(again.script_memory(&hale, 1), json!({}), "the reset stands");
 }
+
+/// A log line's sink for the test below.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A refused booking is logged by its error code; the notes of the
+/// bookings that wait are the agent's own text and stay out of the log.
+#[tokio::test]
+async fn a_refused_script_booking_logs_no_note() {
+    let rig = Rig::new();
+    let hale = EntityId::from("guard_01");
+    let now = rig.game.now_ms();
+    for k in 0..crate::wakes::MAX_PENDING {
+        rig.wakes
+            .book(&hale, now, 10 + k, &format!("zq-note-{k}"))
+            .unwrap();
+    }
+    let logs = LogBuffer::default();
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    let _log = tracing::subscriber::set_default(subscriber);
+    let m = mind(
+        &rig,
+        &host("#{ lines: [], wake_me: #{ minutes: 5, note: \"zq-new\" } }"),
+    );
+    m.wake(ctx(Vec::new(), "w1"), rig.tools("guard_01"))
+        .await
+        .unwrap();
+    let text = logs.text();
+    assert!(text.contains("was not booked"), "{text}");
+    assert!(text.contains("full"), "the error code: {text}");
+    assert!(!text.contains("zq-"), "no note in the log: {text}");
+    assert_eq!(rig.wakes.pending(&hale).len(), 5, "nothing booked");
+}

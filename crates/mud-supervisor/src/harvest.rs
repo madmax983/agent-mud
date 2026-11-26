@@ -41,7 +41,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::mind::{
     BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, Usage, WakeContext,
-    system_prompt, tool_specs, wake_message,
+    persistent_habits, system_prompt, tool_specs, wake_message, wake_tool_specs,
 };
 
 /// The agent kind of every MUD entity in harvest.
@@ -58,6 +58,10 @@ pub struct HarvestPersona {
     pub goal: String,
     /// The pack's rule for a body ([`mud_world::WorldPack::body_rules`]).
     pub body: String,
+    /// Whether it books its own wakes: a Persistent or Turing entity. It
+    /// gets the two wake tools and the habit of using them; an ambient one
+    /// gets neither.
+    pub wakes: bool,
 }
 
 /// How a harvest agent's history stays bounded (`[minds.harvest]`).
@@ -124,9 +128,14 @@ impl std::fmt::Debug for HarvestMind {
     }
 }
 
-/// The four MUD tools as harvest tools, scoped to one entity.
-fn harvest_tools(tools: &MudTools) -> Vec<Arc<dyn autumn_harvest_agent::Tool>> {
-    tool_specs()
+/// The MUD tools as harvest tools, scoped to one entity: the four world
+/// tools, and the two wake tools when it `wakes`.
+fn harvest_tools(tools: &MudTools, wakes: bool) -> Vec<Arc<dyn autumn_harvest_agent::Tool>> {
+    let mut specs = tool_specs();
+    if wakes {
+        specs.extend(wake_tool_specs());
+    }
+    specs
         .into_iter()
         .map(|(name, description, schema)| {
             let t = tools.clone();
@@ -153,6 +162,21 @@ fn tokens_used(
 ) -> impl std::future::Future<Output = Option<u64>> + Send + 'static {
     let query = Box::pin(sqlite::state(rt, id));
     async move { query.await.ok().flatten().map(|s| s.tokens_used) }
+}
+
+/// The system prompt of a harvest agent: the common prompt, plus the
+/// wake habit for an entity that books its own wakes.
+fn harvest_system(persona: &HarvestPersona) -> String {
+    let mut system = system_prompt(
+        &persona.name,
+        &persona.persona,
+        &persona.goal,
+        &persona.body,
+    );
+    if persona.wakes {
+        system.push_str(&persistent_habits());
+    }
+    system
 }
 
 impl HarvestMind {
@@ -213,15 +237,10 @@ impl HarvestMind {
             None => SqliteRuntime::open_in_memory().map_err(|e| unavailable(&e))?,
         };
         let harness = AgentHarness::new(Arc::clone(&self.model))
-            .tools(harvest_tools(tools))
+            .tools(harvest_tools(tools, persona.wakes))
             .agent(
                 AgentProfile::new(AGENT_KIND)
-                    .system(system_prompt(
-                        &persona.name,
-                        &persona.persona,
-                        &persona.goal,
-                        &persona.body,
-                    ))
+                    .system(harvest_system(persona))
                     .window(self.window)
                     .max_ops_per_run(self.history.ops_per_run.max(1)),
             );

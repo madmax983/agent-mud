@@ -70,20 +70,22 @@ impl CommandGate for TypingGate {
     }
 }
 
-/// The MCP wake booker: `mud_wake_me` books in the supervisor's
-/// [`mud_supervisor::wakes::WakeBook`], on the game clock, as in-process
-/// minds do.
+/// The MCP wake booker: the supervisor's wake book, on the game clock.
+///
+/// `mud_wake_me` books in [`mud_supervisor::wakes::WakeBook`] as
+/// in-process minds do. Only a Persistent or Turing entity with a mind may
+/// book ([`Supervisor::can_book`]); any other token is answered
+/// `no_wakes`.
 #[derive(Debug, Clone)]
 pub struct SupervisorWakes(pub Arc<Supervisor>);
 
 impl mud_mcp::WakeBooker for SupervisorWakes {
     fn wake_me(&self, entity: &EntityId, minutes: u32, note: &str) -> serde_json::Value {
-        let now = self.0.game().now_ms();
-        mud_supervisor::mind::book_wake(self.0.wakes(), entity, now, minutes, note)
+        self.0.book_wake(entity, minutes, note)
     }
 
     fn cancel_wake(&self, entity: &EntityId, id: u64) -> serde_json::Value {
-        mud_supervisor::mind::cancel_wake(self.0.wakes(), entity, id)
+        self.0.cancel_wake(entity, id)
     }
 }
 

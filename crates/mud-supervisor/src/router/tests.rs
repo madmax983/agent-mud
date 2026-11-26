@@ -1127,3 +1127,75 @@ fn replay_waives_the_age_limit_for_an_entity_held_out_cold() {
     assert!(queued_for(&notes, "marta").is_some(), "held: still owed");
     assert!(queued_for(&notes, "torin").is_none(), "awake and too old");
 }
+
+fn booking(id: u64) -> crate::wakes::Booking {
+    crate::wakes::Booking {
+        id,
+        due_ms: 0,
+        note: format!("n{id}"),
+    }
+}
+
+#[test]
+fn a_booked_wake_does_not_reset_anti_chatter() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let marta = id("marta");
+    let room = RoomId::from("rusty_flagon_taproom");
+    for (i, line) in ["say one", "say two", "say three"].iter().enumerate() {
+        run(&mut w, &mut r, &rt, &marta, line, 1_000 * (i as u64 + 1));
+    }
+    let max = r.config().max_agent_only_turns;
+    let spent = r.agent_only_turns(&room);
+    assert!(
+        spent >= max,
+        "the room's agent-only turns are spent: {spent}"
+    );
+    r.deliver_booked(&marta, vec![booking(1)], 5_000);
+    r.deliver_booked(&id("torin"), vec![booking(2)], 5_000);
+    assert_eq!(
+        r.agent_only_turns(&room),
+        spent,
+        "a booked wake is no human and no macro tick"
+    );
+    let taken = r.due(5_000);
+    assert_eq!(taken.len(), 2);
+    assert!(taken.iter().all(|wk| wk.priority == Priority::Booked));
+    assert_eq!(r.agent_only_turns(&room), spent, "nor is taking it");
+}
+
+#[test]
+fn a_booking_merges_into_a_pending_room_batch() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let ada = w.login("ada", 0).unwrap();
+    w.drain_fresh();
+    run(&mut w, &mut r, &rt, &ada, "e", 0);
+    let n = run(&mut w, &mut r, &rt, &ada, "say evening all", 1_000);
+    let (priority, _) = queued_for(&n, "marta").unwrap();
+    assert_eq!(priority, Priority::RoomBatch);
+    let note = r.deliver_booked(&id("marta"), vec![booking(9)], 1_200);
+    assert!(
+        matches!(
+            note,
+            RouteNote::Queued {
+                priority: Priority::RoomBatch,
+                due_ms: 1_200,
+                ..
+            }
+        ),
+        "one wake, the room batch's, due now: {note:?}"
+    );
+    let taken = r.due(1_200);
+    assert_eq!(taken.len(), 1, "one wake for marta");
+    assert_eq!(taken[0].priority, Priority::RoomBatch);
+    assert_eq!(taken[0].booked, vec![booking(9)], "it carries the booking");
+    assert!(!taken[0].seqs.is_empty(), "and the speech");
+    r.finish(&id("marta"), 1_300);
+    assert!(
+        r.pending().iter().all(|(e, _, _)| e != &id("marta")),
+        "nothing else waits for marta"
+    );
+}

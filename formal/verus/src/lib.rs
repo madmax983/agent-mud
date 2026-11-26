@@ -7,6 +7,7 @@
 use vstd::prelude::*;
 
 pub mod admit;
+pub mod bookings;
 pub mod budget;
 pub mod chatter;
 pub mod classify;

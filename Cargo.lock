@@ -2210,6 +2210,7 @@ dependencies = [
  "axum",
  "futures",
  "getrandom 0.4.3",
+ "mud-supervisor",
  "mud-world",
  "reqwest 0.13.5",
  "rmcp",
@@ -2301,6 +2302,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
