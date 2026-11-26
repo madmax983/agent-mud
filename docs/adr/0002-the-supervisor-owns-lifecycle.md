@@ -205,3 +205,19 @@ sequenceDiagram
 - **The CI lg is pinned** to littleguy
   `aefce058ca0b18bdf58cd68f012288b6fb4ef099`, whose protocol and config
   these tests check; it is bumped on purpose, with the real-lg tests.
+
+## Amended by ADR 0015: quiet at the hard budget cap
+
+- **A daemon at its hard cap is quiet.** The Steward keeps each running
+  daemon quiet exactly while its entity's budget is `Hard`
+  (`[littleguy.steward] quiet_on_hard`, on by default): it rewrites the
+  config with no `[heartbeat]` and `[memory] enabled = false`, on the same
+  pages port, and sends `reload`. No tick, reflection or nightly
+  consolidation then spends a token; the memory files stay on disk. When
+  the day rolls and the budget allows, the loud config comes back the same
+  way. Quiet is derived from the budget on every pass, not stored: after a
+  restart the first pass sets it again, and at `Hard` no wake starts a
+  daemon meanwhile (the fallback runs).
+- **Tick spend is the mind's own.** A tick's ledger rows are settled by
+  the Steward under a claim, only while the entity is idle, and charged as
+  late `lg` spend; a wake in flight owns its rows.

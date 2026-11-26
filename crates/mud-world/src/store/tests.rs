@@ -111,7 +111,7 @@ fn v0_file_migrates_to_user_version_1_keeping_snapshot_and_events() {
     }
     let s = Store::open(&db, 1, 1_000).unwrap();
     assert_eq!(s.user_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 1);
+    assert_eq!(SCHEMA_VERSION, 2);
     assert_eq!(s.boot(), 1, "the first open of a v0 file is boot 1");
     let loaded = s.load(100).unwrap().unwrap();
     assert_eq!(loaded.pack, "crypt-v01");
@@ -131,6 +131,7 @@ fn v0_file_migrates_to_user_version_1_keeping_snapshot_and_events() {
         "sup_meta",
         "sup_plan",
         "sup_rule_count",
+        "sup_steward",
     ] {
         assert!(tables(&conn).contains(&t.to_owned()), "{t} is made");
     }
@@ -138,23 +139,65 @@ fn v0_file_migrates_to_user_version_1_keeping_snapshot_and_events() {
     drop(s);
     // Opening again runs no step and keeps everything.
     let again = Store::open(&db, 1, 2_000).unwrap();
-    assert_eq!(again.user_version().unwrap(), 1);
+    assert_eq!(again.user_version().unwrap(), 2);
     assert_eq!(again.event_count().unwrap(), 4);
     assert_eq!(again.boot(), 2);
 }
 
 #[test]
-fn a_newer_user_version_is_refused() {
+fn v1_file_migrates_to_v2_keeping_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    {
+        // A version 1 file: the V1 step alone, with a side row.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO sup_booking (id, entity, due_ms, note, booked_ms) VALUES (7, 'pc_ada', 50, 'n', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sup_meta (key, value) VALUES ('boot', 4)", [])
+            .unwrap();
+        assert!(!tables(&conn).contains(&"sup_steward".to_owned()));
+    }
+    let mut s = Store::open(&db, 1, 1_000).unwrap();
+    assert_eq!(s.user_version().unwrap(), 2);
+    assert_eq!(s.boot(), 5, "the boot count goes on");
+    let side = s.load_side().unwrap();
+    assert_eq!(side.bookings[&7].note, "n", "version 1 rows are kept");
+    assert!(side.steward.is_empty());
+    s.apply_side(
+        &[SideOp::Steward {
+            entity: ada(),
+            rev: 1,
+            schema: 1,
+            body: serde_json::json!({ "goals": {} }),
+        }],
+        5,
+        Fsync::Full,
+    )
+    .unwrap();
+    drop(s);
+    let again = Store::open(&db, 1, 2_000).unwrap();
+    let side = again.load_side().unwrap();
+    assert_eq!(side.steward[&ada()].rev, 1);
+    assert_eq!(side.steward[&ada()].body["goals"], serde_json::json!({}));
+}
+
+#[test]
+fn a_version_3_file_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("world.db");
     drop(Store::open(&db, 1, 1).unwrap());
     {
         let conn = Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
     }
     let err = Store::open(&db, 1, 1).unwrap_err();
-    assert!(matches!(err, StoreError::Schema { found: 2 }), "{err:?}");
-    assert!(err.to_string().contains("schema version 2"), "{err}");
+    assert!(matches!(err, StoreError::Schema { found: 3 }), "{err:?}");
+    assert!(err.to_string().contains("schema version 3"), "{err}");
     // Nothing was written: the boot stayed where it was.
     let conn = Connection::open(&db).unwrap();
     let boot: i64 = conn
@@ -170,6 +213,53 @@ fn a_newer_user_version_is_refused() {
         Store::open(&db, 1, 1),
         Err(StoreError::Schema { found: u32::MAX })
     ));
+}
+
+#[test]
+fn drop_entity_drops_the_steward_row() {
+    let mut s = Store::open_in_memory(1, 0).unwrap();
+    let bob = EntityId::from("pc_bob");
+    let row = |entity: &EntityId, rev: u64| SideOp::Steward {
+        entity: entity.clone(),
+        rev,
+        schema: 1,
+        body: serde_json::json!({ "rev": rev }),
+    };
+    s.apply_side(&[row(&ada(), 2), row(&bob, 1)], 1, Fsync::Normal)
+        .unwrap();
+    // A lower rev, late, never moves the row back.
+    s.apply_side(&[row(&ada(), 1)], 2, Fsync::Normal).unwrap();
+    let side = s.load_side().unwrap();
+    assert_eq!(side.steward[&ada()].body["rev"], 2);
+    assert_eq!(side.entity_ids(), [ada(), bob.clone()]);
+    s.apply_side(&[SideOp::DropEntity { entity: ada() }], 3, Fsync::Normal)
+        .unwrap();
+    let side = s.load_side().unwrap();
+    assert!(!side.steward.contains_key(&ada()));
+    assert!(side.steward.contains_key(&bob), "only the dropped entity's");
+    let mut model = SideState::default();
+    model.apply(&row(&ada(), 2), 0);
+    model.apply(&SideOp::DropEntity { entity: ada() }, 0);
+    assert!(model.steward.is_empty());
+}
+
+#[test]
+fn a_steward_body_that_is_not_json_loads_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    drop(Store::open(&db, 1, 1).unwrap());
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO sup_steward (entity, rev, schema, body, saved_ms) VALUES ('pc_ada', 3, 1, 'not json', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let s = Store::open(&db, 1, 2).unwrap();
+    let side = s.load_side().unwrap();
+    assert_eq!(side.steward[&ada()].rev, 3);
+    assert!(side.steward[&ada()].body.is_null());
 }
 
 #[test]
@@ -608,7 +698,7 @@ fn arb_op() -> impl Strategy<Value = SideOp> {
             count
         }),
         (who.clone(), 0u64..90).prop_map(|(entity, seq)| SideOp::SeenSeq { entity, seq }),
-        (who, 0u64..90, 0u32..3).prop_map(|(entity, digest, count)| SideOp::RuleCounts {
+        (who.clone(), 0u64..90, 0u32..3).prop_map(|(entity, digest, count)| SideOp::RuleCounts {
             entity,
             rows: vec![RuleCountRow {
                 digest,
@@ -619,6 +709,14 @@ fn arb_op() -> impl Strategy<Value = SideOp> {
         (0u64..90).prop_map(|value| SideOp::MetaMax {
             key: MetaKey::NextBookingId,
             value,
+        }),
+        // One writer per entity: an equal rev is the same write, so the
+        // body is a function of the entity and the rev.
+        (who, 0u64..6).prop_map(|(entity, rev)| SideOp::Steward {
+            body: serde_json::json!({ "who": entity.as_str(), "rev": rev }),
+            entity,
+            rev,
+            schema: 1,
         }),
     ]
 }

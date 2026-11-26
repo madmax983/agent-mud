@@ -380,6 +380,8 @@ fn a_long_wake_line_stays_under_lgs_cap() {
         login: false,
         wake_id: "w".repeat(200),
         now_ms: NOW,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: (1..=5)
             .map(|id| crate::wakes::Booking {
                 id,
@@ -1090,6 +1092,8 @@ async fn a_timed_out_wake_settles_only_once_its_op_is_read() {
         login: false,
         wake_id: "wake-torin-1".into(),
         now_ms: NOW,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     };
     let tools = MudTools::new(game, typing, torin.clone());
@@ -1277,6 +1281,8 @@ async fn a_real_lg_serve_answers_a_wake() {
         login: false,
         wake_id: "wake-torin-0-1".into(),
         now_ms: NOW,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     };
     let r = mind

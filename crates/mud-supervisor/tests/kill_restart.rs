@@ -10,21 +10,32 @@
 //! good, holding the world, so the files hold exactly what a kill at that
 //! point leaves. The parent then kills it and opens the files one second
 //! later.
+//!
+//! The Steward's cases (ADR 0015) talk to a fake `lg serve` that lives in
+//! this parent process, so it outlives the killed child: it counts every
+//! `decide` it gets across the kill.
 #![cfg(unix)]
 #![expect(clippy::unwrap_used, reason = "test helpers and the child fail loudly")]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write as _;
+use std::io::{BufRead as _, BufReader};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use mud_supervisor::gate::Gate;
+use mud_supervisor::littleguy::PersonaText;
 use mud_supervisor::mind::{BoxFuture, Mind, MindError, MindReply, MudTools, Usage, WakeContext};
 use mud_supervisor::runtime::{ObserverEvent, Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::{FallbackMind, ScriptedMind};
+use mud_supervisor::steward::council::{Ballot, Judge, Vote};
+use mud_supervisor::steward::{OwnedDaemons, Steward, StewardConfig, StewardEvent, StewardPoint};
+use mud_world::side::StewardStored;
 use mud_world::{EntityId, Event, Game, ManualClock, RoomId, WorldPack};
 use tokio::sync::broadcast;
 
@@ -53,6 +64,8 @@ struct Proc {
     clock: Arc<ManualClock>,
     rx: broadcast::Receiver<Arc<Event>>,
     obs: broadcast::Receiver<Arc<ObserverEvent>>,
+    /// The Steward's rows, split off before the supervisor took the rest.
+    steward_rows: BTreeMap<EntityId, StewardStored>,
 }
 
 fn open(dir: &Path, now: u64, torin_mind: Arc<dyn Mind>) -> Proc {
@@ -67,7 +80,8 @@ fn open(dir: &Path, now: u64, torin_mind: Arc<dyn Mind>) -> Proc {
     .unwrap();
     let typing = Gate::new(Arc::clone(&game), 5, 0.0);
     let rx = game.subscribe();
-    let restored = game.take_restored().unwrap_or_default();
+    let mut restored = game.take_restored().unwrap_or_default();
+    let steward_rows = std::mem::take(&mut restored.steward);
     let sup = Supervisor::open(
         Arc::clone(&game),
         typing,
@@ -83,6 +97,7 @@ fn open(dir: &Path, now: u64, torin_mind: Arc<dyn Mind>) -> Proc {
         clock,
         rx,
         obs,
+        steward_rows,
     }
 }
 
@@ -284,6 +299,7 @@ async fn child(point: &str, dir: &Path) {
             p.run_for(1_000, 500).await;
         }
         "retention" => retention_child(&p, dir),
+        "steward-intent" | "steward-decide" => steward_child(point, &mut p, dir).await,
         "tell-pending" | "tell-open" | "tell-answered" => tell_child(point, &mut p, dir).await,
         "spend" => {
             // Past 80% of the default 400 000: soft. Stored at once.
@@ -372,6 +388,242 @@ fn retention_child(p: &Proc, dir: &Path) {
     stop_here();
 }
 
+// ---- the Steward (ADR 0015) ----
+
+/// The daemons of the Steward cases: torin's, on `<dir>/lg.sock`, which
+/// the parent serves.
+#[derive(Debug)]
+struct KillDaemons(PathBuf);
+
+impl OwnedDaemons for KillDaemons {
+    fn entities(&self) -> Vec<EntityId> {
+        vec![torin()]
+    }
+
+    fn running_socket<'a>(&'a self, _: &'a EntityId) -> BoxFuture<'a, Option<PathBuf>> {
+        Box::pin(std::future::ready(Some(self.0.clone())))
+    }
+
+    fn start_key<'a>(&'a self, _: &'a EntityId) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(std::future::ready(Some(1)))
+    }
+
+    fn brief(&self, _: &EntityId) -> Option<PersonaText> {
+        Some(PersonaText {
+            name: "Torin".into(),
+            persona: "A smith.".into(),
+            goal: "Corner the ore.".into(),
+            body: String::new(),
+        })
+    }
+
+    fn settle<'a>(&'a self, _: &'a EntityId, _: u64) -> BoxFuture<'a, Usage> {
+        Box::pin(std::future::ready(Usage::default()))
+    }
+
+    fn set_quiet<'a>(&'a self, _: &'a EntityId, _: bool) -> BoxFuture<'a, Result<(), MindError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn is_quiet(&self, _: &EntityId) -> bool {
+        false
+    }
+}
+
+/// A council that accepts every goal.
+#[derive(Debug)]
+struct Yes;
+
+impl Judge for Yes {
+    fn vote<'a>(&'a self, _: &'a Ballot) -> BoxFuture<'a, Result<(Vote, Usage), MindError>> {
+        Box::pin(std::future::ready(Ok((
+            Vote {
+                yes: true,
+                ..Vote::default()
+            },
+            Usage::default(),
+        ))))
+    }
+}
+
+fn steward_of(p: &mut Proc, dir: &Path) -> Arc<Steward> {
+    Steward::new(
+        Arc::clone(&p.sup),
+        vec![Arc::new(KillDaemons(dir.join("lg.sock"))) as Arc<dyn OwnedDaemons>],
+        Some(Arc::new(Yes) as Arc<dyn Judge>),
+        StewardConfig::default(),
+        std::mem::take(&mut p.steward_rows),
+        p.game.boot(),
+    )
+}
+
+/// torin proposed goal 1; the child's Steward accepts it and is killed
+/// after the intent's write (`steward-intent`) or once its decide is out
+/// (`steward-decide`: the parent's daemon marks it and never answers).
+async fn steward_child(point: &str, p: &mut Proc, dir: &Path) {
+    let steward = steward_of(p, dir);
+    if point == "steward-intent" {
+        let at = dir.to_path_buf();
+        steward.set_probe(Some(Arc::new(move |pt, _: &EntityId| {
+            if pt == StewardPoint::IntentWritten {
+                mark(&at, "intent");
+                stop_here();
+            }
+        })));
+    }
+    steward.pass().await;
+}
+
+/// The fake `lg serve` of the Steward cases, in the parent: goal 1
+/// proposed; it applies each `decide` as it reads it and counts it. With
+/// `hold`, it marks the child's marker and answers a decide only once
+/// `released`.
+struct ParentDaemon {
+    goals: Mutex<Vec<(i64, String)>>,
+    decides: Mutex<Vec<String>>,
+    hold: AtomicBool,
+    released: AtomicBool,
+    marker: PathBuf,
+}
+
+impl ParentDaemon {
+    fn start(dir: &Path, hold: bool) -> Arc<Self> {
+        let me = Arc::new(Self {
+            goals: Mutex::new(vec![(1, "proposed".into())]),
+            decides: Mutex::new(Vec::new()),
+            hold: AtomicBool::new(hold),
+            released: AtomicBool::new(false),
+            marker: dir.join("marker"),
+        });
+        let listener = UnixListener::bind(dir.join("lg.sock")).unwrap();
+        let d = Arc::clone(&me);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let d = Arc::clone(&d);
+                std::thread::spawn(move || d.serve(stream));
+            }
+        });
+        me
+    }
+
+    fn plans(&self) -> String {
+        let goals: Vec<serde_json::Value> = self
+            .goals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, status)| {
+                serde_json::json!({ "id": id, "status": status, "title": "Sell ore",
+                    "why": "coin", "check_every_minutes": 60, "notes": [] })
+            })
+            .collect();
+        serde_json::json!({ "kind": "plans", "goals": goals, "ideas": [], "answered": [] })
+            .to_string()
+    }
+
+    fn serve(&self, stream: std::os::unix::net::UnixStream) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let answer = match v["kind"].as_str().unwrap() {
+            "approvals" => r#"{"kind":"off","message":"no approvals"}"#.to_owned(),
+            "plans" => self.plans(),
+            "notes" => r#"{"kind":"notes","notes":[]}"#.to_owned(),
+            "decide" => {
+                let decision = v["decision"].as_str().unwrap().to_owned();
+                self.decides
+                    .lock()
+                    .unwrap()
+                    .push(format!("{decision} {}", v["id"]));
+                for g in self.goals.lock().unwrap().iter_mut() {
+                    if g.0 == v["id"].as_i64().unwrap() && g.1 == "proposed" && decision == "accept"
+                    {
+                        g.1 = "active".into();
+                    }
+                }
+                if self.hold.load(Ordering::SeqCst) {
+                    mark(self.marker.parent().unwrap(), "decide");
+                    while !self.released.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                self.plans()
+            }
+            other => format!(r#"{{"kind":"error","message":"{other}"}}"#),
+        };
+        let mut stream = reader.into_inner();
+        let _ = writeln!(stream, "{answer}");
+    }
+
+    fn decides(&self) -> Vec<String> {
+        self.decides.lock().unwrap().clone()
+    }
+}
+
+/// What the Steward published on `p`'s feed so far.
+fn steward_events(p: &mut Proc) -> Vec<StewardEvent> {
+    let mut out = Vec::new();
+    while let Ok(e) = p.obs.try_recv() {
+        if let ObserverEvent::Steward(s) = &*e {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// After the kill: the Steward of a new process settles the goal with
+/// exactly one `decide accept` in all, one `accepted` and one live accept.
+async fn steward_after_kill(dir: &Path, daemon: &ParentDaemon, decides_at_kill: usize) {
+    assert_eq!(daemon.decides().len(), decides_at_kill);
+    let mut p = open(dir, T0 + 1_000, scripted());
+    let steward = steward_of(&mut p, dir);
+    let row = steward.row(&torin()).await.unwrap();
+    assert!(
+        row.intent.is_some(),
+        "the intent was written before the kill"
+    );
+    for _ in 0..4 {
+        steward.pass().await;
+        p.clock.advance(600_000);
+    }
+    assert_eq!(daemon.decides(), ["accept 1"], "exactly one accept");
+    let events = steward_events(&mut p);
+    assert_eq!(
+        events.iter().filter(|e| e.action == "accepted").count(),
+        1,
+        "{events:?}"
+    );
+    let row = steward.row(&torin()).await.unwrap();
+    assert!(row.intent.is_none());
+    assert_eq!(row.accepts.reserved, 1);
+    after_restart(dir, &p, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_after_accept_intent_before_decide() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = ParentDaemon::start(dir.path(), false);
+    let marked = kill_at("steward-intent", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "intent");
+    steward_after_kill(dir.path(), &daemon, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_after_decide_before_its_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = ParentDaemon::start(dir.path(), true);
+    let marked = kill_at("steward-decide", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "decide");
+    // The child is dead: the held answer goes nowhere.
+    daemon.hold.store(false, Ordering::SeqCst);
+    daemon.released.store(true, Ordering::SeqCst);
+    steward_after_kill(dir.path(), &daemon, 1).await;
+}
+
 #[test]
 fn kill_child() {
     // The child's entry point; a no-op in the parent's own test run.
@@ -432,7 +684,7 @@ fn after_restart(dir: &Path, p: &Proc, parent_ids: &[String]) {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 1);
+    assert_eq!(v, 2);
     let child_boot: u64 = std::fs::read_to_string(dir.join("boot"))
         .unwrap()
         .parse()

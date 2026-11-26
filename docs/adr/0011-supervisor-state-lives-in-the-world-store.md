@@ -65,8 +65,8 @@ separate (ADR 0009): it has another secret and backup profile.
   had (`snapshot`, `events`, `mints`, `script_memory`, their indexes; all
   `IF NOT EXISTS`, so a version 0 file upgrades in place) and adds the side
   tables: `sup_meta`, `sup_entity`, `sup_booking`, `sup_plan`,
-  `sup_rule_count`. The Steward of the autonomy work adds its table as
-  step 2.
+  `sup_rule_count`. Step 2 adds the Steward's table, `sup_steward`
+  (ADR 0015).
 - `busy_timeout` is 1 s, so a second process (the account CLI) waits for
   the server's transactions instead of failing.
 
@@ -552,3 +552,24 @@ OS crash rolled back.
 Revisit harvest only for a multi-step external Steward saga, in its own
 file, with continue-as-new every 100 signals or fewer, `purge_with`, and
 game-clock drives.
+
+## Amended by ADR 0015: store version 2, the Steward's row
+
+- **Version 2** adds `sup_steward (entity, rev, schema, body, saved_ms)`,
+  `MIGRATIONS = [V1, V2]`. A version 1 file upgrades in place; a version 3
+  file is refused before any write.
+- `SideOp::Steward { entity, rev, schema, body }` stores a row only when
+  `rev` is above the stored one: the proved `rev_join` (mirrored in
+  `formal/verus/src/side.rs`). A retried, reordered or lost write never
+  moves a row back. `SideState.steward` holds the rows, `entity_ids()`
+  includes them, `DropEntity` deletes them, and a body that is not JSON
+  loads as `null` for the Steward to replace.
+- The supervisor never reads the body. `Game::take_restored()` answers
+  once, so `build()` splits the Steward's rows off with
+  `std::mem::take(&mut restored.steward)` before `Supervisor::open`.
+- An intent (a `decide` about to be sent, with its accept reservation) is
+  written with `act` (`synchronous = FULL`) before the owner action; the
+  rest goes through `persist`. The kill cases
+  `kill_after_accept_intent_before_decide` and
+  `kill_after_decide_before_its_answer` end in exactly one `decide accept`,
+  one `accepted` event and one live accept.

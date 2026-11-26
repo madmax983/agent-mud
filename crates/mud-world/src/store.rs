@@ -111,7 +111,7 @@ pub struct Store {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Version 1: the world tables of version 0 (the file before versions;
 /// every statement is `IF NOT EXISTS`, so a version 0 file upgrades in
@@ -190,9 +190,21 @@ CREATE TABLE IF NOT EXISTS sup_rule_count (
 );
 ";
 
+/// Version 2: the Steward's row per entity (ADR 0015). The Steward owns
+/// the body; the store keeps the write with the highest `rev`.
+const V2: &str = "
+CREATE TABLE IF NOT EXISTS sup_steward (
+    entity TEXT PRIMARY KEY,
+    rev INTEGER NOT NULL,
+    schema INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    saved_ms INTEGER NOT NULL
+);
+";
+
 /// The migration steps: step `i` takes a file from version `i` to `i + 1`.
 /// A later change appends a step; a step, once shipped, never changes.
-pub const MIGRATIONS: &[&str] = &[V1];
+pub const MIGRATIONS: &[&str] = &[V1, V2];
 
 const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
 

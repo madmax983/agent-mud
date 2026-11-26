@@ -54,6 +54,7 @@ use crate::persist::{DaySpend, macro_open, plan_resume, restore_macro, wake_id_k
 use crate::replay::replay_floor;
 use crate::router::{EntityRuntime, Priority, Resume, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::{FallbackMind, PlanMind};
+use crate::steward::{AutonomyView, GoalLine, StewardEvent, StewardNote};
 use crate::turing::{Afk, in_session, mix, pick};
 use crate::wakes::WakeBook;
 
@@ -246,6 +247,9 @@ pub enum ObserverEvent {
         /// When it is (or was) due.
         due_ms: u64,
     },
+    /// What the Steward did as each agent's owner (ADR 0015): a goal
+    /// decided, a daemon made quiet or loud, a check that failed.
+    Steward(crate::steward::StewardEvent),
     /// A reactive plan found at boot was older than `replay_max_age_ms`
     /// and was abandoned, not resumed.
     PlanAbandoned {
@@ -315,7 +319,32 @@ pub struct Supervisor {
     /// that subscribe after [`Supervisor::open`] (see
     /// [`Supervisor::boot_report`]).
     boot_report: Mutex<Vec<Arc<ObserverEvent>>>,
+    /// What the Steward last read of each agent's goals (a leaf lock).
+    autonomy: Mutex<HashMap<EntityId, AutonomyView>>,
+    /// The Steward's notes to each agent, for its next wake (a leaf lock).
+    steward_notes: Mutex<HashMap<EntityId, Vec<StewardNote>>>,
 }
+
+/// Holds an entity busy for a short task of the Steward; dropping it ends
+/// the claim ([`Supervisor::claim`]).
+#[derive(Debug)]
+pub struct ClaimGuard {
+    sup: Arc<Supervisor>,
+    entity: EntityId,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        lock(&self.sup.router).release(&self.entity);
+    }
+}
+
+/// The most Steward notes that wait for one agent's next wake; the oldest
+/// go first.
+pub const MAX_STEWARD_NOTES: usize = 16;
+
+/// The most active goals a wake message lists.
+pub const MAX_GOAL_LINES: usize = 3;
 
 impl Supervisor {
     /// A supervisor over `game`, with a mind for each agent entity. It
@@ -399,6 +428,8 @@ impl Supervisor {
             wakes,
             wake_n: Mutex::new(HashMap::new()),
             boot_report: Mutex::new(Vec::new()),
+            autonomy: Mutex::new(HashMap::new()),
+            steward_notes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1117,6 +1148,8 @@ impl Supervisor {
                 login: wake.reason == "login",
                 wake_id,
                 now_ms,
+                goals: Vec::new(),
+                steward: Vec::new(),
                 booked: wake.booked.clone(),
             }
         })
@@ -1329,6 +1362,18 @@ impl Supervisor {
         let (turn, macro_ticks) = self.open_wake(&wake, &wake_id, &booked);
         let mut ctx = self.context(&wake, wake_id, macro_ticks);
         ctx.booked = booked;
+        // The Steward's lines go to the agent's own mind only: the
+        // fallback at the hard cap never takes them.
+        if self
+            .minds
+            .get(&wake.entity)
+            .is_some_and(|m| Arc::ptr_eq(m, &mind))
+        {
+            ctx.steward = self.take_steward_notes(&wake.entity);
+            if ctx.macro_tick || !ctx.booked.is_empty() {
+                ctx.goals = self.goal_lines(&wake.entity);
+            }
+        }
         let mut tools = MudTools::new(
             Arc::clone(&self.game),
             Arc::clone(&self.gate),
@@ -1560,6 +1605,7 @@ impl Supervisor {
             .map(|(id, _)| (*id, self.gate.is_holding(id)))
             .collect();
         let booked = self.wakes.all();
+        let autonomy = lock(&self.autonomy).clone();
         let mut st = lock(&self.state);
         let entities: Vec<Value> = seen
             .into_iter()
@@ -1585,6 +1631,7 @@ impl Supervisor {
                     "afk_until_ms": s.afk_until,
                     "typing": typing.get(id).copied().unwrap_or(false),
                     "booked": booked.get(id).map_or(&[][..], Vec::as_slice),
+                    "autonomy": autonomy.get(id),
                 });
                 if let (Some(obj), Value::Object(more)) = (v.as_object_mut(), extra) {
                     obj.extend(more);
@@ -1596,6 +1643,83 @@ impl Supervisor {
         let cost: u64 = st.values().map(|s| s.budget.cost_usd_micros()).sum();
         drop(st);
         json!({ "now_ms": now, "entities": entities, "tokens_today": tokens, "cost_usd_micros_today": cost })
+    }
+
+    /// Claims an idle `entity` for a short Steward task (ADR 0015): no
+    /// wake starts until the guard drops, and the release starts no
+    /// cooldown. `None` while a wake runs or waits.
+    #[must_use]
+    pub fn claim(self: &Arc<Self>, entity: &EntityId) -> Option<ClaimGuard> {
+        lock(&self.router).claim(entity).then(|| ClaimGuard {
+            sup: Arc::clone(self),
+            entity: entity.clone(),
+        })
+    }
+
+    /// Whether `entity` has a wake in flight, or a Steward claim.
+    #[must_use]
+    pub fn is_busy(&self, entity: &EntityId) -> bool {
+        lock(&self.router).is_busy(entity)
+    }
+
+    /// Owes `usage` of `entity` to its budget: it is charged on the next
+    /// step with the mind's own source and published as late spend, as a
+    /// heartbeat's spend between wakes is.
+    pub fn owe(&self, entity: &EntityId, usage: Usage) {
+        self.usage.add(entity, usage);
+    }
+
+    /// Stores what the Steward read of `entity`'s goals.
+    pub fn set_autonomy(&self, entity: &EntityId, view: AutonomyView) {
+        lock(&self.autonomy).insert(entity.clone(), view);
+    }
+
+    /// What the Steward last read of `entity`'s goals.
+    #[must_use]
+    pub fn autonomy(&self, entity: &EntityId) -> Option<AutonomyView> {
+        lock(&self.autonomy).get(entity).cloned()
+    }
+
+    /// Queues a note for `entity`'s next wake: what the Steward did with
+    /// one of its goals. At most [`MAX_STEWARD_NOTES`] wait; the oldest go.
+    pub fn steward_note(&self, entity: &EntityId, note: StewardNote) {
+        let mut all = lock(&self.steward_notes);
+        let q = all.entry(entity.clone()).or_default();
+        q.push(note);
+        let over = q.len().saturating_sub(MAX_STEWARD_NOTES);
+        q.drain(..over);
+        drop(all);
+    }
+
+    /// Takes the notes waiting for `entity`.
+    fn take_steward_notes(&self, entity: &EntityId) -> Vec<StewardNote> {
+        lock(&self.steward_notes).remove(entity).unwrap_or_default()
+    }
+
+    /// Up to [`MAX_GOAL_LINES`] of `entity`'s active goals, as the Steward
+    /// last read them.
+    fn goal_lines(&self, entity: &EntityId) -> Vec<GoalLine> {
+        lock(&self.autonomy).get(entity).map_or_else(Vec::new, |v| {
+            v.active
+                .iter()
+                .take(MAX_GOAL_LINES)
+                .map(|g| GoalLine {
+                    id: g.id,
+                    title: g.title.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Publishes a Steward event on the observer feed.
+    pub fn publish_steward(&self, event: StewardEvent) {
+        self.publish(ObserverEvent::Steward(event));
+    }
+
+    /// Publishes a Steward event and keeps it in the boot report, for
+    /// what it says once at start (no council model).
+    pub fn report_steward(&self, event: StewardEvent) {
+        self.report(ObserverEvent::Steward(event));
     }
 
     /// Records spend from outside a wake (tests, external minds), metered

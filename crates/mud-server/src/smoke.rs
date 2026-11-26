@@ -155,6 +155,16 @@ pub async fn run() -> anyhow::Result<Transcript> {
     play(&game, &accounts, &mut rig).await?;
     let mut drill = restart_drill().await?;
     drill.push(booking_drill().await?);
+    // No agent runs on littleguy here: the Steward stays idle (ADR 0015).
+    let steward = crate::steward(
+        &crate::config::MudConfig::default(),
+        &rig.sup,
+        &[],
+        std::collections::BTreeMap::new(),
+        game.boot(),
+    )?;
+    ensure!(steward.is_none(), "the Steward ran with no littleguy agent");
+    drill.push("steward: idle, no agent runs on littleguy".to_owned());
     let mut out = Transcript::default();
     while let Ok(ev) = all.try_recv() {
         let room = ev.room.as_ref().map_or("-", RoomId::as_str).to_owned();

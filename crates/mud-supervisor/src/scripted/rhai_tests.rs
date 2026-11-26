@@ -110,6 +110,8 @@ fn ctx(events: Vec<Event>, wake_id: &str) -> WakeContext {
         login: false,
         wake_id: wake_id.into(),
         now_ms: 12 * 3_600_000,
+        goals: Vec::new(),
+        steward: Vec::new(),
         booked: Vec::new(),
     }
 }

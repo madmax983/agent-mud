@@ -383,6 +383,118 @@ async fn a_real_tick_books_a_wake_through_the_world_server_and_cannot_command() 
     s.stop().await;
 }
 
+/// Whether the request is a council ballot (ADR 0015): no tools, and the
+/// Steward's fixed system text.
+fn is_ballot(req: &Value) -> bool {
+    model_stub::offered_tools(req).is_empty()
+        && req["messages"][0]["role"] == "system"
+        && model_stub::content_text(&req["messages"][0]).starts_with("You review")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_tick_proposes_a_goal_and_the_steward_accepts_it() {
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real goal check");
+        return;
+    };
+    let title = "Corner the ore market";
+    let stub = ModelStub::start(Arc::new(move |req: &Value| {
+        if is_ballot(req) {
+            Reply::Text(r#"{"accept": true, "reason": "fits a smith"}"#.into())
+        } else if model_stub::after_tools(req) {
+            Reply::Text("noted".into())
+        } else if model_stub::is_tick(req) {
+            Reply::Calls(vec![(
+                "propose_goal".into(),
+                json!({ "title": title, "why": "Coin for the forge.", "check_every_minutes": 120 }),
+            )])
+        } else {
+            Reply::Calls(vec![(
+                "add_idea".into(),
+                json!({ "title": "Ore prices", "body": "Ask who sells ore." }),
+            )])
+        }
+    }))
+    .await
+    .unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let lg = lg_on_stub(&bin, bins.path());
+    let mut s = serve(&lg, |cfg| {
+        on_stub(cfg, &stub);
+        cfg.littleguy.heartbeat_minutes = 1;
+        cfg.littleguy.steward.every_secs = 1;
+        // The stub takes any key: name a variable every process has, as
+        // tests cannot set one.
+        cfg.models.insert(
+            "council".into(),
+            mud_server::config::ModelConfig {
+                base_url: stub.base_url(),
+                model: "stub".into(),
+                key_env: "PATH".into(),
+            },
+        );
+    })
+    .await;
+    let steward = s.built.steward.clone().expect("the Steward runs");
+    assert!(steward.has_judge());
+    s.tasks.extend(steward.spawn());
+    let torin = EntityId::from("torin");
+    let mut obs = s.built.mud.sup.subscribe();
+    // An attended wake files an idea and starts the daemon; a tick, a
+    // minute later, proposes the goal.
+    s.built.mud.sup.fire_macro_tick(&torin);
+    let accepted = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match obs.recv().await {
+                Ok(ev) => {
+                    if let ObserverEvent::Steward(e) = &*ev
+                        && e.entity == torin
+                        && e.action == "accepted"
+                    {
+                        return e.clone();
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the Steward never accepted a goal: {:#?}\n{}",
+            stub.requests(),
+            s.log("torin")
+        )
+    });
+    assert_eq!(accepted.text.as_deref(), Some(title));
+    let ballots = stub.requests().into_iter().filter(is_ballot).count();
+    assert!(ballots >= 3, "three council votes: {ballots}");
+    let socket = s.built.littleguy[0]
+        .running_socket(&torin)
+        .await
+        .expect("torin's daemon runs");
+    let req = mud_supervisor::littleguy::owner::OwnerRequest::Plans;
+    let plans = mud_supervisor::littleguy::owner::request(&socket, &req, req.timeout())
+        .await
+        .unwrap();
+    let mud_supervisor::littleguy::owner::OwnerResponse::Plans { goals, .. } = plans else {
+        panic!("{plans:?}");
+    };
+    assert!(
+        goals
+            .iter()
+            .any(|g| g.title == title && g.status == "active"),
+        "lg lists the goal as active: {goals:?}"
+    );
+    let (_, spend) = s.built.mud.sup.budget_of(&torin).unwrap();
+    assert!(
+        spend.local.calls >= 3,
+        "the votes are local spend: {spend:?}"
+    );
+    s.stop().await;
+}
+
 /// The observer links to torin's littleguy pages with a fresh sign-in.
 #[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
 async fn observer_links_to_torins_pages(addr: std::net::SocketAddr, token: &str) {

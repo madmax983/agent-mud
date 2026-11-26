@@ -22,6 +22,7 @@ pub mod replay;
 pub mod rewards;
 pub mod schedule;
 pub mod side;
+pub mod steward;
 pub mod throttle;
 pub mod typing;
 pub mod wounds;

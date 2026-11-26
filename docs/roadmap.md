@@ -37,6 +37,11 @@ Restore `world.db` to a point, then replay the events archive.
      under the old epoch, go to new archive files. Without a new epoch,
      retention refuses to trim at the first reused seq whose line differs
      (ADR 0011); it never deletes such an event unarchived.
+- **Agents' plans do not roll back.** lg's goals (and, with refine, its
+  overlays) live in each daemon's own `lg.db`; the Steward's row in
+  `world.db` would roll back with the world while lg keeps what it
+  decided. The Steward settles from lg's listings, so it follows lg, but
+  a rolled-back world meets agents with goals from its future.
 - **Open questions.** Events would need the command line (or enough of the
   state change) to replay deterministically; today they carry the
   outcome, its recipients and the actor. The ledger (`mints`) must roll
@@ -52,4 +57,3 @@ Restore `world.db` to a point, then replay the events archive.
 - `mud vacuum` (an offline `VACUUM` of `world.db`).
 - Skipping quiet ticks by hash.
 - Persisting the Turing AFK spell.
-- The Steward table, which ships with the autonomy work as migration step 2.

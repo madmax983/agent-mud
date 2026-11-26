@@ -37,6 +37,8 @@ use mud_supervisor::gate::Gate;
 use mud_supervisor::littleguy::LittleguyMind;
 use mud_supervisor::runtime::{Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::FallbackMind;
+use mud_supervisor::steward::council::{Judge, LlmJudge};
+use mud_supervisor::steward::{OwnedDaemons, Steward};
 use mud_world::hooks::WorldHooks;
 use mud_world::{Audit, CommandResult, EntityId, Game, HooksChange, SystemClock, WorldPack};
 
@@ -98,6 +100,9 @@ pub struct Built {
     pub tokens: Arc<TokenRegistry>,
     /// The littleguy daemons to stop at exit.
     pub littleguy: Vec<Arc<LittleguyMind>>,
+    /// The Steward, when it runs: `[littleguy.steward] enabled` and an
+    /// agent on littleguy (ADR 0015).
+    pub steward: Option<Arc<Steward>>,
     /// The supervisor step interval.
     pub step: Duration,
     /// Whether the admin token was made at startup (and so may be logged)
@@ -207,6 +212,7 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     cfg.check_proxy()?;
     cfg.supervisor.check_restart()?;
     cfg.littleguy.check()?;
+    cfg.littleguy.check_steward(&cfg.models)?;
     cfg.minds.harvest.history()?;
     for w in cfg.plaintext_warnings() {
         tracing::warn!("{w}");
@@ -246,7 +252,10 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
     // first. Each agent's MCP token starts at its replay floor, the floor
     // the supervisor replays above, so `mud_events` after a restart hands
     // out nothing a committed wake consumed and skips nothing after it.
-    let restored = game.take_restored().unwrap_or_default();
+    let mut restored = game.take_restored().unwrap_or_default();
+    // The Steward's rows are its own (ADR 0015): split off before the
+    // supervisor takes the rest, since the side state is handed over once.
+    let steward_rows = std::mem::take(&mut restored.steward);
     let last = game.read(mud_world::World::last_seq);
     let tokens = Arc::new(TokenRegistry::new());
     let minds = minds::build(
@@ -258,20 +267,7 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             .as_ref()
             .map(|host| minds::MindScripts { host, game: &game }),
     )?;
-    let s = &cfg.supervisor;
-    let sup_cfg = SupervisorConfig {
-        seed: cfg.world.seed,
-        daily_token_budget: (s.daily_token_budget > 0).then_some(s.daily_token_budget),
-        budgets: budgets(&pack, &s.budgets)?,
-        macro_tick_scale: s.macro_tick_scale,
-        first_macro_tick_secs: s.first_macro_tick_secs,
-        replay_max_age_ms: s.replay_max_age_ms,
-        booking_max_late_ms: s.booking_max_late_ms,
-        catchup_spread_ms: s.catchup_spread_ms,
-        wake_timeout_ms: s.wake_timeout_ms,
-        wake_timeout_ms_by_tier: s.wake_timeout_ms_by_tier,
-        ..SupervisorConfig::default()
-    };
+    let sup_cfg = supervisor_config(cfg, &pack)?;
     // Then the supervisor restores the rows (bookings, the macro schedule,
     // rule counters, plans to resume) and derives the router.
     let sup = Supervisor::open(
@@ -282,6 +278,7 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         sup_cfg,
         restored,
     );
+    let steward = steward(cfg, &sup, &minds.littleguy, steward_rows, game.boot())?;
     let (admin_token, admin_token_generated) =
         admin_token(std::env::var(&cfg.server.admin_token_env).ok())?;
     let accounts = Arc::new(open_accounts(cfg, &game).await?);
@@ -298,6 +295,7 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             ),
             shutdown: tokio_util::sync::CancellationToken::new(),
             littleguy: minds.littleguy.clone(),
+            steward: steward.clone(),
             scripts,
             accounts,
             public_url: cfg.server.public_url.clone(),
@@ -306,8 +304,105 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         admin_token_generated,
         tokens,
         littleguy: minds.littleguy,
-        step: Duration::from_millis(s.step_ms.max(10)),
+        steward,
+        step: Duration::from_millis(cfg.supervisor.step_ms.max(10)),
     })
+}
+
+/// The supervisor's settings from `[supervisor]` and the world's seed.
+fn supervisor_config(cfg: &MudConfig, pack: &WorldPack) -> anyhow::Result<SupervisorConfig> {
+    let s = &cfg.supervisor;
+    Ok(SupervisorConfig {
+        seed: cfg.world.seed,
+        daily_token_budget: (s.daily_token_budget > 0).then_some(s.daily_token_budget),
+        budgets: budgets(pack, &s.budgets)?,
+        macro_tick_scale: s.macro_tick_scale,
+        first_macro_tick_secs: s.first_macro_tick_secs,
+        replay_max_age_ms: s.replay_max_age_ms,
+        booking_max_late_ms: s.booking_max_late_ms,
+        catchup_spread_ms: s.catchup_spread_ms,
+        wake_timeout_ms: s.wake_timeout_ms,
+        wake_timeout_ms_by_tier: s.wake_timeout_ms_by_tier,
+        ..SupervisorConfig::default()
+    })
+}
+
+/// The Steward over the littleguy minds, when `[littleguy.steward]` is on
+/// and an agent runs on littleguy; it restores `rows`. With no agent on
+/// littleguy it is idle and says so once.
+pub(crate) fn steward(
+    cfg: &MudConfig,
+    sup: &Arc<Supervisor>,
+    littleguy: &[Arc<LittleguyMind>],
+    rows: BTreeMap<EntityId, mud_world::side::StewardStored>,
+    boot: u64,
+) -> anyhow::Result<Option<Arc<Steward>>> {
+    let s = &cfg.littleguy.steward;
+    if !s.enabled {
+        return Ok(None);
+    }
+    if littleguy.is_empty() {
+        tracing::info!("the Steward is idle: no agent runs on littleguy");
+        return Ok(None);
+    }
+    let daemons = littleguy
+        .iter()
+        .map(|m| Arc::clone(m) as Arc<dyn OwnedDaemons>)
+        .collect();
+    Ok(Some(Steward::new(
+        Arc::clone(sup),
+        daemons,
+        council_judge(cfg)?,
+        s.clone(),
+        rows,
+        boot,
+    )))
+}
+
+/// The council's judge: one client per alias, `council_model` first.
+///
+/// `council_models` follow. `None` when no alias is set, or the first
+/// alias's key variable is unset: the Steward then waits, and says so at
+/// start.
+///
+/// # Errors
+/// An alias is missing (the start-up check refuses that first), or a
+/// client cannot be built.
+pub fn council_judge(cfg: &MudConfig) -> anyhow::Result<Option<Arc<dyn Judge>>> {
+    let Some(first) = cfg.littleguy.council_alias(&cfg.models) else {
+        return Ok(None);
+    };
+    let mut clients = Vec::new();
+    for alias in std::iter::once(&first).chain(&cfg.littleguy.steward.council_models) {
+        let m = cfg
+            .models
+            .get(alias)
+            .with_context(|| format!("no [models.{alias}] for the council"))?;
+        let Ok(key) = std::env::var(&m.key_env) else {
+            if *alias == first {
+                tracing::warn!(
+                    alias = %alias,
+                    key_env = %m.key_env,
+                    "the council model's key is not set: the Steward has no judge"
+                );
+                return Ok(None);
+            }
+            tracing::warn!(alias = %alias, key_env = %m.key_env, "a council alias's key is not set; its members use the others");
+            continue;
+        };
+        let client: Arc<dyn autumn_plugin_agent::LlmClient> = Arc::new(
+            autumn_plugin_agent::OpenAiCompatibleClient::new(
+                m.base_url.clone(),
+                m.model.clone(),
+                key,
+            )
+            .map_err(|e| anyhow::anyhow!("council model {alias}: {e}"))?,
+        );
+        clients.push((alias.clone(), client));
+    }
+    let judge = LlmJudge::new(clients, cfg.littleguy.steward.council_temperature)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Some(Arc::new(judge)))
 }
 
 /// A reload that took.
@@ -570,6 +665,18 @@ pub async fn stop_on(
     }
 }
 
+/// Starts the supervisor and, when it runs, the Steward. The handles hold
+/// every task of both, so [`stop_on`] aborts the Steward with the
+/// supervisor, before any daemon is killed.
+#[must_use]
+pub fn spawn_tasks(built: &Built) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = built.mud.sup.spawn(built.step);
+    if let Some(steward) = &built.steward {
+        tasks.extend(steward.spawn());
+    }
+    tasks
+}
+
 /// Runs the server until a signal stops it.
 ///
 /// # Errors
@@ -584,7 +691,7 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
         mcp = %cfg.server.mcp_url(),
         "the MUD is up"
     );
-    let mut tasks = built.mud.sup.spawn(built.step);
+    let mut tasks = spawn_tasks(&built);
     if let Some(addr) = cfg.server.telnet {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -786,16 +893,16 @@ mod tests {
         // A file a newer server wrote is refused, and left as it was.
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
         }
         let err = format!("{:#}", build(&cfg).await.unwrap_err());
         assert!(err.contains("opening the world"), "{err}");
-        assert!(err.contains("schema version 2"), "{err}");
+        assert!(err.contains("schema version 3"), "{err}");
         let conn = rusqlite::Connection::open(&db).unwrap();
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
     }
 
     #[tokio::test]
@@ -833,6 +940,113 @@ mod tests {
             assert_eq!(built.tokens.cursors_of(&e), [floor], "{e}");
             assert!(floor <= last, "{e}: never past the world");
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn littleguy_cfg(dir: &Path) -> MudConfig {
+        let mut cfg = MudConfig::default();
+        cfg.world.db = None;
+        cfg.accounts.bcrypt_cost = 4;
+        cfg.minds.persistent = crate::config::Runtime::Littleguy;
+        cfg.littleguy.bin = dir.join("no-such-lg");
+        cfg.littleguy.data_dir = dir.join("agents");
+        cfg
+    }
+
+    #[tokio::test]
+    async fn steward_without_council_model_warns_and_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = littleguy_cfg(dir.path());
+        assert!(!cfg.models.contains_key("council"));
+        let logs = Logs::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _log = tracing::subscriber::set_default(subscriber);
+        let built = build(&cfg).await.unwrap();
+        let steward = built.steward.clone().expect("the Steward runs");
+        assert!(!steward.has_judge());
+        let held = Arc::strong_count(&steward);
+        // As serve() does: the Steward starts with the supervisor.
+        let tasks = spawn_tasks(&built);
+        assert!(
+            Arc::strong_count(&steward) > held,
+            "the Steward's tasks run"
+        );
+        let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert_eq!(text.matches("no council model").count(), 1, "{text}");
+        let no_judge = built
+            .mud
+            .sup
+            .boot_report()
+            .into_iter()
+            .filter(|e| {
+                matches!(&**e, mud_supervisor::runtime::ObserverEvent::Steward(s) if s.action == "no_judge")
+            })
+            .count();
+        assert_eq!(no_judge, 3, "one per agent: marta, torin, vich");
+        // stop_on aborts every handle spawn_tasks gave: the Steward's too.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopper = tokio::spawn(stop_on(
+            shutdown.clone(),
+            tasks
+                .iter()
+                .map(tokio::task::JoinHandle::abort_handle)
+                .collect(),
+            built.littleguy.clone(),
+        ));
+        shutdown.cancel();
+        stopper.await.unwrap();
+        for t in tasks {
+            let _ = t.await;
+        }
+        assert_eq!(
+            Arc::strong_count(&steward),
+            held,
+            "no Steward task outlives the stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_council_alias_is_an_error_and_a_known_one_builds_a_judge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = littleguy_cfg(dir.path());
+        cfg.littleguy.steward.council_model = Some("councel".into());
+        let err = build(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("[models.councel]"), "{err}");
+        cfg.littleguy.steward.council_model = None;
+        cfg.models.insert(
+            "council".into(),
+            crate::config::ModelConfig {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "m".into(),
+                key_env: "MUD_TEST_COUNCIL_KEY_UNSET".into(),
+            },
+        );
+        // Its key is not set: no judge, and the server still starts.
+        let built = build(&cfg).await.unwrap();
+        assert!(!built.steward.unwrap().has_judge());
+        cfg.models.get_mut("council").unwrap().key_env = "PATH".into();
+        cfg.littleguy.steward.council_models = vec!["council".into()];
+        let judge = council_judge(&cfg).unwrap().expect("a judge");
+        assert!(format!("{judge:?}").contains("council"));
+        cfg.littleguy.steward.enabled = false;
+        assert!(build(&cfg).await.unwrap().steward.is_none());
     }
 
     #[tokio::test]
