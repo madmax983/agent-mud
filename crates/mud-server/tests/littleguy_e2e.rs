@@ -423,6 +423,8 @@ async fn a_real_tick_proposes_a_goal_and_the_steward_accepts_it() {
         on_stub(cfg, &stub);
         cfg.littleguy.heartbeat_minutes = 1;
         cfg.littleguy.steward.every_secs = 1;
+        // Goals only here; refine has its own test.
+        cfg.littleguy.refine = mud_supervisor::littleguy::RefineMode::Off;
         // The stub takes any key: name a variable every process has, as
         // tests cannot set one.
         cfg.models.insert(
@@ -492,6 +494,155 @@ async fn a_real_tick_proposes_a_goal_and_the_steward_accepts_it() {
         spend.local.calls >= 3,
         "the votes are local spend: {spend:?}"
     );
+    s.stop().await;
+}
+
+/// Whether the request is lg's refine proposer: no tools, and its user
+/// message holds the current overlay block.
+fn is_proposer(req: &Value) -> bool {
+    model_stub::offered_tools(req).is_empty()
+        && model_stub::last_user_text(req).contains("# THE CURRENT OVERLAY")
+}
+
+/// Whether the request is a menu ballot of the Steward's council.
+fn is_menu_ballot(req: &Value) -> bool {
+    model_stub::offered_tools(req).is_empty()
+        && req["messages"][0]["role"] == "system"
+        && model_stub::content_text(&req["messages"][0]).starts_with("You choose")
+}
+
+/// lg's active overlay is `want`, put by the MUD, and the proposer's own
+/// version is stored and never active. Returns the active version.
+#[expect(clippy::unwrap_used, reason = "a test helper fails loudly")]
+async fn lg_runs_the_menu_text(socket: &Path, want: &str) -> u64 {
+    use mud_supervisor::littleguy::owner::{OwnerRequest, OwnerResponse, request};
+    let t = Duration::from_secs(30);
+    let listed = request(socket, &OwnerRequest::Overlays, t).await.unwrap();
+    let OwnerResponse::Overlays {
+        active: Some(active),
+        entries,
+    } = listed
+    else {
+        panic!("{listed:?}");
+    };
+    let shown = request(socket, &OwnerRequest::OverlayShow { version: active }, t)
+        .await
+        .unwrap();
+    let OwnerResponse::Overlay { overlay, entry } = shown else {
+        panic!("{shown:?}");
+    };
+    assert_eq!(entry.author, "operator:mud");
+    assert!(
+        mud_supervisor::steward::vet::overlay_matches(&overlay, want),
+        "lg's active overlay is the menu render: {overlay}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.author == "operator:lg-refine" && !e.active),
+        "the proposal is stored, never activated: {entries:?}"
+    );
+    active
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_refine_propose_reaches_a_menu_activation() {
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real refine check");
+        return;
+    };
+    let stub = ModelStub::start(Arc::new(|req: &Value| {
+        if is_proposer(req) {
+            Reply::Text(r#"{"guardrails":"Answer buyers in one short line.","max_steps":9}"#.into())
+        } else if is_menu_ballot(req) {
+            Reply::Text(r#"{"ids": ["brevity"], "reason": "keeps it short"}"#.into())
+        } else if model_stub::after_tools(req) {
+            Reply::Text("noted".into())
+        } else {
+            Reply::Calls(vec![(
+                "add_idea".into(),
+                json!({ "title": "Ore prices", "body": "Ask who sells ore." }),
+            )])
+        }
+    }))
+    .await
+    .unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let lg = lg_on_stub(&bin, bins.path());
+    let mut s = serve(&lg, |cfg| {
+        on_stub(cfg, &stub);
+        cfg.littleguy.refine = mud_supervisor::littleguy::RefineMode::Menu;
+        cfg.littleguy.steward.every_secs = 1;
+        cfg.littleguy.steward.refine_min_wakes = 1;
+        cfg.models.insert(
+            "council".into(),
+            mud_server::config::ModelConfig {
+                base_url: stub.base_url(),
+                model: "stub".into(),
+                key_env: "PATH".into(),
+            },
+        );
+    })
+    .await;
+    let steward = s.built.steward.clone().expect("the Steward runs");
+    let torin = EntityId::from("torin");
+    let mut obs = s.built.mud.sup.subscribe();
+    s.tasks.extend(steward.spawn());
+    // An attended wake gives lg's proposer a transcript and counts the
+    // wake that makes refine due.
+    s.built.mud.sup.fire_macro_tick(&torin);
+    let mut seen = Vec::new();
+    let activated = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match obs.recv().await {
+                Ok(ev) => {
+                    if let ObserverEvent::Steward(e) = &*ev
+                        && e.entity == torin
+                        && e.item == "overlay"
+                    {
+                        seen.push(format!("{} {}", e.action, e.code));
+                        if e.action == "activated" && e.code == "text" {
+                            return e.clone();
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no menu text was activated: {seen:?}\n{:#?}\n{}",
+            stub.requests(),
+            s.log("torin")
+        )
+    });
+    assert!(
+        seen.iter().any(|l| l == "proposed menu"),
+        "lg's proposer answered proposed, not kept or error: {seen:?}"
+    );
+    assert!(seen.iter().any(|l| l == "activated baseline"), "{seen:?}");
+    let menu = mud_supervisor::steward::vet::default_menu();
+    let want = mud_supervisor::steward::vet::render_guardrails(&menu, &["brevity".to_owned()]);
+    assert!(
+        activated
+            .text
+            .as_deref()
+            .is_some_and(|t| t.ends_with(&want)),
+        "{activated:?}"
+    );
+    assert!(stub.requests().iter().any(is_proposer));
+    assert!(stub.requests().iter().filter(|r| is_menu_ballot(r)).count() >= 3);
+    let socket = s.built.littleguy[0]
+        .running_socket(&torin)
+        .await
+        .expect("torin's daemon runs");
+    let active = lg_runs_the_menu_text(&socket, &want).await;
+    let row = steward.row(&torin).await.unwrap();
+    assert_eq!(row.overlay.pointer, Some(active));
+    assert!(row.overlay.baseline.is_some() && row.overlay.paused.is_none());
     s.stop().await;
 }
 

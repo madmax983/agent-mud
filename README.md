@@ -190,8 +190,12 @@ is tested against) and point `[littleguy] bin` at it:
 ```sh
 git -C littleguy checkout aefce058ca0b18bdf58cd68f012288b6fb4ef099
 cargo build --release -p littleguy --no-default-features \
-  --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction"
+  --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction,refine"
 ```
+
+`refine` is needed while `[littleguy] refine` is `menu` (the default) or
+`free`: lg refuses to start a `[refine]` config without it. Set
+`refine = "off"` to run an `lg` built without it.
 
 Each agent's daemon takes notes, keeps goals and ideas, researches them on
 its heartbeat, and compacts a long op (the `[littleguy]` keys in

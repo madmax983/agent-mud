@@ -84,6 +84,13 @@ compaction_at_percent = 80
 compaction_max_resets = 3
 max_request_bytes = 240000       # keep under the provider's window; 0 is lg's 2 MiB default (warned with compaction on)
 window = 30                      # turns of transcript the agent sees
+# Refine (ADR 0015): the Steward runs lg's proposer on an agent's recent play
+# and lets the council pick standing reminders from the operator menu below;
+# it puts and activates them itself, one move above an empty baseline, so one
+# Roll back on the agent's littleguy page returns to the baseline and pauses
+# refine for that agent. "off" | "menu" | "free" ("free" is not available yet
+# and runs as "menu"). Needs an lg built with the refine feature unless "off".
+refine = "menu"
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
 # The Steward (ADR 0015): the MUD is each daemon's owner. It decides the goals
@@ -113,6 +120,20 @@ title_chars = 120
 why_chars = 800
 deny_phrases = []                # added to the built-in phrases, never replacing them
 quiet_on_hard = true             # at the hard cap: no heartbeat, no memory, no tick spend
+# The next three are 1 to 86400 (a day).
+activate_wait_secs = 600         # one overlay_activate answer is awaited this long, never resent
+refine_timeout_secs = 120        # lg's proposer may run this long under a claim
+refine_drain_secs = 600          # then the claim waits for lg's loop at most this long
+refine_every_hours = 168         # at least 24 between two proposes of an agent
+refine_min_wakes = 20            # at least 1 wake between two proposes
+refine_charge_tokens = 30000     # charged per propose (lg's proposer writes no ledger row)
+max_guardrails = 3               # menu items active at once
+resume_refine = []               # agents whose refine pause ends at the next boot; remove them after
+# The operator menu; with none, the code default menu (brevity, pacing,
+# in_character, look_first, fair_prices, follow_through) is used.
+# [[littleguy.steward.guardrail]]
+# id = "brevity"
+# text = "Keep each line of speech under twenty words."
 
 [supervisor]
 daily_token_budget = 400000      # per agent per UTC day; 0 is unlimited

@@ -657,6 +657,11 @@ pub struct LittleguySection {
     pub max_request_bytes: u64,
     /// Turns of transcript the agent sees (at least 1).
     pub window: u32,
+    /// Refine: `off`, `menu` (the default: the council picks operator menu
+    /// items, using lg's proposer as evidence) or `free` (ADR 0016; until
+    /// it ships it behaves as `menu`, with a warning). Needs an `lg` built
+    /// with the `refine` feature unless `off`.
+    pub refine: mud_supervisor::littleguy::RefineMode,
     /// `[littleguy.steward]`: the MUD as each daemon's owner (ADR 0015).
     pub steward: mud_supervisor::steward::StewardConfig,
 }
@@ -680,6 +685,7 @@ impl Default for LittleguySection {
             compaction_max_resets: c.max_resets,
             max_request_bytes: d.max_request_bytes,
             window: d.window,
+            refine: d.refine,
             steward: mud_supervisor::steward::StewardConfig::default(),
         }
     }
@@ -748,6 +754,77 @@ impl LittleguySection {
                 "[littleguy.steward] deny_phrases entries must be non-empty ASCII, not {p:?}"
             );
         }
+        self.check_refine()
+    }
+
+    /// Checks the refine keys of `[littleguy.steward]`: the floors on the
+    /// rate, and the operator menu.
+    ///
+    /// # Errors
+    /// A value is out of bounds; the message names it.
+    pub fn check_refine(&self) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        use mud_supervisor::steward::vet::{menu_id_ok, menu_text_ok};
+        let s = &self.steward;
+        if self.refine.is_on() {
+            ensure!(
+                s.refine_every_hours >= 24,
+                "[littleguy.steward] refine_every_hours must be at least 24, not {}",
+                s.refine_every_hours
+            );
+            ensure!(
+                s.refine_min_wakes >= 1,
+                "[littleguy.steward] refine_min_wakes must be at least 1"
+            );
+        }
+        ensure!(
+            s.activate_wait_secs >= 1 && s.refine_timeout_secs >= 1,
+            "[littleguy.steward] activate_wait_secs and refine_timeout_secs must be at least 1"
+        );
+        for (key, secs) in [
+            ("activate_wait_secs", s.activate_wait_secs),
+            ("refine_timeout_secs", s.refine_timeout_secs),
+            ("refine_drain_secs", s.refine_drain_secs),
+        ] {
+            ensure!(
+                secs <= 86_400,
+                "[littleguy.steward] {key} must be at most 86400 (a day), not {secs}"
+            );
+        }
+        ensure!(
+            (1..=16).contains(&s.max_guardrails),
+            "[littleguy.steward] max_guardrails must be 1 to 16, not {}",
+            s.max_guardrails
+        );
+        ensure!(
+            s.guardrail.len() <= 16,
+            "[littleguy.steward] at most 16 guardrail menu items, not {}",
+            s.guardrail.len()
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for g in &s.guardrail {
+            ensure!(
+                menu_id_ok(&g.id),
+                "[[littleguy.steward.guardrail]] id {:?} must be 1 to 32 of a-z, 0-9 and _",
+                g.id
+            );
+            ensure!(
+                ids.insert(g.id.as_str()),
+                "[[littleguy.steward.guardrail]] id {:?} is used twice",
+                g.id
+            );
+            ensure!(
+                menu_text_ok(&g.text),
+                "[[littleguy.steward.guardrail]] {:?}: the text must be 1 to 200 characters of ASCII letters, digits, space and . , ; : ' ! ? ( ) -",
+                g.id
+            );
+        }
+        for e in &s.resume_refine {
+            ensure!(
+                !e.trim().is_empty(),
+                "[littleguy.steward] resume_refine names an empty entity id"
+            );
+        }
         Ok(())
     }
 
@@ -781,6 +858,12 @@ impl LittleguySection {
         if self.compaction && self.max_request_bytes == 0 {
             out.push(
                 "[littleguy] compaction is on but max_request_bytes is 0: lg compacts below its 2 MiB default, which may be past the provider's window; set max_request_bytes under it"
+                    .to_owned(),
+            );
+        }
+        if self.refine == mud_supervisor::littleguy::RefineMode::Free {
+            out.push(
+                "[littleguy] refine = \"free\" is not available yet (ADR 0016): it runs as \"menu\", and the council picks only operator menu items"
                     .to_owned(),
             );
         }
@@ -962,6 +1045,7 @@ mod tests {
         );
         assert_eq!(lg.max_request_bytes, 240_000);
         assert_eq!(lg.window, 30);
+        assert_eq!(lg.refine, mud_supervisor::littleguy::RefineMode::Menu);
         assert!(lg.check().is_ok());
         assert_eq!(lg.warnings(), Vec::<String>::new());
         assert!(
@@ -1004,6 +1088,11 @@ mod tests {
         assert_eq!(v["max_request_bytes"].as_integer(), Some(240_000));
         assert_eq!(v["window"].as_integer(), Some(30));
         assert_eq!(v["max_steps"].as_integer(), Some(64));
+        assert_eq!(
+            v["refine"]["messages"].as_integer(),
+            Some(30),
+            "refine = menu"
+        );
     }
 
     #[test]
@@ -1031,6 +1120,103 @@ mod tests {
             },
             "the example sets the code defaults"
         );
+    }
+
+    #[test]
+    fn refine_floors_are_enforced() {
+        use mud_supervisor::littleguy::RefineMode;
+        let models = BTreeMap::new();
+        let check = |edit: &dyn Fn(&mut LittleguySection)| {
+            let mut s = LittleguySection::default();
+            edit(&mut s);
+            s.check_steward(&models).map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            LittleguySection::default().refine,
+            RefineMode::Menu,
+            "the code default"
+        );
+        assert!(check(&|_| {}).is_ok());
+        let every = check(&|s| s.steward.refine_every_hours = 0).unwrap_err();
+        assert!(every.contains("refine_every_hours"), "{every}");
+        assert!(check(&|s| s.steward.refine_every_hours = 23).is_err());
+        assert!(check(&|s| s.steward.refine_every_hours = 24).is_ok());
+        let wakes = check(&|s| s.steward.refine_min_wakes = 0).unwrap_err();
+        assert!(wakes.contains("refine_min_wakes"), "{wakes}");
+        assert!(
+            check(&|s| {
+                s.refine = RefineMode::Off;
+                s.steward.refine_every_hours = 0;
+                s.steward.refine_min_wakes = 0;
+            })
+            .is_ok(),
+            "no floor while refine is off"
+        );
+        // The start-up path refuses it too.
+        let cfg: MudConfig =
+            toml::from_str("[littleguy.steward]\nrefine_every_hours = 0\n").unwrap();
+        assert!(cfg.littleguy.check_steward(&cfg.models).is_err());
+        assert!(
+            toml::from_str::<MudConfig>("[littleguy]\nrefine = \"auto\"").is_err(),
+            "off, menu or free"
+        );
+        assert!(
+            toml::from_str::<MudConfig>("[littleguy.steward]\nrefine = \"menu\"").is_err(),
+            "refine is a [littleguy] key"
+        );
+    }
+
+    #[test]
+    fn the_guardrail_menu_is_checked() {
+        use mud_supervisor::steward::vet::Snippet;
+        let cfg: MudConfig = toml::from_str(
+            "[[littleguy.steward.guardrail]]\nid = \"brief\"\ntext = \"Keep it short.\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.littleguy.steward.guardrail.len(), 1);
+        assert_eq!(cfg.littleguy.steward.menu()[0].id, "brief");
+        assert!(cfg.littleguy.check_refine().is_ok());
+        let bad = |g: Vec<(&str, &str)>| {
+            let mut s = LittleguySection::default();
+            s.steward.guardrail = g
+                .into_iter()
+                .map(|(id, text)| Snippet {
+                    id: id.into(),
+                    text: text.into(),
+                })
+                .collect();
+            s.check_refine().unwrap_err().to_string()
+        };
+        assert!(bad(vec![("Brief", "x")]).contains("id"));
+        assert!(bad(vec![("a", "x"), ("a", "y")]).contains("twice"));
+        assert!(bad(vec![("a", "use {json}")]).contains("text"));
+        assert!(bad(vec![("a", "")]).contains("text"));
+        let mut s = LittleguySection::default();
+        s.steward.guardrail = (0..17)
+            .map(|i| Snippet {
+                id: format!("g{i}"),
+                text: "x".into(),
+            })
+            .collect();
+        assert!(s.check_refine().unwrap_err().to_string().contains("16"));
+        assert!(
+            toml::from_str::<MudConfig>(
+                "[[littleguy.steward.guardrail]]\nid = \"a\"\ntext = \"b\"\nextra = 1\n"
+            )
+            .is_err(),
+            "an unknown menu key is refused"
+        );
+    }
+
+    #[test]
+    fn free_refine_warns_that_it_runs_as_menu() {
+        let s = LittleguySection {
+            refine: mud_supervisor::littleguy::RefineMode::Free,
+            ..LittleguySection::default()
+        };
+        let w = s.warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("runs as \"menu\""), "{w:?}");
     }
 
     #[test]
@@ -1065,6 +1251,14 @@ mod tests {
         assert!(bad(&|s| s.steward.every_secs = 0).contains("every_secs"));
         assert!(bad(&|s| s.steward.title_chars = 0).contains("title_chars"));
         assert!(bad(&|s| s.steward.deny_phrases = vec![" ".into()]).contains("deny_phrases"));
+        assert!(bad(&|s| s.steward.max_guardrails = 0).contains("max_guardrails"));
+        assert!(bad(&|s| s.steward.activate_wait_secs = 0).contains("activate_wait_secs"));
+        assert!(
+            bad(&|s| s.steward.refine_drain_secs = u64::MAX).contains("refine_drain_secs"),
+            "an unbounded drain is refused"
+        );
+        assert!(bad(&|s| s.steward.activate_wait_secs = 86_401).contains("activate_wait_secs"));
+        assert!(bad(&|s| s.steward.resume_refine = vec![String::new()]).contains("resume_refine"));
         assert!(bad(&|s| s.steward.deny_phrases = vec!["é".into()]).contains("deny_phrases"));
         let one = LittleguySection {
             steward: mud_supervisor::steward::StewardConfig {

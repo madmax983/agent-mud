@@ -100,9 +100,40 @@ pub struct LittleguyConfig {
     pub max_request_bytes: u64,
     /// The `window`: the turns of transcript the agent sees.
     pub window: u32,
+    /// Refine: `off` writes no `[refine]`; `menu` and `free` write it, and
+    /// the Steward owns the overlays (ADR 0015).
+    #[serde(default)]
+    pub refine: RefineMode,
     /// How long `lg serve` may take to open its socket.
     pub start_timeout_secs: u64,
 }
+
+/// How an agent refines its own standing text (`[littleguy] refine`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefineMode {
+    /// No `[refine]`: lg's proposer never runs, and the Steward leaves
+    /// overlays alone.
+    Off,
+    /// The Steward runs lg's proposer and lets the council pick operator
+    /// menu items from it as evidence (the code default).
+    #[default]
+    Menu,
+    /// Council-approved free text (ADR 0016). Until that phase ships it
+    /// behaves as `Menu`.
+    Free,
+}
+
+impl RefineMode {
+    /// Whether refine runs at all.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// The messages of transcript lg's proposer reads.
+pub const REFINE_MESSAGES: u32 = 30;
 
 /// The `[compaction]` section of an `lg.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +169,7 @@ impl Default for LittleguyConfig {
             compaction: Some(CompactionRender::default()),
             max_request_bytes: 240_000,
             window: 30,
+            refine: RefineMode::Menu,
             start_timeout_secs: 30,
         }
     }
@@ -291,6 +323,17 @@ pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet
             table([
                 ("at_percent", i64::from(c.at_percent).into()),
                 ("max_resets", i64::from(c.max_resets).into()),
+            ])
+            .into(),
+        );
+    }
+    if cfg.refine.is_on() {
+        // lg's proposer; the Steward is the only caller (ADR 0015).
+        root.insert(
+            "refine".into(),
+            table([
+                ("messages", i64::from(REFINE_MESSAGES).into()),
+                ("dimension", "inv".into()),
             ])
             .into(),
         );

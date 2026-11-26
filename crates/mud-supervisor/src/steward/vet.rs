@@ -7,10 +7,16 @@
 //! prompt injection) and a title the Steward declined before. Ordinary words (owner, prompt, serve, follow)
 //! pass; the council judges what they mean ([`super::council`]).
 //!
-//! [`goal_verdict`] and [`council_majority`] are mirrored in
-//! `formal/verus/src/steward.rs`; the text between the mirror markers must
-//! match it.
+//! Refine (phase 4): the operator menu ([`Snippet`], [`default_menu`]),
+//! its render ([`render_guardrails`]), and the test that finds a lost put
+//! by its content ([`overlay_matches`]).
+//!
+//! [`goal_verdict`], [`council_majority`], [`refine_due`] and
+//! [`pointer_verdict`] are mirrored in `formal/verus/src/steward.rs`; the
+//! text between the mirror markers must match it.
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
@@ -112,6 +118,205 @@ pub const fn council_majority(yes: u32, members: u32) -> bool {
     yes <= members && yes > members - yes
 }
 // mirror-end council_majority
+
+// mirror-begin refine_due
+/// Whether a refine propose is due.
+///
+/// Never while paused or below a normal budget, never before `min_wakes`
+/// wakes, and never before `every_ms` has passed since the last one by the
+/// game clock. A clock set back (`now_ms < last`) is never due.
+#[must_use]
+pub const fn refine_due(
+    now_ms: u64,
+    last_ms: Option<u64>,
+    every_ms: u64,
+    wakes_since: u32,
+    min_wakes: u32,
+    paused: bool,
+    level_normal: bool,
+) -> bool {
+    let time_ok = match last_ms {
+        None => true,
+        Some(l) => now_ms >= l && now_ms - l >= every_ms,
+    };
+    !paused && level_normal && time_ok && wakes_since >= min_wakes
+}
+// mirror-end refine_due
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// mirror-begin pointer_verdict_enum
+/// What lg's active overlay version says, against the one the Steward
+/// expects.
+pub enum PointerVerdict {
+    /// It is the expected version.
+    Same,
+    /// It is a version the Steward activated and gave up on: its activate
+    /// applied late.
+    OwnLate,
+    /// Someone else moved it: a human's veto.
+    Human,
+}
+// mirror-end pointer_verdict_enum
+
+// mirror-begin pointer_verdict
+/// The verdict on lg's active version `lg` against `expected`.
+///
+/// `lg_is_late` says the Steward gave up on an activate of `lg`. Any
+/// other move away from `expected` is a human's.
+#[must_use]
+pub const fn pointer_verdict(
+    lg: Option<u64>,
+    expected: Option<u64>,
+    lg_is_late: bool,
+) -> PointerVerdict {
+    match lg {
+        None => match expected {
+            None => PointerVerdict::Same,
+            Some(_) => PointerVerdict::Human,
+        },
+        Some(a) => {
+            let same = match expected {
+                Some(b) => a == b,
+                None => false,
+            };
+            if same {
+                PointerVerdict::Same
+            } else if lg_is_late {
+                PointerVerdict::OwnLate
+            } else {
+                PointerVerdict::Human
+            }
+        }
+    }
+}
+// mirror-end pointer_verdict
+
+/// One operator menu item (`[[littleguy.steward.guardrail]]`): author
+/// text the council may pick as a standing reminder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snippet {
+    /// Its id: 1 to 32 of `[a-z0-9_]`.
+    pub id: String,
+    /// Its text: 1 to 200 characters of [`menu_text_ok`].
+    pub text: String,
+}
+
+/// The menu when the operator sets none: setting-agnostic code defaults.
+#[must_use]
+pub fn default_menu() -> Vec<Snippet> {
+    [
+        ("brevity", "Keep each line of speech under twenty words."),
+        ("pacing", "Do at most three things in one wake, then stop."),
+        (
+            "in_character",
+            "Speak only as your character; never mention tools, notes, goals or wakes.",
+        ),
+        (
+            "look_first",
+            "Look around before acting in a place you have not seen this wake.",
+        ),
+        (
+            "fair_prices",
+            "Quote only prices your sheet or the list command shows.",
+        ),
+        (
+            "follow_through",
+            "When you say you will do something later, book a wake for it.",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, text)| Snippet {
+        id: id.to_owned(),
+        text: text.to_owned(),
+    })
+    .collect()
+}
+
+/// Whether `id` is a menu id: 1 to 32 of `[a-z0-9_]`.
+#[must_use]
+pub fn menu_id_ok(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Whether `text` is a menu text: 1 to 200 characters of ASCII letters,
+/// digits, space and `. , ; : ' ! ? ( ) -`. Menu texts are the operator's,
+/// so no deny list applies; the character set keeps markup out.
+#[must_use]
+pub fn menu_text_ok(text: &str) -> bool {
+    (1..=200).contains(&text.chars().count())
+        && !text.trim().is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " .,;:'!?()-".contains(c))
+}
+
+/// The guardrails text of the menu items `ids`, in menu order: each text
+/// after `- `, one per line. Unknown ids are dropped; no id gives `""`.
+#[must_use]
+pub fn render_guardrails(menu: &[Snippet], ids: &[String]) -> String {
+    let texts: Vec<&str> = menu
+        .iter()
+        .filter(|s| ids.contains(&s.id))
+        .map(|s| s.text.as_str())
+        .collect();
+    if texts.is_empty() {
+        String::new()
+    } else {
+        format!("- {}", texts.join("\n- "))
+    }
+}
+
+/// The overlay JSON the Steward puts for a guardrails text: `{}` for the
+/// empty baseline, `{"guardrails": text}` otherwise. Nothing else is ever
+/// put.
+#[must_use]
+pub fn overlay_json(guardrails: &str) -> String {
+    if guardrails.is_empty() {
+        "{}".to_owned()
+    } else {
+        serde_json::json!({ "guardrails": guardrails }).to_string()
+    }
+}
+
+/// The digest of a guardrails text (`""` for the baseline). A fixed seed:
+/// the veto list outlives any config change.
+#[must_use]
+pub fn overlay_digest(guardrails: &str) -> u64 {
+    mix(0x7374_6577, &[b"overlay", guardrails.as_bytes()])
+}
+
+/// Whether the overlay JSON `shown` (lg's `overlay_show`) is what the
+/// Steward put for `guardrails`.
+///
+/// It is when it is an object whose `guardrails` equals it (absent or null
+/// for the empty baseline) and whose every other key is null, absent, an
+/// empty array or an empty object.
+#[must_use]
+pub fn overlay_matches(shown: &str, guardrails: &str) -> bool {
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(shown) else {
+        return false;
+    };
+    let empty = |v: &Value| match v {
+        Value::Null => true,
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    };
+    let rails_ok = match obj.get("guardrails") {
+        None | Some(Value::Null) => guardrails.is_empty(),
+        Some(Value::String(g)) => !guardrails.is_empty() && g == guardrails,
+        Some(_) => false,
+    };
+    rails_ok
+        && obj
+            .iter()
+            .filter(|(k, _)| k.as_str() != "guardrails")
+            .all(|(_, v)| empty(v))
+}
 
 /// Why the text guard declined a goal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,7 +599,115 @@ mod tests {
         )
     }
 
+    #[test]
+    fn the_menu_renders_in_menu_order_and_drops_unknown_ids() {
+        let menu = default_menu();
+        assert!(
+            menu.iter()
+                .all(|s| menu_id_ok(&s.id) && menu_text_ok(&s.text))
+        );
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            render_guardrails(&menu, &ids(&["pacing", "nope", "brevity"])),
+            "- Keep each line of speech under twenty words.\n- Do at most three things in one wake, then stop."
+        );
+        assert_eq!(render_guardrails(&menu, &ids(&["nope"])), "");
+        assert_eq!(overlay_json(""), "{}");
+        assert_eq!(
+            overlay_json("- a"),
+            serde_json::json!({ "guardrails": "- a" }).to_string()
+        );
+        assert_ne!(overlay_digest(""), overlay_digest("- a"));
+        assert!(!menu_id_ok("") && !menu_id_ok("Brevity") && !menu_id_ok(&"a".repeat(33)));
+        assert!(!menu_text_ok("") && !menu_text_ok("  ") && !menu_text_ok("use {braces}"));
+        assert!(!menu_text_ok("caf\u{e9}") && !menu_text_ok(&"a".repeat(201)));
+    }
+
+    #[test]
+    fn overlay_matches_reads_only_the_guardrails() {
+        assert!(overlay_matches("{}", ""));
+        assert!(overlay_matches(
+            r#"{"guardrails":null,"skills":[],"tool_guidance":{}}"#,
+            ""
+        ));
+        assert!(!overlay_matches(r#"{"guardrails":"- a"}"#, ""));
+        assert!(overlay_matches(r#"{"guardrails":"- a"}"#, "- a"));
+        assert!(overlay_matches(
+            r#"{"guardrails":"- a","system":null}"#,
+            "- a"
+        ));
+        assert!(!overlay_matches(
+            r#"{"guardrails":"- a","max_steps":9}"#,
+            "- a"
+        ));
+        assert!(!overlay_matches(r#"{"guardrails":"- b"}"#, "- a"));
+        assert!(!overlay_matches("{}", "- a"));
+        assert!(!overlay_matches(r#"{"guardrails":3}"#, "- a"));
+        assert!(!overlay_matches("[]", ""));
+        assert!(!overlay_matches("not json", ""));
+        assert!(!overlay_matches(r#"{"system":"x"}"#, ""));
+    }
+
     proptest! {
+        #[test]
+        fn render_guardrails_output_is_menu_text_only(
+            picks in proptest::collection::vec("[a-z_]{1,14}", 0..8),
+            extra in "[ -~]{0,40}",
+        ) {
+            let menu = default_menu();
+            let mut ids = picks;
+            ids.push(extra);
+            let text = render_guardrails(&menu, &ids);
+            for line in text.lines() {
+                let t = line.strip_prefix("- ");
+                prop_assert!(t.is_some_and(|t| menu.iter().any(|s| s.text == t)), "{}", line);
+            }
+            let want = menu.iter().filter(|s| ids.contains(&s.id)).count();
+            prop_assert_eq!(text.lines().count(), want);
+        }
+
+        #[test]
+        fn refine_due_never_when_paused(
+            now in any::<u64>(),
+            last in proptest::option::of(any::<u64>()),
+            every in any::<u64>(),
+            wakes in any::<u32>(),
+            min in any::<u32>(),
+            paused in any::<bool>(),
+            normal in any::<bool>(),
+        ) {
+            let due = refine_due(now, last, every, wakes, min, paused, normal);
+            if paused || !normal || wakes < min {
+                prop_assert!(!due);
+            }
+            if let Some(l) = last {
+                if now < l {
+                    prop_assert!(!due, "a clock set back");
+                } else if now - l < every {
+                    prop_assert!(!due);
+                }
+            }
+            if !paused && normal && wakes >= min && last.is_none_or(|l| now >= l && now - l >= every) {
+                prop_assert!(due);
+            }
+        }
+
+        #[test]
+        fn pointer_verdict_same_iff_equal(
+            lg in proptest::option::of(0u64..6),
+            expected in proptest::option::of(0u64..6),
+            late in any::<bool>(),
+        ) {
+            let v = pointer_verdict(lg, expected, late);
+            prop_assert_eq!(v == PointerVerdict::Same, lg == expected);
+            if v == PointerVerdict::OwnLate {
+                prop_assert!(late && lg.is_some() && lg != expected);
+            }
+            if lg != expected && !late {
+                prop_assert_eq!(v, PointerVerdict::Human, "every foreign move is a human's");
+            }
+        }
+
         #[test]
         fn goal_verdict_never_admits_bad_text_past_caps_or_without_a_vote(
             ask in arb_ask(),

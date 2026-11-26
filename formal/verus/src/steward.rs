@@ -16,7 +16,15 @@
 //!   disjoint majorities of one council never both hold
 //!   (`lemma_no_two_disjoint_majorities`).
 //!
-//! No overflow: comparisons, and one subtraction under its guard.
+//! - `refine_due` (phase 4): due only when not paused, at a normal budget,
+//!   after `min_wakes` wakes and `every_ms` since the last propose; a pause
+//!   blocks every refine (`lemma_a_pause_blocks_every_refine`) and a clock
+//!   set back is never due (`lemma_a_clock_set_back_is_not_due`).
+//! - `pointer_verdict` (phase 4): `Same` exactly when lg's version is the
+//!   expected one; `OwnLate` only for a version the Steward gave up on;
+//!   every other move is a human's (`lemma_every_foreign_move_is_human`).
+//!
+//! No overflow: comparisons, and subtractions under their guards.
 
 use vstd::prelude::*;
 
@@ -198,6 +206,163 @@ pub proof fn lemma_accepts_never_pass_the_cap(start: u32, caps: GoalCaps, steps:
     if steps.len() > 0 {
         lemma_accepts_never_pass_the_cap(start, caps, steps.drop_last());
     }
+}
+
+pub open spec fn spec_refine_due(
+    now_ms: u64,
+    last_ms: Option<u64>,
+    every_ms: u64,
+    wakes_since: u32,
+    min_wakes: u32,
+    paused: bool,
+    level_normal: bool,
+) -> bool {
+    let time_ok = match last_ms {
+        None => true,
+        Some(l) => now_ms >= l && now_ms - l >= every_ms,
+    };
+    !paused && level_normal && time_ok && wakes_since >= min_wakes
+}
+
+// mirror-begin refine_due
+/// Whether a refine propose is due.
+///
+/// Never while paused or below a normal budget, never before `min_wakes`
+/// wakes, and never before `every_ms` has passed since the last one by the
+/// game clock. A clock set back (`now_ms < last`) is never due.
+#[must_use]
+pub const fn refine_due(
+    now_ms: u64,
+    last_ms: Option<u64>,
+    every_ms: u64,
+    wakes_since: u32,
+    min_wakes: u32,
+    paused: bool,
+    level_normal: bool,
+) -> (r: bool)
+    ensures
+        r == spec_refine_due(now_ms, last_ms, every_ms, wakes_since, min_wakes, paused, level_normal),
+        r ==> !paused && level_normal && wakes_since >= min_wakes,
+        r ==> match last_ms {
+            None => true,
+            Some(l) => now_ms >= l && now_ms - l >= every_ms,
+        },
+{
+    let time_ok = match last_ms {
+        None => true,
+        Some(l) => now_ms >= l && now_ms - l >= every_ms,
+    };
+    !paused && level_normal && time_ok && wakes_since >= min_wakes
+}
+// mirror-end refine_due
+
+/// A pause blocks every refine, whatever the clock, the wakes or the
+/// budget say.
+pub proof fn lemma_a_pause_blocks_every_refine(
+    now_ms: u64,
+    last_ms: Option<u64>,
+    every_ms: u64,
+    wakes_since: u32,
+    min_wakes: u32,
+    level_normal: bool,
+)
+    ensures
+        !spec_refine_due(now_ms, last_ms, every_ms, wakes_since, min_wakes, true, level_normal),
+{
+}
+
+/// A clock set back before the last propose is never due.
+pub proof fn lemma_a_clock_set_back_is_not_due(
+    now_ms: u64,
+    l: u64,
+    every_ms: u64,
+    wakes_since: u32,
+    min_wakes: u32,
+    paused: bool,
+    level_normal: bool,
+)
+    requires
+        now_ms < l,
+    ensures
+        !spec_refine_due(now_ms, Some(l), every_ms, wakes_since, min_wakes, paused, level_normal),
+{
+}
+
+// mirror-begin pointer_verdict_enum
+/// What lg's active overlay version says, against the one the Steward
+/// expects.
+pub enum PointerVerdict {
+    /// It is the expected version.
+    Same,
+    /// It is a version the Steward activated and gave up on: its activate
+    /// applied late.
+    OwnLate,
+    /// Someone else moved it: a human's veto.
+    Human,
+}
+// mirror-end pointer_verdict_enum
+
+pub open spec fn spec_pointer_verdict(
+    lg: Option<u64>,
+    expected: Option<u64>,
+    lg_is_late: bool,
+) -> PointerVerdict {
+    if lg == expected {
+        PointerVerdict::Same
+    } else if lg_is_late && lg is Some {
+        PointerVerdict::OwnLate
+    } else {
+        PointerVerdict::Human
+    }
+}
+
+// mirror-begin pointer_verdict
+/// The verdict on lg's active version `lg` against `expected`.
+///
+/// `lg_is_late` says the Steward gave up on an activate of `lg`. Any
+/// other move away from `expected` is a human's.
+#[must_use]
+pub const fn pointer_verdict(
+    lg: Option<u64>,
+    expected: Option<u64>,
+    lg_is_late: bool,
+) -> (r: PointerVerdict)
+    ensures
+        r == spec_pointer_verdict(lg, expected, lg_is_late),
+        (r is Same) <==> lg == expected,
+        (r is OwnLate) ==> lg_is_late && lg is Some && lg != expected,
+        (r is Human) ==> lg != expected && !(lg_is_late && lg is Some),
+{
+    match lg {
+        None => match expected {
+            None => PointerVerdict::Same,
+            Some(_) => PointerVerdict::Human,
+        },
+        Some(a) => {
+            let same = match expected {
+                Some(b) => a == b,
+                None => false,
+            };
+            if same {
+                PointerVerdict::Same
+            } else if lg_is_late {
+                PointerVerdict::OwnLate
+            } else {
+                PointerVerdict::Human
+            }
+        }
+    }
+}
+// mirror-end pointer_verdict
+
+/// A version the Steward neither expects nor gave up on is a human's
+/// move: never `Same`, never `OwnLate`.
+pub proof fn lemma_every_foreign_move_is_human(lg: Option<u64>, expected: Option<u64>)
+    requires
+        lg != expected,
+    ensures
+        spec_pointer_verdict(lg, expected, false) is Human,
+{
 }
 
 } // verus!

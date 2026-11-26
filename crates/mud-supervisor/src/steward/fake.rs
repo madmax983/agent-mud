@@ -51,6 +51,45 @@ pub enum DecideMode {
     RemovedThenError,
 }
 
+/// What the daemon does with the next `overlay_activate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivateMode {
+    /// Apply it and answer at once.
+    Answer,
+    /// Neither apply nor answer; it waits in the queue until
+    /// [`FakeDaemon::apply_held`].
+    Hold,
+    /// Apply it and never answer.
+    ApplySilently,
+    /// A human activates this version first, then ours runs: its
+    /// `previous` is the human's version.
+    HumanFirst(u64),
+    /// A human presses Roll back first, then ours applies and is never
+    /// answered.
+    RollbackFirstSilently,
+}
+
+/// What the daemon does with the next `refine_propose`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposeMode {
+    /// Store this overlay as a proposal and answer `proposed`.
+    Propose(String),
+    /// Answer `kept`.
+    Kept,
+    /// A human rolls back while it runs; then it answers `proposed`.
+    RollbackFirst(String),
+    /// It runs this long, holding lg's loop, then answers `proposed`.
+    Slow(Duration, String),
+}
+
+/// One overlay version.
+#[derive(Debug, Clone)]
+pub struct FakeVersion {
+    pub version: u64,
+    pub author: String,
+    pub overlay: String,
+}
+
 /// The state behind one fake socket.
 #[derive(Debug)]
 pub struct FakeState {
@@ -64,6 +103,22 @@ pub struct FakeState {
     pub modes: VecDeque<DecideMode>,
     /// Every line read, in order.
     pub lines: Vec<String>,
+    /// Whether refine is on (`overlays` answers `off` otherwise).
+    pub refine: bool,
+    /// Every overlay version, oldest first.
+    pub versions: Vec<FakeVersion>,
+    /// The active version.
+    pub active: Option<u64>,
+    /// Every move of the pointer, `(from, to)`, in order.
+    pub moves: Vec<(Option<u64>, u64)>,
+    /// One mode per `overlay_activate`, in order; then answer.
+    pub activate_modes: VecDeque<ActivateMode>,
+    /// Activates held in the queue.
+    pub held: Vec<u64>,
+    /// Whether the next `overlay_put` is stored but never answered.
+    pub drop_put: bool,
+    /// One mode per `refine_propose`; then `kept`.
+    pub propose_modes: VecDeque<ProposeMode>,
 }
 
 impl Default for FakeState {
@@ -75,6 +130,14 @@ impl Default for FakeState {
             reload: Some(vec!["memory".into(), "heartbeat".into()]),
             modes: VecDeque::new(),
             lines: Vec::new(),
+            refine: true,
+            versions: Vec::new(),
+            active: None,
+            moves: Vec::new(),
+            activate_modes: VecDeque::new(),
+            held: Vec::new(),
+            drop_put: false,
+            propose_modes: VecDeque::new(),
         }
     }
 }
@@ -118,9 +181,143 @@ impl FakeState {
         }
     }
 
+    /// Stores an overlay version by `author`.
+    pub fn store(&mut self, author: &str, overlay: &str) -> u64 {
+        let version = self.versions.last().map_or(1, |v| v.version + 1);
+        self.versions.push(FakeVersion {
+            version,
+            author: author.to_owned(),
+            overlay: overlay.to_owned(),
+        });
+        version
+    }
+
+    /// Makes `version` active, as lg does; returns the version before.
+    pub fn activate(&mut self, version: u64) -> Option<u64> {
+        let previous = self.active;
+        self.active = Some(version);
+        self.moves.push((previous, version));
+        previous
+    }
+
+    /// lg's Roll back: reverses the last move.
+    pub fn rollback(&mut self) {
+        if let Some(&(Some(from), _)) = self.moves.last() {
+            self.activate(from);
+        }
+    }
+
+    fn overlays(&self) -> Value {
+        if !self.refine {
+            return json!({ "kind": "off", "message": "refine is off" });
+        }
+        json!({
+            "kind": "overlays",
+            "active": self.active,
+            "entries": self.versions.iter().map(|v| json!({
+                "version": v.version, "author": v.author, "created_at": "2026-11-25T00:00:00Z",
+                "active": Some(v.version) == self.active,
+                "parts": serde_json::from_str::<Value>(&v.overlay).ok()
+                    .and_then(|o| o.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()))
+                    .unwrap_or_default(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn overlay_answer(&mut self, kind: &str, v: &Value) -> (Option<Duration>, String) {
+        let now = Some(Duration::ZERO);
+        match kind {
+            "overlays" => (now, self.overlays().to_string()),
+            "overlay_show" => {
+                let version = v["version"].as_u64().unwrap_or_default();
+                let Some(found) = self.versions.iter().find(|x| x.version == version) else {
+                    return (
+                        now,
+                        json!({ "kind": "error", "message": "no such version" }).to_string(),
+                    );
+                };
+                (
+                    now,
+                    json!({
+                        "kind": "overlay",
+                        "entry": { "version": found.version, "author": found.author,
+                            "created_at": "2026-11-25T00:00:00Z", "active": Some(version) == self.active, "parts": [] },
+                        "overlay": found.overlay,
+                    })
+                    .to_string(),
+                )
+            }
+            "overlay_put" => {
+                let overlay = v["overlay"].as_str().unwrap_or_default().to_owned();
+                let version = self.store("operator:mud", &overlay);
+                if std::mem::take(&mut self.drop_put) {
+                    return (None, String::new());
+                }
+                (
+                    now,
+                    json!({ "kind": "overlay_stored", "version": version }).to_string(),
+                )
+            }
+            "overlay_activate" => {
+                let version = v["version"].as_u64().unwrap_or_default();
+                if !self.versions.iter().any(|x| x.version == version) {
+                    return (
+                        now,
+                        json!({ "kind": "error", "message": "no such version" }).to_string(),
+                    );
+                }
+                match self
+                    .activate_modes
+                    .pop_front()
+                    .unwrap_or(ActivateMode::Answer)
+                {
+                    ActivateMode::Hold => {
+                        self.held.push(version);
+                        (None, String::new())
+                    }
+                    ActivateMode::ApplySilently => {
+                        self.activate(version);
+                        (None, String::new())
+                    }
+                    ActivateMode::RollbackFirstSilently => {
+                        self.rollback();
+                        self.activate(version);
+                        (None, String::new())
+                    }
+                    ActivateMode::HumanFirst(h) => {
+                        self.activate(h);
+                        let previous = self.activate(version);
+                        (now, json!({ "kind": "overlay_active", "version": version, "previous": previous }).to_string())
+                    }
+                    ActivateMode::Answer => {
+                        let previous = self.activate(version);
+                        (now, json!({ "kind": "overlay_active", "version": version, "previous": previous }).to_string())
+                    }
+                }
+            }
+            "refine_propose" => match self.propose_modes.pop_front() {
+                None | Some(ProposeMode::Kept) => (now, json!({ "kind": "kept" }).to_string()),
+                Some(ProposeMode::Propose(o)) => (now, self.proposed(&o)),
+                Some(ProposeMode::RollbackFirst(o)) => {
+                    self.rollback();
+                    (now, self.proposed(&o))
+                }
+                Some(ProposeMode::Slow(d, o)) => (Some(d), self.proposed(&o)),
+            },
+            _ => (
+                now,
+                json!({ "kind": "error", "message": "unknown request" }).to_string(),
+            ),
+        }
+    }
+
+    fn proposed(&mut self, overlay: &str) -> String {
+        let version = self.store("operator:lg-refine", overlay);
+        json!({ "kind": "proposed", "version": version, "overlay": overlay }).to_string()
+    }
+
     /// The answer to `line`, and how long to wait before it (`None`: never).
     fn answer(&mut self, line: &str) -> (Option<Duration>, String) {
-        self.lines.push(line.to_owned());
         let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
         let now = Some(Duration::ZERO);
         match v["kind"].as_str().unwrap_or_default() {
@@ -166,10 +363,10 @@ impl FakeState {
                 };
                 (wait, answer)
             }
-            _ => (
-                now,
-                json!({ "kind": "error", "message": "unknown request" }).to_string(),
-            ),
+            other => {
+                let other = other.to_owned();
+                self.overlay_answer(&other, &v)
+            }
         }
     }
 }
@@ -181,24 +378,40 @@ pub struct FakeDaemon {
     pub state: Arc<Mutex<FakeState>>,
 }
 
+/// Whether lg runs `line` in its job loop behind a running proposer (only
+/// the proposer and `reload` take the loop here; the other loop jobs of
+/// the fake answer by their own modes).
+fn takes_the_loop(line: &str) -> bool {
+    line.contains(r#""kind":"refine_propose""#) || line.contains(r#""kind":"reload""#)
+}
+
 impl FakeDaemon {
     /// Serves `socket` on the current runtime.
     pub fn start(socket: PathBuf) -> Arc<Self> {
         let listener = UnixListener::bind(&socket).unwrap();
         let state = Arc::new(Mutex::new(FakeState::default()));
         let shared = Arc::clone(&state);
+        let job_loop = Arc::new(tokio::sync::Mutex::new(()));
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let st = Arc::clone(&shared);
+                let job_loop = Arc::clone(&job_loop);
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
                     if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
                         return;
                     }
+                    // Recorded when read, before it waits for lg's loop.
+                    st.lock().unwrap().lines.push(line.trim_end().to_owned());
+                    let _turn = if takes_the_loop(&line) {
+                        Some(job_loop.lock().await)
+                    } else {
+                        None
+                    };
                     let (wait, answer) = st.lock().unwrap().answer(line.trim_end());
                     let Some(wait) = wait else {
                         // Hold the connection open, unanswered.
@@ -315,6 +528,93 @@ impl FakeDaemon {
 
     pub fn clear_lines(&self) {
         self.state.lock().unwrap().lines.clear();
+    }
+
+    /// lg's Roll back button.
+    pub fn rollback(&self) {
+        self.state.lock().unwrap().rollback();
+    }
+
+    /// A human activates `version` on lg's refine tab.
+    pub fn human_activate(&self, version: u64) {
+        self.state.lock().unwrap().activate(version);
+    }
+
+    /// A human (or an operator) stores an overlay.
+    pub fn human_put(&self, overlay: &str) -> u64 {
+        self.state.lock().unwrap().store("operator:mud", overlay)
+    }
+
+    /// The operator deletes the agent's lg data: a fresh overlay store,
+    /// numbered from 1 again, with nothing active and nothing queued.
+    pub fn reset_store(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.versions.clear();
+        st.active = None;
+        st.moves.clear();
+        st.held.clear();
+    }
+
+    /// Applies the activates held in the queue, as lg's loop would.
+    pub fn apply_held(&self) {
+        let mut st = self.state.lock().unwrap();
+        for v in std::mem::take(&mut st.held) {
+            st.activate(v);
+        }
+    }
+
+    pub fn active(&self) -> Option<u64> {
+        self.state.lock().unwrap().active
+    }
+
+    pub fn moves(&self) -> Vec<(Option<u64>, u64)> {
+        self.state.lock().unwrap().moves.clone()
+    }
+
+    /// The overlay JSON of `version`.
+    pub fn overlay(&self, version: u64) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .versions
+            .iter()
+            .find(|v| v.version == version)
+            .map(|v| v.overlay.clone())
+            .unwrap()
+    }
+
+    /// The overlays of every `overlay_put` line, in order.
+    pub fn puts(&self) -> Vec<String> {
+        self.lines()
+            .iter()
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).ok()?;
+                (v["kind"] == "overlay_put").then(|| v["overlay"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    /// The version of every `overlay_activate` line, in order.
+    pub fn activates(&self) -> Vec<u64> {
+        self.lines()
+            .iter()
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).ok()?;
+                (v["kind"] == "overlay_activate").then(|| v["version"].as_u64().unwrap())
+            })
+            .collect()
+    }
+
+    pub fn activate_modes(&self, modes: &[ActivateMode]) {
+        self.state
+            .lock()
+            .unwrap()
+            .activate_modes
+            .extend(modes.iter().copied());
+    }
+
+    pub fn propose_mode(&self, mode: ProposeMode) {
+        self.state.lock().unwrap().propose_modes.push_back(mode);
     }
 }
 

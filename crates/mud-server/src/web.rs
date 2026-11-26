@@ -766,8 +766,47 @@ fn autonomy_cell(a: &Value) -> Markup {
             @if a["quiet"] == true { br; span.hard { "quiet (hard budget)" } }
             @if let Some(i) = a["intent"].as_str() { br; span.soft { "sending: " (i) } }
             @for off in a["off"].as_array().into_iter().flatten() { br; span.muted { "off: " (off.as_str().unwrap_or("")) } }
+            @if a["overlay"].is_object() { (overlay_lines(&a["overlay"])) }
         } @else {
             span.muted { "—" }
+        }
+    }
+}
+
+/// The Steward's overlays of one agent (ADR 0015): lg's active version,
+/// the pause, what lg's Roll back would do, and the Steward's own versions
+/// with the text each holds, newest first. The text is escaped by maud.
+/// lg's own Roll back button, on the page the littleguy link opens, is
+/// the veto.
+fn overlay_lines(o: &Value) -> Markup {
+    let version = |v: &Value| {
+        v.as_u64()
+            .map_or_else(|| "none".to_owned(), |n| format!("v{n}"))
+    };
+    html! {
+        br; span { "refine (" (o["mode"].as_str().unwrap_or("menu")) "): lg runs " (version(&o["pointer"])) }
+        @if let Some(src) = o["source"].as_str() { span.muted { " · " (src) } }
+        @if let Some(code) = o["paused"].as_str() { br; span.hard { "refine paused: " (code) } }
+        @if let Some(b) = o["baseline"].as_u64() {
+            br;
+            // lg's Roll back reverses lg's last move, which is not always
+            // a move off the baseline.
+            @match o["rollback_to"].as_u64() {
+                Some(to) if to == b => {
+                    span.muted { "Roll back on the littleguy page returns to the empty baseline (version " (b) ")." }
+                }
+                Some(to) => {
+                    span.soft { "Roll back on the littleguy page brings back version " (to) ", not the empty baseline (version " (b) ")." }
+                }
+                None => {
+                    span.muted { "The empty baseline is version " (b) " on the littleguy refine tab." }
+                }
+            }
+        }
+        @for c in o["chain"].as_array().into_iter().flatten() {
+            br;
+            @let line = format!("v{} {}: {}", c["version"], c["label"].as_str().unwrap_or(""), c["text"].as_str().unwrap_or(""));
+            @if c["active"] == true { span { (line) " (active)" } } @else { span.muted { (line) } }
         }
     }
 }

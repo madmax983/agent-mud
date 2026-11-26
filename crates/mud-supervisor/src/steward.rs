@@ -21,7 +21,12 @@
 //!    store as an intent before `decide` is sent, so a crash or a lost
 //!    answer ends in exactly one owner action. Stale active goals are
 //!    dropped.
-//! 5. Notes: counted, for the observer.
+//! 5. Refine ([`refine`], with `[littleguy] refine` on): the pointer
+//!    check of lg's active overlay, every pass; the empty baseline at first
+//!    contact; and, when due, lg's proposer under a claim, a menu ballot,
+//!    and a put and an activate one move above the baseline. A human's
+//!    move pauses refine.
+//! 6. Notes: counted, for the observer.
 //!
 //! Every decision is published on the observer feed and noted for the
 //! agent's next wake. The Steward holds no supervisor lock across a `Game`
@@ -30,6 +35,7 @@
 pub mod council;
 #[cfg(test)]
 pub(crate) mod fake;
+mod refine;
 pub mod state;
 pub mod vet;
 
@@ -46,15 +52,15 @@ use tokio::task::JoinHandle;
 
 use crate::budget::{BudgetLevel, DAY_MS};
 use crate::held::assert_none_held;
-use crate::littleguy::PersonaText;
 use crate::littleguy::owner::{
     self, GoalEntry, OwnerRequest, OwnerResponse, PlanDecision, READ_TIMEOUT,
 };
+use crate::littleguy::{PersonaText, RefineMode};
 use crate::mind::{BoxFuture, MindError, Usage};
 use crate::runtime::{ObserverEvent, Supervisor};
 use council::{Ballot, Judge};
 use state::{IntentAction, ROW_SCHEMA, StewardRow, StuckAccept};
-use vet::{GoalAsk, GoalCaps, GoalVerdict, TextLimits, TextVerdict};
+use vet::{GoalAsk, GoalCaps, GoalVerdict, Snippet, TextLimits, TextVerdict};
 
 /// The daemons the Steward owns: the seam between it and littleguy.
 /// [`crate::littleguy::LittleguyMind`] implements it; tests implement it
@@ -129,6 +135,32 @@ pub struct StewardConfig {
     pub deny_phrases: Vec<String>,
     /// Whether a daemon goes quiet at the hard budget cap.
     pub quiet_on_hard: bool,
+    /// The refine mode, from `[littleguy] refine` (not a key of this
+    /// section): the server copies it in. `Off` leaves overlays alone.
+    #[serde(skip)]
+    pub refine: RefineMode,
+    /// How long the Steward waits on one `overlay_activate` answer. A lost
+    /// answer is never resent.
+    pub activate_wait_secs: u64,
+    /// How long `refine_propose` may take.
+    pub refine_timeout_secs: u64,
+    /// After a propose timed out, how long the claim drains lg's loop.
+    pub refine_drain_secs: u64,
+    /// Hours between two proposes of one entity (at least 24).
+    pub refine_every_hours: u64,
+    /// Wakes that end well between two proposes (at least 1).
+    pub refine_min_wakes: u32,
+    /// Tokens charged before each propose, as local spend: lg's proposer
+    /// writes no ledger row.
+    pub refine_charge_tokens: u64,
+    /// Menu items active at once at most.
+    pub max_guardrails: u32,
+    /// Entities whose refine pause, recorded in an earlier boot, ends at
+    /// this boot. Remove an entity once it is resumed.
+    pub resume_refine: Vec<String>,
+    /// The operator menu (`[[littleguy.steward.guardrail]]`); empty uses
+    /// [`vet::default_menu`].
+    pub guardrail: Vec<Snippet>,
 }
 
 impl Default for StewardConfig {
@@ -155,6 +187,16 @@ impl Default for StewardConfig {
             why_chars: 800,
             deny_phrases: Vec::new(),
             quiet_on_hard: true,
+            refine: RefineMode::Off,
+            activate_wait_secs: 600,
+            refine_timeout_secs: 120,
+            refine_drain_secs: 600,
+            refine_every_hours: 168,
+            refine_min_wakes: 20,
+            refine_charge_tokens: 30_000,
+            max_guardrails: 3,
+            resume_refine: Vec::new(),
+            guardrail: Vec::new(),
         }
     }
 }
@@ -177,6 +219,16 @@ impl StewardConfig {
         TextLimits {
             title_chars: self.title_chars,
             why_chars: self.why_chars,
+        }
+    }
+
+    /// The operator menu: `guardrail`, or the code default.
+    #[must_use]
+    pub fn menu(&self) -> Vec<Snippet> {
+        if self.guardrail.is_empty() {
+            vet::default_menu()
+        } else {
+            self.guardrail.clone()
         }
     }
 }
@@ -225,10 +277,47 @@ pub struct AutonomyView {
     pub pass_ms: u64,
     /// What lg answered `off` to.
     pub off: Vec<String>,
+    /// The overlays, when refine is on.
+    pub overlay: Option<OverlayView>,
     /// Whether the daemon is quiet.
     pub quiet: bool,
     /// The open intent's action, if any.
     pub intent: Option<String>,
+}
+
+/// The overlays of one agent as the observer shows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayView {
+    /// `menu` or `free`.
+    pub mode: String,
+    /// lg's active version, as the Steward last confirmed it.
+    pub pointer: Option<u64>,
+    /// The empty baseline: one Roll back on lg's page returns to it.
+    pub baseline: Option<u64>,
+    /// What the Steward's active text came from (menu ids), if any.
+    pub source: Option<String>,
+    /// Why refine is paused, if it is.
+    pub paused: Option<String>,
+    /// The version lg's Roll back button would activate, as far as the
+    /// Steward knows (`None`: unknown).
+    #[serde(default)]
+    pub rollback_to: Option<u64>,
+    /// The Steward's own versions, newest first, with their full text.
+    pub chain: Vec<ChainEntry>,
+}
+
+/// One version the Steward put.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainEntry {
+    /// lg's version.
+    pub version: u64,
+    /// `baseline`, or the menu ids.
+    pub label: String,
+    /// Its guardrails text as put (`""` for the baseline): operator text
+    /// in menu mode, escaped on render.
+    pub text: String,
+    /// Whether lg has it active.
+    pub active: bool,
 }
 
 /// One of the agent's goals in its wake message.
@@ -245,7 +334,8 @@ pub struct GoalLine {
 pub struct StewardNote {
     /// What happened: `accepted`, `declined_text`, `declined_repeat`,
     /// `declined_check_too_frequent`, `declined_council`,
-    /// `declined_stale`, `dropped_stale` or `waiting_cap`.
+    /// `declined_stale`, `dropped_stale` or `waiting_cap`; for refine,
+    /// `overlay_on` or `overlay_off` (with no goal and no text).
     pub code: String,
     /// The goal.
     pub goal: Option<i64>,
@@ -258,9 +348,9 @@ pub struct StewardNote {
 pub struct StewardEvent {
     /// Whose.
     pub entity: EntityId,
-    /// `goal`, `approval`, `budget` or `council`.
+    /// `goal`, `overlay`, `approval`, `budget` or `council`.
     pub item: String,
-    /// The goal, if any.
+    /// The goal, or the overlay version, if any.
     pub id: Option<i64>,
     /// What happened, such as `accepted`, `declined` or `quiet`.
     pub action: String,
@@ -268,7 +358,8 @@ pub struct StewardEvent {
     pub code: String,
     /// Yes and no votes, when the council voted.
     pub votes: Option<[u32; 2]>,
-    /// The goal title (untrusted, cut to [`VIEW_CHARS`]).
+    /// The goal title (untrusted, cut to [`VIEW_CHARS`]), or the menu ids
+    /// and text of an overlay.
     pub text: Option<String>,
     /// The council's reasons, each cut to 200 characters: here only,
     /// never for lg or the agent.
@@ -279,8 +370,10 @@ pub struct StewardEvent {
 /// A point in a pass, for fault drills ([`Steward::set_probe`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StewardPoint {
-    /// An intent was written durably; its `decide` is not sent yet.
+    /// An intent was written durably; its owner request is not sent yet.
     IntentWritten,
+    /// lg stored an overlay put; the row does not know its version yet.
+    OverlayStored,
 }
 
 /// Called at each [`StewardPoint`].
@@ -336,6 +429,18 @@ pub struct Steward {
     cfg: StewardConfig,
     boot: u64,
     owner_timeout: Duration,
+    /// How long a read beside lg's loop may take.
+    read_timeout: Duration,
+    /// How long one `overlay_activate` answer is awaited.
+    activate_wait: Duration,
+    /// How long `refine_propose` may take.
+    refine_timeout: Duration,
+    /// How long a drain after a propose timeout may take.
+    refine_drain: Duration,
+    /// How often a drain probes lg's loop.
+    drain_every: Duration,
+    /// The operator menu.
+    menu: Vec<Snippet>,
     runs: tokio::sync::Mutex<BTreeMap<EntityId, Run>>,
     /// Wakes that ended well, per entity, since the last pass.
     wakes_done: Mutex<BTreeMap<EntityId, u32>>,
@@ -371,7 +476,7 @@ impl Steward {
         restored: BTreeMap<EntityId, StewardStored>,
         boot: u64,
     ) -> Arc<Self> {
-        let runs = restored
+        let mut runs: BTreeMap<EntityId, Run> = restored
             .into_iter()
             .map(|(entity, stored)| {
                 let row = StewardRow::from_body(stored.schema, &stored.body).unwrap_or_else(|| {
@@ -392,11 +497,18 @@ impl Steward {
                 )
             })
             .collect();
+        resume_refine(&sup, &cfg, boot, &mut runs);
         Arc::new(Self {
             sup,
             daemons,
             judge,
             owner_timeout: Duration::from_secs(cfg.owner_timeout_secs.max(1)),
+            read_timeout: READ_TIMEOUT,
+            activate_wait: Duration::from_secs(cfg.activate_wait_secs.max(1)),
+            refine_timeout: Duration::from_secs(cfg.refine_timeout_secs.max(1)),
+            refine_drain: Duration::from_secs(cfg.refine_drain_secs).min(MAX_WAIT),
+            drain_every: DRAIN_EVERY,
+            menu: cfg.menu(),
             cfg,
             boot,
             runs: tokio::sync::Mutex::new(runs),
@@ -427,6 +539,25 @@ impl Steward {
     pub(crate) fn set_owner_timeout(self: &mut Arc<Self>, t: Duration) {
         if let Some(me) = Arc::get_mut(self) {
             me.owner_timeout = t;
+        }
+    }
+
+    /// Shortens the refine waits (tests): one activate answer, a propose,
+    /// its drain, and the drain's probe.
+    #[cfg(test)]
+    pub(crate) fn set_refine_waits(
+        self: &mut Arc<Self>,
+        activate: Duration,
+        propose: Duration,
+        drain: Duration,
+        drain_every: Duration,
+    ) {
+        if let Some(me) = Arc::get_mut(self) {
+            me.activate_wait = activate;
+            me.refine_timeout = propose;
+            me.refine_drain = drain;
+            me.drain_every = drain_every;
+            me.read_timeout = activate;
         }
     }
 
@@ -529,8 +660,16 @@ impl Steward {
         self.quiet(d, e, socket, level, run).await;
         let key = d.start_key(e).await;
         if key.is_some() && key != run.checked {
+            if run.checked.is_some() && !run.row.overlay.late.is_empty() {
+                // A restarted lg holds no queued activate of ours.
+                run.row.overlay.late.clear();
+                run.dirty = true;
+            }
             self.check_approvals(e, socket).await;
             run.checked = key;
+        }
+        if !self.cfg.refine.is_on() {
+            self.refine_off(e, run, now);
         }
         let mut view = AutonomyView {
             pass_ms: now,
@@ -569,8 +708,12 @@ impl Steward {
             view.proposed = old.proposed;
             view.ideas = old.ideas;
         }
+        if self.cfg.refine.is_on() {
+            self.refine(d, e, socket, run, now, level).await;
+            view.overlay = Some(self.overlay_view(run));
+        }
         view.notes = self.read_notes(socket, &mut view).await;
-        view.intent = run.row.intent.map(|i| i.action.name().to_owned());
+        view.intent = run.row.intent.as_ref().map(|i| i.action.name().to_owned());
         self.sup.set_autonomy(e, view);
         if run.dirty {
             self.write(e, run, false);
@@ -708,7 +851,11 @@ impl Steward {
         if self.settle_intent(e, run, listing) {
             return;
         }
-        let Some(intent) = run.row.intent else {
+        let Some(intent) = run.row.intent.clone() else {
+            return;
+        };
+        // An overlay intent is refine's to settle (step 5).
+        let Some(goal) = intent.action.goal() else {
             return;
         };
         let retry_ms = self.cfg.intent_retry_secs.saturating_mul(1_000);
@@ -716,7 +863,6 @@ impl Steward {
             return;
         }
         if intent.tries >= self.cfg.max_intent_tries {
-            let goal = intent.action.goal();
             tracing::warn!(entity = %e, goal, tries = intent.tries, "an owner action got no answer; the Steward backs off");
             run.row.intent = None;
             if let IntentAction::Accept { goal } = intent.action {
@@ -754,10 +900,12 @@ impl Steward {
     /// Settles the intent against `listing` if the listing shows it done.
     /// Returns whether it was settled.
     fn settle_intent(&self, e: &EntityId, run: &mut Run, listing: &Listing) -> bool {
-        let Some(intent) = run.row.intent else {
+        let Some(intent) = run.row.intent.clone() else {
             return false;
         };
-        let g = intent.action.goal();
+        let Some(g) = intent.action.goal() else {
+            return false;
+        };
         let status = listing.status(g);
         let done = match intent.action {
             IntentAction::Accept { .. } => match status {
@@ -786,6 +934,9 @@ impl Steward {
             },
             IntentAction::Decline { .. } => status != Some("proposed"),
             IntentAction::DropGoal { .. } => status != Some("active"),
+            IntentAction::Put { .. } | IntentAction::Activate { .. } | IntentAction::Propose => {
+                false
+            }
         };
         if done {
             run.row.intent = None;
@@ -835,15 +986,15 @@ impl Steward {
         action: IntentAction,
         now: u64,
     ) {
-        let decision = match action {
-            IntentAction::Accept { .. } => PlanDecision::Accept,
-            IntentAction::Decline { .. } => PlanDecision::Decline,
-            IntentAction::DropGoal { .. } => PlanDecision::DropGoal,
+        let (decision, id) = match action {
+            IntentAction::Accept { goal } => (PlanDecision::Accept, goal),
+            IntentAction::Decline { goal } => (PlanDecision::Decline, goal),
+            IntentAction::DropGoal { goal } => (PlanDecision::DropGoal, goal),
+            IntentAction::Put { .. } | IntentAction::Activate { .. } | IntentAction::Propose => {
+                return;
+            }
         };
-        let req = OwnerRequest::Decide {
-            decision,
-            id: action.goal(),
-        };
+        let req = OwnerRequest::Decide { decision, id };
         let answer = match owner::request(socket, &req, self.owner_timeout).await {
             Ok(OwnerResponse::Plans { goals, ideas, .. }) => Some(Listing {
                 goals,
@@ -951,7 +1102,7 @@ impl Steward {
                 return;
             }
             let action = IntentAction::DropGoal { goal: id };
-            run.row.open(action, now);
+            run.row.open(action.clone(), now);
             if !self.write(e, run, true) {
                 run.row.intent = None;
                 return;
@@ -1045,7 +1196,7 @@ impl Steward {
                         // The new intent settles this goal from now on.
                         run.row.stuck_accept = None;
                     }
-                    run.row.open(action, now);
+                    run.row.open(action.clone(), now);
                     if !self.write(e, run, true) {
                         run.row.intent = None;
                         (run.row.accepts, run.row.stuck_accept) = saved;
@@ -1157,7 +1308,7 @@ impl Steward {
         now: u64,
     ) -> bool {
         let action = IntentAction::Decline { goal: g.id };
-        run.row.open(action, now);
+        run.row.open(action.clone(), now);
         if !self.write(e, run, true) {
             run.row.intent = None;
             return false;
@@ -1256,6 +1407,65 @@ impl Steward {
     }
 }
 
+/// How often a drain probes lg's loop after a propose timed out.
+pub const DRAIN_EVERY: Duration = Duration::from_secs(10);
+
+/// The longest drain after a propose timed out: one day.
+pub const MAX_WAIT: Duration = Duration::from_hours(24);
+
+/// Ends, at this boot, the refine pause of each entity `resume_refine`
+/// names, if an earlier boot recorded it; warns about a name that is not
+/// paused, so the operator removes it. The rows are written durably.
+fn resume_refine(
+    sup: &Supervisor,
+    cfg: &StewardConfig,
+    boot: u64,
+    runs: &mut BTreeMap<EntityId, Run>,
+) {
+    let mut ops = Vec::new();
+    for name in &cfg.resume_refine {
+        let e = EntityId::from(name.as_str());
+        let Some(run) = runs
+            .get_mut(&e)
+            .filter(|r| r.row.overlay.paused.as_ref().is_some_and(|p| p.boot < boot))
+        else {
+            tracing::warn!(entity = %e, "resume_refine names an entity whose refine is not paused from an earlier boot; remove it");
+            continue;
+        };
+        let code = run
+            .row
+            .overlay
+            .paused
+            .take()
+            .map(|p| p.code)
+            .unwrap_or_default();
+        run.rev = run.rev.saturating_add(1);
+        ops.push(SideOp::Steward {
+            entity: e.clone(),
+            rev: run.rev,
+            schema: ROW_SCHEMA,
+            body: run.row.body(),
+        });
+        tracing::info!(entity = %e, %code, "refine resumed by the operator");
+        sup.report_steward(StewardEvent {
+            entity: e,
+            item: "overlay".into(),
+            id: None,
+            action: "resumed".into(),
+            code,
+            votes: None,
+            text: None,
+            reasons: Vec::new(),
+        });
+    }
+    if !ops.is_empty() {
+        assert_none_held("a steward write");
+        if let Err(err) = sup.game().act(&ops) {
+            tracing::warn!(error = %err, "a refine resume was not written; it is retried at the next boot");
+        }
+    }
+}
+
 /// The feedback code of a declined goal.
 const fn decline_code(text: TextVerdict, ask: GoalAsk, caps: GoalCaps) -> &'static str {
     match text {
@@ -1276,5 +1486,7 @@ fn goal_view(g: &GoalEntry) -> GoalView {
     }
 }
 
+#[cfg(test)]
+mod refine_tests;
 #[cfg(test)]
 mod tests;

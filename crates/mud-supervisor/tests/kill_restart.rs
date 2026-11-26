@@ -13,7 +13,8 @@
 //!
 //! The Steward's cases (ADR 0015) talk to a fake `lg serve` that lives in
 //! this parent process, so it outlives the killed child: it counts every
-//! `decide` it gets across the kill.
+//! `decide` it gets across the kill, and, in the refine cases, every
+//! `overlay_put` and `overlay_activate`.
 #![cfg(unix)]
 #![expect(clippy::unwrap_used, reason = "test helpers and the child fail loudly")]
 
@@ -29,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use mud_supervisor::gate::Gate;
-use mud_supervisor::littleguy::PersonaText;
+use mud_supervisor::littleguy::{PersonaText, RefineMode};
 use mud_supervisor::mind::{BoxFuture, Mind, MindError, MindReply, MudTools, Usage, WakeContext};
 use mud_supervisor::runtime::{ObserverEvent, Supervisor, SupervisorConfig};
 use mud_supervisor::scripted::{FallbackMind, ScriptedMind};
@@ -300,6 +301,9 @@ async fn child(point: &str, dir: &Path) {
         }
         "retention" => retention_child(&p, dir),
         "steward-intent" | "steward-decide" => steward_child(point, &mut p, dir).await,
+        "refine-put" | "refine-stored" | "refine-activate" | "refine-paused" => {
+            refine_child(point, &mut p, dir).await;
+        }
         "tell-pending" | "tell-open" | "tell-answered" => tell_child(point, &mut p, dir).await,
         "spend" => {
             // Past 80% of the default 400 000: soft. Stored at once.
@@ -447,11 +451,15 @@ impl Judge for Yes {
 }
 
 fn steward_of(p: &mut Proc, dir: &Path) -> Arc<Steward> {
+    steward_with(p, dir, StewardConfig::default())
+}
+
+fn steward_with(p: &mut Proc, dir: &Path, cfg: StewardConfig) -> Arc<Steward> {
     Steward::new(
         Arc::clone(&p.sup),
         vec![Arc::new(KillDaemons(dir.join("lg.sock"))) as Arc<dyn OwnedDaemons>],
         Some(Arc::new(Yes) as Arc<dyn Judge>),
-        StewardConfig::default(),
+        cfg,
         std::mem::take(&mut p.steward_rows),
         p.game.boot(),
     )
@@ -622,6 +630,256 @@ async fn kill_after_decide_before_its_answer() {
     daemon.hold.store(false, Ordering::SeqCst);
     daemon.released.store(true, Ordering::SeqCst);
     steward_after_kill(dir.path(), &daemon, 1).await;
+}
+
+// ---- refine (ADR 0015, phase 4) ----
+
+fn refine_cfg() -> StewardConfig {
+    StewardConfig {
+        refine: RefineMode::Menu,
+        refine_min_wakes: 0,
+        ..StewardConfig::default()
+    }
+}
+
+/// The child's Steward meets torin's daemon for the first time: it puts
+/// and activates the empty baseline. It is killed after the put's intent
+/// (`refine-put`), once lg stored the put (`refine-stored`), or once its
+/// activate is out (`refine-activate`: the parent's daemon marks it and
+/// answers only after the kill). With a human's overlay already active it
+/// pauses (`refine-paused`) and is killed after the pass.
+async fn refine_child(point: &str, p: &mut Proc, dir: &Path) {
+    let steward = steward_with(p, dir, refine_cfg());
+    let at = dir.to_path_buf();
+    let stop_at = match point {
+        "refine-put" => Some(StewardPoint::IntentWritten),
+        "refine-stored" => Some(StewardPoint::OverlayStored),
+        _ => None,
+    };
+    steward.set_probe(Some(Arc::new(move |pt, _: &EntityId| {
+        if Some(pt) == stop_at {
+            mark(&at, &format!("{pt:?}"));
+            stop_here();
+        }
+    })));
+    steward.pass().await;
+    if point == "refine-paused" {
+        let row = steward.row(&torin()).await.unwrap();
+        mark(dir, &row.overlay.paused.map(|p| p.code).unwrap_or_default());
+        stop_here();
+    }
+}
+
+/// The fake `lg serve` of the refine cases, in the parent: no goals, an
+/// lg-like overlay pointer, and a log of every request kind. With `hold`,
+/// it marks the child's marker at the first `overlay_activate` and applies
+/// and answers it only once `released`.
+struct RefineDaemon {
+    versions: Mutex<Vec<(u64, String)>>,
+    active: Mutex<Option<u64>>,
+    kinds: Mutex<Vec<String>>,
+    hold: AtomicBool,
+    released: AtomicBool,
+    marker: PathBuf,
+}
+
+impl RefineDaemon {
+    fn start(dir: &Path, hold: bool, preexisting: bool) -> Arc<Self> {
+        let me = Arc::new(Self {
+            versions: Mutex::new(Vec::new()),
+            active: Mutex::new(None),
+            kinds: Mutex::new(Vec::new()),
+            hold: AtomicBool::new(hold),
+            released: AtomicBool::new(false),
+            marker: dir.join("marker"),
+        });
+        if preexisting {
+            me.versions
+                .lock()
+                .unwrap()
+                .push((1, r#"{"guardrails":"- an operator's own"}"#.into()));
+            *me.active.lock().unwrap() = Some(1);
+        }
+        let listener = UnixListener::bind(dir.join("lg.sock")).unwrap();
+        let d = Arc::clone(&me);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let d = Arc::clone(&d);
+                std::thread::spawn(move || d.serve(stream));
+            }
+        });
+        me
+    }
+
+    fn overlays(&self) -> String {
+        let active = *self.active.lock().unwrap();
+        let entries: Vec<serde_json::Value> = self
+            .versions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(v, _)| {
+                serde_json::json!({ "version": v, "author": "operator:mud",
+                    "created_at": "2026-11-25T00:00:00Z", "active": Some(*v) == active, "parts": [] })
+            })
+            .collect();
+        serde_json::json!({ "kind": "overlays", "active": active, "entries": entries }).to_string()
+    }
+
+    fn serve(&self, stream: std::os::unix::net::UnixStream) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let kind = v["kind"].as_str().unwrap().to_owned();
+        self.kinds.lock().unwrap().push(kind.clone());
+        let answer = match kind.as_str() {
+            "approvals" => r#"{"kind":"off","message":"no approvals"}"#.to_owned(),
+            "plans" => r#"{"kind":"plans","goals":[],"ideas":[],"answered":[]}"#.to_owned(),
+            "notes" => r#"{"kind":"notes","notes":[]}"#.to_owned(),
+            "overlays" => self.overlays(),
+            "refine_propose" => r#"{"kind":"kept"}"#.to_owned(),
+            "overlay_show" => {
+                let want = v["version"].as_u64().unwrap();
+                let overlay = self
+                    .versions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(x, _)| *x == want)
+                    .map(|(_, o)| o.clone())
+                    .unwrap();
+                serde_json::json!({ "kind": "overlay", "entry": { "version": want,
+                    "author": "operator:mud", "created_at": "2026-11-25T00:00:00Z",
+                    "active": false, "parts": [] }, "overlay": overlay })
+                .to_string()
+            }
+            "overlay_put" => {
+                let mut versions = self.versions.lock().unwrap();
+                let version = versions.last().map_or(1, |(x, _)| x + 1);
+                versions.push((version, v["overlay"].as_str().unwrap().to_owned()));
+                drop(versions);
+                serde_json::json!({ "kind": "overlay_stored", "version": version }).to_string()
+            }
+            "overlay_activate" => {
+                if self.hold.swap(false, Ordering::SeqCst) {
+                    mark(self.marker.parent().unwrap(), "activate");
+                    while !self.released.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                let version = v["version"].as_u64().unwrap();
+                let previous = self.active.lock().unwrap().replace(version);
+                serde_json::json!({ "kind": "overlay_active", "version": version, "previous": previous })
+                    .to_string()
+            }
+            other => format!(r#"{{"kind":"error","message":"{other}"}}"#),
+        };
+        let mut stream = reader.into_inner();
+        let _ = writeln!(stream, "{answer}");
+    }
+
+    fn count(&self, kind: &str) -> usize {
+        self.kinds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| *k == kind)
+            .count()
+    }
+}
+
+/// After the kill: a new process's Steward ends with exactly one put and
+/// one activate of the baseline in all, and the baseline active.
+async fn refine_after_kill(dir: &Path, daemon: &RefineDaemon) {
+    let mut p = open(dir, T0 + 1_000, scripted());
+    let steward = steward_with(&mut p, dir, refine_cfg());
+    for _ in 0..4 {
+        steward.pass().await;
+        p.clock.advance(600_000);
+    }
+    assert_eq!(daemon.count("overlay_put"), 1, "exactly one put");
+    assert_eq!(daemon.count("overlay_activate"), 1, "exactly one activate");
+    let row = steward.row(&torin()).await.unwrap();
+    assert!(row.intent.is_none(), "{row:?}");
+    assert_eq!(row.overlay.baseline, Some(1));
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert!(row.overlay.paused.is_none());
+    assert_eq!(*daemon.active.lock().unwrap(), Some(1));
+    assert_eq!(daemon.versions.lock().unwrap()[0].1, "{}");
+    after_restart(dir, &p, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_after_put_intent_before_overlay_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = RefineDaemon::start(dir.path(), false, false);
+    let marked = kill_at("refine-put", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "IntentWritten");
+    assert_eq!(daemon.count("overlay_put"), 0);
+    refine_after_kill(dir.path(), &daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_after_overlay_put_before_activate_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = RefineDaemon::start(dir.path(), false, false);
+    let marked = kill_at("refine-stored", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "OverlayStored");
+    assert_eq!(daemon.count("overlay_put"), 1);
+    assert_eq!(daemon.count("overlay_activate"), 0);
+    // The restart finds the version by its content (`overlay_show`), and
+    // shows it again before it activates it.
+    refine_after_kill(dir.path(), &daemon).await;
+    assert_eq!(daemon.count("overlay_show"), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_after_activate_sent_before_its_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = RefineDaemon::start(dir.path(), true, false);
+    let marked = kill_at("refine-activate", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "activate");
+    // The child is dead: lg's loop applies it now, and its answer goes
+    // nowhere. The restart never sends it again: it adopts the move to
+    // the baseline from lg's pointer.
+    daemon.released.store(true, Ordering::SeqCst);
+    while daemon.active.lock().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    refine_after_kill(dir.path(), &daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refine_pause_survives_a_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = RefineDaemon::start(dir.path(), false, true);
+    let marked = kill_at("refine-paused", dir.path(), T0, Duration::ZERO);
+    assert_eq!(marked, "preexisting");
+    let mut p = open(dir.path(), T0 + 1_000, scripted());
+    let steward = steward_with(&mut p, dir.path(), refine_cfg());
+    let row = steward.row(&torin()).await.unwrap();
+    assert_eq!(
+        row.overlay.paused.unwrap().code,
+        "preexisting",
+        "still paused"
+    );
+    for _ in 0..3 {
+        steward.pass().await;
+        p.clock.advance(200 * 3_600_000);
+    }
+    for kind in ["overlay_put", "overlay_activate", "refine_propose"] {
+        assert_eq!(daemon.count(kind), 0, "no {kind} while paused");
+    }
+    assert_eq!(
+        *daemon.active.lock().unwrap(),
+        Some(1),
+        "the operator's stands"
+    );
+    after_restart(dir.path(), &p, &[]);
 }
 
 #[test]

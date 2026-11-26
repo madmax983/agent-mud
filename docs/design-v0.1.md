@@ -129,7 +129,14 @@ alias. Each decision is written to `world.db` as an intent before `decide`
 is sent, shown on the observer and noted in the agent's next wake. An
 accepted goal is pursued on a macro tick or a booked wake, whose message
 lists it as data. At the hard budget cap the daemon goes quiet (no
-heartbeat, no memory), and lg's own goals page stays the veto.
+heartbeat, no memory), and lg's own goals page stays the veto. With
+`[littleguy] refine` (the default is `menu`), the Steward also runs lg's
+refine proposer now and then, lets the council pick operator menu items
+from it as evidence, and activates them itself one move above an empty
+baseline, checking lg's pointer before and after each move; while a
+text runs, one press of lg's Roll back button returns to the baseline and
+pauses refine for that agent (the observer says what a Roll back would
+do).
 
 ## 4. Turing PCs
 

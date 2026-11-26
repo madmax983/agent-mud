@@ -89,7 +89,8 @@ pass:
    - An active goal with no new note for `goal_stale_days` is dropped.
      Every time is the game clock; lg's own stamps are compared only with
      themselves.
-5. **Notes** are counted for the observer.
+5. **Refine** (with `[littleguy] refine` not `off`; below).
+6. **Notes** are counted for the observer.
 
 **The council** runs on the MUD side. `LlmJudge` holds one
 OpenAI-compatible client per `[models]` alias (`council_model`, then
@@ -127,6 +128,106 @@ key variable unset, the Steward starts without a judge: it warns once,
 publishes `no_judge`, and goals wait until the TTL declines them. No model
 id is written in Rust.
 
+**Refine** (phase 4). `[littleguy] refine` is `off`, `menu` (the code
+default) or `free` (ADR 0016; until it ships it runs as `menu`, with a
+start-up warning). With it on, lg's config gains `[refine]` (the pinned
+CI `lg` is built with the `refine` feature) and the Steward owns the
+agent's overlays. lg's `overlay_activate` takes no expected version: lg
+compares with its own pointer, read inside the request. So the Steward
+keeps its own view of lg's active version (`pointer`) and checks every
+move:
+
+- **The pointer check**, every pass: `overlays` (a read beside lg's loop)
+  and the proved `pointer_verdict(lg, pointer, lg is late)`. `Same`:
+  nothing. `OwnLate` (an activate the Steward gave up on applied later):
+  a text is undone (`late_undone`); a move to `{}` is adopted when no
+  text of the Steward's was active, and otherwise taken as a human's
+  Roll back (paused `unconfirmed`, the text vetoed), because the Steward's
+  late Clear and a human's Roll back off the text look the same. A
+  version stays late until the daemon restarts (its queue is gone) or
+  `6 × activate_wait_secs` pass; a move to it after that is a human's.
+  `Human`
+  (lg's Roll back button, or an activation on lg's refine tab): refine
+  pauses for that entity (`rolled_back`, written with `act`), the
+  Steward's text there is vetoed, the pointer follows the human, and the
+  agent hears `overlay_off`. The Steward never moves the pointer away from
+  a human's choice; while paused it adopts later moves silently.
+- **First contact** puts and activates an empty `{}` **baseline**. If lg
+  already has an active overlay, nobody's text is replaced: the Steward
+  adopts it and pauses (`preexisting`).
+- **lg's store, not the row's numbers.** lg numbers versions per store,
+  so a deleted lg data dir starts again at 1. A listing that lacks a
+  version the row holds, lists one of the Steward's under an author other
+  than `operator:mud`, or ends below `known_max` means the store was
+  reset: the row forgets every version number (the pause and `vetoed`
+  stay), publishes `reset store_reset`, and goes back to first contact.
+  A version put in an earlier pass (the baseline for a Clear, a menu text
+  picked again) is shown (`overlay_show`) and matched with
+  `overlay_matches` before it is activated; another text there is a reset
+  too.
+- **Activate** re-reads `overlays` right before (a version other than the
+  expected one goes to the pointer check, and nothing is sent), writes the
+  intent `Activate{version, expected_previous, purpose}` with `act`, and
+  waits on the connection up to `activate_wait_secs`. An answer whose
+  `previous` is not the expected one means a human moved the pointer in
+  between and the activate overwrote it: the Steward activates that
+  `previous` again (a restore, which never chains), vetoes the text, and
+  pauses. A restore whose intent cannot be written pauses too
+  (`unconfirmed`): the Steward's move then stands over the human's, and
+  nothing more may move. **An activate is never resent.** A lost answer
+  is settled from lg's pointer: not applied, the version goes on the
+  `late` list (if it applies later, the pointer check undoes it);
+  applied, a move to `{}` is adopted when no text of the Steward's was
+  active, and otherwise taken as a human's Roll back off the text (paused
+  `unconfirmed`, the text vetoed), since a Roll back just before it leaves
+  lg on the same version; a text is undone and refine pauses
+  (`unconfirmed`), since a human move in the window cannot be ruled out;
+  anything else is the human path. The same rules settle an activate
+  intent left open by a restart. With `refine = "off"` nothing
+  reads lg's pointer, so an open overlay intent is given up (`stuck
+  refine_off`; an activate goes on the `late` list) and goals are decided
+  again.
+- **Put** writes `Put{digest, source}` with `act`, then `overlay_put`. A
+  lost answer is found by its content: the next pass shows each newer
+  `operator:mud` version (`overlay_show`) and tests `overlay_matches`; no
+  match after `intent_retry_secs`, it is sent again (a duplicate version
+  is harmless; only a recorded version is activated).
+- **One move above the baseline.** lg's Roll back reverses the last move
+  only. Every Steward text goes on from the baseline (text A, then back to
+  the baseline, then text B), so while a text runs lg's last move is
+  baseline to text, and **one Roll back lands on `{}`**. After a Clear
+  (no item picked) or an undo, lg's last move ends on the baseline, and a
+  Roll back would bring the earlier text back; the observer says which.
+- **Propose**, when the proved `refine_due` holds (never paused, never
+  below `Normal`, `refine_every_hours >= 24` and `refine_min_wakes >= 1`
+  since the last one, both floors checked at start), a judge exists, a
+  ballot is left today, and no player is in the agent's room: under a
+  claim, `refine_charge_tokens` is charged as `local` spend (lg's proposer
+  writes no ledger row), then `refine_propose`. A timeout keeps the claim
+  and drains lg's loop with `reload` probes before the release, so wakes
+  queue in the router, not inside lg. lg stores the proposal as an
+  inactive version by `operator:lg-refine`; **the Steward never activates
+  it**.
+- **Menu** (`refine = "menu"`): the proposal is only evidence. Each
+  council member picks items from the operator menu
+  (`[[littleguy.steward.guardrail]]`, or six setting-agnostic defaults);
+  an item a strict majority picks is selected, in menu order, at most
+  `max_guardrails`. The Steward puts only `{"guardrails": "- item\n- item"}`
+  of operator text, and keeps the text it put. No pick returns to the
+  baseline; the same text is `kept` (by its digest, so an item whose menu
+  text the operator edited is put again); a vetoed text is never put again (`vetoed` is never evicted,
+  apart from the goal declines).
+- **Resume.** Only the operator ends a pause: `[littleguy.steward]
+  resume_refine = ["<entity>"]` clears, at boot, a pause from an earlier
+  boot and publishes `resumed`; the Steward warns at every boot while it
+  names an entity that is not paused. A resume never clears `vetoed`.
+- **Observer.** Overlay events (`activated`, `paused`, `restored`,
+  `unconfirmed`, `late_undone`, `kept`, `declined`, `resumed`, `reset`,
+  `stuck`) and, per agent, the pointer, the baseline version, what lg's
+  Roll back would do (to the baseline only when the Steward's last
+  confirmed move left it), the pause, and the Steward's versions with the
+  text each holds as put, newest first, escaped.
+
 ```mermaid
 flowchart LR
   T[lg tick] -->|propose_goal| L[(lg plans)]
@@ -151,6 +252,14 @@ flowchart LR
 - **New veto routes**: lg's own goals page is the veto.
 - **A harvest saga** for the Steward: the intent journal in the store is
   enough.
+- **`overlay_rollback` from the Steward**: its target depends on moves the
+  Steward cannot see. The Steward undoes its own move by activating the
+  version lg named as `previous`, checked the same way.
+- **Activating the proposer's version**: a proposal may set `system`,
+  `model`, `max_steps`, tool guidance and more. The Steward puts only its
+  own `{"guardrails": …}`.
+- **The Steward going back to the baseline after a human's rollback**: it
+  would move the pointer away from a human's choice.
 
 ## Consequences
 
@@ -164,4 +273,12 @@ flowchart LR
 - Player talk can shape the goals an agent proposes, within the guards,
   the council and the caps. The observer shows every decision, and lg's
   pages remain the veto.
-- A world rollback (roadmap) does not roll back lg's goals.
+- A world rollback (roadmap) does not roll back lg's goals or overlays.
+- Refine runs without a human approving each text, and lg's Roll back
+  button stays the veto: one press returns to the empty baseline and
+  pauses refine for that agent until the operator resumes it. The residual
+  window: lg gives no expected-version activate (an upstream ask), so a
+  human move and an activate that land in the same instant are detected
+  after the fact, by `previous`, and undone, not refused.
+- An `lg` without the `refine` feature refuses the config while `refine`
+  is on; `refine = "off"` runs it.
