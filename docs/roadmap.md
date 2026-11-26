@@ -1,6 +1,7 @@
 # Roadmap
 
-Planned work that a decision already shapes. Nothing here is built yet.
+Planned work that a decision already shapes. Nothing here is built yet,
+apart from the upstream asks marked done.
 
 Runtime persistence (ADR 0011) is built, all four phases: the versioned
 store, its side rows and turns, events retention with an archive; persisted
@@ -50,6 +51,36 @@ Restore `world.db` to a point, then replay the events archive.
 - **Tooling.** A `mud rollback --to-seq T` command beside `mud check`,
   read-only until `--apply`, that reports how far the archive covers and
   where a replay would diverge.
+
+## Upstream littleguy asks
+
+The autonomy work (ADR 0015, ADR 0016) asks littleguy for these, as
+issues and PRs, never as patches. Each is worked around here until it
+lands.
+
+- **Done: an expected pointer on `overlay_activate` (ask 13).** littleguy
+  #122 (`c507731`, the commit CI pins): `overlays` answers `head`, and
+  `overlay_activate` takes `expected: {"active", "head"}`, checked in the
+  store's swap. The Steward sends it on every activate, so a human move
+  between its read and its activate is refused (`overlay_moved`), not
+  undone after the fact. The phase 4 `previous` check stays only for an
+  older lg, which answers without `guarded`.
+- **Open: the activation log on the socket (ask 14).** The head says that
+  the pointer moved after a read, which settles a lost answer when lg
+  shows the read pointer (not applied) or the read version with a new
+  head (a move away and back, a veto). It does not say who moved it. When
+  lg shows the activate's own version, the Steward's move and a human's
+  move to that version look the same, so the Steward still fails safe
+  (undo a text and pause; take a `{}` off a text as a Roll back). It
+  needs each move's `from`, `to`, `seq` and author on the socket, or an
+  `overlay_active` that names the new `head`.
+- **Open: dropping a queued activate whose client is gone (ask 15).** It
+  would end the late list.
+- **Open:** a ledger row for the proposer (ask 1), `[refine] parts` (2),
+  a guardrails ceiling (3), provenance of a web move (4), idempotency keys
+  (5), a loop probe (6), goal fields (7), a decide reason (8), tick pause
+  (9), a `features` request (10), an owner event stream (11),
+  host-delivered wakes (12), and the tool and memory switches (16, 17).
 
 ## Deferred until a need is shown
 

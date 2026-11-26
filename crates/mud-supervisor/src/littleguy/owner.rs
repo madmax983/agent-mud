@@ -12,6 +12,11 @@
 //! and `ui_link`) is a loop job: it waits behind a wake chat or a heartbeat
 //! tick that runs, so it gets [`LOOP_JOB_TIMEOUT`], not [`READ_TIMEOUT`].
 //!
+//! An `overlay_activate` names the pointer it read (`expected`, lg #122,
+//! ADR 0013 of littleguy): lg moves the pointer only when no move came in
+//! between, and answers `overlay_moved` otherwise. An older lg drops the
+//! field and moves unchecked; its answer then has no `guarded`.
+//!
 //! The requests are a closed set. There is no `approve`, no `deny` and no
 //! `overlay_rollback`: the MUD never approves a tool call for an agent,
 //! and a rollback is the human's veto on lg's own pages, never the MUD's.
@@ -46,6 +51,31 @@ pub enum PlanDecision {
     Decline,
     /// Drop an active goal.
     DropGoal,
+}
+
+/// The overlay pointer that an `overlay_activate` expects.
+///
+/// Both fields are copied from the `overlays` answer read just before it.
+/// Both keys are always on the wire, and `null` means what it means in
+/// `overlays`: no active version, or no move yet. lg refuses a partial
+/// pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedPointer {
+    /// The active version, or `None`.
+    pub active: Option<u64>,
+    /// The `seq` of the last move of the pointer, or `None` before the
+    /// first move. A move away and back changes it.
+    pub head: Option<u64>,
+}
+
+/// Reads a field that is there, `null` included, as `Some`; a missing one
+/// is `None` through `#[serde(default)]`.
+fn named<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 /// One owner request to `lg serve`.
@@ -84,6 +114,11 @@ pub enum OwnerRequest {
     OverlayActivate {
         /// The version.
         version: u64,
+        /// The pointer read just before. With it, lg moves the pointer
+        /// only when nothing moved since, checked in its swap transaction.
+        /// Left off the wire when `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected: Option<ExpectedPointer>,
     },
     /// Read the config file again, and apply it.
     Reload,
@@ -250,6 +285,12 @@ pub enum OwnerResponse {
     Overlays {
         /// The active version, if any.
         active: Option<u64>,
+        /// The `seq` of the last move of the pointer, read with `active`
+        /// from one row. lg #122 always names it: `Some(None)` before the
+        /// first move. An lg before #122 never does: `None`. Only a named
+        /// head guards an activate.
+        #[serde(default, deserialize_with = "named")]
+        head: Option<Option<u64>>,
         /// Each version, oldest first.
         entries: Vec<OverlayEntry>,
     },
@@ -280,6 +321,20 @@ pub enum OwnerResponse {
         version: u64,
         /// The version that was active before, if any.
         previous: Option<u64>,
+        /// lg checked the `expected` pointer of the request, so the move
+        /// was exactly from it. An lg before #122 never says so.
+        #[serde(default)]
+        guarded: bool,
+    },
+    /// The pointer moved after the read that `expected` copied, so lg did
+    /// not move it now: nothing changed.
+    OverlayMoved {
+        /// The version the request named.
+        version: u64,
+        /// The active version now, if any.
+        active: Option<u64>,
+        /// The `seq` of the last move now, if any.
+        head: Option<u64>,
     },
     /// The daemon read its config again.
     Reloaded {

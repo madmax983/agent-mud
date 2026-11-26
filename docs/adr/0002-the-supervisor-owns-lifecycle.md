@@ -203,8 +203,9 @@ sequenceDiagram
   `mud__mud_events`. `chat` refuses a line over the cap before it sends a
   byte (`the wake is longer than lg accepts`).
 - **The CI lg is pinned** to littleguy
-  `aefce058ca0b18bdf58cd68f012288b6fb4ef099`, whose protocol and config
-  these tests check; it is bumped on purpose, with the real-lg tests.
+  `c507731f7a8930444931c60169931d657cecec73` (littleguy #122, the guarded
+  `overlay_activate`), whose protocol and config these tests check; it is
+  bumped on purpose, with the real-lg tests.
 
 ## Amended by ADR 0015: quiet at the hard budget cap
 

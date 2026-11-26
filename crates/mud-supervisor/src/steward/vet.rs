@@ -18,7 +18,8 @@
 //! [`render_free`].
 //!
 //! [`goal_verdict`], [`council_majority`], [`refine_due`],
-//! [`pointer_verdict`], [`overlay_verdict`] and [`FREE_MIN_MEMBERS`] are
+//! [`pointer_verdict`], [`one_move`], [`lost_verdict`], [`overlay_verdict`] and
+//! [`FREE_MIN_MEMBERS`] are
 //! mirrored in `formal/verus/src/steward.rs`; the text between the mirror
 //! markers must match it.
 
@@ -197,6 +198,82 @@ pub const fn pointer_verdict(
     }
 }
 // mirror-end pointer_verdict
+
+// mirror-begin one_move
+/// Whether lg's head `after` is exactly one move past `before` (lg #122).
+///
+/// lg numbers each move of the pointer one past the last, from 1, so the
+/// first move after a read of `before` is the only one that lands there.
+#[must_use]
+pub const fn one_move(before: Option<u64>, after: Option<u64>) -> bool {
+    match (before, after) {
+        (None, Some(a)) => a == 1,
+        (Some(b), Some(a)) => b < a && a - b == 1,
+        _ => false,
+    }
+}
+// mirror-end one_move
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// mirror-begin lost_verdict_enum
+/// What lg's pointer, read again, says of an activate whose answer never
+/// came.
+pub enum LostVerdict {
+    /// The pointer is where the activate read it: the activate did not
+    /// apply. It may still wait in lg's queue.
+    NotApplied,
+    /// The pointer is on the activate's version, and (with the guard) one
+    /// move past the read: it applied, or someone else made that one move
+    /// to it. The two cannot be told apart.
+    AtTarget,
+    /// Someone else moved the pointer: a human's veto.
+    Human,
+}
+// mirror-end lost_verdict_enum
+
+// mirror-begin lost_verdict
+/// The verdict on lg's pointer `(lg, lg_head)`, read after an activate of
+/// `target` from `(from, from_head)` got no answer.
+///
+/// `guarded` says the activate carried `from_head` as lg's guard (lg
+/// #122), and lg named a head both times. Each move raises the head by
+/// one, so a head that moved is a move after the read, and a pointer back
+/// on `from` is then a move away and back, never "not applied". A guarded
+/// activate can only be the first move after its read ([`one_move`]): lg
+/// on `target` with the head two or more moves on is a later move to it,
+/// a human's. Without the guard only the version counts.
+#[must_use]
+pub const fn lost_verdict(
+    lg: Option<u64>,
+    lg_head: Option<u64>,
+    from: Option<u64>,
+    from_head: Option<u64>,
+    guarded: bool,
+    target: u64,
+) -> LostVerdict {
+    let at_from = match (lg, from) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    let head_same = match (lg_head, from_head) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    let at_target = match lg {
+        Some(a) => a == target,
+        None => false,
+    };
+    if at_from && (head_same || !guarded) {
+        LostVerdict::NotApplied
+    } else if at_target && (!guarded || one_move(from_head, lg_head)) {
+        LostVerdict::AtTarget
+    } else {
+        LostVerdict::Human
+    }
+}
+// mirror-end lost_verdict
 
 // mirror-begin steward_consts
 /// The fewest council members that may approve a free text (ADR 0016).
@@ -1608,6 +1685,44 @@ mod tests {
             if lg != expected && !late {
                 prop_assert_eq!(v, PointerVerdict::Human, "every foreign move is a human's");
             }
+        }
+
+        #[test]
+        fn lost_verdict_is_not_applied_only_on_the_pointer_it_read(
+            lg in proptest::option::of(0u64..4),
+            lg_head in proptest::option::of(0u64..4),
+            from in proptest::option::of(0u64..4),
+            from_head in proptest::option::of(0u64..4),
+            guarded in any::<bool>(),
+            target in 0u64..4,
+        ) {
+            let v = lost_verdict(lg, lg_head, from, from_head, guarded, target);
+            let not_applied = lg == from && (lg_head == from_head || !guarded);
+            prop_assert_eq!(v == LostVerdict::NotApplied, not_applied);
+            let next = Some(from_head.map_or(1, |h| h + 1));
+            if !not_applied {
+                prop_assert_eq!(
+                    v == LostVerdict::AtTarget,
+                    lg == Some(target) && (!guarded || lg_head == next)
+                );
+            }
+            if guarded && lg_head != from_head && lg == from && from != Some(target) {
+                prop_assert_eq!(v, LostVerdict::Human, "a move away and back");
+            }
+            if guarded && lg == Some(target) && from != lg && lg_head != next {
+                prop_assert_eq!(v, LostVerdict::Human, "a later move to the target");
+            }
+        }
+
+        #[test]
+        fn one_move_is_exactly_the_next_head(
+            before in proptest::option::of(0u64..6),
+            after in proptest::option::of(0u64..8),
+        ) {
+            prop_assert_eq!(
+                one_move(before, after),
+                after == Some(before.map_or(1, |h| h + 1))
+            );
         }
 
         #[test]

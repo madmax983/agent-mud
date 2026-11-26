@@ -1,7 +1,8 @@
 # ADR 0016: Exception: council-approved model text in an agent's guardrails
 
 Status: proposed. It is accepted when the owner merges it. It is an
-exception the owner chose ("Free-text overlays").
+exception the owner chose ("Free-text overlays"). Amended 2026-11-26:
+control 7 uses lg's guarded activation (littleguy #122).
 
 ## The rule it breaks
 
@@ -132,16 +133,24 @@ Each control has a test.
 7. **The veto.** lg's Roll back button (and its refine tab) acts at once.
    Every Steward text sits one move above the `{}` baseline, so one Roll
    back returns to `{}`. The Steward re-reads the pointer before each
-   activate and checks the `previous` of every answer; when a human moved
-   the pointer in between, it restores the human's version, pauses refine
-   for that entity, and never proposes that text again (`vetoed` is never
-   evicted). An activate whose answer is lost is never resent; if it
-   applied, the Steward undoes it and pauses. Only the operator resumes
-   (`resume_refine`). The residual window: lg gives no expected-version
-   activate, so a human move and an activate that land in the same
-   instant are detected after the fact, by `previous`, and undone, not
-   refused (upstream ask: an `expected` version on `overlay_activate`).
-   Tests: the phase 4 veto tests in `steward::refine_tests` (ADR 0015).
+   activate and sends it as `expected` (littleguy #122): lg moves the
+   pointer only when nothing moved since, and answers `overlay_moved`
+   otherwise. Then lg changed nothing, refine pauses for that entity, and
+   the Steward's active text and the text it was about to activate are
+   never proposed again (`vetoed` is never evicted). A text the human
+   lands on, or returns to after a move away and back, is their choice and
+   is never vetoed. An activate whose answer is lost is never resent; if
+   it applied, the Steward undoes it and pauses; a move away and back in
+   the meantime pauses too and vetoes the text, which may have run and
+   been rolled back; lg on the text two or more moves on is a human's
+   choice of it, left as it is. Only the operator resumes
+   (`resume_refine`).
+   Against an lg older than #122, which moves unchecked, the phase 4
+   check stays: a human move in between is detected by `previous`,
+   restored, and refine pauses (amended 2026-11-26; ADR 0015 has the
+   details). Tests: the veto tests in `steward::refine_tests` (ADR 0015)
+   and the real-lg test
+   `a_human_move_before_a_real_guarded_activate_is_refused_and_pauses`.
 8. **Rate.** At most one propose per `refine_every_hours` (at least 24) and
    `refine_min_wakes` (at least 1), only at a `Normal` budget, never with a
    player in the room. Tests: `refine_waits_for_interval_and_wakes`,

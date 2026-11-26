@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::vet;
 use crate::budget::DAY_MS;
 
 /// The schema of the row body this code writes.
@@ -268,8 +269,14 @@ pub enum IntentAction {
     Activate {
         /// The version.
         version: u64,
-        /// The version lg should report as `previous`.
+        /// The version lg should report as `previous`: the `active` of the
+        /// pointer the activate expects.
         expected_previous: Option<u64>,
+        /// The head of the pointer the activate expects, sent as lg's
+        /// guard. `None` when the read named no head (an lg before #122),
+        /// and in an intent written before the Steward sent one.
+        #[serde(default)]
+        guard: Option<Guard>,
         /// Why.
         purpose: Purpose,
     },
@@ -305,6 +312,15 @@ impl IntentAction {
             Self::Propose => "refine_propose",
         }
     }
+}
+
+/// The head of lg's pointer that a guarded `overlay_activate` expects
+/// (lg #122). With `expected_previous` it is the whole `expected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guard {
+    /// The `seq` of the last move of the pointer, as `overlays` named it;
+    /// `None` before the first move, and from an lg before #122.
+    pub head: Option<u64>,
 }
 
 /// An owner action written before it is sent: the journal that makes a
@@ -344,6 +360,11 @@ pub struct Late {
     pub version: u64,
     /// When it was given up on, by the game clock.
     pub at_ms: u64,
+    /// The head its guarded activate sent (lg #122). lg runs it only as
+    /// the next move after that head. `None` for an unguarded one: only
+    /// its version tells it.
+    #[serde(default)]
+    pub guard: Option<Guard>,
 }
 
 /// Why refine is paused for an entity, and since when. Only the operator
@@ -442,13 +463,14 @@ impl OverlayRow {
         }
     }
 
-    /// Remembers an activate given up on at `now_ms`; past [`LATE_CAP`]
-    /// the oldest go.
-    pub fn add_late(&mut self, version: u64, now_ms: u64) {
+    /// Remembers an activate given up on at `now_ms`, with the guard it
+    /// sent; past [`LATE_CAP`] the oldest go.
+    pub fn add_late(&mut self, version: u64, now_ms: u64, guard: Option<Guard>) {
         self.late.retain(|l| l.version != version);
         self.late.push(Late {
             version,
             at_ms: now_ms,
+            guard,
         });
         let over = self.late.len().saturating_sub(LATE_CAP);
         self.late.drain(..over);
@@ -458,6 +480,39 @@ impl OverlayRow {
     #[must_use]
     pub fn is_late(&self, version: u64) -> bool {
         self.late.iter().any(|l| l.version == version)
+    }
+
+    /// Whether lg on `version` at `head` is a late activate of the
+    /// Steward's own. A guarded one runs only as the next move after the
+    /// head it sent ([`vet::one_move`]); any other head on that version is
+    /// a later move to it, someone else's. When lg names no head now
+    /// (`named` is false), only the version tells.
+    #[must_use]
+    pub fn own_late(&self, version: u64, head: Option<u64>, named: bool) -> bool {
+        self.late.iter().any(|l| {
+            l.version == version
+                && match l.guard {
+                    Some(g) if named => vet::one_move(g.head, head),
+                    _ => true,
+                }
+        })
+    }
+
+    /// Forgets every guarded late activate that lg refuses now: the head
+    /// moved past the one it sent. lg on `active` one move past it ran it,
+    /// and it stays for the pointer check. Nothing goes when lg names no
+    /// head (`named` is false). Returns whether one went.
+    pub fn prune_late(&mut self, active: Option<u64>, head: Option<u64>, named: bool) -> bool {
+        if !named {
+            return false;
+        }
+        let before = self.late.len();
+        self.late.retain(|l| {
+            l.guard.is_none_or(|g| {
+                g.head == head || (active == Some(l.version) && vet::one_move(g.head, head))
+            })
+        });
+        self.late.len() != before
     }
 
     /// Forgets `version` as late.
@@ -670,8 +725,8 @@ mod tests {
         assert_eq!(ov.text_at(Some(1)), None, "the baseline is no text");
         assert_eq!(ov.text_at(None), None);
         for v in 0..20 {
-            ov.add_late(v, 100 + v);
-            ov.add_late(v, 100 + v);
+            ov.add_late(v, 100 + v, None);
+            ov.add_late(v, 100 + v, None);
         }
         assert_eq!(
             ov.late.iter().map(|l| l.version).collect::<Vec<_>>(),
@@ -685,6 +740,14 @@ mod tests {
         assert_eq!(
             ov.late.iter().map(|l| l.version).collect::<Vec<_>>(),
             [17, 18, 19]
+        );
+        assert!(
+            ov.own_late(17, Some(9), true),
+            "an unguarded one by version"
+        );
+        assert!(
+            !ov.prune_late(None, Some(9), true),
+            "an unguarded one stays"
         );
         ov.see(5);
         assert_eq!(ov.known_max, Some(59));
@@ -728,6 +791,35 @@ mod tests {
     }
 
     #[test]
+    fn a_guarded_late_activate_is_own_only_one_move_past_its_head() {
+        let mut ov = OverlayRow::default();
+        ov.add_late(3, 1, Some(Guard { head: Some(4) }));
+        ov.add_late(5, 1, Some(Guard { head: None }));
+        assert!(ov.own_late(3, Some(5), true), "the next move: lg ran it");
+        assert!(!ov.own_late(3, Some(6), true), "a later move to it");
+        assert!(!ov.own_late(3, Some(4), true));
+        assert!(ov.own_late(3, None, false), "no head named: by version");
+        assert!(ov.own_late(5, Some(1), true), "the first move after none");
+        assert!(!ov.own_late(5, Some(2), true));
+        assert!(!ov.own_late(4, Some(5), true), "not late at all");
+        assert!(!ov.prune_late(Some(1), Some(9), false), "no head named");
+        assert!(ov.prune_late(Some(1), Some(4), true), "5 can no longer run");
+        assert!(ov.is_late(3) && !ov.is_late(5), "3 may still run");
+        assert!(
+            !ov.prune_late(Some(3), Some(5), true),
+            "3 ran: the check sees it"
+        );
+        assert!(ov.prune_late(Some(1), Some(6), true));
+        assert_eq!(ov.late, []);
+    }
+
+    #[test]
+    fn an_older_late_entry_reads_as_unguarded() {
+        let late: Late = serde_json::from_str(r#"{"version":3,"at_ms":7}"#).unwrap();
+        assert_eq!(late.guard, None);
+    }
+
+    #[test]
     fn a_forgotten_store_keeps_only_the_pause_and_the_last_propose() {
         let mut ov = OverlayRow {
             known_max: Some(9),
@@ -742,7 +834,7 @@ mod tests {
             }),
             ..OverlayRow::default()
         };
-        ov.add_late(4, 1);
+        ov.add_late(4, 1, None);
         assert_eq!(ov.recorded(), [(3, false), (1, true)]);
         let paused = ov.paused.clone();
         ov.forget_store();
@@ -764,6 +856,7 @@ mod tests {
             IntentAction::Activate {
                 version: 4,
                 expected_previous: Some(1),
+                guard: Some(Guard { head: Some(6) }),
                 purpose: Purpose::Text {
                     digest: 9,
                     source: OverlaySource::Menu {
@@ -782,7 +875,19 @@ mod tests {
         row.veto(3);
         let body = row.body();
         assert_eq!(body["intent"]["action"]["kind"], "activate");
+        assert_eq!(body["intent"]["action"]["guard"]["head"], 6);
         assert_eq!(StewardRow::from_body(ROW_SCHEMA, &body), Some(row.clone()));
+        // An intent written before the guard reads as unguarded.
+        let mut old = body;
+        old["intent"]["action"]
+            .as_object_mut()
+            .unwrap()
+            .remove("guard");
+        let back = StewardRow::from_body(ROW_SCHEMA, &old).unwrap();
+        assert!(matches!(
+            back.intent.unwrap().action,
+            IntentAction::Activate { guard: None, .. }
+        ));
         let action = row.intent.unwrap().action;
         assert_eq!((action.goal(), action.is_overlay()), (None, true));
         assert_eq!(action.name(), "overlay_activate");
@@ -828,6 +933,7 @@ mod tests {
             IntentAction::Activate {
                 version: 4,
                 expected_previous: Some(1),
+                guard: None,
                 purpose: Purpose::Text {
                     digest: 11,
                     source: free.clone(),

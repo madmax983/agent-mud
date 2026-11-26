@@ -1579,6 +1579,81 @@ async fn raw_owner_line(socket: &Path, line: &str) -> serde_json::Value {
     serde_json::from_str(buf.trim()).unwrap()
 }
 
+/// The pointer as `overlays` names it, for `expected` (lg #122).
+async fn read_pointer(sock: &Path) -> owner::ExpectedPointer {
+    let listed = owner::request(
+        sock,
+        &owner::OwnerRequest::Overlays,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    match listed {
+        owner::OwnerResponse::Overlays { active, head, .. } => owner::ExpectedPointer {
+            active,
+            head: head.flatten(),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+/// lg runs text `a` over `baseline`. A human's Roll back, and then a move
+/// away and back, each refuse an activate that read the pointer before
+/// them, and change nothing.
+async fn stale_reads_move_nothing(sock: &Path, baseline: u64, a: u64) {
+    use owner::{OwnerRequest as Req, OwnerResponse as Resp, request};
+    let t = Duration::from_secs(30);
+    let read = read_pointer(sock).await;
+    assert_eq!(read.active, Some(a));
+    // The human's Roll back, sent by the test (never by the Steward).
+    let back = raw_owner_line(sock, r#"{"kind":"overlay_rollback"}"#).await;
+    assert_eq!(back["kind"], "overlay_active", "{back}");
+    assert_eq!(
+        back["version"], baseline,
+        "one Roll back lands on the baseline"
+    );
+    let now = read_pointer(sock).await;
+    assert_eq!(now.active, Some(baseline));
+    assert_ne!(now.head, read.head, "the Roll back moved the head");
+    // An activate that read the pointer before the Roll back moves nothing.
+    let activate = |expected| Req::OverlayActivate {
+        version: a,
+        expected: Some(expected),
+    };
+    let stale = request(sock, &activate(read), t).await.unwrap();
+    assert_eq!(
+        stale,
+        Resp::OverlayMoved {
+            version: a,
+            active: now.active,
+            head: now.head,
+        }
+    );
+    assert_eq!(read_pointer(sock).await, now, "nothing changed");
+    // A move away and back: the active version is the same, the head is
+    // not, so a read from before refuses too.
+    let away = raw_owner_line(
+        sock,
+        &format!(r#"{{"kind":"overlay_activate","version":{a}}}"#),
+    )
+    .await;
+    assert_eq!(away["kind"], "overlay_active", "{away}");
+    assert!(
+        away.get("guarded").is_none(),
+        "an unguarded move says so: {away}"
+    );
+    let back = raw_owner_line(sock, r#"{"kind":"overlay_rollback"}"#).await;
+    assert_eq!(back["version"], baseline, "{back}");
+    let again = read_pointer(sock).await;
+    assert_eq!(again.active, now.active);
+    assert_ne!(again.head, now.head);
+    let stale = request(sock, &activate(now), t).await.unwrap();
+    assert!(
+        matches!(stale, Resp::OverlayMoved { active, head, .. } if active == again.active && head == again.head),
+        "{stale:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_real_lg_with_refine_takes_overlay_requests() {
     use owner::{OwnerRequest as Req, OwnerResponse as Resp, request};
@@ -1615,7 +1690,14 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
     };
     let listed = ask(Req::Overlays).await;
     assert!(
-        matches!(&listed, Resp::Overlays { active: None, .. }),
+        matches!(
+            &listed,
+            Resp::Overlays {
+                active: None,
+                head: Some(None),
+                ..
+            }
+        ),
         "{listed:?}\n{}",
         log()
     );
@@ -1625,13 +1707,20 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
     let Resp::OverlayStored { version: baseline } = ask(put("")).await else {
         panic!("{}", log());
     };
-    let on = ask(Req::OverlayActivate { version: baseline }).await;
+    let on = ask(Req::OverlayActivate {
+        version: baseline,
+        // No version and no move yet, as `overlays` named it (lg #122).
+        expected: Some(read_pointer(&sock).await),
+    })
+    .await;
     assert_eq!(
         on,
         Resp::OverlayActive {
             version: baseline,
-            previous: None
-        }
+            previous: None,
+            guarded: true,
+        },
+        "this lg checks the pointer it is given"
     );
     let menu = crate::steward::vet::default_menu();
     let text = crate::steward::vet::render_guardrails(&menu, &["brevity".to_owned()]);
@@ -1647,25 +1736,22 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
         "{overlay}"
     );
     assert_eq!(entry.author, "operator:mud");
-    let on = ask(Req::OverlayActivate { version: a }).await;
+    let read = read_pointer(&sock).await;
+    assert_eq!(read.active, Some(baseline));
+    assert!(read.head.is_some(), "the first move set the head");
+    let on = ask(Req::OverlayActivate {
+        version: a,
+        expected: Some(read),
+    })
+    .await;
     assert_eq!(
         on,
         Resp::OverlayActive {
             version: a,
-            previous: Some(baseline)
+            previous: Some(baseline),
+            guarded: true,
         }
     );
-    // The human's Roll back, sent by the test (never by the Steward).
-    let back = raw_owner_line(&sock, r#"{"kind":"overlay_rollback"}"#).await;
-    assert_eq!(back["kind"], "overlay_active", "{back}");
-    assert_eq!(
-        back["version"], baseline,
-        "one Roll back lands on the baseline"
-    );
-    let listed = ask(Req::Overlays).await;
-    assert!(
-        matches!(&listed, Resp::Overlays { active: Some(v), .. } if *v == baseline),
-        "{listed:?}"
-    );
+    stale_reads_move_nothing(&sock, baseline, a).await;
     mind.shutdown().await;
 }

@@ -184,11 +184,13 @@ per tier:
 | `plugin-agent` | an autumn-plugin-agent loop (ambient NPCs) | `[models.<alias>]` and its key |
 
 With littleguy, build `lg` from the littleguy repository at commit
-`aefce058ca0b18bdf58cd68f012288b6fb4ef099` (the one CI pins and the MUD
-is tested against) and point `[littleguy] bin` at it:
+`c507731f7a8930444931c60169931d657cecec73` (the one CI pins and the MUD
+is tested against; littleguy #122, whose `overlay_activate` refuses a
+move from a pointer that moved since the Steward read it) and point
+`[littleguy] bin` at it:
 
 ```sh
-git -C littleguy checkout aefce058ca0b18bdf58cd68f012288b6fb4ef099
+git -C littleguy checkout c507731f7a8930444931c60169931d657cecec73
 cargo build --release -p littleguy --no-default-features \
   --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction,refine"
 ```
