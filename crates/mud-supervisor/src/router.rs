@@ -9,7 +9,7 @@
 //! | Immediate | attack on it, a tell, a nudge, speech naming it | 0–500 ms |
 //! | `RoomBatch` | human speech, emotes, arrivals, drops | 2–4 s rolling |
 //! | Ambient   | agent activity while a human is present | 5–10 s + cooldown |
-//! | `MacroTick` | the slow timer, only with no other player in the room | none |
+//! | `MacroTick` | the slow timer, unless another player acted in the room within `macro_defer_ms` | none |
 //!
 //! It also runs the per-room anti-chatter counter, the budget breakers,
 //! the Turing attention filter and distracted spells.
@@ -33,6 +33,7 @@ use crate::admit::{Admit, CAME_TO, wake_admit};
 use crate::budget::BudgetLevel;
 use crate::chatter::{ChatterInput, MAX_AGENT_ONLY_TURNS, RoomChatter, chatter_input_for};
 use crate::replay::replay_due;
+use crate::ticks::tick_deferred;
 use crate::turing::{Salience, has_keyword, mix, notices, pick};
 
 /// How urgent a wake is. Higher wins when wakes merge.
@@ -66,6 +67,18 @@ pub struct RouterConfig {
     pub max_agent_only_turns: u8,
     /// The seed of every jitter.
     pub seed: u64,
+    /// A player other than the entity who acted in its room within this
+    /// many game-clock ms defers its macro tick ([`tick_deferred`]). An
+    /// idle player does not: after the window the tick fires as if the
+    /// entity were alone.
+    #[serde(default = "default_macro_defer_ms")]
+    pub macro_defer_ms: u64,
+}
+
+/// The default of [`RouterConfig::macro_defer_ms`]: 10 minutes.
+#[must_use]
+pub const fn default_macro_defer_ms() -> u64 {
+    600_000
 }
 
 impl Default for RouterConfig {
@@ -77,6 +90,7 @@ impl Default for RouterConfig {
             cooldown_ms: [3_000, 8_000],
             max_agent_only_turns: MAX_AGENT_ONLY_TURNS,
             seed: 0x006d_7564,
+            macro_defer_ms: default_macro_defer_ms(),
         }
     }
 }
@@ -202,6 +216,17 @@ impl Pending {
     }
 }
 
+/// The room reset a retried macro tick owes ([`Router::macro_tick`]).
+#[derive(Debug, Clone)]
+struct OwedReset {
+    /// The room the entity stood in when the tick fired.
+    room: RoomId,
+    /// The world's last seq when the wake that carried the tick ended. An
+    /// act after it belongs to a later wake and gets no reset. `None`
+    /// while that wake has not ended.
+    until: Option<Seq>,
+}
+
 /// The router.
 #[derive(Debug, Default)]
 pub struct Router {
@@ -219,6 +244,9 @@ pub struct Router {
     /// The newest come-to line each entity was woken for, so the tick's
     /// report and the line itself wake it once.
     came_to_seen: HashMap<EntityId, Seq>,
+    /// The room resets that retried macro ticks owe, paid at the entity's
+    /// first act.
+    owed_resets: BTreeMap<EntityId, OwedReset>,
 }
 
 /// Where the chatter counter reads whether a player saw an agent's event.
@@ -505,6 +533,37 @@ impl Router {
         (actor_is_agent, allow_cross)
     }
 
+    /// Pays the room reset a retried macro tick owes its actor, before
+    /// `ev` counts: the act shows that the tick's wake reached the mind.
+    /// A reset whose wake ended before `ev` lapses unpaid.
+    fn pay_owed_reset(&mut self, ev: &Event) {
+        if self.owed_resets.is_empty() {
+            return;
+        }
+        self.owed_resets
+            .retain(|_, o| o.until.is_none_or(|until| ev.seq <= until));
+        // The engine's line about a body and a self-control nudge are not
+        // the mind's acts.
+        if ev.is_body_line() || ev.kind == EventKind::SelfControlNudge {
+            return;
+        }
+        let Some(actor) = &ev.actor else { return };
+        if let Some(owed) = self.owed_resets.remove(&actor.id) {
+            let max = self.cfg.max_agent_only_turns;
+            self.room(&owed.room).step(ChatterInput::MacroTick, max);
+        }
+    }
+
+    /// The wake that carried `entity`'s macro tick ended, with the world
+    /// at `last`. A room reset its retried tick still owes goes only to an
+    /// act at or before `last`: the router may read the wake's own acts
+    /// after this call.
+    pub fn tick_wake_ended(&mut self, entity: &EntityId, last: Seq) {
+        if let Some(owed) = self.owed_resets.get_mut(entity) {
+            owed.until.get_or_insert(last);
+        }
+    }
+
     /// Reads one event. Returns what was decided for each recipient.
     pub fn observe(
         &mut self,
@@ -513,6 +572,7 @@ impl Router {
         rt: &HashMap<EntityId, EntityRuntime>,
         now: u64,
     ) -> Vec<RouteNote> {
+        self.pay_owed_reset(ev);
         let (actor_is_agent, allow_cross) = self.chatter(ev, world, Presence::Live);
         self.route(ev, world, rt, now, actor_is_agent, allow_cross, None)
     }
@@ -744,10 +804,24 @@ impl Router {
         notes
     }
 
-    /// A macro-tick for `entity`. It fires only with no player in its room
-    /// but the entity itself: a hidden PC is a player, and alone it still
-    /// gets its quiet wakes.
-    pub fn macro_tick(&mut self, entity: &EntityId, world: &World, now: u64) -> RouteNote {
+    /// A macro-tick for `entity`. It waits while a player other than the
+    /// entity acted in its room within `macro_defer_ms` ([`tick_deferred`]):
+    /// that player's acts wake the entity anyway. An idle player, human or
+    /// agent, does not hold it back past the window. A hidden PC is a
+    /// player, and alone it still gets its quiet wakes.
+    ///
+    /// A tick resets its room's anti-chatter count. A `retry` of a tick
+    /// whose wake never reached the mind owes the reset instead, and pays
+    /// it at the entity's first act in the wake that carries it: a mind
+    /// that stays down must not reopen a held room every few minutes, and
+    /// the retry that reaches the mind reopens it as a tick does.
+    pub fn macro_tick(
+        &mut self,
+        entity: &EntityId,
+        world: &World,
+        now: u64,
+        retry: bool,
+    ) -> RouteNote {
         let seq = world.last_seq();
         let Some(e) = world.entity(entity) else {
             return RouteNote::Dropped {
@@ -756,16 +830,24 @@ impl Router {
                 why: "unknown entity".into(),
             };
         };
-        if world.player_present_except(&e.room, entity) {
+        let window = self.cfg.macro_defer_ms;
+        let last = world.last_player_act(&e.room, entity, now.saturating_sub(window));
+        if tick_deferred(last, now, window) {
             return RouteNote::Dropped {
                 entity: entity.clone(),
                 seq,
-                why: "macro-tick deferred: a player is present".into(),
+                why: "macro-tick deferred: a player acted here recently".into(),
             };
         }
-        let max = self.cfg.max_agent_only_turns;
         let room = e.room.clone();
-        self.room(&room).step(ChatterInput::MacroTick, max);
+        if retry {
+            self.owed_resets
+                .insert(entity.clone(), OwedReset { room, until: None });
+        } else {
+            self.owed_resets.remove(entity);
+            let max = self.cfg.max_agent_only_turns;
+            self.room(&room).step(ChatterInput::MacroTick, max);
+        }
         let p = self
             .pending
             .entry(entity.clone())

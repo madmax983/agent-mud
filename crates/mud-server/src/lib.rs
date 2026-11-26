@@ -300,6 +300,7 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
             accounts,
             public_url: cfg.server.public_url.clone(),
             trusted_proxies: !cfg.server.trusted_proxies.is_empty(),
+            sessions: tokio_util::task::TaskTracker::new(),
         }),
         admin_token_generated,
         tokens,
@@ -323,6 +324,10 @@ fn supervisor_config(cfg: &MudConfig, pack: &WorldPack) -> anyhow::Result<Superv
         catchup_spread_ms: s.catchup_spread_ms,
         wake_timeout_ms: s.wake_timeout_ms,
         wake_timeout_ms_by_tier: s.wake_timeout_ms_by_tier,
+        router: mud_supervisor::router::RouterConfig {
+            macro_defer_ms: s.macro_defer_ms,
+            ..mud_supervisor::router::RouterConfig::default()
+        },
         ..SupervisorConfig::default()
     })
 }
@@ -706,27 +711,101 @@ pub async fn serve(cfg: MudConfig) -> anyhow::Result<()> {
         tasks.push(tokio::spawn(telnet::serve_limited(
             Arc::clone(&built.mud.limiter),
             listener,
-            telnet::Shared {
-                game: Arc::clone(&built.mud.game),
-                presence: Arc::clone(&built.mud.presence),
-                accounts: Arc::clone(&built.mud.accounts),
-                timeouts: cfg.server.timeouts(),
-            },
+            telnet_shared(&built.mud),
         )));
     }
-    let stopper = tokio::spawn(stop_on(
+    let stopper = stopper(&built, &tasks);
+    Box::pin(app(&built, settings).run()).await;
+    shut_down(&built.mud, stopper).await;
+    Ok(())
+}
+
+/// What a telnet listener shares with the rest of the server.
+#[must_use]
+pub fn telnet_shared(mud: &Mud) -> telnet::Shared {
+    telnet::Shared {
+        game: Arc::clone(&mud.game),
+        presence: Arc::clone(&mud.presence),
+        accounts: Arc::clone(&mud.accounts),
+        timeouts: mud.timeouts,
+        sessions: mud.sessions.clone(),
+        shutdown: mud.shutdown.clone(),
+    }
+}
+
+/// Starts [`stop_on`] over `tasks` (the supervisor, the Steward and the
+/// telnet listener) and the littleguy daemons. Hand it to [`shut_down`].
+#[must_use]
+pub fn stopper(
+    built: &Built,
+    tasks: &[tokio::task::JoinHandle<()>],
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(stop_on(
         built.mud.shutdown.clone(),
         tasks
             .iter()
             .map(tokio::task::JoinHandle::abort_handle)
             .collect(),
         built.littleguy.clone(),
-    ));
-    Box::pin(app(&built, settings).run()).await;
-    // However the server ended, nothing outlives it.
-    built.mud.shutdown.cancel();
+    ))
+}
+
+/// How long the stop waits for the terminal sessions, then for the
+/// wakes, still running when it begins.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// The end of [`serve`], however the server ended: nothing outlives it.
+///
+/// It cancels the shutdown token and waits for `stopper` ([`stop_on`]),
+/// then closes what still writes and what the server keeps open
+/// ([`close_stores`]).
+pub async fn shut_down(mud: &Mud, stopper: tokio::task::JoinHandle<()>) {
+    mud.shutdown.cancel();
     let _ = stopper.await;
-    Ok(())
+    close_stores(mud).await;
+}
+
+/// Closes what the server keeps open, once it has stopped.
+///
+/// It runs after [`stop_on`] has stopped the supervisor's clock, the
+/// Steward and the daemons. Then, in order:
+/// 1. the terminal sessions end (the shutdown token ends each), and their
+///    logouts reach the store, within [`STOP_GRACE`];
+/// 2. the minds close (a harvest mind's databases), so a wake still
+///    running fails at once;
+/// 3. the wakes still running end, and their closes reach the store,
+///    within [`STOP_GRACE`] ([`Supervisor::drain`]);
+/// 4. `world.db` and `accounts.db` close, each with its write-ahead log
+///    checkpointed into the main file.
+///
+/// Without it a stop leaves the newest state only in the `-wal` files
+/// (the owner's run of 2026-11-26). A writer still running past a grace
+/// loses its last writes, as a crash would. A failure is logged; SQLite
+/// finishes the log at the next open.
+pub async fn close_stores(mud: &Mud) {
+    mud.shutdown.cancel();
+    mud.sessions.close();
+    if tokio::time::timeout(STOP_GRACE, mud.sessions.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            running = mud.sessions.len(),
+            "a terminal session outlived the shutdown; its last writes are lost"
+        );
+    }
+    mud.sup.close_minds().await;
+    mud.sup.drain(STOP_GRACE).await;
+    let game = Arc::clone(&mud.game);
+    match tokio::task::spawn_blocking(move || game.close_store()).await {
+        Ok(Ok(())) => tracing::info!("world.db closed"),
+        Ok(Err(e)) => tracing::error!(error = %e, "closing world.db failed"),
+        Err(e) => tracing::error!(error = %e, "closing world.db stopped"),
+    }
+    match mud.accounts.close().await {
+        Ok(()) => tracing::info!("accounts.db closed"),
+        Err(e) => tracing::error!(error = %e, "closing accounts.db failed"),
+    }
 }
 
 /// Reads `path` if it exists, or the defaults.
@@ -843,6 +922,115 @@ mod tests {
             .unwrap();
         assert!(lg.is_closed());
         assert!(forever.await.unwrap_err().is_cancelled());
+    }
+
+    /// What `world.db` alone holds, as a copy without its `-wal` file:
+    /// what a stop that never closed the store left in the main file.
+    fn main_file_alone(db: &Path) -> Option<mud_world::store::Loaded> {
+        let copy = tempfile::tempdir().unwrap();
+        let alone = copy.path().join("world.db");
+        std::fs::copy(db, &alone).unwrap();
+        mud_world::store::Store::open(&alone, 1, 0)
+            .unwrap()
+            .load(10)
+            .unwrap()
+    }
+
+    fn wal_len(db: &Path) -> u64 {
+        let mut wal = db.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::metadata(std::path::PathBuf::from(wal)).map_or(0, |m| m.len())
+    }
+
+    fn humans_online(game: &Game) -> usize {
+        game.read(|w| {
+            w.state()
+                .entities
+                .values()
+                .filter(|e| e.human && e.online)
+                .count()
+        })
+    }
+
+    #[tokio::test]
+    async fn closing_the_stores_leaves_complete_files_and_no_write_ahead_log() {
+        // Regression (the owner's run of 2026-11-26): after Ctrl+C,
+        // world.db held yesterday's pages and a 4 MB world.db-wal all of
+        // today's state.
+        use tokio::io::AsyncWriteExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = MudConfig::default();
+        let db = dir.path().join("world.db");
+        cfg.world.db = Some(db.clone());
+        cfg.accounts.bcrypt_cost = 4;
+        let built = build(&cfg).await.unwrap();
+        let game = &built.mud.game;
+        crate::test_support::auth(&built.mud.accounts, game, "ada").await;
+        // As serve() runs: the supervisor, the Steward and a telnet
+        // listener, with Ada playing on it when the stop comes.
+        let mut tasks = spawn_tasks(&built);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tasks.push(tokio::spawn(telnet::serve_limited(
+            Arc::clone(&built.mud.limiter),
+            listener,
+            telnet_shared(&built.mud),
+        )));
+        let mut ada = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let login = format!(
+            "ada\r\n{}\r\nsay the last words before the stop\r\n",
+            crate::test_support::PW
+        );
+        ada.write_all(login.as_bytes()).await.unwrap();
+        let said = |g: &Game| {
+            g.read(|w| {
+                w.logged()
+                    .any(|e| e.untrusted_text.as_deref() == Some("the last words before the stop"))
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !said(game) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ada spoke");
+        assert_eq!(humans_online(game), 1, "the session is open");
+        // The symptom: the newest state is only in the log.
+        assert!(wal_len(&db) > 0);
+        let last = game.read(mud_world::World::last_seq);
+        let before = main_file_alone(&db);
+        assert!(
+            before.is_none_or(|b| b.recent.last().is_none_or(|e| e.seq < last)),
+            "the main file alone lags the log"
+        );
+        assert!(wal_len(&dir.path().join("accounts.db")) > 0);
+        let errors = game.store_errors();
+        let stopper = stopper(&built, &tasks);
+        shut_down(&built.mud, stopper).await;
+        // The session ended before the store closed: its logout is in the
+        // file, and no write came after the close.
+        assert!(built.mud.sessions.is_empty(), "every session ended");
+        assert_eq!(humans_online(game), 0, "ada was logged out");
+        assert_eq!(game.store_errors(), errors, "no write after the close");
+        assert_eq!(wal_len(&db), 0, "the world log is checkpointed");
+        assert_eq!(wal_len(&dir.path().join("accounts.db")), 0);
+        let after = main_file_alone(&db).unwrap();
+        assert_eq!(
+            after.recent.last().map(|e| e.seq),
+            Some(game.read(mud_world::World::last_seq))
+        );
+        assert_eq!(after.state, game.read(mud_world::World::snapshot));
+        // A write after the close is refused, logged and counted, never a
+        // panic; a second close does nothing.
+        let bo = game.login("bo").unwrap();
+        assert!(game.execute(&bo, "say anyone?").ok);
+        assert!(game.store_errors() > errors);
+        close_stores(&built.mud).await;
+        assert!(matches!(
+            built.mud.accounts.admin_list().await,
+            Err(mud_accounts::AccountError::Closed)
+        ));
     }
 
     #[tokio::test]

@@ -39,6 +39,20 @@ pub enum AccountError {
     /// The name is not a human character.
     #[error("{0} is not a human character; only human characters have accounts")]
     NotHuman(String),
+    /// `accounts.db` was closed: the server is stopping.
+    #[error("the account store is closed")]
+    Closed,
+    /// The close could not move the whole write-ahead log into
+    /// `accounts.db`: another connection holds it open. Nothing is lost.
+    #[error(
+        "the write-ahead log was not fully checkpointed ({checkpointed} of {log} pages): another connection holds accounts.db open"
+    )]
+    Busy {
+        /// The pages in the log.
+        log: i64,
+        /// The pages moved into the main file.
+        checkpointed: i64,
+    },
     /// No account has that name.
     #[error("there is no account named {0}")]
     NoAccount(String),

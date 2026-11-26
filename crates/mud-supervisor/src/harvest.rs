@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ use autumn_harvest_sqlite::{PurgePolicy, SqliteRuntime};
 use mud_world::EntityId;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::mind::{
     BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, ToolNames, Usage,
@@ -102,6 +104,12 @@ struct Job {
 /// The lifetime token count each entity's budget was charged up to.
 type Marks = Arc<std::sync::Mutex<HashMap<EntityId, u64>>>;
 
+/// An entity's job queue and the task that owns its runtime.
+type Worker = (mpsc::Sender<Job>, JoinHandle<()>);
+
+/// How long [`Mind::close`] waits for a harvest job in flight.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
 /// Durable in-process agents.
 pub struct HarvestMind {
     model: Arc<dyn AgentModel>,
@@ -109,13 +117,19 @@ pub struct HarvestMind {
     window: u32,
     history: HarvestHistory,
     personas: HashMap<EntityId, HarvestPersona>,
-    workers: Mutex<HashMap<EntityId, mpsc::Sender<Job>>>,
+    /// Each entity's job queue and the task that owns its runtime.
+    workers: Mutex<HashMap<EntityId, Worker>>,
     /// Jobs queued or running, per entity: a wake settles when its job is
     /// done, even after the wake gave up on it.
     in_flight: InFlight,
     /// The token marks: restored at boot, raised by each job before its
     /// spend is handed over.
     marks: Marks,
+    /// Set by [`Mind::close`], under the `workers` lock: a wake racing the
+    /// shutdown cannot open `harvest.db` again after the close.
+    closed: AtomicBool,
+    /// How long [`Mind::close`] waits for a job in flight.
+    close_grace: Duration,
 }
 
 impl std::fmt::Debug for HarvestMind {
@@ -197,6 +211,8 @@ impl HarvestMind {
             workers: Mutex::new(HashMap::new()),
             in_flight: InFlight::default(),
             marks: Arc::default(),
+            closed: AtomicBool::new(false),
+            close_grace: CLOSE_GRACE,
         }
     }
 
@@ -256,14 +272,17 @@ impl HarvestMind {
         tools: &MudTools,
     ) -> Result<mpsc::Sender<Job>, MindError> {
         let mut workers = self.workers.lock().await;
-        if let Some(tx) = workers.get(entity).filter(|tx| !tx.is_closed()) {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(MindError::Unavailable("the MUD is shutting down".into()));
+        }
+        if let Some((tx, _)) = workers.get(entity).filter(|(tx, _)| !tx.is_closed()) {
             return Ok(tx.clone());
         }
         let (mut rt, id) = self.open(entity, tools)?;
         let (tx, mut rx) = mpsc::channel::<Job>(16);
         let (sink, who) = (Arc::clone(tools.usage_sink()), entity.clone());
         let (marks, history) = (Arc::clone(&self.marks), self.history);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Spend is measured from the last count that was charged, not
             // from the start of this job, so a job whose wake was abandoned
             // (or failed) is still paid for, and so are tokens spent before
@@ -331,7 +350,7 @@ impl HarvestMind {
                 }
             }
         });
-        workers.insert(entity.clone(), tx.clone());
+        workers.insert(entity.clone(), (tx.clone(), task));
         drop(workers);
         Ok(tx)
     }
@@ -388,6 +407,39 @@ impl Mind for HarvestMind {
     /// Resolves once the entity's jobs are done.
     fn settled(&self, entity: &EntityId) -> BoxFuture<'_, ()> {
         self.in_flight.settled(entity)
+    }
+
+    /// Ends every worker: its queue closes, the job in flight gets
+    /// [`CLOSE_GRACE`] to finish, and the task that owns the agent's
+    /// `harvest.db` ends, which closes the file and its write-ahead log.
+    /// A later wake is refused as `Unavailable`; it never opens the file
+    /// again.
+    ///
+    /// A job past the grace is aborted. Harvest runs a model call inside
+    /// `block_in_place`, so the abort lands only when that call returns:
+    /// the close waits one more grace for it, then leaves the task behind
+    /// rather than hang the shutdown.
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let workers = {
+                let mut held = self.workers.lock().await;
+                self.closed.store(true, Ordering::SeqCst);
+                std::mem::take(&mut *held)
+            };
+            for (entity, (tx, mut task)) in workers {
+                drop(tx);
+                if tokio::time::timeout(self.close_grace, &mut task)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(entity = %entity, "a harvest job outlived the shutdown; stopping it");
+                    task.abort();
+                    if tokio::time::timeout(self.close_grace, task).await.is_err() {
+                        tracing::warn!(entity = %entity, "a harvest model call did not end; leaving it");
+                    }
+                }
+            }
+        })
     }
 
     fn wake(

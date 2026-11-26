@@ -172,6 +172,17 @@ overdue by more than `booking_max_late_ms` (a day) is dropped. `cargo test
 -p mud-supervisor --test kill_restart` kills a real process at each of
 these points and checks it.
 
+A macro tick whose wake never reached the mind (it failed before any
+spend: lg did not start, say) comes again in about 3 minutes, then twice
+as long after each loss in a row, up to the cast's shortest interval. A
+retry resets the room's anti-chatter count only at its mind's first act,
+so a mind that stays down never reopens a held room. The
+`runtime::tick_tests` of `mud-supervisor` check it. When the server stops,
+the terminal sessions and the wakes still running end first, within 5 s
+each, and then it closes `world.db` and `accounts.db`, so the main files
+are complete and no `-wal` file is left. The `mud-server` test
+`closing_the_stores_leaves_complete_files_and_no_write_ahead_log` checks it.
+
 A character out cold is not limbo (ADR 0012). Everyone regains 1 HP a
 minute; in crypt-v01 an unconscious body also rolls HT each minute to come
 to, and the room sees it stir. While an agent is out cold its wakes wait:
@@ -347,7 +358,7 @@ flowchart LR
 |---|---|
 | The server owns physics | every change is `World::execute` of one parsed line; property test over random play keeps items and money conserved |
 | Information is local | each event names its recipients when emitted; `mud_events` returns only those |
-| Zero tokens in empty rooms | event-driven wakes; macro-ticks only with no player present; anti-chatter (proved) |
+| Zero tokens in empty rooms | event-driven wakes; a macro-tick waits only while another player acted in the room within `macro_defer_ms` (proved, ADR 0003); anti-chatter (proved) |
 | Untrusted speech is data | `untrusted_text` never enters narratives or cues; policy codes such as `POLICY_TRADE_REQUIRED` |
 | Setting-agnostic engine | rooms, items, skills, skill effects, traits, shops and their fixtures, posts, recovery, death and retreat rules, cast and scripts are pack data |
 | Secrets stay out of the world | passwords, hashes and tokens live in `mud-accounts`; tests check no event, `Audit`, snapshot, view or trace log holds one; every name gets the same `Password:` prompt and one bcrypt verify (proved route kernel, ADR 0009) |

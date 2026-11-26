@@ -281,6 +281,44 @@ fn each_open_bumps_boot_and_keeps_epoch() {
     }
 }
 
+/// A reader in another connection that holds `db` open in a read
+/// transaction, as `mud account` or a `sqlite3` shell can.
+fn reader_holding(db: &std::path::Path) -> Connection {
+    let r = Connection::open(db).unwrap();
+    r.execute_batch("BEGIN").unwrap();
+    let _: i64 = r
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    r
+}
+
+#[test]
+fn a_close_that_another_connection_blocks_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let (w, recent) = chatty(3);
+    let mut s = Store::open(&db, 7, 100).unwrap();
+    s.save("crypt", &w.snapshot(), &recent, &[], 100).unwrap();
+    let reader = reader_holding(&db);
+    // A write the reader's snapshot does not cover keeps the log in use.
+    s.save("crypt", &w.snapshot(), &recent, &[], 200).unwrap();
+    let err = s.close().unwrap_err();
+    assert!(matches!(err, StoreError::Busy { .. }), "{err}");
+    assert!(err.to_string().contains("another connection"), "{err}");
+    assert!(s.is_closed(), "closed all the same");
+    drop(reader);
+    // With no other connection the same close checkpoints the whole log.
+    let mut s = Store::open(&db, 7, 300).unwrap();
+    s.save("crypt", &w.snapshot(), &recent, &[], 300).unwrap();
+    s.close().unwrap();
+    assert!(
+        checkpoint_done(0, -1, -1),
+        "not in WAL mode: nothing to move"
+    );
+    assert!(!checkpoint_done(1, 4, 4), "blocked");
+    assert!(!checkpoint_done(0, 4, 3), "a page short");
+}
+
 #[test]
 fn a_new_world_db_mints_a_new_epoch() {
     let dir = tempfile::tempdir().unwrap();
@@ -569,7 +607,8 @@ fn a_side_op_commits_with_the_events_or_not_at_all() {
     };
     // A bad op (a plan's JSON cannot fail, so: a failing table) rolls
     // the whole commit back.
-    s.conn
+    s.conn()
+        .unwrap()
         .execute_batch(
             "CREATE TEMP TRIGGER no_seen BEFORE UPDATE OF seen_seq ON sup_entity
              BEGIN SELECT RAISE(ABORT, 'refused'); END;",
@@ -586,7 +625,10 @@ fn a_side_op_commits_with_the_events_or_not_at_all() {
     assert!(s.commit(&c).is_err());
     assert_eq!(s.event_count().unwrap(), 0, "no event without its op");
     assert!(s.load(10).unwrap().is_none(), "no snapshot either");
-    s.conn.execute_batch("DROP TRIGGER no_seen;").unwrap();
+    s.conn()
+        .unwrap()
+        .execute_batch("DROP TRIGGER no_seen;")
+        .unwrap();
     s.commit(&c).unwrap();
     assert_eq!(s.event_count().unwrap(), 3);
     assert_eq!(s.load_side().unwrap().entities[&ada()].seen_seq, 9);
@@ -839,7 +881,8 @@ fn a_crash_between_archive_and_delete_archives_each_event_once() {
     // commit.
     let rows: Vec<ArchiveRow> = {
         let mut q = s
-            .conn
+            .conn()
+            .unwrap()
             .prepare("SELECT seq, at_ms, body FROM events ORDER BY seq LIMIT 4")
             .unwrap();
         q.query_map([], |r| {

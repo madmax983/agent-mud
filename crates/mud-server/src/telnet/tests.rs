@@ -13,6 +13,8 @@ async fn shared_with(timeouts: Timeouts) -> Shared {
         presence: Arc::new(Presence::default()),
         accounts: accounts().await,
         timeouts,
+        sessions: tokio_util::task::TaskTracker::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     }
 }
 

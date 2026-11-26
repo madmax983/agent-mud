@@ -81,7 +81,7 @@ flowchart TB
 | Immediate | attack on the entity, a tell, a self-control nudge, speech naming it | 0–500 ms | wakes at once, bypasses AFK |
 | RoomBatch | player say/emote/enter/leave/drop in the room | 2–4 s rolling | one wake per burst |
 | Ambient | NPC activity while a player is present | 5–10 s + cooldown | selective attention, cooldown |
-| MacroTick | timer, 2–6 h ± 20% | none | only with no other player in the room (a hidden PC alone gets its own) |
+| MacroTick | timer, 2–6 h ± 20% | none | unless another player acted in the room within `macro_defer_ms` (10 min); an idle player does not hold it back, and a tick lost to an unavailable mind retries in minutes (ADR 0003) |
 
 **Anti-chatter.** Each room tracks `agent_only_turns` and
 `player_present`. A player event (human or agent PC) or a macro-tick

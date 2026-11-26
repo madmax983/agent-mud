@@ -1017,6 +1017,16 @@ impl Accounts {
             .await
     }
 
+    /// Closes `accounts.db` at shutdown ([`AccountStore::close`]): its
+    /// write-ahead log goes into the main file. Later calls fail with
+    /// [`AccountError::Closed`].
+    ///
+    /// # Errors
+    /// The checkpoint or the close failed.
+    pub async fn close(&self) -> Result<(), AccountError> {
+        self.store.close().await
+    }
+
     /// Login counts since start.
     #[must_use]
     pub fn stats(&self) -> AccountStatsView {

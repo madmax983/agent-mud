@@ -302,6 +302,14 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
         Box::pin(std::future::ready(()))
     }
 
+    /// Releases what the mind holds open (a database, a task) at
+    /// shutdown, once no new wake starts. A wake already running can race
+    /// it: refuse that wake as `Unavailable`, and never open again what
+    /// the close released. The default holds nothing.
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
     /// Restores the counters the mind persisted for `entity` (the scripted
     /// mind's rule counts), at boot, and returns the stale ones: counts of
     /// rules the mind no longer has (edited or removed), for the caller to

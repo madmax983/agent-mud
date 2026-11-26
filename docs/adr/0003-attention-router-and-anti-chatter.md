@@ -18,7 +18,7 @@ and decides, per recipient agent, whether and when to wake it.
 | RoomBatch | any player action in the room | rolling 2 s window, capped at 4 s from the first |
 | Ambient   | NPC or world activity | 5–10 s, plus the entity's cooldown |
 | Booked    | a wake the agent booked for itself (`mud_wake_me`, ADR 0008) | when due, if the agent is ready (see below) |
-| MacroTick | the slow timer (2–6 h, jittered) | only when no player is in the room |
+| MacroTick | the slow timer (2–6 h, jittered) | unless another player acted in the room within `macro_defer_ms` (amended 2026-11-26) |
 
 A **player** is any player character (`kind = player`), whoever plays it:
 a human, or an agent PC such as kestrel. Routing, anti-chatter and
@@ -125,3 +125,65 @@ A booking also waits while its agent is away for a spell (`afk_until`),
 offline, out cold or at its hard cap. No hold outlasts
 `booking_max_late_ms` past the booking's due time: after that the
 booking is dropped (ADR 0008, Live expiry).
+
+## Amended 2026-11-26: an idle player does not hold a macro tick back
+
+The owner's run of 2026-11-26 showed the old rule's hole. After a
+restart, kestrel (an agent PC, online, its mind not answering) and torin
+(a persistent NPC) stood in the flooded cistern. Torin's tick was
+"deferred: a player is present" every few minutes, forever: kestrel stood
+there and never acted, and nothing else happened in the room.
+
+The deferral exists because a present player's acts wake the agent
+anyway. So a player now defers an agent's macro tick only while it acts:
+
+- **The rule (`tick_deferred`, proved).** A tick waits exactly when a
+  player other than the entity acted in its room less than
+  `[supervisor] macro_defer_ms` (default 600000, 10 minutes of game time)
+  before it. An act is an event of the room whose actor is a player
+  present there now (`World::last_player_act`). The world keeps each
+  player's last act in each room beside the event log, so an act the
+  log has dropped (it holds 10000 events) still counts. A boot knows the
+  acts of the log it reloaded: when that log does not reach the world's
+  first event, its oldest time stands in for an act a present player may
+  have made before it, so a tick waits at most one window past that
+  time. With no such act it never
+  waits, and once the room is quiet for the window it stays undeferred as
+  the clock runs on (`lemma_quiet_stays_quiet`), so an idle player holds a
+  tick back for at most the window. A tick that waits is tried again in 2
+  to 10 minutes, as before.
+- **Players, not humans.** The rule reads who acted and when, from the
+  events (`player_actor`, `at_ms`), never `human` or a tier: a human
+  and an agent PC defer a tick alike, and an NPC beside either gets the
+  same wakes. It is deterministic: the times are the game clock's.
+- **A lost tick comes again soon (`tick_retry_ms`, proved).** A wake that
+  carried a tick and never reached the mind (a failure, `Unavailable` or
+  not, with no spend; a timeout is not one) used to leave the
+  next tick on the normal 2 to 6 hour schedule. Kestrel's one tick fired
+  at boot while the owner's lg was too old to start, and nothing woke it
+  again. Now the next tick comes after a delay that starts at 3 minutes
+  and doubles with each loss in a row, up to the cast's shortest interval
+  (2 hours in crypt-v01), with a deterministic jitter of up to a quarter
+  below it. No delay passes the cap, none is shorter than the one before,
+  and the `n`-th is at least `min(3 min * n, cap)`, so a broken lg is
+  tried less and less often, never every step. A wake that reaches the
+  mind ends the run; the schedule it fired under stays. The time is
+  stored as before (`SideOp::MacroSchedule`, `sup_entity.next_macro_ms`);
+  the run's length is kept in memory and starts over at a boot. The
+  observer feed shows nothing new.
+- **A failure after a spend is not a lost tick.** littleguy also answers
+  `Unavailable` when the daemon exits or its socket fails mid-turn, after
+  model calls ran. That wake reached the mind, and a retry in minutes
+  would spend again, so it keeps the normal schedule.
+- **A retry resets the room only when its mind acts.** A tick resets its
+  room's agent-only count (`ChatterInput::MacroTick`). A retry fires
+  while the entity's run of losses goes on, and it owes that reset
+  instead: the router pays it at the entity's first act, before the act
+  counts. A mind that stays down acts nothing, so it does not reopen a
+  held room at each retry, about every 3 to 96 minutes, and hand the
+  other agents there a fresh set of cross-agent turns each time. The
+  retry that reaches the mind and acts reopens the room as a tick does.
+  The reset lapses when the wake that carries the tick ends
+  (`Router::tick_wake_ended`): an act of a later wake is not the tick's
+  turn. The router may read the wake's own acts after the wake ends, so
+  the bound is the world's last seq at that end, not the time.

@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 use crate::admit::wake_expired;
 use crate::budget::{Budget, BudgetLevel, DAY_MS, SpendSource};
@@ -55,6 +56,7 @@ use crate::replay::replay_floor;
 use crate::router::{EntityRuntime, Priority, Resume, RouteNote, Router, RouterConfig, Wake};
 use crate::scripted::{FallbackMind, PlanMind};
 use crate::steward::{AutonomyView, GoalLine, StewardEvent, StewardNote};
+use crate::ticks::{TICK_RETRY_FIRST_MS, tick_retry_ms};
 use crate::turing::{Afk, in_session, mix, pick};
 use crate::wakes::WakeBook;
 
@@ -284,6 +286,10 @@ struct EntityState {
     /// boot delivers it, under its number, without queuing another.
     owed_at_boot: bool,
     next_macro_ms: u64,
+    /// The delay of the last retry of a lost macro tick, while its wakes
+    /// keep failing before they reach the mind ([`tick_retry_ms`]); 0
+    /// once a wake reaches it.
+    tick_retry_ms: u64,
     /// The replay floor at boot ([`replay_floor`]), then the last event
     /// seq a wake of this process carried.
     seen_seq: u64,
@@ -332,6 +338,10 @@ pub struct Supervisor {
     autonomy: Mutex<HashMap<EntityId, AutonomyView>>,
     /// The Steward's notes to each agent, for its next wake (a leaf lock).
     steward_notes: Mutex<HashMap<EntityId, Vec<StewardNote>>>,
+    /// Every wake and retention job [`Supervisor::step`] starts, so the
+    /// shutdown can wait for them ([`Supervisor::drain`]) before the
+    /// store closes.
+    tasks: TaskTracker,
 }
 
 /// Holds an entity busy for a short task of the Steward; dropping it ends
@@ -439,6 +449,7 @@ impl Supervisor {
             boot_report: Mutex::new(Vec::new()),
             autonomy: Mutex::new(HashMap::new()),
             steward_notes: Mutex::new(HashMap::new()),
+            tasks: TaskTracker::new(),
         })
     }
 
@@ -954,11 +965,19 @@ impl Supervisor {
     /// wake that carries it numbers it when it opens (`run_wake`), so two
     /// ticks can merge into one wake. A tick owed at boot goes out first,
     /// without queuing another.
+    ///
+    /// A tick fired while the entity's earlier ticks keep getting lost
+    /// ([`Supervisor::after_tick`]) is a retry: it resets the room's
+    /// anti-chatter count only at the entity's first act in its wake
+    /// ([`Router::macro_tick`]).
     pub fn fire_macro_tick(&self, entity: &EntityId) -> RouteNote {
         let now = self.game.now_ms();
+        let retry = lock(&self.state)
+            .get(entity)
+            .is_some_and(|s| s.tick_retry_ms != 0);
         let note = self
             .game
-            .read(|w| lock(&self.router).macro_tick(entity, w, now));
+            .read(|w| lock(&self.router).macro_tick(entity, w, now, retry));
         if matches!(note, RouteNote::Queued { .. }) {
             let op = lock(&self.state).get_mut(entity).map(|s| {
                 if s.owed_at_boot {
@@ -1063,7 +1082,9 @@ impl Supervisor {
             let (lo_ms, hi_ms) = (self.hours_ms(lo), self.hours_ms(hi));
             let wait = match note {
                 RouteNote::Queued { .. } => pick(h, lo_ms, hi_ms),
-                // A human was there: try again in a few minutes.
+                // A player acted there just now: try again in a few
+                // minutes. A wake that loses the tick comes back sooner
+                // (`after_tick`).
                 RouteNote::Dropped { .. } => pick(h, 120_000, 600_000),
             };
             let next_ms = now.saturating_add(wait.max(1));
@@ -1092,7 +1113,8 @@ impl Supervisor {
         }
     }
 
-    /// One pass of the clock. Returns the wake tasks it started.
+    /// One pass of the clock. Returns the wake tasks it started; each is
+    /// tracked for [`Supervisor::drain`] as well.
     ///
     /// The order matters for an agent that comes to: the world tick
     /// brings it to and the router queues its "came to" wake; the bookings
@@ -1119,14 +1141,14 @@ impl Supervisor {
             .into_iter()
             .map(|w| {
                 let me = Arc::clone(self);
-                tokio::spawn(async move { me.run_wake(w).await })
+                self.tasks.spawn(async move { me.run_wake(w).await })
             })
             .collect();
         if self.game.retention_due(now) {
             // Archive, then trim, old events off the async workers; each
             // batch holds only the store cell, so commands go on.
             let game = Arc::clone(&self.game);
-            tasks.push(tokio::task::spawn_blocking(move || {
+            tasks.push(self.tasks.spawn_blocking(move || {
                 // `retain` logs and counts its own failures.
                 let _ = game.retain(now);
             }));
@@ -1340,6 +1362,22 @@ impl Supervisor {
         (turn, ticks)
     }
 
+    /// The tools one wake of `entity` gets: its spend goes to the usage
+    /// sink, and it may book wakes when its tier allows that.
+    fn wake_tools(&self, entity: &EntityId) -> MudTools {
+        let tools = MudTools::new(
+            Arc::clone(&self.game),
+            Arc::clone(&self.gate),
+            entity.clone(),
+        )
+        .with_usage_sink(Arc::clone(&self.usage));
+        if self.can_book(entity) {
+            tools.with_wakes(Arc::clone(&self.wakes))
+        } else {
+            tools
+        }
+    }
+
     /// Runs one wake to the end and records it.
     ///
     /// The order is open, run, settle, close: the entity stays busy until
@@ -1384,15 +1422,7 @@ impl Supervisor {
                 ctx.goals = self.goal_lines(&wake.entity);
             }
         }
-        let mut tools = MudTools::new(
-            Arc::clone(&self.game),
-            Arc::clone(&self.gate),
-            wake.entity.clone(),
-        )
-        .with_usage_sink(Arc::clone(&self.usage));
-        if self.can_book(&wake.entity) {
-            tools = tools.with_wakes(Arc::clone(&self.wakes));
-        }
+        let tools = self.wake_tools(&wake.entity);
         let res = self
             .bounded(
                 &wake.entity,
@@ -1404,23 +1434,10 @@ impl Supervisor {
         // failure, littleguy's `no_answer` or a timeout is not one, unless
         // the op answered once read late (checked when it settles).
         let answered = matches!(&res, Some(Ok(r)) if !r.unanswered);
-        let (ok, reply) = match res {
-            Some(Ok(r)) => (true, r),
-            Some(Err(e)) => (
-                false,
-                MindReply {
-                    text: Some(e.to_string()),
-                    ..MindReply::default()
-                },
-            ),
-            None => (
-                false,
-                MindReply {
-                    text: Some("timed out".into()),
-                    ..MindReply::default()
-                },
-            ),
-        };
+        // Whether the wake failed: an error, not a timeout. A timeout is
+        // never a lost tick, because the mind was running.
+        let failed = matches!(&res, Some(Err(_)));
+        let (ok, reply) = reply_of(res);
         for notice in mind.take_notices() {
             self.report(ObserverEvent::MindNotice {
                 mind: mind.kind().to_owned(),
@@ -1431,6 +1448,11 @@ impl Supervisor {
         // The reply's spend, plus what the mind could not put in a reply: a
         // failed wake, or one dropped by the timeout above.
         let usage = reply.usage.plus(self.usage.take(&wake.entity));
+        // A lost wake never reached the mind: it failed before any spend
+        // (lg did not start, say). A wake that failed after it spent
+        // reached the mind, even when it ends `Unavailable` (lg exited
+        // mid-turn): a quick retry would spend again.
+        let lost = failed && usage.is_zero();
         let source = self.source(&wake.entity);
         let budget = {
             let mut st = lock(&self.state);
@@ -1452,6 +1474,66 @@ impl Supervisor {
         mind.settled(&wake.entity).await;
         let late = self.usage.take_answered_late(&wake.entity);
         self.close_wake(&wake.entity, &turn, answered || late);
+        let carried = wake.macro_tick && wake.resume.is_none();
+        self.after_tick(&wake.entity, carried, lost, self.game.now_ms());
+    }
+
+    /// After a wake ends: a macro tick it carried but lost (the wake never
+    /// reached the mind) comes again soon, and each loss in a row waits
+    /// twice as long, up to the entity's shortest normal interval
+    /// ([`tick_retry_ms`]). A wake that reached the mind ends the run of
+    /// losses; the schedule it fired under stays.
+    ///
+    /// Regression (the owner's run of 2026-11-26): kestrel's one tick
+    /// fired at boot while lg was too old to start, and the next came 2 to
+    /// 6 hours later.
+    ///
+    /// The wake's end also bounds the room reset a retried tick owes
+    /// ([`Router::tick_wake_ended`]).
+    fn after_tick(&self, entity: &EntityId, carried: bool, lost: bool, now: u64) {
+        if carried {
+            let seq = self.game.read(mud_world::World::last_seq);
+            lock(&self.router).tick_wake_ended(entity, seq);
+        }
+        if !lost {
+            if let Some(s) = lock(&self.state).get_mut(entity) {
+                s.tick_retry_ms = 0;
+            }
+            return;
+        }
+        if !carried {
+            return;
+        }
+        let [lo, _] = self
+            .game
+            .read(|w| {
+                w.pack()
+                    .cast
+                    .get(entity)
+                    .and_then(|c| c.mind.macro_tick_hours)
+            })
+            .unwrap_or([2.0, 6.0]);
+        let cap = self.hours_ms(lo).max(1);
+        let h = mix(
+            self.cfg.seed,
+            &[
+                entity.as_str().as_bytes(),
+                &now.to_le_bytes(),
+                b"macro-retry",
+            ],
+        );
+        let mut st = lock(&self.state);
+        let Some(s) = st.get_mut(entity) else { return };
+        let delay = tick_retry_ms(s.tick_retry_ms, TICK_RETRY_FIRST_MS, cap);
+        s.tick_retry_ms = delay;
+        let wait = pick(h, delay - delay / 4, delay).max(1);
+        s.next_macro_ms = s.next_macro_ms.min(now.saturating_add(wait));
+        let next_ms = s.next_macro_ms;
+        drop(st);
+        self.game.persist(vec![SideOp::MacroSchedule {
+            entity: entity.clone(),
+            next_ms,
+        }]);
     }
 
     /// Closes a wake whose mind has really finished ([`Mind::settled`]):
@@ -1549,6 +1631,44 @@ impl Supervisor {
                 out = &mut fut => return Some(out),
                 () = tokio::time::sleep(Duration::from_millis(left)) => {}
             }
+        }
+    }
+
+    /// Waits, at shutdown, for the wakes and retention jobs already
+    /// running, up to `within`. Call it once the clock task is stopped
+    /// and the minds are closed ([`Supervisor::close_minds`]): a wake
+    /// whose mind is gone ends at once, and its close (the turn, the
+    /// spend, the macro schedule) then reaches the store before the store
+    /// closes. Returns whether every task ended. A task still running
+    /// after `within` loses its last writes, as a crash would.
+    pub async fn drain(&self, within: Duration) -> bool {
+        self.tasks.close();
+        let done = tokio::time::timeout(within, self.tasks.wait())
+            .await
+            .is_ok();
+        if !done {
+            tracing::warn!(
+                running = self.tasks.len(),
+                "a wake outlived the shutdown; its last writes are lost"
+            );
+        }
+        done
+    }
+
+    /// Closes every mind ([`Mind::close`]) at shutdown, once the
+    /// supervisor's tasks are stopped: a harvest mind's workers end and
+    /// close their databases, and a wake still running fails at once.
+    /// Each mind is closed once, however many entities share it.
+    pub async fn close_minds(&self) {
+        let fallback: Arc<dyn Mind> = Arc::clone(&self.fallback) as Arc<dyn Mind>;
+        let mut once: Vec<Arc<dyn Mind>> = Vec::new();
+        for mind in self.minds.values().chain(std::iter::once(&fallback)) {
+            if !once.iter().any(|m| Arc::ptr_eq(m, mind)) {
+                once.push(Arc::clone(mind));
+            }
+        }
+        for mind in once {
+            mind.close().await;
         }
     }
 
@@ -1765,6 +1885,28 @@ impl Supervisor {
 /// The `Spend` op that stores `budget`'s day: absolute tallies, joined in
 /// the store by the proved [`crate::persist::budget_join`], so a retried,
 /// reordered or lost op never stores more than memory holds.
+/// Whether a wake's mind answered, and its reply: an error or a timeout
+/// becomes a reply that says so, with nothing to apply.
+fn reply_of<E: std::fmt::Display>(res: Option<Result<MindReply, E>>) -> (bool, MindReply) {
+    match res {
+        Some(Ok(r)) => (true, r),
+        Some(Err(e)) => (
+            false,
+            MindReply {
+                text: Some(e.to_string()),
+                ..MindReply::default()
+            },
+        ),
+        None => (
+            false,
+            MindReply {
+                text: Some("timed out".into()),
+                ..MindReply::default()
+            },
+        ),
+    }
+}
+
 fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>) -> SideOp {
     SideOp::Spend {
         entity: entity.clone(),
@@ -1789,3 +1931,8 @@ mod persist_tests;
 mod replay_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tick_tests;
+
+#[cfg(test)]
+mod shutdown_tests;

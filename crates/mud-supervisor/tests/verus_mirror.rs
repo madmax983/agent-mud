@@ -48,6 +48,11 @@ fn the_steward_proof_covers_the_shipped_kernels() -> TestResult {
 }
 
 #[test]
+fn the_ticks_proof_covers_the_shipped_kernels() -> TestResult {
+    proof_mirrors("ticks")
+}
+
+#[test]
 fn every_proof_module_is_checked() -> TestResult {
     every_proof_module_is_listed()
 }

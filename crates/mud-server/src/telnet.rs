@@ -212,6 +212,10 @@ pub struct Shared {
     pub accounts: Arc<Accounts>,
     /// The timeouts.
     pub timeouts: Timeouts,
+    /// Every session runs here, for the stop to wait on.
+    pub sessions: tokio_util::task::TaskTracker,
+    /// Cancelled when the server stops: each session ends on it.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 async fn handle(stream: TcpStream, from: SocketAddr, shared: Shared) -> std::io::Result<()> {
@@ -334,7 +338,8 @@ async fn play(
 }
 
 /// Serves telnet clients on `listener` until the task is aborted, with
-/// the default limits.
+/// the default limits. Aborting it stops the accept loop only; each
+/// session ends on `shared.shutdown`.
 pub async fn serve(listener: TcpListener, shared: Shared) {
     serve_limited(
         ConnLimiter::new(crate::MAX_CONNECTIONS, crate::MAX_CONNECTIONS_PER_ADDRESS),
@@ -362,9 +367,15 @@ pub async fn serve_limited(limiter: Arc<ConnLimiter>, listener: TcpListener, sha
                     }
                 };
                 let shared = shared.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle(stream, peer, shared).await {
-                        tracing::debug!(%peer, error = %e, "telnet session ended");
+                let stop = shared.shutdown.clone();
+                shared.sessions.clone().spawn(async move {
+                    // The stop ends the session where it waits; its drop
+                    // logs the player out before the store closes.
+                    tokio::select! {
+                        r = handle(stream, peer, shared) => if let Err(e) = r {
+                            tracing::debug!(%peer, error = %e, "telnet session ended");
+                        },
+                        () = stop.cancelled() => {}
                     }
                     drop(permit);
                 });

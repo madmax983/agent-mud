@@ -13,7 +13,7 @@ mod social;
 
 pub use script::{DECLINED, HookStatus, Inadmissible};
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use mud_rules::{recovery_rolls, recovery_step, self_control_roll, success_roll};
@@ -561,6 +561,24 @@ fn contiguous_tail(recent: Vec<Event>, last: u64) -> VecDeque<Event> {
     recent.into_iter().skip(skip).collect()
 }
 
+/// When each player last acted in each room, in game-clock ms.
+type PlayerActs = BTreeMap<EntityId, BTreeMap<RoomId, u64>>;
+
+/// Records `ev` in `acts` when a player acted with it in a room.
+fn note_player_act(acts: &mut PlayerActs, ev: &Event) {
+    if !ev.player_actor {
+        return;
+    }
+    if let (Some(room), Some(actor)) = (&ev.room, &ev.actor) {
+        let at = acts
+            .entry(actor.id.clone())
+            .or_default()
+            .entry(room.clone())
+            .or_insert(ev.at_ms);
+        *at = (*at).max(ev.at_ms);
+    }
+}
+
 /// A running world: the pack, the state, the dice and the recent events.
 #[derive(Debug, Clone)]
 pub struct World {
@@ -568,6 +586,14 @@ pub struct World {
     state: WorldState,
     dice: WorldDice,
     log: VecDeque<Event>,
+    /// When each player last acted in each room. It outlives the log
+    /// ([`EVENT_LOG_CAP`]), so an act the log has dropped still defers a
+    /// macro tick ([`World::last_player_act`]).
+    player_acts: PlayerActs,
+    /// The time before which acts are unknown: the reloaded log starts
+    /// there and does not reach the world's first event. `None` when the
+    /// log reaches it, or holds nothing.
+    acts_known_from_ms: Option<u64>,
     fresh: Vec<Event>,
     audit: Vec<Audit>,
     /// Ledger rows not yet saved: the store appends them with the events.
@@ -605,11 +631,18 @@ impl World {
         }
         let dice = WorldDice::seeded(state.dice_state);
         let log = contiguous_tail(recent, state.next_seq.saturating_sub(1));
+        let mut player_acts = PlayerActs::new();
+        for ev in &log {
+            note_player_act(&mut player_acts, ev);
+        }
+        let acts_known_from_ms = log.front().filter(|e| e.seq.0 > 1).map(|e| e.at_ms);
         Self {
             pack,
             state,
             dice,
             log,
+            player_acts,
+            acts_known_from_ms,
             fresh: Vec::new(),
             audit: Vec::new(),
             mints: Vec::new(),
@@ -699,6 +732,34 @@ impl World {
         self.state.entities.values().any(|e| {
             e.kind == EntityKind::Player && e.present() && &e.room == room && &e.id != except
         })
+    }
+
+    /// When a player character other than `except` last acted in `room`,
+    /// at or after `since_ms`: the newest act there of a player present
+    /// there now. `None` when no such player acted since then. A human and
+    /// an agent-played PC count alike.
+    ///
+    /// The acts outlive the in-memory log. A boot knows only the acts of
+    /// the log it reloaded: when that log starts at or after `since_ms`
+    /// and does not reach the world's first event, a present player may
+    /// have acted before it, unseen. Its start then stands in for that
+    /// act, the safe direction: a tick waits at most one window past it.
+    #[must_use]
+    pub fn last_player_act(&self, room: &RoomId, except: &EntityId, since_ms: u64) -> Option<u64> {
+        let mut present = self
+            .state
+            .entities
+            .values()
+            .filter(|e| {
+                e.kind == EntityKind::Player && e.present() && &e.room == room && &e.id != except
+            })
+            .peekable();
+        present.peek()?;
+        present
+            .filter_map(|e| self.player_acts.get(&e.id)?.get(room).copied())
+            .filter(|at| *at >= since_ms)
+            .max()
+            .or_else(|| self.acts_known_from_ms.filter(|from| since_ms <= *from))
     }
 
     /// The entities present in `room`.
@@ -1071,6 +1132,7 @@ impl World {
             player_actor,
             party_rooms,
         };
+        note_player_act(&mut self.player_acts, &event);
         self.log.push_back(event.clone());
         while self.log.len() > EVENT_LOG_CAP {
             self.log.pop_front();

@@ -71,6 +71,11 @@ pub struct Mud {
     pub public_url: Option<String>,
     /// Whether `[server] trusted_proxies` is set.
     pub trusted_proxies: bool,
+    /// Every terminal session, web and telnet. Each ends when `shutdown`
+    /// is cancelled, and the stop waits for them ([`crate::shut_down`]):
+    /// a session's last command and its logout reach the store before
+    /// the store closes.
+    pub sessions: tokio_util::task::TaskTracker,
 }
 
 impl Mud {
@@ -478,45 +483,68 @@ async fn terminal(
     let slot = app.as_ref().map(|a| a.limiter.try_acquire(addr));
     move |mut socket: WebSocket| async move {
         let Some(app) = app else { return };
-        let _slot = match slot {
-            Some(Ok(s)) => s,
-            Some(Err(refusal)) => {
-                let _ = socket.send(error_msg(&refusal.to_string())).await;
-                close(&mut socket, CloseKind::Policy).await;
-                return;
-            }
-            None => return,
+        // Counted until the socket ends, for the stop to wait on.
+        let _live = app.sessions.token();
+        let stop = app.shutdown.clone();
+        let stopped = tokio::select! {
+            () = connect(&app, &mut socket, slot, origin_ok, who) => false,
+            () = stop.cancelled() => true,
         };
-        if !origin_ok {
+        if stopped {
             let _ = socket
-                .send(error_msg(
-                    "This terminal only accepts connections from its own page.",
-                ))
+                .send(error_msg("The MUD is shutting down. Farewell."))
                 .await;
-            close(&mut socket, CloseKind::Policy).await;
+            close(&mut socket, CloseKind::Normal).await;
+        }
+    }
+}
+
+/// One terminal socket: the slot and origin checks, the login, then play.
+async fn connect(
+    app: &Mud,
+    socket: &mut WebSocket,
+    slot: Option<Result<crate::limits::ConnSlot, crate::limits::Refusal>>,
+    origin_ok: bool,
+    who: mud_accounts::Peer,
+) {
+    let _slot = match slot {
+        Some(Ok(s)) => s,
+        Some(Err(refusal)) => {
+            let _ = socket.send(error_msg(&refusal.to_string())).await;
+            close(socket, CloseKind::Policy).await;
             return;
         }
-        let Some(auth) = login(&app, &mut socket, who).await else {
+        None => return,
+    };
+    if !origin_ok {
+        let _ = socket
+            .send(error_msg(
+                "This terminal only accepts connections from its own page.",
+            ))
+            .await;
+        close(socket, CloseKind::Policy).await;
+        return;
+    }
+    let Some(auth) = login(app, socket, who).await else {
+        return;
+    };
+    let (session, greet) = match Session::login(
+        Arc::clone(&app.game),
+        Arc::clone(&app.presence),
+        Arc::clone(&app.accounts),
+        auth,
+        who,
+        Transport::Web,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = socket.send(error_msg(&format!("{e}. Farewell."))).await;
+            close(socket, CloseKind::Policy).await;
             return;
-        };
-        let (session, greet) = match Session::login(
-            Arc::clone(&app.game),
-            Arc::clone(&app.presence),
-            Arc::clone(&app.accounts),
-            auth,
-            who,
-            Transport::Web,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = socket.send(error_msg(&format!("{e}. Farewell."))).await;
-                close(&mut socket, CloseKind::Policy).await;
-                return;
-            }
-        };
-        if send_lines(&mut socket, &greet).await {
-            play(&app, &mut socket, session).await;
         }
+    };
+    if send_lines(socket, &greet).await {
+        play(app, socket, session).await;
     }
 }
 

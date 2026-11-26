@@ -67,7 +67,9 @@ That stays, and is now tested against the littleguy socket protocol.
   goes on.
 - **A PC's macro-tick counts the other players.** The tick is deferred
   only when a player other than the entity itself is in its room
-  (`World::player_present_except`).
+  (`World::player_present_except`). Amended 2026-11-26 (ADR 0003): only
+  when such a player acted there within `macro_defer_ms`
+  (`World::last_player_act`, `tick_deferred`).
 - **A body's line is the world's.** The engine names its lines about a
   body by verb: `collapse`, `stagger`, `die`, `respawn` (`BODY_VERBS`,
   `Event::is_body_line`). The proved kernel `chatter_input_for` classifies
