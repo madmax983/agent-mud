@@ -532,6 +532,34 @@ async fn the_observer_feed_ends_when_shutdown_begins() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_ends_and_logs_out_when_shutdown_begins() {
+    // The stop waits for each session (`Mud::sessions`) before the store
+    // closes, so a session must end on the token, not outlive it.
+    let (addr, built) = boot().await;
+    let mut ada = ws(addr).await;
+    register(&mut ada, "ada", false).await;
+    let online = |b: &Built| {
+        b.mud.game.read(|w| {
+            w.state()
+                .entities
+                .values()
+                .filter(|e| e.human && e.online)
+                .count()
+        })
+    };
+    assert_eq!(online(&built), 1);
+    assert!(!built.mud.sessions.is_empty(), "the session is tracked");
+    built.mud.shutdown.cancel();
+    assert_eq!(until(&mut ada, "shutting down").await["kind"], "error");
+    assert_eq!(close_code(&mut ada).await, Some(1000));
+    built.mud.sessions.close();
+    tokio::time::timeout(Duration::from_secs(3), built.mud.sessions.wait())
+        .await
+        .expect("the session ended");
+    assert_eq!(online(&built), 0, "its drop logged ada out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn littleguy_pages_need_the_token_and_a_littleguy() {
     let (addr, built) = boot().await;
     let anon = http()

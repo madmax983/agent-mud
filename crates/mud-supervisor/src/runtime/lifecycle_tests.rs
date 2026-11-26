@@ -559,7 +559,7 @@ fn a_forced_cause_survives_the_drop_of_read_events() {
     let rt = HashMap::new();
     r.game.read(|w| router.observe(&ev, w, &rt, now));
     // Torin is away from any player: the tick queues.
-    let tick = r.game.read(|w| router.macro_tick(&torin(), w, now));
+    let tick = r.game.read(|w| router.macro_tick(&torin(), w, now, false));
     assert!(matches!(tick, RouteNote::Queued { .. }), "{tick:?}");
     router.finish_seen(&torin(), now, tell);
     let left = router.due(now + 60_000);

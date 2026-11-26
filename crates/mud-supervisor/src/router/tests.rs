@@ -213,7 +213,7 @@ fn macro_ticks_wait_while_an_agent_pc_is_in_the_room() {
     let mut r = Router::new(RouterConfig::default());
     let kestrel = id("pc_kestrel");
     w.bring_online(&kestrel, 1);
-    let note = r.macro_tick(&id("marta"), &w, 5);
+    let note = r.macro_tick(&id("marta"), &w, 5, false);
     assert!(
         matches!(note, RouteNote::Dropped { ref why, .. } if why.contains("player")),
         "{note:?}"
@@ -242,7 +242,7 @@ fn the_cistern_after_a_restart(humans: &[&str]) -> (World, Vec<EntityId>) {
 }
 
 fn tick(r: &mut Router, w: &World, who: &str, now: u64) -> RouteNote {
-    r.macro_tick(&id(who), w, now)
+    r.macro_tick(&id(who), w, now, false)
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn a_hidden_pc_alone_gets_its_macro_tick() {
     let mut r = Router::new(RouterConfig::default());
     let kestrel = id("pc_kestrel");
     w.bring_online(&kestrel, 1);
-    let note = r.macro_tick(&kestrel, &w, 5);
+    let note = r.macro_tick(&kestrel, &w, 5, false);
     assert!(matches!(note, RouteNote::Queued { .. }), "{note:?}");
     assert!(
         r.due(5)
@@ -365,7 +365,7 @@ fn a_hidden_pc_alone_gets_its_macro_tick() {
     run(&mut w, &mut r, &HashMap::new(), &ada, "e", 7);
     r.finish(&kestrel, 7);
     r.pending.clear();
-    let note = r.macro_tick(&kestrel, &w, 8);
+    let note = r.macro_tick(&kestrel, &w, 8, false);
     assert!(
         matches!(note, RouteNote::Dropped { ref why, .. } if why.contains("player")),
         "another player still defers it: {note:?}"
@@ -572,7 +572,7 @@ fn soft_budget_drops_ambient_and_doubles_cooldown() {
 fn macro_ticks_wait_while_a_player_acts_in_the_room() {
     let mut w = world();
     let mut r = Router::new(RouterConfig::default());
-    let note = r.macro_tick(&id("torin"), &w, 5);
+    let note = r.macro_tick(&id("torin"), &w, 5, false);
     assert!(matches!(
         note,
         RouteNote::Queued {
@@ -585,8 +585,32 @@ fn macro_ticks_wait_while_a_player_acts_in_the_room() {
     r.finish(&id("torin"), 6);
     let ada = w.login("ada", 7).unwrap();
     w.execute(&ada, "w", 8);
-    let note = r.macro_tick(&id("torin"), &w, 9);
+    let note = r.macro_tick(&id("torin"), &w, 9, false);
     assert!(matches!(note, RouteNote::Dropped { .. }));
+}
+
+#[test]
+fn a_retried_macro_tick_does_not_reopen_a_held_room() {
+    // A tick whose wake never reached the mind comes again in minutes
+    // (`tick_retry_ms`). The tick it retries reset the room already; the
+    // retry must not hand the other agents a fresh set of turns each time.
+    let w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let smithy = RoomId::from("smithy");
+    let max = r.config().max_agent_only_turns;
+    r.rooms.insert(
+        smithy.clone(),
+        RoomChatter {
+            agent_only_turns: max,
+        },
+    );
+    let note = r.macro_tick(&id("torin"), &w, 5, true);
+    assert!(matches!(note, RouteNote::Queued { .. }), "{note:?}");
+    assert!(r.due(5).iter().any(|wake| wake.macro_tick), "still a tick");
+    assert_eq!(r.agent_only_turns(&smithy), max, "the room stays held");
+    r.finish(&id("torin"), 6);
+    r.macro_tick(&id("torin"), &w, 7, false);
+    assert_eq!(r.agent_only_turns(&smithy), 0, "a scheduled tick resets it");
 }
 
 #[test]
@@ -594,7 +618,7 @@ fn a_macro_tick_keeps_its_identity_inside_a_merged_wake() {
     let w = world();
     let mut r = Router::new(RouterConfig::default());
     r.force(&id("torin"), Priority::RoomBatch, "leave by ada", 0);
-    r.macro_tick(&id("torin"), &w, 5);
+    r.macro_tick(&id("torin"), &w, 5, false);
     let wakes = r.due(5);
     assert_eq!(wakes[0].priority, Priority::RoomBatch);
     assert!(wakes[0].macro_tick, "{wakes:?}");

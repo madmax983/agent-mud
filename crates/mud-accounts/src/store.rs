@@ -264,8 +264,9 @@ impl AccountStore {
     /// [`AccountError::Closed`]; a second close does nothing.
     ///
     /// # Errors
-    /// The checkpoint or the close failed; the connection is dropped all
-    /// the same.
+    /// The checkpoint or the close failed, or another connection held the
+    /// log ([`AccountError::Busy`]); the connection is dropped all the
+    /// same.
     pub async fn close(&self) -> Result<(), AccountError> {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
@@ -275,11 +276,24 @@ impl AccountStore {
             };
             let checkpoint = c
                 .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                    r.get::<_, i64>(0)
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })
-                .map_err(AccountError::from);
+                .map_err(AccountError::from)
+                .and_then(|(busy, log, checkpointed)| {
+                    // A blocked checkpoint is a row with busy = 1, not an
+                    // error; a file not in WAL mode answers -1 for both.
+                    if busy == 0 && checkpointed >= log {
+                        Ok(())
+                    } else {
+                        Err(AccountError::Busy { log, checkpointed })
+                    }
+                });
             let closed = c.close().map_err(|(_, e)| AccountError::from(e));
-            checkpoint.and(closed).map(drop)
+            checkpoint.and(closed)
         })
         .await?
     }
@@ -693,6 +707,35 @@ mod tests {
             now: 5,
             must_change: false,
         }
+    }
+
+    #[tokio::test]
+    async fn a_close_that_another_connection_blocks_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.db");
+        let (s, _) = AccountStore::open(&path, 50).unwrap();
+        let k = key("ada");
+        s.call(move |c| insert(c, &new(&k, "Ada"), None, 5).map(drop))
+            .await
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        let k = key("bo");
+        s.call(move |c| insert(c, &new(&k, "Bo"), None, 5).map(drop))
+            .await
+            .unwrap();
+        let err = s.close().await.unwrap_err();
+        assert!(matches!(err, AccountError::Busy { .. }), "{err}");
+        assert!(matches!(
+            s.call(|_| Ok(())).await,
+            Err(AccountError::Closed)
+        ));
+        drop(reader);
+        let (s, _) = AccountStore::open(&path, 50).unwrap();
+        s.close().await.unwrap();
     }
 
     #[test]

@@ -660,3 +660,112 @@ fn purges_come_at_most_once_per_interval_and_never_with_keep_days_zero() {
     let keep = HarvestHistory { keep_days: 0, ..h };
     assert!(!purge_due(keep, None, 0), "0 keeps every run");
 }
+
+fn wake_of(game: &Game, torin: &EntityId, wake_id: &str) -> WakeContext {
+    WakeContext {
+        entity: torin.clone(),
+        name: "Torin".into(),
+        priority: Priority::Booked,
+        reason: "test".into(),
+        events: vec![],
+        event_views: vec![],
+        look: game.look(torin),
+        you: serde_json::Value::Null,
+        macro_tick: false,
+        macro_ticks: 0,
+        login: false,
+        wake_id: wake_id.into(),
+        now_ms: 0,
+        goals: Vec::new(),
+        steward: Vec::new(),
+        booked: Vec::new(),
+    }
+}
+
+fn wal_len(db: &std::path::Path) -> u64 {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    std::fs::metadata(std::path::PathBuf::from(wal)).map_or(0, |m| m.len())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_ends_each_worker_closes_harvest_db_and_refuses_later_wakes() {
+    let game = Game::new(
+        World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let mind = HarvestMind::new(
+        Arc::new(Scripted::default()) as Arc<dyn AgentModel>,
+        Some(dir.path().to_path_buf()),
+        smith(torin.clone()),
+    );
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
+    mind.wake(wake_of(&game, &torin, "wake-torin-0-1"), tools.clone())
+        .await
+        .unwrap();
+    let db = dir.path().join("torin/harvest.db");
+    assert!(wal_len(&db) > 0, "the open worker holds a log");
+    mind.close().await;
+    assert_eq!(wal_len(&db), 0, "the worker's end closed harvest.db");
+    // A wake that races the shutdown never opens the file again.
+    let late = mind
+        .wake(wake_of(&game, &torin, "wake-torin-0-2"), tools)
+        .await;
+    assert!(
+        matches!(&late, Err(MindError::Unavailable(m)) if m.contains("shutting down")),
+        "{late:?}"
+    );
+    assert!(mind.workers.lock().await.is_empty(), "no new worker");
+    assert_eq!(wal_len(&db), 0);
+    mind.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_stops_a_job_that_outlives_the_grace() {
+    let game = Game::new(
+        World::new(Arc::new(WorldPack::crypt_v01().unwrap()), 1),
+        None,
+        Arc::new(ManualClock::new(1_000)),
+    );
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let torin = EntityId::from("torin");
+    let model = Arc::new(Held::default());
+    let mut mind = HarvestMind::new(
+        Arc::clone(&model) as Arc<dyn AgentModel>,
+        None,
+        smith(torin.clone()),
+    );
+    mind.close_grace = std::time::Duration::from_millis(100);
+    let mind = Arc::new(mind);
+    let tools = MudTools::new(Arc::clone(&game), typing, torin.clone());
+    let waking = {
+        let (mind, ctx) = (Arc::clone(&mind), wake_of(&game, &torin, "wake-torin-0-1"));
+        tokio::spawn(async move { mind.wake(ctx, tools).await })
+    };
+    // The job is in flight once the worker exists and has not settled.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while mind.workers.lock().await.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The model call never returns: the close gives up on it after two
+    // graces, and does not hang the shutdown.
+    tokio::time::timeout(std::time::Duration::from_secs(5), mind.close())
+        .await
+        .expect("the close does not wait on the stuck job");
+    assert!(mind.workers.lock().await.is_empty());
+    // Once the call returns, the aborted worker ends and the wake with it.
+    model.go.notify_one();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), waking)
+        .await
+        .expect("the wake ends");
+    tokio::time::timeout(std::time::Duration::from_secs(5), mind.settled(&torin))
+        .await
+        .expect("the stopped job settled");
+}

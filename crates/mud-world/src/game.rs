@@ -492,7 +492,8 @@ impl Game {
     /// Closes the store at shutdown: writes what the backlog still holds,
     /// with a snapshot, then checkpoints the write-ahead log into the main
     /// file and closes it ([`Store::close`]). Call it once nothing else
-    /// runs a command; a later write fails with [`StoreError::Closed`],
+    /// runs a command (the server ends its sessions and drains its wakes
+    /// first); a later write fails with [`StoreError::Closed`],
     /// is counted and logged, and is lost as a crash would lose it. A
     /// turn still open is dropped the same way: the next boot owes its
     /// obligations again. No-op without a store, or a second time.

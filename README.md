@@ -168,13 +168,19 @@ booking fires once. A plan made by a macro tick, a booking or a login
 resumes at its cursor however long the server was down; a reactive plan
 older than `[supervisor] replay_max_age_ms` (120 s) is dropped. A missed
 macro tick fires once within `catchup_spread_ms` of boot, and a booking
-overdue by more than `booking_max_late_ms` (a day) is dropped. A macro tick
-whose wake never reached the mind (lg did not start) comes again in about 3
-minutes, then twice as long after each loss in a row, up to the cast's
-shortest interval. When the server stops it closes `world.db` and
-`accounts.db`, so the main files are complete and no `-wal` file is left. `cargo test
+overdue by more than `booking_max_late_ms` (a day) is dropped. `cargo test
 -p mud-supervisor --test kill_restart` kills a real process at each of
 these points and checks it.
+
+A macro tick whose wake never reached the mind (it failed before any
+spend: lg did not start, say) comes again in about 3 minutes, then twice
+as long after each loss in a row, up to the cast's shortest interval. A
+retry does not reset the room's anti-chatter count again. The
+`runtime::tick_tests` of `mud-supervisor` check it. When the server stops,
+the terminal sessions and the wakes still running end first, within 5 s
+each, and then it closes `world.db` and `accounts.db`, so the main files
+are complete and no `-wal` file is left. The `mud-server` test
+`closing_the_stores_leaves_complete_files_and_no_write_ahead_log` checks it.
 
 A character out cold is not limbo (ADR 0012). Everyone regains 1 HP a
 minute; in crypt-v01 an unconscious body also rolls HT each minute to come

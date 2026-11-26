@@ -17,10 +17,12 @@ use crate::mind::{BoxFuture, MindError};
 const HOUR: u64 = 3_600_000;
 
 /// A mind that is up or down: down, every wake fails as an `lg serve`
-/// that exits at start does.
+/// that exits at start does. With `spends`, a down wake fails only after
+/// it spent, as an `lg serve` that exits mid-turn does.
 #[derive(Debug, Default)]
 struct Switch {
     down: AtomicBool,
+    spends: AtomicBool,
     wakes: AtomicU32,
 }
 
@@ -29,9 +31,19 @@ impl Mind for Switch {
         "switch"
     }
 
-    fn wake(&self, _: WakeContext, _: MudTools) -> BoxFuture<'_, Result<MindReply, MindError>> {
+    fn wake(&self, _: WakeContext, tools: MudTools) -> BoxFuture<'_, Result<MindReply, MindError>> {
         self.wakes.fetch_add(1, Ordering::SeqCst);
         let down = self.down.load(Ordering::SeqCst);
+        if down && self.spends.load(Ordering::SeqCst) {
+            tools.usage_sink().add(
+                &torin(),
+                Usage {
+                    calls: 1,
+                    input_tokens: 500,
+                    ..Usage::default()
+                },
+            );
+        }
         Box::pin(async move {
             if down {
                 Err(MindError::Unavailable(
@@ -196,4 +208,73 @@ async fn retries_never_come_sooner_than_the_last_and_stop_at_the_cast_range() {
     }
     assert!(last >= 90 * 60_000, "reached the cap: {last}");
     assert_eq!(mind.wakes.load(Ordering::SeqCst), 11);
+}
+
+#[tokio::test]
+async fn an_unavailable_wake_that_spent_is_not_a_lost_tick() {
+    // lg can exit, or its socket fail, after the turn's model calls ran.
+    // That wake reached the mind: a retry in minutes would spend again.
+    let disk = Disk::new();
+    let mind = Arc::new(Switch::default());
+    mind.down.store(true, Ordering::SeqCst);
+    mind.spends.store(true, Ordering::SeqCst);
+    let mut r = start(&disk, T0, ticking(), only_torin(&mind));
+    let mut at = 0;
+    r.run_for(2_000, 500).await;
+    assert_eq!(last_wake_end(&r.feed(), &mut at), Some(false));
+    assert_eq!(mind.wakes.load(Ordering::SeqCst), 1);
+    let wait = next_macro(&r) - at;
+    assert!(
+        (2 * HOUR..=6 * HOUR).contains(&wait),
+        "the normal schedule, not a retry: {wait}"
+    );
+    assert!(
+        entity(&r, "torin")["budget"]["tokens"].as_u64().unwrap() >= 500,
+        "the spend was charged"
+    );
+}
+
+#[tokio::test]
+async fn a_retried_tick_does_not_reopen_a_room_held_at_the_bound() {
+    // Each retry of a lost tick used to reset the room's anti-chatter
+    // count, about every 3 to 96 minutes while the mind stayed down.
+    let disk = Disk::new();
+    let mind = Arc::new(Switch::default());
+    mind.down.store(true, Ordering::SeqCst);
+    let mut r = start(&disk, T0, ticking(), only_torin(&mind));
+    let mut at = 0;
+    // The first tick fires at boot, resets the smithy and is lost.
+    r.run_for(2_000, 500).await;
+    assert_eq!(last_wake_end(&r.feed(), &mut at), Some(false));
+    // Then the smithy's agent-only turns are spent.
+    for l in ["say one", "say two", "say three"] {
+        assert!(r.game.execute(&torin(), l).ok, "{l}");
+    }
+    r.run_for(0, 1).await;
+    let max = r.sup.cfg.router.max_agent_only_turns;
+    let smithy = RoomId::from("smithy");
+    let held = lock(&r.sup.router).agent_only_turns(&smithy);
+    assert!(held >= max, "held at the bound: {held}");
+    // The retry fires, and is lost again: the room stays held.
+    let due = next_macro(&r);
+    r.clock.advance(due - r.game.now_ms());
+    r.run_for(1_000, 500).await;
+    assert_eq!(mind.wakes.load(Ordering::SeqCst), 2, "the retry fired");
+    assert_eq!(last_wake_end(&r.feed(), &mut at), Some(false));
+    assert_eq!(lock(&r.sup.router).agent_only_turns(&smithy), held);
+    // Once a wake reaches the mind, the next scheduled tick resets it.
+    mind.down.store(false, Ordering::SeqCst);
+    let due = next_macro(&r);
+    r.clock.advance(due - r.game.now_ms());
+    r.run_for(1_000, 500).await;
+    assert_eq!(last_wake_end(&r.feed(), &mut at), Some(true));
+    for l in ["say four", "say five", "say six"] {
+        assert!(r.game.execute(&torin(), l).ok, "{l}");
+    }
+    r.run_for(0, 1).await;
+    let due = next_macro(&r);
+    r.clock.advance(due - r.game.now_ms());
+    r.run_for(1_000, 500).await;
+    assert_eq!(mind.wakes.load(Ordering::SeqCst), 4);
+    assert_eq!(lock(&r.sup.router).agent_only_turns(&smithy), 0);
 }

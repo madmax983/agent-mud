@@ -151,8 +151,8 @@ anyway. So a player now defers an agent's macro tick only while it acts:
   and an agent PC defer a tick alike, and an NPC beside either gets the
   same wakes. It is deterministic: the times are the game clock's.
 - **A lost tick comes again soon (`tick_retry_ms`, proved).** A wake that
-  carried a tick and never reached the mind (`MindError::Unavailable`, or
-  a failure before any spend; a timeout is not one) used to leave the
+  carried a tick and never reached the mind (a failure, `Unavailable` or
+  not, with no spend; a timeout is not one) used to leave the
   next tick on the normal 2 to 6 hour schedule. Kestrel's one tick fired
   at boot while the owner's lg was too old to start, and nothing woke it
   again. Now the next tick comes after a delay that starts at 3 minutes
@@ -165,3 +165,14 @@ anyway. So a player now defers an agent's macro tick only while it acts:
   stored as before (`SideOp::MacroSchedule`, `sup_entity.next_macro_ms`);
   the run's length is kept in memory and starts over at a boot. The
   observer feed shows nothing new.
+- **A failure after a spend is not a lost tick.** littleguy also answers
+  `Unavailable` when the daemon exits or its socket fails mid-turn, after
+  model calls ran. That wake reached the mind, and a retry in minutes
+  would spend again, so it keeps the normal schedule.
+- **A retry does not reset the room.** A tick resets its room's
+  agent-only count (`ChatterInput::MacroTick`). A retry fires while the
+  entity's run of losses goes on, and it skips that reset: the tick it
+  retries reset the room already. Otherwise a mind that stays down would
+  reopen a held room at each retry, about every 3 to 96 minutes, and hand
+  the other agents there a fresh set of cross-agent turns each time, while
+  the broken entity never takes one.

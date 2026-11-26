@@ -303,7 +303,9 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
     }
 
     /// Releases what the mind holds open (a database, a task) at
-    /// shutdown, once no wake runs. The default holds nothing.
+    /// shutdown, once no new wake starts. A wake already running can race
+    /// it: refuse that wake as `Unavailable`, and never open again what
+    /// the close released. The default holds nothing.
     fn close(&self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::ready(()))
     }

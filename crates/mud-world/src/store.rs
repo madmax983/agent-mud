@@ -38,6 +38,19 @@ pub enum StoreError {
     /// The store was closed ([`Store::close`]): the server is stopping.
     #[error("the world store is closed")]
     Closed,
+    /// [`Store::close`] could not move the whole write-ahead log into the
+    /// main file: another connection (`mud account`, a `sqlite3` shell, a
+    /// backup) holds it open. Nothing is lost; the log stays beside the
+    /// file until the last connection closes.
+    #[error(
+        "the write-ahead log was not fully checkpointed ({checkpointed} of {log} pages): another connection holds world.db open"
+    )]
+    Busy {
+        /// The pages in the log.
+        log: i64,
+        /// The pages moved into the main file.
+        checkpointed: i64,
+    },
     /// The file was written by a newer server.
     #[error(
         "the world database has schema version {found}; this server knows versions up to {SCHEMA_VERSION}: run a newer server, or restore a backup"
@@ -312,19 +325,31 @@ impl Store {
     /// `world.db-wal` (the owner's run of 2026-11-26).
     ///
     /// # Errors
-    /// The checkpoint or the close failed. The connection is dropped all
-    /// the same: SQLite finishes the log at the next open.
+    /// The checkpoint or the close failed, or another connection held the
+    /// log ([`StoreError::Busy`]). The connection is dropped all the same:
+    /// SQLite finishes the log at the next open.
     pub fn close(&mut self) -> Result<(), StoreError> {
         let Some(conn) = self.conn.take() else {
             return Ok(());
         };
         let checkpoint = conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                r.get::<_, i64>(0)
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })
-            .map_err(StoreError::from);
+            .map_err(StoreError::from)
+            .and_then(|(busy, log, checkpointed)| {
+                if checkpoint_done(busy, log, checkpointed) {
+                    Ok(())
+                } else {
+                    Err(StoreError::Busy { log, checkpointed })
+                }
+            });
         let closed = conn.close().map_err(|(_, e)| StoreError::from(e));
-        checkpoint.and(closed).map(drop)
+        checkpoint.and(closed)
     }
 
     /// Whether [`Store::close`] ran.
@@ -717,6 +742,17 @@ impl Store {
             _ => None,
         })
     }
+}
+
+/// Whether a checkpoint moved the whole log into the main file.
+///
+/// The arguments are the row of `PRAGMA wal_checkpoint` (`busy`, `log`,
+/// `checkpointed`). A blocked checkpoint is a row with `busy = 1`, not an
+/// error. A database not in WAL mode (in memory) answers `-1` for both
+/// counts.
+#[must_use]
+pub const fn checkpoint_done(busy: i64, log: i64, checkpointed: i64) -> bool {
+    busy == 0 && checkpointed >= log
 }
 
 #[cfg(test)]

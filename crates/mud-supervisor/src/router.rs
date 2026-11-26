@@ -763,7 +763,18 @@ impl Router {
     /// that player's acts wake the entity anyway. An idle player, human or
     /// agent, does not hold it back past the window. A hidden PC is a
     /// player, and alone it still gets its quiet wakes.
-    pub fn macro_tick(&mut self, entity: &EntityId, world: &World, now: u64) -> RouteNote {
+    ///
+    /// A tick resets its room's anti-chatter count, unless it is a
+    /// `retry` of a tick whose wake never reached the mind: the tick it
+    /// retries reset the room already, and a mind that stays down must
+    /// not reopen a held room every few minutes.
+    pub fn macro_tick(
+        &mut self,
+        entity: &EntityId,
+        world: &World,
+        now: u64,
+        retry: bool,
+    ) -> RouteNote {
         let seq = world.last_seq();
         let Some(e) = world.entity(entity) else {
             return RouteNote::Dropped {
@@ -781,9 +792,11 @@ impl Router {
                 why: "macro-tick deferred: a player acted here recently".into(),
             };
         }
-        let max = self.cfg.max_agent_only_turns;
-        let room = e.room.clone();
-        self.room(&room).step(ChatterInput::MacroTick, max);
+        if !retry {
+            let max = self.cfg.max_agent_only_turns;
+            let room = e.room.clone();
+            self.room(&room).step(ChatterInput::MacroTick, max);
+        }
         let p = self
             .pending
             .entry(entity.clone())
