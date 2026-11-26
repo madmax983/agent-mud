@@ -221,8 +221,9 @@ is locked (lockpicking −2 or the key) and locks itself again 30 minutes
 after it is opened. Two rat pups in the root cellar (the way in for a new
 player), giant rats in the vault and warren, a rusted lockbox in the
 cistern, a skeletal warden and a dwarven iron-ore cache in the ossuary.
-Rubble chokes the ossuary's dwarf stair: `clear` opens it while the
-warden is down, for an hour. Below it, a cave crawler guards a seam of
+Rubble chokes the ossuary's dwarf stair: no pick opens it
+(`pickable = false` on the lock), and `clear` opens it while the warden
+is down, for an hour. Below it, a cave crawler guards a seam of
 ore.
 
 What the pack's scripts add (docs/scripting.md walks through each):
@@ -230,15 +231,18 @@ What the pack's scripts add (docs/scripting.md walks through each):
 - `search` the fallen: each death of a mob pays its first good searcher
   one roll on the mob's loot table, from a per-day pool.
 - Liar's bones at the Flagon: `bones` and `call`; bids are `say`, stakes
-  are `give`, and Marta can hold the pot.
+  are `give`, and Marta can hold the pot. A cup down stays as it fell
+  until the call, and the call ends the round for every cup of it.
 - The rumor of the day: the day picks a cache's room and spot.
   `eavesdrop` at the Flagon hints at the room, `case` in Vich's backroom
   at the spot, and the first `dig` in the right place pays.
 - The dwarf drift: `mine` with a miner's pick (Torin sells three) gives
-  each miner a chunk a day, four a day in all. Torin pays 15s a chunk, so
-  ore comes back each day and his bounty keeps its worth, while the seam
-  costs him at most 60s a day. Torin also sells a hatchet, the cheap step
-  between the dagger and a sword.
+  each miner a chunk a day, four a day in all. Torin pays 15s a chunk.
+  His shop's `buy_pool`, the town's `ore_bounty` of 60s a day, pays for
+  four chunks a day, as many as the seam yields, and he smelts them. His
+  own purse pays only past that. So ore comes back each day, and his bounty keeps its
+  worth however long the world runs. Torin also sells a hatchet, the
+  cheap step between the dagger and a sword.
 
 Shops (ADR 0013): Marta's stock sits on the shelf behind the bar, Torin's
 on the weapon rack, Vich's in his crate of oddments. A shop sells while
@@ -268,19 +272,22 @@ world:
   starting dagger beats it by 10 points or more against a rat. Its value
   is 0, so no keeper buys it, and farming the warden empties no purse.
 - A fresh player beats both root-cellar pups in one fight 85-95% of the
-  time, 10 points more often than one giant rat, and almost never dies
-  of it.
+  time, 10 points more often than one giant rat, and dies of it 2% of
+  the time or less (no death in 2000 seeds).
 - A fresh player beats the drift's cave crawler 45-60% of the time, and
   85% or more with a shortsword and a jerkin. Against its chitin (DR 1) a
   hatchet beats the dagger by 8 points or more, and the sword beats the
-  hatchet by 20 or more; against a rat the hatchet does about as well as
-  the dagger.
+  hatchet by 20 or more. Against the warden's bone (DR 2) one player with
+  a hatchet beats one with the dagger by 8 points or more (about 12% to
+  2%). Against a rat the hatchet stays within 8 points of the dagger
+  (about 72% to 77%).
 
 The fast test, `crypt_v01_holds_its_balance`, plays 400 seeds per row and
-checks wider bands, that each heal works, and the orderings with a
-smaller margin (the broadsword rows summed over the party sizes). The ignored `balance_table` test plays 2000 seeds per
-row, prints the full table and a `MISS` line for each target it misses;
-`BAL_PACK` points it at an edited copy of a pack.
+checks wider bands, the pups' death share, that each heal works, and the
+orderings and the close pair with a looser margin (the broadsword rows
+summed over the party sizes). The ignored `balance_table` test plays 2000
+seeds per row, prints the full table and a `MISS` line for each target it
+misses; `BAL_PACK` points it at an edited copy of a pack.
 
 These targets hold for a world made under this pack. A saved world keeps
 the attrs and skills its cast and players had when it was saved:

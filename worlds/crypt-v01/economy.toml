@@ -12,7 +12,13 @@ short = "s"
 # nobody minding it. A shop with no fixture keeps its stock on the
 # keeper's body.
 # `buys` lists the tags or item ids the keeper buys, at `buy_rate` of the
-# value. `prices` overrides the buying price of one item.
+# value. `prices` overrides the buying price of one item. `buy_pool` names
+# a reward pool below that pays for what the shop buys, as a ledgered mint
+# to the seller, while the pool has the price left today. The shop uses
+# up what the pool pays for: it never goes on sale, so no item is paid
+# from the pool twice. Goods that hold something never go to the pool.
+# When the pool cannot pay, the keeper's own purse pays, and the goods go
+# on sale as usual.
 [shops.marta]
 keeper = "marta"
 fixture = "flagon_shelf"
@@ -29,6 +35,7 @@ buys = ["iron_ore"]
 buy_rate = 0.5
 sell_markup = 1.0
 prices = { iron_ore = 15 }
+buy_pool = "ore_bounty"
 
 [shops.vich]
 keeper = "vich"
@@ -77,13 +84,19 @@ items = { healing_draught = 1 }
 per = "day"
 
 # The old dwarf drift (scripts/rooms/drift.rhai, `mine`): four chunks of
-# ore a day, at most one a day to each miner. Torin pays 15s a chunk, so
-# the seam can cost him 60s a day, half the purse he starts with. His
-# picks (3 x 20s) and his other stock win some of it back, and Vich pays
-# only 6s. So ore keeps coming back, and his bounty keeps its worth: a
-# chunk a day is a fair wage, and the seam cannot empty his purse in a
-# day. The four chunks in the ossuary stay a one-off find.
+# ore a day, at most one a day to each miner. The four chunks in the
+# ossuary stay a one-off find.
 [rewards.drift_ore]
 currency = 0
 items = { iron_ore = 4 }
+per = "day"
+
+# Torin's ore bounty (`buy_pool` of his shop). The town pays his 15s a
+# chunk for four chunks a day, as many as the seam yields, and he smelts
+# them. His own 120s purse pays only past that. So over the days it pays
+# for no more ore than the one-off finds (the ossuary's four, 60s at
+# most), and his bounty keeps its worth however long the world runs. Vich
+# pays 6s a chunk from his own purse.
+[rewards.ore_bounty]
+currency = 60
 per = "day"

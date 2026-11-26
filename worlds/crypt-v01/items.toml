@@ -43,7 +43,7 @@ damage_type = "imp"
 # shortsword with the Axe/Mace skill, which the template has one level
 # lower than Shortsword. So it does about as well as the dagger against a
 # rat, and better against the warden's bone and the crawler's chitin
-# (balance_tests.rs checks the crawler).
+# (balance_tests.rs checks all three).
 [items.hatchet]
 name = "hatchet"
 aliases = ["axe", "hand axe"]

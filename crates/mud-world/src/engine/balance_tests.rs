@@ -5,15 +5,18 @@
 //! resolves every strike. A row plays one seeded world per seed, so a row
 //! is deterministic. The fast test plays a few hundred seeds per row and
 //! checks wide bands, so a pack edit that breaks the balance fails here.
-//! It also checks that each heal in a run works, and the orderings with a
-//! margin each (a heal between the rats helps, a bigger party wins more,
-//! a broadsword beats a shortsword over the party sizes summed, the
-//! dagger beats the grave-blade, the pups are easier than a rat, and the
-//! hatchet beats the dagger against the crawler).
+//! It also checks that each heal in a run works, that the pups almost
+//! never kill, and the orderings with a margin each (a heal between the
+//! rats helps, a bigger party wins more, a broadsword beats a shortsword
+//! over the party sizes summed, the dagger beats the grave-blade, the
+//! pups are easier than a rat, and the hatchet beats the dagger against
+//! the crawler and the warden). It checks that the hatchet and the dagger
+//! stay close against a rat.
 //! The ignored test plays more seeds, prints the table, and checks the
-//! targets themselves (the win rate, and for one rat the share of wins
-//! that end wounded) and the orderings with the margins the targets ask
-//! for. It prints a `MISS` line for each one that fails:
+//! targets themselves (the win rate, for one rat the share of wins that
+//! end wounded, and for the pups the share of deaths), the orderings and
+//! the close pairs with the margins the targets ask for. It prints a
+//! `MISS` line for each one that fails:
 //!
 //! ```text
 //! cargo test -p mud-world --lib balance_table -- --ignored --nocapture
@@ -44,7 +47,8 @@
 //!   squealer, and each pup still standing strikes after every action.
 //! - A crawler row walks down the dwarf stair from the ossuary, with the
 //!   stair open and the warden out of the way, so it measures the
-//!   crawler alone. "hatchet" swaps the dagger for a hatchet, no armor.
+//!   crawler alone. "hatchet" swaps the dagger for a hatchet, no armor,
+//!   in a crawler, rat or warden row.
 //! - A "saved" row makes its world, and logs the party in, under the pack
 //!   as it stood before the balance step. It then loads that state under
 //!   the pack as it is now, as a server that restarts on an edited pack
@@ -658,6 +662,8 @@ struct Row {
     target: Option<Bound>,
     /// The target the long run holds the share of wounded wins to.
     wounded: Option<Bound>,
+    /// The bound every run holds the share of deaths to.
+    dead: Option<Bound>,
 }
 
 impl Row {
@@ -668,6 +674,11 @@ impl Row {
 
     const fn wounded(mut self, lo: u64, hi: u64) -> Self {
         self.wounded = Some((lo, hi));
+        self
+    }
+
+    const fn dead(mut self, lo: u64, hi: u64) -> Self {
+        self.dead = Some((lo, hi));
         self
     }
 
@@ -693,6 +704,7 @@ fn info(label: &str, build: Build, scenario: Scenario) -> Row {
         band: None,
         target: None,
         wounded: None,
+        dead: None,
     }
 }
 
@@ -728,7 +740,10 @@ fn targets() -> Vec<Row> {
             (35, 68),
         ),
         row("grave-blade vs rat1", grave_blade, rat1(), (0, 80)),
-        row("fresh vs the pups", fresh, pups(), (80, 97)).target(85, 95),
+        row("hatchet vs rat1", hatchet, rat1(), (55, 88)),
+        row("fresh vs the pups", fresh, pups(), (80, 97))
+            .target(85, 95)
+            .dead(0, 2),
         row("fresh vs crawler", fresh_drift, crawler(1), (40, 66)).target(45, 60),
         row("hatchet vs crawler", hatchet_drift, crawler(1), (50, 78)),
         row("sword vs crawler", sword_drift, crawler(1), (82, 100)).target(85, 100),
@@ -742,6 +757,7 @@ fn targets() -> Vec<Row> {
         let at = |s: &str| format!("{s} vs {w}");
         rows.extend([
             row(&at("fresh"), fresh, warden(1, respawned), (0, 12)).target(0, 10),
+            row(&at("hatchet"), hatchet, warden(1, respawned), (4, 24)),
             row(&at("sword x1"), sword, warden(1, respawned), (14, 42)).target(20, 35),
             row(&at("sword x2"), sword, warden(2, respawned), (52, 82)).target(60, 75),
             row(&at("sword x3"), sword, warden(3, respawned), (78, 100)).target(85, 100),
@@ -785,7 +801,6 @@ fn reference() -> Vec<Row> {
     vec![
         info("fresh vs rat1, retreat at HP<=3", fresh, retreat),
         info("sword vs rat1", sword, rat1()),
-        info("hatchet vs rat1", hatchet, rat1()),
         info("sword vs rat2", sword_no_rat1, rat2()),
         info("sword run, no heal", sword, Scenario::RatRun(Heal::None)),
         info("kestrel vs rat1", kestrel, rat1()),
@@ -858,6 +873,7 @@ fn misses(rows: &[Row], stats: &[Stats], long: bool) -> Vec<String> {
             out.extend(bound.and_then(|bd| outside(&r.label, what, bd, a, b)));
         };
         check("win", r.band, s.wins, s.trials);
+        check("dead", r.dead, s.dead, s.trials);
         if long {
             check("win (target)", r.target, s.wins, s.trials);
             check("wounded on win (target)", r.wounded, s.wounded, s.wins);
@@ -913,6 +929,8 @@ fn order(better: &str, worse: &str, fast: u64, long: u64) -> Order {
 /// - Against the crawler's chitin, the hatchet beats the dagger by 8
 ///   points or more, and a shortsword with a jerkin beats the hatchet by
 ///   20 or more. So the hatchet earns its price, and a sword still pays.
+/// - Against the warden's bone, one player with the hatchet beats one
+///   with the dagger by 8 points or more.
 fn orders() -> Vec<Order> {
     let (bandage, draught, none) = (
         "fresh run, bandage between",
@@ -927,6 +945,13 @@ fn orders() -> Vec<Order> {
         order("fresh vs the pups", "fresh vs rat1", 50, 100),
         order("hatchet vs crawler", "fresh vs crawler", 40, 80),
         order("sword vs crawler", "hatchet vs crawler", 150, 200),
+        order("hatchet vs warden", "fresh vs warden", 40, 80),
+        order(
+            "hatchet vs respawned warden",
+            "fresh vs respawned warden",
+            40,
+            80,
+        ),
     ];
     for foe in ["warden", "respawned warden"] {
         for arm in ["sword", "broad"] {
@@ -961,11 +986,46 @@ fn orders() -> Vec<Order> {
     out
 }
 
-/// The orderings that fail, as lines, with the fast margins or the long
-/// ones (`long`).
+/// Two rows that win about as often as each other: no more than `fast`
+/// (the fast test) or `long` (the long run) apart, in tenths of a percent.
+struct Near {
+    a: &'static str,
+    b: &'static str,
+    fast: u64,
+    long: u64,
+}
+
+/// The rows the targets ask to stay close.
+/// - Against a rat the hatchet does about as well as the dagger: within
+///   8 points (12 in the fast test).
+const fn nears() -> [Near; 1] {
+    [Near {
+        a: "hatchet vs rat1",
+        b: "fresh vs rat1",
+        fast: 120,
+        long: 80,
+    }]
+}
+
+/// The orderings and the close pairs that fail, as lines, with the fast
+/// margins or the long ones (`long`).
 fn order_misses(rows: &[Row], stats: &[Stats], long: bool) -> Vec<String> {
     let sum = |labels: &[String]| labels.iter().map(|l| win(rows, stats, l)).sum::<u64>();
     let show = |permille: u64| decimal(i64::try_from(permille).unwrap(), 10, 1);
+    let near = nears().into_iter().filter_map(|n| {
+        let gap = if long { n.long } else { n.fast };
+        let (a, b) = (win(rows, stats, n.a), win(rows, stats, n.b));
+        (a.abs_diff(b) > gap).then(|| {
+            format!(
+                "{} ({}) and {} ({}) should be within {}",
+                n.a,
+                show(a),
+                n.b,
+                show(b),
+                show(gap)
+            )
+        })
+    });
     orders()
         .into_iter()
         .filter_map(|o| {
@@ -982,6 +1042,7 @@ fn order_misses(rows: &[Row], stats: &[Stats], long: bool) -> Vec<String> {
                 )
             })
         })
+        .chain(near)
         .collect()
 }
 

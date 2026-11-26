@@ -426,6 +426,11 @@ pub struct LockDef {
     /// The modifier of a lockpicking attempt.
     #[serde(default)]
     pub pick: i32,
+    /// Whether lockpicking can open it. `false` refuses every attempt
+    /// before it rolls, so only a key or a world script's `unlock` opens
+    /// it: rubble that a script clears, say.
+    #[serde(default = "yes")]
+    pub pickable: bool,
     /// What `look` says about it.
     #[serde(default)]
     pub describe: Option<String>,
@@ -747,8 +752,18 @@ pub struct ShopDef {
     /// still needs the keeper. Only for a shop with a fixture.
     #[serde(default)]
     pub unattended: bool,
+    /// A reward pool of `[rewards]` that pays for what the shop buys, as a
+    /// ledgered mint to the seller, while the pool has the price left in
+    /// its period. When it does not, the keeper's own purse pays. A pool
+    /// that refills each day keeps a buyer's bounty alive however long
+    /// the world runs.
+    #[serde(default)]
+    pub buy_pool: Option<PoolId>,
 }
 
+const fn yes() -> bool {
+    true
+}
 const fn half() -> f64 {
     0.5
 }
@@ -1520,6 +1535,14 @@ impl WorldPack {
                         problems.push(format!("shop {id} names unknown room {r:?}"));
                     }
                 }
+            }
+            if let Some(p) = &shop.buy_pool
+                && !self.economy.rewards.contains_key(p)
+            {
+                problems.push(format!(
+                    "shop {id} buy_pool names unknown pool {:?}",
+                    p.as_str()
+                ));
             }
         }
         for (id, c) in &self.cast {

@@ -136,10 +136,11 @@ description = "Skulls stacked to the vault of the ceiling. A cracked sarcophagus
 dark = true
 exits = { nw = "wine_vault", ne = "flooded_cistern", d = "collapsed_drift" }
 items = ["iron_ore", "iron_ore", "iron_ore", "iron_ore", "bone_charm"]
-# The rubble is a lock with no key. `clear` (scripts/rooms/drift.rhai)
-# opens it with a strength roll while the warden is down, and it slides
-# back an hour later. From below, the way up is never blocked.
-locks = { d = { lock = "rubble", pick = -10, describe = "Fallen rubble chokes the old stair. Someone strong could clear it, with nothing standing over them.", relock_minutes = 60 } }
+# The rubble is a lock with no key, and no pick works it loose
+# (`pickable = false`). Only `clear` (scripts/rooms/drift.rhai) opens it,
+# with a strength roll while the warden is down, and it slides back an
+# hour later. From below, the way up is never blocked.
+locks = { d = { lock = "rubble", pickable = false, describe = "Fallen rubble chokes the old stair. Someone strong could clear it, with nothing standing over them.", relock_minutes = 60 } }
 
 # The old dwarf drift: a seam of iron ore that a miner with a pick can
 # work once a day (`mine`), four chunks a day in all (economy.toml

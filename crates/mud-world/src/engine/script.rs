@@ -828,20 +828,6 @@ impl World {
                 }))
         };
         let seq = self.emit(ctx, spec);
-        ctx.changes.push(StateChange::Minted {
-            pool: m.pool.clone(),
-            entity: actor.clone(),
-            currency: m.currency,
-            items: made.iter().map(|i| i.id).collect(),
-        });
-        self.audit.push(Audit::Minted {
-            hook: m.key.to_owned(),
-            entity: actor.clone(),
-            pool: m.pool.clone(),
-            currency: m.currency,
-            items: made.iter().map(|i| i.proto.clone()).collect(),
-            at_ms: ctx.now,
-        });
         let record = MintRecord {
             seq,
             pool: m.pool.clone(),
@@ -852,9 +838,7 @@ impl World {
             items: made,
             at_ms: ctx.now,
         };
-        let totals = self.state.minted.entry(m.pool.clone()).or_default();
-        *totals = totals.with(&record);
-        self.mints.push(record);
+        self.record_mint(ctx, record);
         Some(line)
     }
 

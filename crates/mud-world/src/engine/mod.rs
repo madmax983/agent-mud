@@ -1043,6 +1043,28 @@ impl World {
         }
     }
 
+    /// Records one ledgered mint that has already paid out: the change,
+    /// the audit line, the pool's running totals and the ledger row.
+    pub(crate) fn record_mint(&mut self, ctx: &mut Ctx, record: MintRecord) {
+        ctx.changes.push(StateChange::Minted {
+            pool: record.pool.clone(),
+            entity: record.entity.clone(),
+            currency: record.currency,
+            items: record.items.iter().map(|i| i.id).collect(),
+        });
+        self.audit.push(Audit::Minted {
+            hook: record.hook.clone(),
+            entity: record.entity.clone(),
+            pool: record.pool.clone(),
+            currency: record.currency,
+            items: record.items.iter().map(|i| i.proto.clone()).collect(),
+            at_ms: record.at_ms,
+        });
+        let totals = self.state.minted.entry(record.pool.clone()).or_default();
+        *totals = totals.with(&record);
+        self.mints.push(record);
+    }
+
     pub(crate) fn relocate_item(&mut self, ctx: &mut Ctx, item: ItemId, to: Holder) {
         let proto = self.item_proto(item).unwrap_or_else(|| ProtoId::from("?"));
         let from = self.state.move_item(item, &to);

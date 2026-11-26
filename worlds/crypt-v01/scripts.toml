@@ -134,7 +134,9 @@ rolls = [
 ]
 
 # Liar's bones at the Flagon (scripts/rooms/flagon.rhai). A cup is a world
-# flag, bones.<id>; `call` lifts every cup at the table.
+# flag, bones.<id>, tied to the round in the flag bones_round. A cup down
+# stays as it fell until the call. `call` lifts every cup at the table and
+# ends the round, so a cup left behind never counts in a later one.
 [[verbs]]
 name = "bones"
 usage = "bones"
@@ -150,7 +152,6 @@ usage = "call"
 rooms = ["rusty_flagon_taproom"]
 file = "rooms/flagon.rhai"
 fn = "on_call"
-config = { max_effects = 8 }
 
 # The rumor of the day (scripts/rooms/rumor.rhai): `eavesdrop` hints at
 # the room, `case` at the spot, and `dig <spot>` in the right room pays

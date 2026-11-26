@@ -195,7 +195,7 @@ pack pool with what is left and its running totals. Money in the world is
 always the start plus the ledger's currency, and every item made after the
 start is a new player's kit or named by the ledger. The property tests
 check exactly that. A reward is not a sale: shops and `POLICY_TRADE_REQUIRED` are
-unchanged.
+unchanged. A shop can buy with a pool, though (below).
 
 The engine writes to the same ledger without a script: a respawned mob's
 kit (`[cast.x] respawn_kit`, ADR 0012) is one row in the pool `@respawn`
@@ -204,6 +204,21 @@ no budget. No pack can declare that pool, because `@` is not in a pool
 id. Its rows reach the `mints` table, `WorldState.minted`, `state_changes`
 and the feed as a script's do, and `check_rewards` checks them. The
 Scripts panel shows pack pools only, so `@respawn` is not in it.
+
+A shop can buy with a pack pool. `buy_pool = "<pool>"` on a shop of
+`economy.toml` pays for what the shop buys from the pool, while the pool
+has the price left in its period: the seller gets the price as one ledger
+row (hook `shops.<shop>`, currency only, `seq` of the sale's `trade`
+event, whose data names the `pool`), and the keeper's purse does not
+move. The shop uses up what the pool pays for: the item leaves the world
+and never goes on sale, so no item is paid from the pool twice and
+selling it back and forth makes no money. Goods that hold something (a
+container with contents, a purse with coins) never go to the pool. When
+the pool cannot pay, the
+keeper's purse pays as it always does, the goods go on sale, and a
+keeper short of the price buys nothing. crypt-v01's Torin
+buys ore with `ore_bounty`, 60s a day, so the drift's daily ore never
+empties his purse.
 
 ## Natives
 
@@ -311,7 +326,7 @@ running when you reset does not save its memory over the reset.
 
 ```sh
 cargo run -p mud-server --bin mud -- check worlds/crypt-v01
-# crypt-v01: 13 rooms, 27 items, 15 skills, 11 cast, 3 shops, 5 reward pools — ok
+# crypt-v01: 13 rooms, 27 items, 15 skills, 11 cast, 3 shops, 6 reward pools — ok
 # scripts rhai-… (11 files: 1 mind, 2 rooms, 2 items, 11 verbs) — ok
 ```
 
@@ -337,8 +352,10 @@ These come from crypt-v01's scripts, and each one keeps a rule above.
   `ctx.room.present` shows no marks. So state that a later hook reads for
   someone else goes in a world flag named for that player, such as
   `bones.<id>`. Ids are lowercase words, so the name is valid. Give such a
-  flag a day in its value, and sweep stale ones as you go, so the 256
-  flags last.
+  flag a day in its value (or a round that holds the day, as `bones`
+  does), and sweep stale ones as you go, so the 256 flags last. Put the
+  sweep's `clear_flag`s before the new `set_flag`: admission counts the
+  list in order, so a full table still takes the new flag.
 - **Content of the day.** `day_utc(ctx.now_ms)` through a small hash picks
   the day's room and spot. Every player and every mind sees the same pick
   all day, it changes at midnight of the game clock, and no wall clock
@@ -380,8 +397,12 @@ These come from crypt-v01's scripts, and each one keeps a rule above.
   crawler, `warden_hoard` for the warden. A failed roll leaves the body
   for the next player. When the pool is spent, the body yields nothing.
 - `rooms/flagon.rhai`: liar's bones in the taproom. `bones` shakes five
-  dice that only the shaker sees, eight rounds a day; `call` shows every
-  cup at the table, with a tally of each face, and clears them. Bids are
+  dice that only the shaker sees, eight rounds a day. A cup down stays as
+  it fell until the call: a second shake is refused. `call` shows every
+  cup of the round at the table, with a tally of each face, and ends the
+  round (the flag `bones_round`), so every cup of it goes stale at once.
+  A cup whose owner left the table stays out of the count, and the call
+  says how many. Alone, `call` tips the caller's dice back. Bids are
   `say` and stakes are `give`.
 - `rooms/rumor.rhai`: the rumor of the day. The day picks one of five
   rooms and one of three spots. `eavesdrop` in the taproom (IQ, once a
@@ -391,9 +412,12 @@ These come from crypt-v01's scripts, and each one keeps a rule above.
   the first finder 15s and a draught from `rumor_cache`.
 - `rooms/drift.rhai`: the old dwarf drift. `clear` in the ossuary (ST,
   with nothing standing there) unlocks the rubble on the stair, which
-  locks itself again an hour later. `mine` in the drift needs a miner's
-  pick and the crawler down: one HT roll a day per player, and a success
-  mints one chunk of ore from `drift_ore`, four a day in all.
+  locks itself again an hour later. The rubble's lock has
+  `pickable = false` in `world.toml`, so `attempt lockpicking` on it is
+  refused before it rolls, and `clear` is the only way down. `mine` in
+  the drift needs a miner's pick and the crawler down: one HT roll a day
+  per player (-3 in the dark), and a success mints one chunk of ore from
+  `drift_ore`, four a day in all. Torin's `ore_bounty` buys them.
 - `minds/hale.rhai`: Hale (on Rhai through `runtime = "rhai"`) warns
   players off the alley, by night by name, remembers who he warned today,
   and answers talk of the grate. He says it is locked only when he stands

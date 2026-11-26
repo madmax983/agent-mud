@@ -385,7 +385,7 @@ fn check_reports_scripts_and_lists_every_problem() {
     assert!(lines[1].starts_with("scripts rhai-"), "{lines:?}");
     assert!(lines[1].ends_with("(11 files: 1 mind, 2 rooms, 2 items, 11 verbs) — ok"));
     assert!(
-        lines[0].ends_with("3 shops, 5 reward pools — ok"),
+        lines[0].ends_with("3 shops, 6 reward pools — ok"),
         "{lines:?}"
     );
     std::fs::write(dir.path().join("scripts/extra.rhai"), "fn x(ctx) { [] }").unwrap();
