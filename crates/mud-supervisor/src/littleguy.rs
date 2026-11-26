@@ -3,15 +3,23 @@
 //! The supervisor owns the lifecycle (the Mercer pattern). For each
 //! persistent entity it writes an `lg.toml`, starts `lg serve` with its own
 //! SQLite database and socket, and hands it a bearer token for the MUD's
-//! MCP server. From inside littleguy the world is just one MCP server with
-//! four tools; the agent never learns that it is supervised.
+//! MCP server. From inside littleguy the world is six MUD tools on two
+//! servers, plus lg's own plan, note and workspace tools; the agent never
+//! learns that it is supervised.
 //!
-//! littleguy refuses non-internal MCP calls on unattended heartbeat ticks,
-//! so the supervisor never relies on the heartbeat to act. It delivers each
-//! wake over the socket as a `chat` message, an attended op, and keeps the
-//! heartbeat for quiet reflection and memory consolidation.
+//! The two servers split the tools by effect. `world` (effect `internal`)
+//! serves `mud_look`, `mud_sheet`, `mud_wake_me` and `mud_cancel_wake`, so
+//! an unattended heartbeat tick may read and book a wake. `mud` (effect
+//! `write`) serves `mud_events` and `mud_command`: littleguy refuses effect
+//! write on ticks, so a tick never moves the world or the event cursor. The
+//! supervisor delivers each wake over the socket as a `chat` message, an
+//! attended op, in which every tool works.
+//!
+//! The supervisor is also each daemon's owner on its socket ([`owner`]):
+//! lg takes the caller with its own uid for the owner.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,9 +35,26 @@ use tokio::sync::{Mutex, oneshot};
 
 use crate::ledger::LedgerMeter;
 use crate::mind::{
-    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, SpendSource, Usage,
-    UsageSink, WakeContext, persistent_habits, system_prompt, wake_message,
+    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, SpendSource,
+    ToolNames, Usage, UsageSink, WakeContext, heartbeat_prompt, littleguy_habits, system_prompt,
+    wake_message,
 };
+
+pub mod owner;
+
+use owner::{OwnerRequest, OwnerResponse};
+
+/// The longest request line this client sends, newline included: under
+/// lg's cap (`MAX_REQUEST_BYTES`, 64 KiB), which refuses a longer line
+/// unread.
+pub const LG_MAX_LINE_BYTES: usize = 64 * 1024 - 1;
+
+/// The tools of the `world` server: reads and wakes, which a quiet tick
+/// may use.
+pub const WORLD_TOOLS: [&str; 4] = ["mud_look", "mud_sheet", "mud_wake_me", "mud_cancel_wake"];
+
+/// The tools of the `mud` server: effect write, attended chats only.
+pub const MUD_TOOLS: [&str; 2] = ["mud_events", "mud_command"];
 
 /// How long a daemon's reply is still read after its wake was given up.
 const LATE_REPLY_GRACE: Duration = Duration::from_secs(3_600);
@@ -60,10 +85,41 @@ pub struct LittleguyConfig {
     /// looks, reads and speaks, each a round, and one that runs out ends
     /// with no answer, so leave room for a whole errand.
     pub max_steps: u32,
-    /// Minutes between reflection heartbeats; 0 turns them off.
+    /// Minutes between heartbeat ticks; 0 writes no `[heartbeat]`.
     pub heartbeat_minutes: u32,
+    /// `heartbeat.research`: a tick researches the agent's open ideas.
+    pub research: bool,
+    /// `tools.files`: the note tools (with memory on). It also turns on
+    /// lg's workspace file tools in the daemon's own folder; the ones that
+    /// change it are effect write, so a tick cannot use them.
+    pub notes: bool,
+    /// `[compaction]`, or none.
+    pub compaction: Option<CompactionRender>,
+    /// The top-level `max_request_bytes` (below the provider's window); 0
+    /// writes none (lg's default).
+    pub max_request_bytes: u64,
+    /// The `window`: the turns of transcript the agent sees.
+    pub window: u32,
     /// How long `lg serve` may take to open its socket.
     pub start_timeout_secs: u64,
+}
+
+/// The `[compaction]` section of an `lg.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionRender {
+    /// Compact at this percent of the request cap (1 to 100).
+    pub at_percent: u8,
+    /// Resets of one op at most (1 or more).
+    pub max_resets: u32,
+}
+
+impl Default for CompactionRender {
+    fn default() -> Self {
+        Self {
+            at_percent: 80,
+            max_resets: 3,
+        }
+    }
 }
 
 impl Default for LittleguyConfig {
@@ -77,12 +133,17 @@ impl Default for LittleguyConfig {
             base_url: None,
             max_steps: 64,
             heartbeat_minutes: 240,
+            research: true,
+            notes: true,
+            compaction: Some(CompactionRender::default()),
+            max_request_bytes: 240_000,
+            window: 30,
             start_timeout_secs: 30,
         }
     }
 }
 
-/// What one entity's daemon needs.
+/// What one entity's daemon needs. Its token never leaves this module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Persona {
     /// The display name.
@@ -97,10 +158,75 @@ pub struct Persona {
     pub token: String,
 }
 
+impl Persona {
+    /// The author's text of this persona, with no token.
+    #[must_use]
+    pub fn text(&self) -> PersonaText {
+        PersonaText {
+            name: self.name.clone(),
+            persona: self.persona.clone(),
+            goal: self.goal.clone(),
+            body: self.body.clone(),
+        }
+    }
+}
+
+/// The author's text of a persona: trusted pack text, and no token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaText {
+    /// The display name.
+    pub name: String,
+    /// The persona text.
+    pub persona: String,
+    /// The private goal.
+    pub goal: String,
+    /// The pack's rule for a body.
+    pub body: String,
+}
+
+/// One table of a rendered config.
+fn table<const N: usize>(entries: [(&str, toml::Value); N]) -> toml::Table {
+    entries
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect()
+}
+
+/// One `[[mcp.server]]` of the MUD: both servers reach the same endpoint
+/// with the same token, and differ by effect and the tools they keep.
+fn mcp_server(cfg: &LittleguyConfig, id: &str, effect: &str, tools: &[&str]) -> toml::Value {
+    table([
+        ("id", id.into()),
+        ("url", cfg.mcp_url.clone().into()),
+        ("bearer_env", TOKEN_ENV.into()),
+        // Players write what the tools return; nothing returned is private.
+        ("labels", toml::Value::Array(vec!["untrusted_input".into()])),
+        ("effect", effect.into()),
+        (
+            "tools",
+            toml::Value::Array(tools.iter().map(|t| (*t).into()).collect()),
+        ),
+    ])
+    .into()
+}
+
 /// Renders the `lg.toml` of one entity, its pages served on loopback
 /// `ui_port`.
+///
+/// `quiet` renders the same file with `[memory] enabled = false` and no
+/// `[heartbeat]`: lg's reload applies both live, so no tick, reflection or
+/// nightly consolidation spends a token. The memory files stay on disk.
+/// Its system text then names no note tool, as lg serves none without
+/// memory (the same holds for `notes = false`).
+/// The config never asks for an owner-gated feature: no `[council]`,
+/// `[skills]`, `[sandbox]`, `[approvals]`, `[scripts]`, `[patches]`,
+/// `[research]`, `[hooks]`, `[followups]` or `allow_actions`.
 #[must_use]
-pub fn render_config(cfg: &LittleguyConfig, p: &Persona, ui_port: u16) -> String {
+pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet: bool) -> String {
+    let names = ToolNames::LITTLEGUY;
+    // lg serves the note tools only with `tools.files` and `[memory]
+    // enabled`, so the prompts name them only then.
+    let notes = cfg.notes && !quiet;
     let mut root = toml::Table::new();
     root.insert("owner".into(), "mud".into());
     root.insert(
@@ -108,61 +234,118 @@ pub fn render_config(cfg: &LittleguyConfig, p: &Persona, ui_port: u16) -> String
         // A littleguy agent is a Persistent or Turing entity: it books its
         // own wakes (an ambient one would be answered `no_wakes`).
         format!(
-            "{}{}",
-            system_prompt(&p.name, &p.persona, &p.goal, &p.body),
-            persistent_habits()
+            "{}\n\n{}",
+            system_prompt(names, &p.name, &p.persona, &p.goal, &p.body),
+            littleguy_habits(names, notes)
         )
         .into(),
     );
-    root.insert("window".into(), 30.into());
+    root.insert("window".into(), i64::from(cfg.window).into());
     if cfg.max_steps > 0 {
         root.insert("max_steps".into(), i64::from(cfg.max_steps).into());
     }
-    let mut tools = toml::Table::new();
-    for (k, v) in [
-        ("web_fetch", false),
-        ("web_search", false),
-        ("files", false),
-        ("runs", false),
-        ("plans", true),
-    ] {
-        tools.insert(k.into(), v.into());
+    if cfg.max_request_bytes > 0 {
+        root.insert(
+            "max_request_bytes".into(),
+            i64::try_from(cfg.max_request_bytes)
+                .unwrap_or(i64::MAX)
+                .into(),
+        );
     }
-    root.insert("tools".into(), tools.into());
-    let mut memory = toml::Table::new();
-    memory.insert("enabled".into(), true.into());
-    memory.insert("consolidate".into(), "0 4 * * *".into());
-    memory.insert("timezone".into(), "UTC".into());
-    memory.insert("reflect".into(), true.into());
-    root.insert("memory".into(), memory.into());
-    let mut ui = toml::Table::new();
+    root.insert(
+        "tools".into(),
+        table([
+            ("web_fetch", false.into()),
+            ("web_search", false.into()),
+            ("files", cfg.notes.into()),
+            ("runs", false.into()),
+            ("plans", true.into()),
+        ])
+        .into(),
+    );
+    root.insert(
+        "memory".into(),
+        table([
+            ("enabled", (!quiet).into()),
+            ("consolidate", "0 4 * * *".into()),
+            ("timezone", "UTC".into()),
+            ("reflect", true.into()),
+        ])
+        .into(),
+    );
+    if cfg.heartbeat_minutes > 0 && !quiet {
+        root.insert(
+            "heartbeat".into(),
+            table([
+                ("every_minutes", i64::from(cfg.heartbeat_minutes).into()),
+                // Researches open ideas; not lg's [research] sweep tool.
+                ("research", cfg.research.into()),
+                ("prompt", heartbeat_prompt(names, notes).into()),
+            ])
+            .into(),
+        );
+    }
+    if let Some(c) = cfg.compaction {
+        root.insert(
+            "compaction".into(),
+            table([
+                ("at_percent", i64::from(c.at_percent).into()),
+                ("max_resets", i64::from(c.max_resets).into()),
+            ])
+            .into(),
+        );
+    }
+    root.insert("flow".into(), table([("rule_of_two", true.into())]).into());
     // A concrete port: littleguy builds its sign-in link from this address,
     // so port 0 would hand out links to port 0.
-    ui.insert("bind".into(), format!("127.0.0.1:{ui_port}").into());
-    root.insert("ui".into(), ui.into());
-    if cfg.heartbeat_minutes > 0 {
-        let mut hb = toml::Table::new();
-        hb.insert(
-            "every_minutes".into(),
-            i64::from(cfg.heartbeat_minutes).into(),
-        );
-        hb.insert("research".into(), false.into());
-        root.insert("heartbeat".into(), hb.into());
-    }
-    let mut server = toml::Table::new();
-    server.insert("id".into(), "mud".into());
-    server.insert("url".into(), cfg.mcp_url.clone().into());
-    server.insert("bearer_env".into(), TOKEN_ENV.into());
-    // Players write what the tools return; nothing returned is private.
-    server.insert(
-        "labels".into(),
-        toml::Value::Array(vec!["untrusted_input".into()]),
+    root.insert(
+        "ui".into(),
+        table([("bind", format!("127.0.0.1:{ui_port}").into())]).into(),
     );
-    server.insert("effect".into(), "write".into());
-    let mut mcp = toml::Table::new();
-    mcp.insert("server".into(), toml::Value::Array(vec![server.into()]));
-    root.insert("mcp".into(), mcp.into());
+    root.insert(
+        "mcp".into(),
+        table([(
+            "server",
+            toml::Value::Array(vec![
+                // May run on a quiet tick: no cursor moves, no world change.
+                mcp_server(cfg, "world", "internal", &WORLD_TOOLS),
+                // Attended chats only.
+                mcp_server(cfg, "mud", "write", &MUD_TOOLS),
+            ]),
+        )])
+        .into(),
+    );
     toml::to_string(&root).unwrap_or_default()
+}
+
+/// Writes `text` to `path` so a reader never sees half a file: a temp file
+/// in the same folder, flushed to disk, then renamed over `path`.
+///
+/// # Errors
+/// The file cannot be written or renamed.
+pub fn write_config(path: &Path, text: &str) -> std::io::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map_or_else(|| "lg.toml".into(), |n| n.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    // The rename itself survives a crash once the folder is flushed.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// The socket reply of `lg serve`, as far as the supervisor reads it.
@@ -201,15 +384,22 @@ struct LgUsage {
 /// Sends one `chat` request over a littleguy socket and reads the answer.
 ///
 /// # Errors
-/// The socket does not answer, or the answer is not a reply.
+/// The line is longer than lg reads (nothing is sent then), the socket
+/// does not answer, or the answer is not a reply.
 pub async fn chat(socket: &Path, message_id: &str, text: &str) -> Result<MindReply, MindError> {
     let unavailable =
         |e: std::io::Error| MindError::Unavailable(format!("{}: {e}", socket.display()));
-    let mut stream = UnixStream::connect(socket).await.map_err(unavailable)?;
     let mut line =
         serde_json::to_string(&json!({ "kind": "chat", "message_id": message_id, "text": text }))
             .map_err(|e| MindError::Failed(e.to_string()))?;
     line.push('\n');
+    // lg refuses a longer line unread: never send half a request.
+    if line.len() > LG_MAX_LINE_BYTES {
+        return Err(MindError::Failed(
+            "the wake is longer than lg accepts".into(),
+        ));
+    }
+    let mut stream = UnixStream::connect(socket).await.map_err(unavailable)?;
     stream
         .write_all(line.as_bytes())
         .await
@@ -353,36 +543,32 @@ fn free_loopback_port() -> std::io::Result<u16> {
         .port())
 }
 
-/// Asks the daemon at `socket` for a one-time sign-in link to its pages.
+/// Asks the daemon at `socket` for a one-time sign-in link to its pages,
+/// as its owner ([`owner`]). lg makes the link in its job loop, so this
+/// waits behind a wake or a tick that runs ([`owner::LOOP_JOB_TIMEOUT`]).
 ///
 /// # Errors
 /// The socket does not answer, or the daemon refuses.
 pub async fn ui_link(socket: &Path) -> Result<String, MindError> {
-    let unavailable =
-        |e: std::io::Error| MindError::Unavailable(format!("{}: {e}", socket.display()));
-    let mut stream = UnixStream::connect(socket).await.map_err(unavailable)?;
-    stream
-        .write_all(b"{\"kind\":\"ui_link\"}\n")
-        .await
-        .map_err(unavailable)?;
-    let mut answer = String::new();
-    BufReader::new(stream)
-        .read_line(&mut answer)
-        .await
-        .map_err(unavailable)?;
-    let v: Value =
-        serde_json::from_str(answer.trim()).map_err(|e| MindError::Failed(e.to_string()))?;
-    match (v["kind"].as_str(), v["link"].as_str()) {
-        (Some("connect_link"), Some(link)) if is_loopback_link(link) => Ok(link.to_owned()),
-        (Some("connect_link"), _) => Err(MindError::Failed(
+    match owner::request(
+        socket,
+        &OwnerRequest::UiLink,
+        OwnerRequest::UiLink.timeout(),
+    )
+    .await
+    {
+        Ok(OwnerResponse::ConnectLink { link }) if is_loopback_link(&link) => Ok(link),
+        Ok(OwnerResponse::ConnectLink { .. }) => Err(MindError::Failed(
             "littleguy gave a sign-in link that is not on loopback".into(),
         )),
-        _ => Err(MindError::Failed(
-            v["message"]
-                .as_str()
-                .unwrap_or("unexpected answer from lg serve")
-                .to_owned(),
-        )),
+        Ok(OwnerResponse::Error { message } | OwnerResponse::Off { message }) => {
+            Err(MindError::Failed(message))
+        }
+        Ok(_) => Err(MindError::Failed("unexpected answer from lg serve".into())),
+        Err(e @ (owner::OwnerError::Io(_) | owner::OwnerError::Timeout)) => {
+            Err(MindError::Unavailable(e.to_string()))
+        }
+        Err(e) => Err(MindError::Failed(e.to_string())),
     }
 }
 
@@ -436,10 +622,52 @@ pub(crate) async fn reap_orphan(dir: &Path, socket: &Path) {
     let _ = std::fs::remove_file(pid_file);
 }
 
+/// What a daemon answered when it was asked `approvals` after its start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalCheck {
+    /// `off`: no tool call ever waits for an owner. The MUD expects this.
+    Off,
+    /// Approvals are on: a wake may stop at an approval the MUD never
+    /// gives.
+    On {
+        /// The calls that wait now.
+        waiting: usize,
+    },
+    /// No answer, or one this check does not expect.
+    Unknown(String),
+}
+
+/// Asks a daemon that just started whether any tool call waits for an
+/// owner's approval. The MUD config has no `[sandbox]` and no tool carries
+/// `private_data`, so lg answers `off`; anything else is logged, because
+/// then a wake could stop at an approval the MUD never gives.
+async fn check_approvals(entity: &EntityId, socket: &Path) -> ApprovalCheck {
+    let req = OwnerRequest::Approvals;
+    let check = match owner::request(socket, &req, req.timeout()).await {
+        Ok(OwnerResponse::Off { .. }) => return ApprovalCheck::Off,
+        Ok(OwnerResponse::Approvals { entries }) => ApprovalCheck::On {
+            waiting: entries.len(),
+        },
+        Ok(other) => ApprovalCheck::Unknown(format!("{other:?}")),
+        Err(e) => ApprovalCheck::Unknown(e.to_string()),
+    };
+    if let ApprovalCheck::On { waiting } = check {
+        tracing::warn!(%entity, waiting, "lg serve has approvals on; a wake may wait for one");
+    } else {
+        tracing::warn!(%entity, answer = ?check, "lg serve did not answer the approvals check with off");
+    }
+    check
+}
+
 #[derive(Debug)]
 struct Daemon {
     child: Child,
     socket: PathBuf,
+    /// The loopback port of its pages, kept so a config rewrite (quiet or
+    /// loud) never moves them.
+    ui_port: u16,
+    /// What it answered to the approvals check after its start.
+    approvals: ApprovalCheck,
 }
 
 /// A mind that runs each entity as its own `lg serve`.
@@ -449,6 +677,8 @@ pub struct LittleguyMind {
     personas: HashMap<EntityId, Persona>,
     daemons: Mutex<HashMap<EntityId, Daemon>>,
     meters: std::sync::Mutex<HashMap<EntityId, Arc<LedgerMeter>>>,
+    /// The entities whose config is rendered quiet ([`render_config`]).
+    quiet: std::sync::Mutex<BTreeSet<EntityId>>,
     /// Set by [`LittleguyMind::shutdown`]: no daemon starts after it.
     closed: std::sync::atomic::AtomicBool,
     /// Ops still read after their wake (see [`chat_charged`]).
@@ -464,6 +694,7 @@ impl LittleguyMind {
             personas,
             daemons: Mutex::new(HashMap::new()),
             meters: std::sync::Mutex::new(HashMap::new()),
+            quiet: std::sync::Mutex::new(BTreeSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             in_flight: InFlight::default(),
         }
@@ -519,7 +750,11 @@ impl LittleguyMind {
         std::fs::create_dir_all(&dir).map_err(io)?;
         let config = dir.join("lg.toml");
         let ui_port = free_loopback_port().map_err(io)?;
-        std::fs::write(&config, render_config(&self.cfg, persona, ui_port)).map_err(io)?;
+        write_config(
+            &config,
+            &render_config(&self.cfg, &persona.text(), ui_port, self.is_quiet(entity)),
+        )
+        .map_err(io)?;
         let socket = dir.join("lg.sock");
         reap_orphan(&dir, &socket).await;
         let _ = std::fs::remove_file(&socket);
@@ -580,14 +815,98 @@ impl LittleguyMind {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let approvals = check_approvals(entity, &socket).await;
         daemons.insert(
             entity.clone(),
             Daemon {
                 child,
                 socket: socket.clone(),
+                ui_port,
+                approvals,
             },
         );
         Ok(socket)
+    }
+
+    /// The config file of `entity`'s daemon.
+    fn config_path(&self, entity: &EntityId) -> PathBuf {
+        self.entity_dir(entity).join("lg.toml")
+    }
+
+    /// The socket of `entity`'s daemon while it runs. It never starts one.
+    pub async fn running_socket(&self, entity: &EntityId) -> Option<PathBuf> {
+        self.daemons
+            .lock()
+            .await
+            .get_mut(entity)
+            .and_then(|d| matches!(d.child.try_wait(), Ok(None)).then(|| d.socket.clone()))
+    }
+
+    /// What `entity`'s running daemon answered to the approvals check
+    /// after its start ([`ApprovalCheck::Off`] is expected). `None` while
+    /// no daemon runs.
+    pub async fn approval_check(&self, entity: &EntityId) -> Option<ApprovalCheck> {
+        self.daemons
+            .lock()
+            .await
+            .get_mut(entity)
+            .and_then(|d| matches!(d.child.try_wait(), Ok(None)).then(|| d.approvals.clone()))
+    }
+
+    /// The author's text of `entity`'s persona, with no token.
+    #[must_use]
+    pub fn brief(&self, entity: &EntityId) -> Option<PersonaText> {
+        self.personas.get(entity).map(Persona::text)
+    }
+
+    /// Whether `entity`'s config is rendered quiet.
+    #[must_use]
+    pub fn is_quiet(&self, entity: &EntityId) -> bool {
+        self.quiet
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(entity)
+    }
+
+    /// Renders `entity`'s config quiet (no heartbeat, memory off) or loud,
+    /// and rewrites it now when its daemon runs, on the same pages port.
+    /// lg looks at its config file every 2 s and reloads a changed one by
+    /// itself; the caller's `reload` applies it at once if the watcher has
+    /// not yet. So any `reloaded` answer is success, and its `applied` list
+    /// may be empty: the watcher's reload may have applied the change
+    /// first. A daemon that starts later starts with it.
+    ///
+    /// # Errors
+    /// The entity is not this mind's, or the file cannot be written.
+    pub async fn set_quiet(&self, entity: &EntityId, quiet: bool) -> Result<(), MindError> {
+        let persona = self
+            .personas
+            .get(entity)
+            .ok_or_else(|| MindError::Unavailable(format!("no persona for {entity}")))?;
+        // Under the daemons lock, through the write: a start renders the
+        // same flag, and two calls never write out of order.
+        let daemons = self.daemons.lock().await;
+        {
+            let mut set = self
+                .quiet
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if quiet {
+                set.insert(entity.clone());
+            } else {
+                set.remove(entity);
+            }
+        }
+        let Some(ui_port) = daemons.get(entity).map(|d| d.ui_port) else {
+            return Ok(());
+        };
+        let path = self.config_path(entity);
+        let written = write_config(
+            &path,
+            &render_config(&self.cfg, &persona.text(), ui_port, quiet),
+        );
+        drop(daemons);
+        written.map_err(|e| MindError::Unavailable(format!("{}: {e}", path.display())))
     }
 
     /// Stops every daemon and waits for each to exit; no daemon starts
@@ -617,13 +936,7 @@ impl LittleguyMind {
     /// # Errors
     /// The daemon is not running yet, or does not answer.
     pub async fn ui_link(&self, entity: &EntityId) -> Result<String, MindError> {
-        let socket = {
-            let mut daemons = self.daemons.lock().await;
-            daemons
-                .get_mut(entity)
-                .and_then(|d| matches!(d.child.try_wait(), Ok(None)).then(|| d.socket.clone()))
-        };
-        let Some(socket) = socket else {
+        let Some(socket) = self.running_socket(entity).await else {
             return Err(MindError::Unavailable(format!(
                 "{entity}'s littleguy is not running yet; it starts on its first wake"
             )));
@@ -687,7 +1000,7 @@ impl Mind for LittleguyMind {
             chat_charged(
                 socket,
                 ctx.wake_id.clone(),
-                wake_message(&ctx),
+                wake_message(ToolNames::LITTLEGUY, &ctx),
                 ctx.entity.clone(),
                 Arc::clone(tools.usage_sink()),
                 charge,

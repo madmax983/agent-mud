@@ -110,3 +110,20 @@ sequenceDiagram
   `cancelled` and `requeued` (a wake took it but never showed it to a
   mind). The note never goes in the feed; the boot's `booking_dropped`
   line stays.
+
+## Amended by the autonomy work (phase 2): wake tools on the tick server
+
+- A littleguy daemon reaches the wake tools on its `world` MCP server,
+  whose effect is `internal` (ADR 0002), so the model sees them as
+  `world__mud_wake_me` and `world__mud_cancel_wake`, and its prompts name
+  them so. An unattended heartbeat tick may therefore book a real wake:
+  the tick cannot act in the world, but the wake it books can. The world
+  tools a tick reaches are reads (`world__mud_look`, `world__mud_sheet`);
+  `mud__mud_command` and `mud__mud_events` sit on the `write` server, which
+  lg refuses on a tick. The e2e test
+  `a_real_tick_books_a_wake_through_the_world_server_and_cannot_command`
+  runs a real tick on a scripted model: the booking lands in the
+  `WakeBook`, and the command is refused and leaves no event.
+- A wake message stays under lg's 64 KiB line cap however long a hold
+  was (ADR 0002, the wire bound): the booked notes always go in, and the
+  newest events that fit.

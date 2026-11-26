@@ -157,7 +157,10 @@ async fn a_durable_torin_posts_the_bounty_through_its_tools() {
         ]
     );
     let system = system_of(&model.seen.lock().unwrap()[0]);
-    assert!(system.ends_with(&persistent_habits()), "{system}");
+    assert!(
+        system.ends_with(&persistent_habits(crate::mind::ToolNames::BARE)),
+        "{system}"
+    );
 
     // The same wake again is a duplicate: no new model calls, no new post.
     let calls = model.seen.lock().unwrap().len();
@@ -231,7 +234,10 @@ async fn an_ambient_harvest_mind_sees_no_wake_tools_or_habit() {
         "the persona's own prompt: {system}"
     );
     assert!(!system.contains("mud_wake_me"), "{system}");
-    assert!(!system.contains(&persistent_habits()), "{system}");
+    assert!(
+        !system.contains(&persistent_habits(crate::mind::ToolNames::BARE)),
+        "{system}"
+    );
 }
 
 /// Looks once, then answers; holds call `hold_at` until released.

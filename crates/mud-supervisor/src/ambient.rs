@@ -20,8 +20,8 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::mind::{
-    BoxFuture, Mind, MindError, MindReply, MudTools, Usage, UsageMeter, UsageRecorder, WakeContext,
-    system_prompt, tool_specs, wake_message,
+    BoxFuture, Mind, MindError, MindReply, MudTools, ToolNames, Usage, UsageMeter, UsageRecorder,
+    WakeContext, system_prompt, tool_specs, wake_message,
 };
 
 /// A client that records each call's spend as it comes in, so a wake that
@@ -118,7 +118,13 @@ impl AmbientMind {
             spent,
         });
         let mut agent = Agent::new(client)
-            .system_prompt(system_prompt(&card.0, &card.1, &card.2, &card.3))
+            .system_prompt(system_prompt(
+                ToolNames::BARE,
+                &card.0,
+                &card.1,
+                &card.2,
+                &card.3,
+            ))
             .max_steps(MAX_STEPS);
         for (name, description, schema) in tool_specs() {
             let t = tools.clone();
@@ -167,7 +173,7 @@ impl Mind for AmbientMind {
             let meter = UsageMeter::new(&tools);
             let turn = self
                 .agent(card, &tools, meter.recorder())
-                .run_turn(history, &wake_message(&ctx))
+                .run_turn(history, &wake_message(ToolNames::BARE, &ctx))
                 .await
                 .map_err(|e| MindError::Failed(e.to_string()))?;
             // The reply reports the spend from here on.

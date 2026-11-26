@@ -69,6 +69,12 @@ fn littleguy_mind(
             .cloned(),
         base_url: lg.base_url.clone(),
         max_steps: lg.max_steps,
+        heartbeat_minutes: lg.heartbeat_minutes,
+        research: lg.research,
+        notes: lg.notes,
+        compaction: lg.compaction(),
+        max_request_bytes: lg.max_request_bytes,
+        window: lg.window,
         ..LittleguyConfig::default()
     };
     let mut personas = HashMap::new();
@@ -239,6 +245,11 @@ pub fn build(
             by_entity.insert(id.clone(), Arc::clone(&mind));
         }
     }
+    if !littleguy.is_empty() {
+        for w in cfg.littleguy.warnings() {
+            tracing::warn!("{w}");
+        }
+    }
     Ok(Minds {
         by_entity,
         littleguy,
@@ -354,13 +365,27 @@ mod tests {
         cfg.minds.persistent = Runtime::Littleguy;
         cfg.littleguy.bin = dir.path().join("no-such-lg");
         cfg.littleguy.data_dir = dir.path().join("agents");
+        // The autonomy keys pass through to each daemon's config.
+        cfg.littleguy.window = 12;
+        cfg.littleguy.research = false;
+        cfg.littleguy.compaction = false;
+        cfg.littleguy.heartbeat_minutes = 15;
+        cfg.littleguy.notes = false;
+        cfg.littleguy.max_request_bytes = 123_456;
         let m = build(&cfg, &pack, &tokens, &|_| Seq(0), None).unwrap();
         let marta = EntityId::from("marta");
         assert!(m.littleguy[0].ensure(&marta).await.is_err(), "no binary");
         let text =
             std::fs::read_to_string(m.littleguy[0].entity_dir(&marta).join("lg.toml")).unwrap();
         let v: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(v["window"].as_integer(), Some(12));
+        assert_eq!(v["heartbeat"]["research"].as_bool(), Some(false));
+        assert_eq!(v["heartbeat"]["every_minutes"].as_integer(), Some(15));
+        assert!(!v.contains_key("compaction"));
+        assert_eq!(v["tools"]["files"].as_bool(), Some(false), "notes off");
+        assert_eq!(v["max_request_bytes"].as_integer(), Some(123_456));
         let system = v["system"].as_str().unwrap();
+        assert!(!system.contains("write_note"), "no note tool: {system}");
         assert!(system.contains(&pack.body_rules()), "{system}");
         assert!(system.contains("every 5 minutes"), "{system}");
         assert!(!system.contains("every minute"), "{system}");

@@ -64,6 +64,17 @@ data_dir = "data/agents"
 provider = "openrouter"          # offline | claude | openai | openrouter
 # base_url = "http://127.0.0.1:8080/v1"
 max_steps = 64                   # tool rounds per wake (0: no bound; the daily budget still caps spend)
+# Autonomy (ADR 0002). Each key below is its code default, so an older
+# mud.toml means the same. A heartbeat tick is a quiet moment: it may read,
+# book a wake and keep notes and plans, never change the world.
+heartbeat_minutes = 240          # minutes between heartbeat ticks (lg's minimum is 1); 0 turns them off
+research = true                  # a tick researches the agent's open ideas
+notes = true                     # the agent keeps notes; also lg's workspace file tools (write ones refused on ticks)
+compaction = true                # a long op saves notes and starts over below max_request_bytes
+compaction_at_percent = 80
+compaction_max_resets = 3
+max_request_bytes = 240000       # keep under the provider's window; 0 is lg's 2 MiB default (warned with compaction on)
+window = 30                      # turns of transcript the agent sees
 [littleguy.model_names]
 default = "deepseek/deepseek-chat"
 

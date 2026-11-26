@@ -616,6 +616,10 @@ pub struct ModelConfig {
 }
 
 /// `[littleguy]`.
+///
+/// Every key has a code default, so a `[littleguy]` written before a key
+/// existed keeps working: notes, research and compaction are on unless
+/// turned off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LittleguySection {
@@ -632,18 +636,96 @@ pub struct LittleguySection {
     /// Tool rounds one wake may use; `0` is no bound. A wake that needs
     /// more ends with no answer (and is still charged).
     pub max_steps: u32,
+    /// Minutes between heartbeat ticks (lg's minimum is 1); 0 turns them
+    /// off.
+    pub heartbeat_minutes: u32,
+    /// A tick researches the agent's open ideas (`heartbeat.research`).
+    pub research: bool,
+    /// The agent keeps notes (`tools.files`). This also turns on lg's
+    /// workspace file tools in the daemon's own folder; the ones that
+    /// change it are refused on ticks.
+    pub notes: bool,
+    /// `[compaction]`: a long op saves notes and starts over below the
+    /// request cap, instead of failing.
+    pub compaction: bool,
+    /// Compact at this percent of `max_request_bytes` (1 to 100).
+    pub compaction_at_percent: u8,
+    /// Resets of one op at most (at least 1).
+    pub compaction_max_resets: u32,
+    /// The largest model request lg sends, in bytes; keep it under the
+    /// provider's window. 0 is lg's default (2 MiB).
+    pub max_request_bytes: u64,
+    /// Turns of transcript the agent sees (at least 1).
+    pub window: u32,
 }
 
 impl Default for LittleguySection {
     fn default() -> Self {
+        let d = mud_supervisor::littleguy::LittleguyConfig::default();
+        let c = d.compaction.unwrap_or_default();
         Self {
             bin: PathBuf::from("lg"),
             data_dir: PathBuf::from("data/agents"),
             provider: "offline".into(),
             model_names: BTreeMap::new(),
             base_url: None,
-            max_steps: mud_supervisor::littleguy::LittleguyConfig::default().max_steps,
+            max_steps: d.max_steps,
+            heartbeat_minutes: d.heartbeat_minutes,
+            research: d.research,
+            notes: d.notes,
+            compaction: d.compaction.is_some(),
+            compaction_at_percent: c.at_percent,
+            compaction_max_resets: c.max_resets,
+            max_request_bytes: d.max_request_bytes,
+            window: d.window,
         }
+    }
+}
+
+impl LittleguySection {
+    /// Checks the bounds lg would refuse at start.
+    ///
+    /// # Errors
+    /// A value is out of bounds; the message names it.
+    pub fn check(&self) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!(
+            (1..=100).contains(&self.compaction_at_percent),
+            "[littleguy] compaction_at_percent must be 1 to 100, not {}",
+            self.compaction_at_percent
+        );
+        ensure!(
+            self.compaction_max_resets >= 1,
+            "[littleguy] compaction_max_resets must be at least 1"
+        );
+        ensure!(self.window >= 1, "[littleguy] window must be at least 1");
+        Ok(())
+    }
+
+    /// The `[compaction]` to render, if on.
+    #[must_use]
+    pub const fn compaction(&self) -> Option<mud_supervisor::littleguy::CompactionRender> {
+        if self.compaction {
+            Some(mud_supervisor::littleguy::CompactionRender {
+                at_percent: self.compaction_at_percent,
+                max_resets: self.compaction_max_resets,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// What to warn about at start when littleguy runs.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.compaction && self.max_request_bytes == 0 {
+            out.push(
+                "[littleguy] compaction is on but max_request_bytes is 0: lg compacts below its 2 MiB default, which may be past the provider's window; set max_request_bytes under it"
+                    .to_owned(),
+            );
+        }
+        out
     }
 }
 
@@ -807,6 +889,101 @@ mod tests {
         assert_eq!(d.minds.persistent, Runtime::Scripted);
         assert_eq!(d.server.mcp_url(), "http://127.0.0.1:3000/mcp");
         assert!(toml::from_str::<MudConfig>("[server]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn the_example_sets_the_littleguy_autonomy_keys() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        let lg = &ex.littleguy;
+        assert_eq!(lg.heartbeat_minutes, 240);
+        assert!(lg.research && lg.notes && lg.compaction);
+        assert_eq!(
+            (lg.compaction_at_percent, lg.compaction_max_resets),
+            (80, 3)
+        );
+        assert_eq!(lg.max_request_bytes, 240_000);
+        assert_eq!(lg.window, 30);
+        assert!(lg.check().is_ok());
+        assert_eq!(lg.warnings(), Vec::<String>::new());
+        assert!(
+            toml::from_str::<MudConfig>("[littleguy]\nnotez = true").is_err(),
+            "an unknown key is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_mud_toml_keeps_its_meaning() {
+        // A [littleguy] section written before the autonomy keys.
+        let dir = tempfile::tempdir().unwrap();
+        let old: MudConfig = toml::from_str(&format!(
+            "[minds]\npersistent = \"littleguy\"\n[littleguy]\nbin = {:?}\ndata_dir = {:?}\nprovider = \"openrouter\"\nmax_steps = 64\n",
+            dir.path().join("no-such-lg"),
+            dir.path().join("agents"),
+        ))
+        .unwrap();
+        let lg = &old.littleguy;
+        assert_eq!(lg.provider, "openrouter");
+        assert!(lg.research && lg.notes && lg.compaction, "autonomy is on");
+        assert_eq!(lg.heartbeat_minutes, 240);
+        // The real path: minds::build passes [littleguy] to each daemon,
+        // which writes its lg.toml before it tries to start.
+        let pack = mud_world::WorldPack::crypt_v01().unwrap();
+        let tokens = mud_mcp::TokenRegistry::new();
+        let m = crate::minds::build(&old, &pack, &tokens, &|_| mud_world::Seq(0), None).unwrap();
+        let marta = mud_world::EntityId::from("marta");
+        assert!(m.littleguy[0].ensure(&marta).await.is_err(), "no binary");
+        let text =
+            std::fs::read_to_string(m.littleguy[0].entity_dir(&marta).join("lg.toml")).unwrap();
+        let v: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(v["tools"]["files"].as_bool(), Some(true), "notes");
+        assert_eq!(v["memory"]["enabled"].as_bool(), Some(true));
+        assert!(v["system"].as_str().unwrap().contains("write_note"));
+        assert_eq!(v["heartbeat"]["research"].as_bool(), Some(true));
+        assert_eq!(v["heartbeat"]["every_minutes"].as_integer(), Some(240));
+        assert_eq!(v["compaction"]["at_percent"].as_integer(), Some(80));
+        assert_eq!(v["compaction"]["max_resets"].as_integer(), Some(3));
+        assert_eq!(v["max_request_bytes"].as_integer(), Some(240_000));
+        assert_eq!(v["window"].as_integer(), Some(30));
+        assert_eq!(v["max_steps"].as_integer(), Some(64));
+    }
+
+    #[test]
+    fn littleguy_bounds_are_checked() {
+        let bad = |edit: &dyn Fn(&mut LittleguySection)| {
+            let mut s = LittleguySection::default();
+            edit(&mut s);
+            s.check().unwrap_err().to_string()
+        };
+        assert_eq!(
+            bad(&|s| s.compaction_at_percent = 0),
+            "[littleguy] compaction_at_percent must be 1 to 100, not 0"
+        );
+        assert_eq!(
+            bad(&|s| s.compaction_at_percent = 101),
+            "[littleguy] compaction_at_percent must be 1 to 100, not 101"
+        );
+        assert_eq!(
+            bad(&|s| s.compaction_max_resets = 0),
+            "[littleguy] compaction_max_resets must be at least 1"
+        );
+        assert_eq!(
+            bad(&|s| s.window = 0),
+            "[littleguy] window must be at least 1"
+        );
+        let off = LittleguySection {
+            compaction: false,
+            max_request_bytes: 0,
+            ..LittleguySection::default()
+        };
+        assert_eq!(off.compaction(), None);
+        assert_eq!(off.warnings(), Vec::<String>::new());
+        let unbounded = LittleguySection {
+            max_request_bytes: 0,
+            ..LittleguySection::default()
+        };
+        let w = unbounded.warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("max_request_bytes is 0"), "{w:?}");
     }
 
     #[test]

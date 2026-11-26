@@ -183,13 +183,22 @@ per tier:
 | `harvest` | a durable autumn-harvest agent in process | `[models.<alias>]` and its key |
 | `plugin-agent` | an autumn-plugin-agent loop (ambient NPCs) | `[models.<alias>]` and its key |
 
-With littleguy, build `lg` from the littleguy repository and point
-`[littleguy] bin` at it:
+With littleguy, build `lg` from the littleguy repository at commit
+`aefce058ca0b18bdf58cd68f012288b6fb4ef099` (the one CI pins and the MUD
+is tested against) and point `[littleguy] bin` at it:
 
 ```sh
+git -C littleguy checkout aefce058ca0b18bdf58cd68f012288b6fb4ef099
 cargo build --release -p littleguy --no-default-features \
   --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction"
 ```
+
+Each agent's daemon takes notes, keeps goals and ideas, researches them on
+its heartbeat, and compacts a long op (the `[littleguy]` keys in
+`mud.toml.example`; all on by default). A heartbeat tick is a quiet moment:
+it may read and book a wake through the `world` MCP server, but lg refuses
+`mud__mud_command` on it. `notes = true` also gives each agent lg's
+workspace file tools in its own folder (ADR 0002).
 
 The supervisor writes each entity's `lg.toml` under `data/agents/<id>/`, starts
 `lg serve` with its own database and socket, and hands it a bearer token for
