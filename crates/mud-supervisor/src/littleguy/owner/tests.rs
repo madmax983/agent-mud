@@ -189,7 +189,7 @@ async fn owner_requests_speak_the_socket_protocol() {
     );
     assert!(matches!(&answers[4], OwnerResponse::Notes { notes } if notes[0].name == "ore"));
     assert!(
-        matches!(&answers[5], OwnerResponse::Overlays { active: Some(1), head: Some(4), entries } if entries[0].parts == ["guardrails"])
+        matches!(&answers[5], OwnerResponse::Overlays { active: Some(1), head: Some(Some(4)), entries } if entries[0].parts == ["guardrails"])
     );
     assert!(matches!(
         &answers[6],
@@ -254,19 +254,23 @@ fn an_older_overlays_answer_reads_with_no_head() {
             active: Some(1),
             head: None,
             entries: Vec::new(),
-        }
+        },
+        "no head named: an lg before #122"
     );
     let fresh: OwnerResponse =
         serde_json::from_str(r#"{"kind":"overlays","active":null,"head":null,"entries":[]}"#)
             .unwrap();
-    assert!(matches!(
-        fresh,
-        OwnerResponse::Overlays {
-            active: None,
-            head: None,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            fresh,
+            OwnerResponse::Overlays {
+                active: None,
+                head: Some(None),
+                ..
+            }
+        ),
+        "a named null: lg #122 before the first move"
+    );
 }
 
 #[tokio::test]

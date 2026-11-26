@@ -133,10 +133,10 @@ default) or `free` (ADR 0016: council-approved model text in the
 guardrails, with its own guards and controls; a Turing-tier agent still
 uses the menu). With it on, lg's config gains `[refine]` (the pinned
 CI `lg` is built with the `refine` feature) and the Steward owns the
-agent's overlays. lg's `overlay_activate` takes no expected version: lg
-compares with its own pointer, read inside the request. So the Steward
-keeps its own view of lg's active version (`pointer`) and checks every
-move:
+agent's overlays. The Steward keeps its own view of lg's active version
+(`pointer`) and checks every move. Since littleguy #122, each activate
+also sends the pointer it read (`expected`), and lg refuses a move from a
+pointer that moved (amended below):
 
 - **The pointer check**, every pass: `overlays` (a read beside lg's loop)
   and the proved `pointer_verdict(lg, pointer, lg is late)`. `Same`:
@@ -176,7 +176,8 @@ move:
   `overlay_moved` means the pointer moved after the read: lg changed
   nothing, so nothing is restored and nothing is sent again, and it is a
   human's veto (`moved overlay_moved`, then the human path; back on the
-  read version is a move away and back, also a veto). An older lg drops
+  read version is a move away and back, also a veto, which keeps the text
+  the human returned to). An older lg drops
   `expected` and answers without `guarded` (`unguarded old_lg`, once per
   daemon start); for it the phase 4 check stands: an answer whose
   `previous` is not the expected one means a human moved the pointer in
@@ -190,9 +191,12 @@ move:
   `late` list (if it applies later, the pointer check undoes it); the
   head moved and lg back on the read version is a move away and back, a
   human's veto (not late: lg's guard refuses a queued activate once the
-  head moved); lg on the activate's version is applied, or a human's move
-  to that very version, which the protocol cannot tell apart, so it fails
-  safe:
+  head moved); lg on the activate's version two or more moves on is a
+  later move to it, a human's choice that stands (a guarded activate is
+  only ever the first move after its read); lg on the activate's version
+  one move on (or by version alone, unguarded) is applied, or a human's
+  one move to that very version, which the protocol cannot tell apart, so
+  it fails safe:
   applied, a move to `{}` is adopted when no text of the Steward's was
   active, and otherwise taken as a human's Roll back off the text (paused
   `unconfirmed`, the text vetoed), since a Roll back just before it leaves
@@ -317,15 +321,29 @@ nothing changes. A guarded move answers `overlay_active` with
   just before them. The intent records the head it sent (`guard`), so a
   lost answer settles the same way after a restart. An intent written
   before the guard has none and settles by the version alone, as before.
+  So does one whose read named no `head` (an older lg drops `expected`):
+  the Steward records a guard only when lg names a head, and counts it at
+  settlement only when lg names one again, so a daemon that changed its
+  build between the send and the settlement is judged by version, not
+  taken for a human's move. An `overlay_moved` back on the read version,
+  after a read that named no head, is such a build change: nothing moved,
+  and the next pass reads again.
 - **`guarded: true`** is the move meant, from the read pointer: the
   Steward records it at once and needs no check of `previous`.
 - **`overlay_moved`** is a human's veto, and the human-override path runs
   as for a move the pointer check finds: refine pauses (`rolled_back`),
   the pointer follows lg, the Steward's active text is vetoed, and the
-  agent hears `overlay_off`. lg changed nothing, so the Steward restores
-  nothing and sends nothing again. A version on the late list goes to the
-  pointer check instead: a late activate of the Steward's own may have
-  run between the read and this one.
+  agent hears `overlay_off`. The text the activate was about to make live
+  is vetoed too, as on an older lg ("never chose this one"), unless lg is
+  on it: a version the human lands on is their choice and is never
+  vetoed. lg changed nothing, so the Steward restores nothing and sends
+  nothing again. Back on the read version (a move away and back), the
+  text there is the one the human returned to and stays; each late text
+  sent from the same read may have run and been rolled back, so it is
+  vetoed and leaves the late list. A late version of the Steward's own,
+  one move past its read, goes to the pointer check instead: it ran
+  between the read and this one, and the next pass undoes it (a pass
+  makes one move).
 - **No `guarded`** means an older lg, which moved the pointer unchecked.
   The phase 4 fail-safe stays for it (the `previous` check, restore and
   pause), and the Steward logs and publishes `unguarded old_lg` once per
@@ -334,14 +352,20 @@ nothing changes. A guarded move answers `overlay_active` with
   (`vet.rs`, proved in `formal/verus/src/steward.rs`): "not applied" only
   while lg shows the pointer as read, and with the guard only while the
   head has not moved. The head tells "not applied" from a move away and
-  back, which is now a veto where phase 4 took it as "not applied". It
-  cannot tell the Steward's own move to `v` from a human's move to `v`:
-  both are one move that lands on `v`, and the protocol names no mover.
-  There the phase 4 fail-safe still decides. A guarded activate given up
-  on after the head moved is not put on the late list: the head only
-  rises, so lg refuses it if it is still queued.
-- **What ask 14 still lacks.** The head says that the pointer moved, not
-  who moved it or how often. Settling "lg is on `v`" exactly needs the
+  back, which is now a veto where phase 4 took it as "not applied". lg
+  numbers each move one past the last (`MAX(seq) + 1` in every store), and
+  a guarded activate applies only as the first move after its read
+  (`one_move`, also proved). So lg on `v` two or more moves on is a later
+  move to `v`, a human's choice that stands (`Human`, nothing restored).
+  It cannot tell the Steward's own move to `v` from a human's one move to
+  `v`: the protocol names no mover. There the phase 4 fail-safe still
+  decides. A guarded activate given up on after the head moved is not put
+  on the late list: the head only rises, so lg refuses it if it is still
+  queued. A late entry keeps the head its activate sent: lg on a late
+  version counts as the Steward's own only one move past that head, and
+  an entry lg can no longer run (the head moved past it) is dropped.
+- **What ask 14 still lacks.** The head says how often the pointer moved,
+  not who moved it. Settling "lg is on `v`, one move on" exactly needs the
   activation log on the socket (each move's `from`, `to`, `seq` and
   author), or an `overlay_active` that names the new `head`, so the
   Steward could match the move after `H` to its own request. Ask 15 (drop
@@ -353,8 +377,18 @@ Tests: `every_activate_sends_the_pointer_it_read`,
 `a_lost_answer_after_a_move_away_and_back_is_a_human_veto`,
 `a_lost_guarded_activate_with_an_unmoved_head_is_late_after_a_restart`,
 `a_lost_guarded_activate_after_a_move_away_and_back_pauses_after_a_restart`,
-and `a_human_move_between_read_and_activate_on_an_older_lg_is_restored`
-for the older lg, all against the fake daemon; the wire tests in
+`a_lost_text_a_human_rolled_back_and_activated_again_is_theirs`,
+`a_refused_clear_after_a_move_away_and_back_keeps_the_text_returned_to`,
+`a_late_text_run_and_rolled_back_before_a_refused_activate_is_vetoed`,
+`a_late_version_a_human_activates_after_another_move_is_theirs`,
+`an_own_late_activate_that_runs_before_a_refused_one_is_undone_not_a_veto`,
+`a_restore_refused_by_lg_is_a_human_veto_and_restores_nothing`,
+`a_refusal_from_a_newer_build_than_the_read_is_no_human_veto`,
+`an_open_activate_from_an_older_lg_settles_by_version_on_a_newer_build`,
+and `a_human_move_between_read_and_activate_on_an_older_lg_is_restored`,
+`a_human_rollback_before_a_lost_clear_on_an_older_lg_pauses_and_vetoes`
+and `a_late_activate_on_an_older_lg_is_undone_once` for the older lg,
+all against the fake daemon; the wire tests in
 `littleguy::owner`; `a_real_lg_with_refine_takes_overlay_requests` and
 the real-lg end-to-end test
 `a_human_move_before_a_real_guarded_activate_is_refused_and_pauses`,

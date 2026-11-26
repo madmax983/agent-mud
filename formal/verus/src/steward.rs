@@ -29,7 +29,11 @@
 //!   (`lemma_a_moved_head_is_never_not_applied`); a move away and back is
 //!   a human's (`lemma_away_and_back_is_human`); a version that is neither
 //!   the read one nor the target is a human's
-//!   (`lemma_a_third_version_is_human`).
+//!   (`lemma_a_third_version_is_human`). A guarded activate can only be
+//!   the first move after its read (`one_move`), so with the guard lg on
+//!   the target two or more moves on is a human's
+//!   (`lemma_a_later_move_to_the_target_is_human`), and exactly one move
+//!   on is `AtTarget` (`lemma_one_move_to_the_target_is_at_target`).
 //! - `overlay_verdict` (phase 5, ADR 0016): a free text activates only
 //!   with the guard passed, a unanimous council of at least `min_members`
 //!   (at least one), no pause and a normal budget; a pause blocks every
@@ -377,6 +381,36 @@ pub proof fn lemma_every_foreign_move_is_human(lg: Option<u64>, expected: Option
 {
 }
 
+/// lg's head `after` is one move past `before`: 1 after no move, else
+/// one more.
+pub open spec fn spec_one_move(before: Option<u64>, after: Option<u64>) -> bool {
+    match before {
+        None => after == Some(1u64),
+        Some(b) => match after {
+            Some(a) => a as int == b as int + 1,
+            None => false,
+        },
+    }
+}
+
+// mirror-begin one_move
+/// Whether lg's head `after` is exactly one move past `before` (lg #122).
+///
+/// lg numbers each move of the pointer one past the last, from 1, so the
+/// first move after a read of `before` is the only one that lands there.
+#[must_use]
+pub const fn one_move(before: Option<u64>, after: Option<u64>) -> (r: bool)
+    ensures
+        r == spec_one_move(before, after),
+{
+    match (before, after) {
+        (None, Some(a)) => a == 1,
+        (Some(b), Some(a)) => b < a && a - b == 1,
+        _ => false,
+    }
+}
+// mirror-end one_move
+
 // mirror-begin lost_verdict_enum
 /// What lg's pointer, read again, says of an activate whose answer never
 /// came.
@@ -384,8 +418,9 @@ pub enum LostVerdict {
     /// The pointer is where the activate read it: the activate did not
     /// apply. It may still wait in lg's queue.
     NotApplied,
-    /// The pointer is on the activate's version: it applied, or someone
-    /// else moved it there. The two cannot be told apart.
+    /// The pointer is on the activate's version, and (with the guard) one
+    /// move past the read: it applied, or someone else made that one move
+    /// to it. The two cannot be told apart.
     AtTarget,
     /// Someone else moved the pointer: a human's veto.
     Human,
@@ -402,7 +437,7 @@ pub open spec fn spec_lost_verdict(
 ) -> LostVerdict {
     if lg == from && (lg_head == from_head || !guarded) {
         LostVerdict::NotApplied
-    } else if lg == Some(target) {
+    } else if lg == Some(target) && (!guarded || spec_one_move(from_head, lg_head)) {
         LostVerdict::AtTarget
     } else {
         LostVerdict::Human
@@ -414,9 +449,12 @@ pub open spec fn spec_lost_verdict(
 /// `target` from `(from, from_head)` got no answer.
 ///
 /// `guarded` says the activate carried `from_head` as lg's guard (lg
-/// #122). Each move raises the head, so a head that moved is a move after
-/// the read, and a pointer back on `from` is then a move away and back,
-/// never "not applied". Without the guard only the version counts.
+/// #122), and lg named a head both times. Each move raises the head by
+/// one, so a head that moved is a move after the read, and a pointer back
+/// on `from` is then a move away and back, never "not applied". A guarded
+/// activate can only be the first move after its read ([`one_move`]): lg
+/// on `target` with the head two or more moves on is a later move to it,
+/// a human's. Without the guard only the version counts.
 #[must_use]
 pub const fn lost_verdict(
     lg: Option<u64>,
@@ -431,7 +469,8 @@ pub const fn lost_verdict(
         (r is NotApplied) ==> lg == from,
         (r is NotApplied) && guarded ==> lg_head == from_head,
         (r is AtTarget) ==> lg == Some(target),
-        (r is Human) ==> lg != Some(target),
+        (r is AtTarget) && guarded ==> spec_one_move(from_head, lg_head),
+        (r is Human) ==> lg != Some(target) || (guarded && !spec_one_move(from_head, lg_head)),
         (r is Human) ==> lg != from || (guarded && lg_head != from_head),
 {
     let at_from = match (lg, from) {
@@ -450,7 +489,7 @@ pub const fn lost_verdict(
     };
     if at_from && (head_same || !guarded) {
         LostVerdict::NotApplied
-    } else if at_target {
+    } else if at_target && (!guarded || one_move(from_head, lg_head)) {
         LostVerdict::AtTarget
     } else {
         LostVerdict::Human
@@ -500,6 +539,47 @@ pub proof fn lemma_an_unmoved_pointer_is_not_applied(
 )
     ensures
         spec_lost_verdict(from, from_head, from, from_head, guarded, target) is NotApplied,
+{
+}
+
+/// With the guard, lg on the target two or more moves past the read is a
+/// later move to it: the guarded activate could only be the first move.
+/// It is a human's, never `AtTarget`.
+pub proof fn lemma_a_later_move_to_the_target_is_human(
+    lg_head: Option<u64>,
+    from: Option<u64>,
+    from_head: Option<u64>,
+    target: u64,
+)
+    requires
+        from != Some(target),
+        !spec_one_move(from_head, lg_head),
+    ensures
+        spec_lost_verdict(Some(target), lg_head, from, from_head, true, target) is Human,
+{
+}
+
+/// With the guard, lg on the target exactly one move past the read is
+/// `AtTarget`: the Steward's move, or a human's one move to it.
+pub proof fn lemma_one_move_to_the_target_is_at_target(
+    from: Option<u64>,
+    from_head: Option<u64>,
+    target: u64,
+)
+    requires
+        from != Some(target),
+    ensures
+        spec_lost_verdict(
+            Some(target),
+            Some(match from_head {
+                None => 1u64,
+                Some(h) => if h < u64::MAX { (h + 1) as u64 } else { h },
+            }),
+            from,
+            from_head,
+            true,
+            target,
+        ) is AtTarget || from_head == Some(u64::MAX),
 {
 }
 

@@ -1589,9 +1589,10 @@ async fn read_pointer(sock: &Path) -> owner::ExpectedPointer {
     .await
     .unwrap();
     match listed {
-        owner::OwnerResponse::Overlays { active, head, .. } => {
-            owner::ExpectedPointer { active, head }
-        }
+        owner::OwnerResponse::Overlays { active, head, .. } => owner::ExpectedPointer {
+            active,
+            head: head.flatten(),
+        },
         other => panic!("{other:?}"),
     }
 }
@@ -1693,7 +1694,7 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
             &listed,
             Resp::Overlays {
                 active: None,
-                head: None,
+                head: Some(None),
                 ..
             }
         ),

@@ -136,10 +136,15 @@ Each control has a test.
    activate and sends it as `expected` (littleguy #122): lg moves the
    pointer only when nothing moved since, and answers `overlay_moved`
    otherwise. Then lg changed nothing, refine pauses for that entity, and
-   the Steward's active text is never proposed again (`vetoed` is never
-   evicted). An activate whose answer is lost is never resent; if it
-   applied, the Steward undoes it and pauses; a move away and back in the
-   meantime pauses too. Only the operator resumes (`resume_refine`).
+   the Steward's active text and the text it was about to activate are
+   never proposed again (`vetoed` is never evicted). A text the human
+   lands on, or returns to after a move away and back, is their choice and
+   is never vetoed. An activate whose answer is lost is never resent; if
+   it applied, the Steward undoes it and pauses; a move away and back in
+   the meantime pauses too and vetoes the text, which may have run and
+   been rolled back; lg on the text two or more moves on is a human's
+   choice of it, left as it is. Only the operator resumes
+   (`resume_refine`).
    Against an lg older than #122, which moves unchecked, the phase 4
    check stays: a human move in between is detected by `previous`,
    restored, and refine pauses (amended 2026-11-26; ADR 0015 has the

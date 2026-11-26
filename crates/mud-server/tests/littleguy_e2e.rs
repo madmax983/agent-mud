@@ -779,6 +779,12 @@ async fn a_human_move_before_a_real_guarded_activate_is_refused_and_pauses() {
         Some("rolled_back")
     );
     assert!(row.intent.is_none() && row.overlay.late.is_empty());
+    let menu = mud_supervisor::steward::vet::default_menu();
+    let brevity = mud_supervisor::steward::vet::render_guardrails(&menu, &["brevity".to_owned()]);
+    assert!(
+        row.is_vetoed(mud_supervisor::steward::vet::overlay_digest(&brevity)),
+        "the text about to go live is vetoed: {row:?}"
+    );
     // Passes go on; the person's choice stands, and nothing moves it.
     let before = blocking_owner_line(&socket, r#"{"kind":"overlays"}"#).unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;

@@ -77,6 +77,18 @@ pub enum ActivateMode {
     /// where ours read it, with a new head; then ours runs (refused by the
     /// guard) and is never answered.
     AwayAndBackSilently(u64),
+    /// As [`Self::AwayAndBackSilently`], but ours is answered: lg refuses
+    /// it with `overlay_moved` on the version ours read.
+    AwayAndBackFirst(u64),
+    /// Ours applies; then a human presses Roll back and activates ours
+    /// again by hand. It is never answered: lg is on ours, three moves on.
+    ApplyRollbackReactivateSilently,
+    /// lg's loop runs the held activates first (a late one of ours), then
+    /// ours, which is answered.
+    ApplyHeldFirst,
+    /// lg's loop runs the held activates first, a human presses Roll back
+    /// off them, then ours runs and is answered.
+    ApplyHeldRollbackFirst,
 }
 
 /// What the daemon does with the next `refine_propose`.
@@ -246,6 +258,13 @@ impl FakeState {
         }
     }
 
+    /// Runs the activates held in the queue, as lg's loop would.
+    fn run_held(&mut self) {
+        for (v, expected) in std::mem::take(&mut self.held) {
+            let _ = self.guarded_activate(v, expected.as_ref());
+        }
+    }
+
     /// lg's Roll back: reverses the last move.
     pub fn rollback(&mut self) {
         if let Some(&(Some(from), _)) = self.moves.last() {
@@ -308,47 +327,7 @@ impl FakeState {
                     json!({ "kind": "overlay_stored", "version": version }).to_string(),
                 )
             }
-            "overlay_activate" => {
-                let version = v["version"].as_u64().unwrap_or_default();
-                if !self.versions.iter().any(|x| x.version == version) {
-                    return (
-                        now,
-                        json!({ "kind": "error", "message": "no such version" }).to_string(),
-                    );
-                }
-                let expected = v.get("expected").cloned();
-                let expected = expected.as_ref();
-                match self
-                    .activate_modes
-                    .pop_front()
-                    .unwrap_or(ActivateMode::Answer)
-                {
-                    ActivateMode::Hold => {
-                        self.held.push((version, expected.cloned()));
-                        (None, String::new())
-                    }
-                    ActivateMode::ApplySilently => {
-                        let _ = self.guarded_activate(version, expected);
-                        (None, String::new())
-                    }
-                    ActivateMode::RollbackFirstSilently => {
-                        self.rollback();
-                        let _ = self.guarded_activate(version, expected);
-                        (None, String::new())
-                    }
-                    ActivateMode::AwayAndBackSilently(h) => {
-                        self.activate(h);
-                        self.rollback();
-                        let _ = self.guarded_activate(version, expected);
-                        (None, String::new())
-                    }
-                    ActivateMode::HumanFirst(h) => {
-                        self.activate(h);
-                        (now, self.guarded_activate(version, expected))
-                    }
-                    ActivateMode::Answer => (now, self.guarded_activate(version, expected)),
-                }
-            }
+            "overlay_activate" => self.activate_answer(v),
             "refine_propose" => match self.propose_modes.pop_front() {
                 None | Some(ProposeMode::Kept) => (now, json!({ "kind": "kept" }).to_string()),
                 Some(ProposeMode::Propose(o)) => (now, self.proposed(&o)),
@@ -362,6 +341,70 @@ impl FakeState {
                 now,
                 json!({ "kind": "error", "message": "unknown request" }).to_string(),
             ),
+        }
+    }
+
+    /// The answer to an `overlay_activate`, by the next activate mode.
+    fn activate_answer(&mut self, v: &Value) -> (Option<Duration>, String) {
+        let now = Some(Duration::ZERO);
+        let version = v["version"].as_u64().unwrap_or_default();
+        if !self.versions.iter().any(|x| x.version == version) {
+            return (
+                now,
+                json!({ "kind": "error", "message": "no such version" }).to_string(),
+            );
+        }
+        let expected = v.get("expected").cloned();
+        let expected = expected.as_ref();
+        match self
+            .activate_modes
+            .pop_front()
+            .unwrap_or(ActivateMode::Answer)
+        {
+            ActivateMode::Hold => {
+                self.held.push((version, expected.cloned()));
+                (None, String::new())
+            }
+            ActivateMode::ApplySilently => {
+                let _ = self.guarded_activate(version, expected);
+                (None, String::new())
+            }
+            ActivateMode::RollbackFirstSilently => {
+                self.rollback();
+                let _ = self.guarded_activate(version, expected);
+                (None, String::new())
+            }
+            ActivateMode::AwayAndBackSilently(h) => {
+                self.activate(h);
+                self.rollback();
+                let _ = self.guarded_activate(version, expected);
+                (None, String::new())
+            }
+            ActivateMode::HumanFirst(h) => {
+                self.activate(h);
+                (now, self.guarded_activate(version, expected))
+            }
+            ActivateMode::AwayAndBackFirst(h) => {
+                self.activate(h);
+                self.rollback();
+                (now, self.guarded_activate(version, expected))
+            }
+            ActivateMode::ApplyRollbackReactivateSilently => {
+                let _ = self.guarded_activate(version, expected);
+                self.rollback();
+                self.activate(version);
+                (None, String::new())
+            }
+            ActivateMode::ApplyHeldFirst => {
+                self.run_held();
+                (now, self.guarded_activate(version, expected))
+            }
+            ActivateMode::ApplyHeldRollbackFirst => {
+                self.run_held();
+                self.rollback();
+                (now, self.guarded_activate(version, expected))
+            }
+            ActivateMode::Answer => (now, self.guarded_activate(version, expected)),
         }
     }
 
@@ -611,10 +654,7 @@ impl FakeDaemon {
 
     /// Applies the activates held in the queue, as lg's loop would.
     pub fn apply_held(&self) {
-        let mut st = self.state.lock().unwrap();
-        for (v, expected) in std::mem::take(&mut st.held) {
-            let _ = st.guarded_activate(v, expected.as_ref());
-        }
+        self.state.lock().unwrap().run_held();
     }
 
     pub fn active(&self) -> Option<u64> {

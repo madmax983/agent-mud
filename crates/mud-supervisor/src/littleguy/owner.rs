@@ -68,6 +68,16 @@ pub struct ExpectedPointer {
     pub head: Option<u64>,
 }
 
+/// Reads a field that is there, `null` included, as `Some`; a missing one
+/// is `None` through `#[serde(default)]`.
+fn named<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
 /// One owner request to `lg serve`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -276,10 +286,11 @@ pub enum OwnerResponse {
         /// The active version, if any.
         active: Option<u64>,
         /// The `seq` of the last move of the pointer, read with `active`
-        /// from one row; `None` before the first move, and always from an
-        /// lg before #122.
-        #[serde(default)]
-        head: Option<u64>,
+        /// from one row. lg #122 always names it: `Some(None)` before the
+        /// first move. An lg before #122 never does: `None`. Only a named
+        /// head guards an activate.
+        #[serde(default, deserialize_with = "named")]
+        head: Option<Option<u64>>,
         /// Each version, oldest first.
         entries: Vec<OverlayEntry>,
     },
