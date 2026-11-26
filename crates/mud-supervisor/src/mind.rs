@@ -345,6 +345,25 @@ pub trait Mind: Send + Sync + std::fmt::Debug + 'static {
         let _ = entity;
         None
     }
+
+    /// What the mind has to tell the operator since it was last asked: a
+    /// degraded start, say. The supervisor takes them after each wake and
+    /// shows each on the observer. The default has none.
+    fn take_notices(&self) -> Vec<MindNotice> {
+        Vec::new()
+    }
+}
+
+/// One thing a mind tells the operator ([`Mind::take_notices`]). It holds
+/// server text only: never a token, a key or a player's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MindNotice {
+    /// The entity whose wake found it.
+    pub entity: EntityId,
+    /// A stable code, such as `lg_lacks_section`.
+    pub code: String,
+    /// What happened and what to do about it.
+    pub text: String,
 }
 
 /// Work of a mind that outlives its wake, per entity: a wake starts it

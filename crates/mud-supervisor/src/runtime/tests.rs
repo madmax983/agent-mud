@@ -633,3 +633,79 @@ async fn the_step_archives_then_trims_old_events_off_the_workers() {
     assert!(!game.retention_due(clock.now_ms()));
     assert_eq!(game.store_errors(), 0);
 }
+
+/// Fails each wake, and has one notice for the operator after the first.
+#[derive(Debug, Default)]
+struct Notifies {
+    told: std::sync::atomic::AtomicBool,
+}
+
+impl Mind for Notifies {
+    fn kind(&self) -> &'static str {
+        "notifies"
+    }
+
+    fn wake(
+        &self,
+        _ctx: WakeContext,
+        _tools: MudTools,
+    ) -> crate::mind::BoxFuture<'_, Result<MindReply, crate::mind::MindError>> {
+        Box::pin(async { Err(crate::mind::MindError::Unavailable("no daemon".into())) })
+    }
+
+    fn take_notices(&self) -> Vec<crate::mind::MindNotice> {
+        if self.told.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
+        vec![crate::mind::MindNotice {
+            entity: EntityId::from("torin"),
+            code: "lg_lacks_section".into(),
+            text: "the lg runs without [compaction]".into(),
+        }]
+    }
+}
+
+/// A mind's notice reaches the observer once, even from a failed wake,
+/// and stays in the boot report for an observer that opens later.
+#[tokio::test]
+async fn a_minds_notice_reaches_the_observer_once() {
+    let torin = EntityId::from("torin");
+    let r = rig_with(
+        quiet(),
+        HashMap::from([(
+            torin.clone(),
+            Arc::new(Notifies::default()) as Arc<dyn Mind>,
+        )]),
+    );
+    let mut obs = r.sup.subscribe();
+    for _ in 0..2 {
+        r.sup.fire_macro_tick(&torin);
+        for h in r.sup.step() {
+            h.await.unwrap();
+        }
+    }
+    let notices = |events: Vec<Arc<ObserverEvent>>| -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match &**e {
+                ObserverEvent::MindNotice { mind, notice } => {
+                    Some((mind.clone(), notice.code.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let want = vec![("notifies".to_owned(), "lg_lacks_section".to_owned())];
+    assert_eq!(
+        notices(std::iter::from_fn(|| obs.try_recv().ok()).collect()),
+        want
+    );
+    assert_eq!(
+        notices(r.sup.boot_report()),
+        want,
+        "kept for a later observer"
+    );
+    let line = serde_json::to_value(&*r.sup.boot_report()[0]).unwrap();
+    assert_eq!(line["kind"], "mind_notice");
+    assert_eq!(line["notice"]["entity"], "torin");
+}

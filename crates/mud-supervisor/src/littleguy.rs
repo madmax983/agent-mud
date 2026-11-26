@@ -35,12 +35,15 @@ use tokio::sync::{Mutex, oneshot};
 
 use crate::ledger::LedgerMeter;
 use crate::mind::{
-    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindReply, MudTools, SpendSource,
-    ToolNames, Usage, UsageSink, WakeContext, heartbeat_prompt, littleguy_habits, system_prompt,
-    wake_message,
+    BoxFuture, InFlight, InFlightGuard, Mind, MindError, MindNotice, MindReply, MudTools,
+    SpendSource, ToolNames, Usage, UsageSink, WakeContext, heartbeat_prompt, littleguy_habits,
+    system_prompt, wake_message,
 };
 
+pub mod compat;
 pub mod owner;
+
+use compat::{LG_MIN_COMMIT, Optional, README_INSTALL};
 
 use owner::{OwnerRequest, OwnerResponse};
 
@@ -257,6 +260,19 @@ fn mcp_server(cfg: &LittleguyConfig, id: &str, effect: &str, tools: &[&str]) -> 
 /// `[research]`, `[hooks]`, `[followups]` or `allow_actions`.
 #[must_use]
 pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet: bool) -> String {
+    render_config_without(cfg, p, ui_port, quiet, &BTreeSet::new())
+}
+
+/// [`render_config`] with the optional parts in `lacks` left out, for an
+/// `lg` too old to read them ([`compat`]).
+#[must_use]
+pub fn render_config_without(
+    cfg: &LittleguyConfig,
+    p: &PersonaText,
+    ui_port: u16,
+    quiet: bool,
+    lacks: &BTreeSet<Optional>,
+) -> String {
     let names = ToolNames::LITTLEGUY;
     // lg serves the note tools only with `tools.files` and `[memory]
     // enabled`, so the prompts name them only then.
@@ -278,7 +294,7 @@ pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet
     if cfg.max_steps > 0 {
         root.insert("max_steps".into(), i64::from(cfg.max_steps).into());
     }
-    if cfg.max_request_bytes > 0 {
+    if cfg.max_request_bytes > 0 && !lacks.contains(&Optional::MaxRequestBytes) {
         root.insert(
             "max_request_bytes".into(),
             i64::try_from(cfg.max_request_bytes)
@@ -312,14 +328,17 @@ pub fn render_config(cfg: &LittleguyConfig, p: &PersonaText, ui_port: u16, quiet
             "heartbeat".into(),
             table([
                 ("every_minutes", i64::from(cfg.heartbeat_minutes).into()),
+                ("prompt", heartbeat_prompt(names, notes).into()),
                 // Researches open ideas; not lg's [research] sweep tool.
                 ("research", cfg.research.into()),
-                ("prompt", heartbeat_prompt(names, notes).into()),
             ])
             .into(),
         );
     }
-    if let Some(c) = cfg.compaction {
+    if let Some(c) = cfg
+        .compaction
+        .filter(|_| !lacks.contains(&Optional::Compaction))
+    {
         root.insert(
             "compaction".into(),
             table([
@@ -625,6 +644,51 @@ fn is_loopback_link(link: &str) -> bool {
         .any(|p| link.starts_with(p))
 }
 
+/// The error of a start that failed because the `lg` at `bin` is older
+/// than the MUD needs: it refused `path`, which the MUD cannot leave out.
+fn older_lg(
+    entity: &EntityId,
+    status: std::process::ExitStatus,
+    bin: &Path,
+    path: &str,
+    log: &Path,
+) -> MindError {
+    MindError::Unavailable(format!(
+        "lg serve for {entity} exited ({status}): the lg at {} is older than the MUD needs, \
+         as it does not read `{path}` in lg.toml, which the MUD needs. \
+         Build lg at littleguy {LG_MIN_COMMIT} or later ({README_INSTALL}); see {}",
+        bin.display(),
+        log.display()
+    ))
+}
+
+/// The error of a start whose log holds no refusal. The cause is in the
+/// log, not in the parts the MUD left out, so it is the plain crash error.
+/// When the `lg` at `bin` was found to lack parts, it says so too, so a
+/// later start of that binary gives the same error.
+fn exited(
+    entity: &EntityId,
+    status: std::process::ExitStatus,
+    bin: &Path,
+    lacks: &BTreeSet<Optional>,
+    log: &Path,
+) -> MindError {
+    let plain = format!(
+        "lg serve for {entity} exited ({status}); see {}",
+        log.display()
+    );
+    if lacks.is_empty() {
+        return MindError::Unavailable(plain);
+    }
+    let parts: Vec<String> = lacks.iter().map(|p| format!("`{}`", p.path())).collect();
+    MindError::Unavailable(format!(
+        "{plain}. The lg at {} also lacks {} in lg.toml, which the MUD leaves out; \
+         littleguy {LG_MIN_COMMIT} or later reads all of it ({README_INSTALL})",
+        bin.display(),
+        parts.join(", ")
+    ))
+}
+
 /// The file in an entity's folder that holds its daemon's process id.
 const PID_FILE: &str = "lg.pid";
 
@@ -728,6 +792,17 @@ pub struct LittleguyMind {
     closed: std::sync::atomic::AtomicBool,
     /// Ops still read after their wake (see [`chat_charged`]).
     in_flight: InFlight,
+    /// What to tell the operator after the next wake ([`Mind::take_notices`]).
+    notices: std::sync::Mutex<Vec<MindNotice>>,
+}
+
+/// How one `lg serve` start ended.
+#[derive(Debug)]
+enum Started {
+    /// The daemon runs and its socket is open.
+    Running(Child),
+    /// The daemon exited before it opened its socket.
+    Exited(std::process::ExitStatus),
 }
 
 impl LittleguyMind {
@@ -742,6 +817,7 @@ impl LittleguyMind {
             quiet: std::sync::Mutex::new(BTreeSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             in_flight: InFlight::default(),
+            notices: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -767,8 +843,14 @@ impl LittleguyMind {
     /// Writes the files and starts the daemon of `entity`, if it is not
     /// running. Returns its socket.
     ///
+    /// A daemon that exits before its socket opens because its `lg` does
+    /// not read an optional part of the config ([`compat`]) starts again
+    /// without that part, once per part, with a warning.
+    ///
     /// # Errors
-    /// The files cannot be written, or the daemon does not start in time.
+    /// The files cannot be written, the daemon does not start in time, or
+    /// it exits: then the error names an `lg` that is older than the MUD
+    /// needs, if its log says so.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "the lock is held through start-up so one entity never gets two daemons"
@@ -794,23 +876,82 @@ impl LittleguyMind {
         let io = |e: std::io::Error| MindError::Unavailable(format!("{}: {e}", dir.display()));
         std::fs::create_dir_all(&dir).map_err(io)?;
         let config = dir.join("lg.toml");
+        let log = dir.join("lg.log");
         let ui_port = free_loopback_port().map_err(io)?;
-        write_config(
-            &config,
-            &render_config(&self.cfg, &persona.text(), ui_port, self.is_quiet(entity)),
-        )
-        .map_err(io)?;
+        let bin = compat::resolve_bin(&self.cfg.bin);
         let socket = dir.join("lg.sock");
-        reap_orphan(&dir, &socket).await;
-        let _ = std::fs::remove_file(&socket);
+        // An older lg refuses a part it does not read, and the next start
+        // leaves that part out. Each optional part is dropped once at most,
+        // so a crashing lg never loops.
+        let mut dropped: Vec<Optional> = Vec::new();
+        loop {
+            let text = render_config_without(
+                &self.cfg,
+                &persona.text(),
+                ui_port,
+                self.is_quiet(entity),
+                &compat::lacks(&bin),
+            );
+            write_config(&config, &text).map_err(io)?;
+            let status = match self.start(entity, persona, &dir, &config, &socket).await? {
+                Started::Running(child) => {
+                    let approvals = check_approvals(entity, &socket).await;
+                    daemons.insert(
+                        entity.clone(),
+                        Daemon {
+                            child,
+                            socket: socket.clone(),
+                            ui_port,
+                            approvals,
+                        },
+                    );
+                    return Ok(socket);
+                }
+                Started::Exited(status) => status,
+            };
+            let refused = compat::refused_key(&compat::log_tail(&log), &text);
+            match refused
+                .as_deref()
+                .map(|path| (path, Optional::from_path(path)))
+            {
+                Some((_, Some(part))) if !dropped.contains(&part) => {
+                    dropped.push(part);
+                    self.lacks_part(entity, &bin, part);
+                }
+                Some((path, _)) => {
+                    return Err(older_lg(entity, status, &bin, path, &log));
+                }
+                None => {
+                    return Err(exited(entity, status, &bin, &compat::lacks(&bin), &log));
+                }
+            }
+        }
+    }
+
+    /// Spawns `lg serve` for `entity` on the config at `config` and waits
+    /// for its socket.
+    ///
+    /// # Errors
+    /// The process does not spawn, or opens no socket in time.
+    async fn start(
+        &self,
+        entity: &EntityId,
+        persona: &Persona,
+        dir: &Path,
+        config: &Path,
+        socket: &Path,
+    ) -> Result<Started, MindError> {
+        let io = |e: std::io::Error| MindError::Unavailable(format!("{}: {e}", dir.display()));
+        reap_orphan(dir, socket).await;
+        let _ = std::fs::remove_file(socket);
         let mut cmd = Command::new(&self.cfg.bin);
         cmd.arg("serve")
             .arg("--config")
-            .arg(&config)
+            .arg(config)
             .arg("--db")
             .arg(dir.join("lg.db"))
             .arg("--socket")
-            .arg(&socket)
+            .arg(socket)
             .arg("--model")
             .arg(&self.cfg.provider);
         if let Some(name) = &self.cfg.model_name {
@@ -848,10 +989,7 @@ impl LittleguyMind {
             tokio::time::Instant::now() + Duration::from_secs(self.cfg.start_timeout_secs);
         while !socket.exists() {
             if let Ok(Some(status)) = child.try_wait() {
-                return Err(MindError::Unavailable(format!(
-                    "lg serve for {entity} exited ({status}); see {}",
-                    dir.join("lg.log").display()
-                )));
+                return Ok(Started::Exited(status));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(MindError::Unavailable(format!(
@@ -860,17 +998,39 @@ impl LittleguyMind {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let approvals = check_approvals(entity, &socket).await;
-        daemons.insert(
-            entity.clone(),
-            Daemon {
-                child,
-                socket: socket.clone(),
-                ui_port,
-                approvals,
-            },
+        Ok(Started::Running(child))
+    }
+
+    /// Records that the `lg` at `bin` lacks `part`, and warns once per
+    /// binary and part: in the log and, after the wake, on the observer.
+    fn lacks_part(&self, entity: &EntityId, bin: &Path, part: Optional) {
+        if !compat::record(bin, part) {
+            return;
+        }
+        let text = format!(
+            "the lg at {} does not read `{}` in lg.toml ({} added it), so its agents run without it. \
+             Build lg at littleguy {LG_MIN_COMMIT} or later ({README_INSTALL}), or set [littleguy] {} to leave it out",
+            bin.display(),
+            part.path(),
+            part.since(),
+            part.off_key(),
         );
-        Ok(socket)
+        tracing::warn!(
+            %entity,
+            bin = %bin.display(),
+            section = part.path(),
+            min_commit = LG_MIN_COMMIT,
+            readme = README_INSTALL,
+            "{text}"
+        );
+        self.notices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(MindNotice {
+                entity: entity.clone(),
+                code: "lg_lacks_section".into(),
+                text,
+            });
     }
 
     /// The config file of `entity`'s daemon.
@@ -946,9 +1106,10 @@ impl LittleguyMind {
             return Ok(());
         };
         let path = self.config_path(entity);
+        let lacks = compat::lacks(&compat::resolve_bin(&self.cfg.bin));
         let written = write_config(
             &path,
-            &render_config(&self.cfg, &persona.text(), ui_port, quiet),
+            &render_config_without(&self.cfg, &persona.text(), ui_port, quiet, &lacks),
         );
         drop(daemons);
         written.map_err(|e| MindError::Unavailable(format!("{}: {e}", path.display())))
@@ -1057,6 +1218,15 @@ impl Mind for LittleguyMind {
         "littleguy"
     }
 
+    fn take_notices(&self) -> Vec<MindNotice> {
+        std::mem::take(
+            &mut *self
+                .notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// littleguy's ledger is the one complete record of its spend.
     fn spend_source(&self) -> SpendSource {
         SpendSource::Ledger
@@ -1111,5 +1281,7 @@ impl Mind for LittleguyMind {
     }
 }
 
+#[cfg(test)]
+mod old_lg_tests;
 #[cfg(test)]
 mod tests;

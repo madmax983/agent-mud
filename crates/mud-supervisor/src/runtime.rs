@@ -250,6 +250,15 @@ pub enum ObserverEvent {
     /// What the Steward did as each agent's owner (ADR 0015): a goal
     /// decided, a daemon made quiet or loud, a check that failed.
     Steward(crate::steward::StewardEvent),
+    /// What a mind told the operator ([`Mind::take_notices`]), such as an
+    /// older `lg` that runs without a section. It is kept in the boot
+    /// report too, so an observer opened later still sees it.
+    MindNotice {
+        /// The mind's kind, such as `littleguy`.
+        mind: String,
+        /// The notice.
+        notice: crate::mind::MindNotice,
+    },
     /// A reactive plan found at boot was older than `replay_max_age_ms`
     /// and was abandoned, not resumed.
     PlanAbandoned {
@@ -889,7 +898,8 @@ impl Supervisor {
         let _ = self.observer.send(Arc::new(e));
     }
 
-    /// Publishes a boot event and keeps it in the boot report.
+    /// Publishes a boot event, or a mind's notice, and keeps it in the
+    /// boot report.
     fn report(&self, e: ObserverEvent) {
         let e = Arc::new(e);
         lock(&self.boot_report).push(Arc::clone(&e));
@@ -1411,6 +1421,12 @@ impl Supervisor {
                 },
             ),
         };
+        for notice in mind.take_notices() {
+            self.report(ObserverEvent::MindNotice {
+                mind: mind.kind().to_owned(),
+                notice,
+            });
+        }
         let end = self.game.now_ms();
         // The reply's spend, plus what the mind could not put in a reply: a
         // failed wake, or one dropped by the timeout above.

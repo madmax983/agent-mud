@@ -23,14 +23,14 @@ max_connections_per_address = 8  # from one address; an IPv6 /64 counts as one (
 [world]
 # pack = "worlds/crypt-v01"      # unset: the pack compiled into the binary
 db = "data/world.db"             # the SQLite world store
-seed = 1
+seed = 1                         # the dice seed of a new world
 # Events retention: old events are appended to
 # <archive_dir>/events-YYYY-MM-<epoch>.jsonl (one file per month and world.db
 # epoch, synced) before they are trimmed from world.db; nothing is deleted
 # outright.
 events_keep_days = 7             # 0 keeps every event in world.db
 events_keep_min = 10000          # the newest events are never trimmed (at least 10000)
-retention_every_ms = 3600000
+retention_every_ms = 3600000     # how often retention runs, in ms
 retention_batch = 5000           # events per transaction
 # archive_dir = "data/archive"   # unset: archive/ beside db
 
@@ -40,38 +40,68 @@ retention_batch = 5000           # events per transaction
 #   littleguy    one `lg serve` per entity (uses [littleguy])
 #   plugin-agent an autumn-plugin-agent loop (ambient only; uses [models])
 [minds]
-persistent = "littleguy"
-turing = "littleguy"
-ambient = "plugin-agent"
+persistent = "littleguy"         # named NPCs with memory and goals
+turing = "littleguy"             # the hidden agent PC
+ambient = "plugin-agent"         # background NPCs
 
 # Harvest agents keep their own history bounded (ADR 0011): each continues
 # as new after ops_per_run wakes, and sealed runs older than keep_days (by
 # harvest's own clock) are purged, at most once per purge_every_ms.
 [minds.harvest]
-ops_per_run = 32
+ops_per_run = 32                 # wakes per run, then continue as new
 keep_days = 3                    # 0 keeps every run
-purge_every_ms = 3600000
+purge_every_ms = 3600000         # the purge runs at most this often
 
 # Model aliases named by `mind.model` in cast.toml.
 [models.flash]
-base_url = "https://openrouter.ai/api/v1"
-model = "deepseek/deepseek-chat"
-key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1" # an OpenAI-compatible server
+model = "deepseek/deepseek-chat" # the model id at that server
+key_env = "OPENROUTER_API_KEY"   # the variable that holds its key
 
 # The council's model (ADR 0015): the Steward asks it, with no tools, whether a
 # goal an agent proposed for itself fits the game. Pick a model that ranks well
 # for decisions and put its id here:
 # https://openrouter.ai/rankings/decisions#top-models
 [models.council]
-base_url = "https://openrouter.ai/api/v1"
-model = "deepseek/deepseek-chat"
-key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1" # an OpenAI-compatible server
+model = "deepseek/deepseek-chat" # the model id at that server
+key_env = "OPENROUTER_API_KEY"   # the variable that holds its key
 
 [littleguy]
-bin = "lg"
-data_dir = "data/agents"
+# ==========================================================================
+# INSTALL LITTLEGUY FIRST: README.md#install-littleguy
+#
+# Any [minds] tier set to "littleguy" runs one `lg serve` per agent, from
+# `bin`. The scripted, harvest and plugin-agent runtimes need no lg.
+#
+# Build lg at littleguy commit c507731f7a8930444931c60169931d657cecec73 or
+# later: the one CI pins and the MUD is tested against. `bin = "lg"` runs
+# the first lg on PATH, which may be an older build. An older lg refuses
+# what it does not know in its config, and its daemon exits at start.
+#
+# The MUD writes each agent's lg.toml itself (<data_dir>/<id>/lg.toml) at
+# each start; edits to it are lost. It always writes owner, system, window,
+# [tools], [memory], [flow], [ui] and [mcp] (the MUD needs them), and
+# max_steps unless it is 0. It writes these parts only while a key here
+# asks for them:
+#   part of lg.toml       turned off with           first read by
+#   [compaction]          compaction = false        littleguy #108
+#   max_request_bytes     max_request_bytes = 0     littleguy #108
+#   [heartbeat]           heartbeat_minutes = 0     littleguy #41, with heartbeat.research
+#   [refine]              refine = "off"            an lg with the refine feature
+# An older lg that refuses compaction or max_request_bytes still starts:
+# the MUD leaves that part out for that binary until it restarts, and
+# warns once in its log and on the observer. An lg that refuses anything
+# else does not start, and the wake's error names the commit above.
+# ==========================================================================
+bin = "lg"                       # the lg binary: a path, or a name looked up on PATH
+data_dir = "data/agents"         # each agent's lg.toml, lg.db, lg.sock and lg.log
+# lg reads its model key from the MUD's environment, by provider: claude
+# needs ANTHROPIC_API_KEY, openai needs OPENAI_API_KEY, openrouter needs
+# OPENROUTER_API_KEY, and offline needs none (its model only echoes). The
+# MUD passes only these three to lg (README.md#run-littleguy-minds).
 provider = "openrouter"          # offline | claude | openai | openrouter
-# base_url = "http://127.0.0.1:8080/v1"
+# base_url = "http://127.0.0.1:8080/v1" # --base-url, for an OpenAI-compatible server
 max_steps = 64                   # tool rounds per wake (0: no bound; the daily budget still caps spend)
 # Autonomy (ADR 0002). Each key below is its code default, so an older
 # mud.toml means the same. A heartbeat tick is a quiet moment: it may read,
@@ -80,8 +110,8 @@ heartbeat_minutes = 240          # minutes between heartbeat ticks (lg's minimum
 research = true                  # a tick researches the agent's open ideas
 notes = true                     # the agent keeps notes; also lg's workspace file tools (write ones refused on ticks)
 compaction = true                # a long op saves notes and starts over below max_request_bytes
-compaction_at_percent = 80
-compaction_max_resets = 3
+compaction_at_percent = 80       # compact at this percent of max_request_bytes (1 to 100)
+compaction_max_resets = 3        # resets of one op at most (at least 1)
 max_request_bytes = 240000       # keep under the provider's window; 0 is lg's 2 MiB default (warned with compaction on)
 window = 30                      # turns of transcript the agent sees
 # Refine (ADR 0015): the Steward runs lg's proposer on an agent's recent play
@@ -97,33 +127,33 @@ window = 30                      # turns of transcript the agent sees
 # the menu. Use "menu" to keep model text out of every agent's instructions:
 # the first Steward pass after the restart clears an active free text.
 refine = "free"
-[littleguy.model_names]
-default = "deepseek/deepseek-chat"
+[littleguy.model_names]          # --model-name of lg serve, by cast model alias
+default = "deepseek/deepseek-chat" # for every alias not named here
 # The Steward (ADR 0015): the MUD is each daemon's owner. It decides the goals
 # an agent proposes for itself (text guards, then a council of council_members
 # votes), keeps a daemon quiet at the hard budget cap, and shows each decision
 # on the observer. lg's own goals page stays the veto. With no council model,
 # proposed goals wait and expire. Each key below is its code default.
 [littleguy.steward]
-enabled = true
+enabled = true                   # false: no Steward; proposed goals wait and expire
 every_secs = 60                  # one pass over the running daemons
 owner_timeout_secs = 30          # a decide or reload waits behind lg's loop this long
 intent_retry_secs = 600          # an unanswered decide is sent again after this
 max_intent_tries = 5             # then the agent's actions wait stuck_backoff_hours
-stuck_backoff_hours = 6
+stuck_backoff_hours = 6          # how long a stuck agent's actions wait
 council_model = "council"        # a [models] alias; unset: "council" when it exists
 council_models = []              # more aliases; members cycle council_model, then these
 council_temperature = 0.7        # above 0 (at most 2) with more than one member
 council_members = 3              # odd, 1 to 7; with one alias they are samples of one model
 max_council_votes_per_day = 12   # ballots per agent per game-clock day (1 to 100)
-max_decisions_per_pass = 2
-max_active_goals = 3
-max_goal_accepts_per_day = 2
+max_decisions_per_pass = 2       # decides or intents per agent per pass
+max_active_goals = 3             # active goals of one agent at most
+max_goal_accepts_per_day = 2     # accepts per agent per game-clock day
 min_check_minutes = 60           # a goal checked more often is declined
 proposal_ttl_hours = 48          # a goal still waiting then is declined
 goal_stale_days = 7              # an active goal with no new note this long is dropped
-title_chars = 120
-why_chars = 800
+title_chars = 120                # the longest goal title, in characters
+why_chars = 800                  # the longest goal reason, in characters
 deny_phrases = []                # added to the built-in phrases, never replacing them; goals and free text
 quiet_on_hard = true             # at the hard cap: no heartbeat, no memory, no tick spend
 # The next three are 1 to 86400 (a day).
@@ -145,15 +175,15 @@ resume_refine = []               # agents whose refine pause ends at the next bo
 # The operator menu; with none, the code default menu (brevity, pacing,
 # in_character, look_first, fair_prices, follow_through) is used.
 # [[littleguy.steward.guardrail]]
-# id = "brevity"
-# text = "Keep each line of speech under twenty words."
+# id = "brevity"                 # 1 to 32 of a-z, 0-9 and _
+# text = "Keep each line of speech under twenty words." # at most 200 plain characters
 
 [supervisor]
 daily_token_budget = 400000      # per agent per UTC day; 0 is unlimited
 typing_scale = 1.0               # Turing PC typing holds; 0 for demos
 macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
-first_macro_tick_secs = [30, 120]
-step_ms = 250
+first_macro_tick_secs = [30, 120] # the first macro tick, this many seconds after start
+step_ms = 250                    # how often the supervisor steps, in ms
 # The bound on one wake (1 s..=1 h). Time a hidden PC spends typing a line does
 # not count, so a long notice never times a wake out. A tier can have its own.
 wake_timeout_ms = 120000
@@ -165,16 +195,18 @@ wake_timeout_ms = 120000
 replay_max_age_ms = 120000       # such an event, or a reactive plan, older than this is not replayed (0..=1 day)
 booking_max_late_ms = 86400000   # a booking overdue by more is dropped, held or not, live or at boot (0..=30 days)
 catchup_spread_ms = 120000       # a missed macro tick fires once, within this of boot (0..=1 h)
-[supervisor.wake_timeout_ms_by_tier] # ambient, persistent, turing; unset: wake_timeout_ms
-turing = 180000
+[supervisor.wake_timeout_ms_by_tier] # one tier's wake bound; unset: wake_timeout_ms
+# ambient = 120000               # background NPCs
+# persistent = 120000            # named NPCs
+turing = 180000                  # the hidden agent PC
 [supervisor.budgets]                 # by entity id; 0 is unlimited
-pc_kestrel = 600000
+pc_kestrel = 600000              # tokens per UTC day for this entity
 
 # World scripts (ADR 0010, docs/scripting.md). The limits are pack data, in
 # the pack's scripts.toml. Reload with:
 #   curl -X POST "http://127.0.0.1:3000/observer/scripts/reload?token=$MUD_ADMIN_TOKEN"
 [scripts]
-enabled = true
+enabled = true                   # false: no world script runs
 # A mind binding with runtime = "rhai" (Hale in crypt-v01) runs on its Rhai
 # script whatever [minds] says; false keeps every entity on its tier's runtime.
 allow_runtime_override = true
@@ -206,22 +238,22 @@ max_password_attempts = 3        # wrong passwords per connection before it clos
 hash_concurrency = 2             # bcrypt checks at once (1..=64)
 revalidate_secs = 30             # live sessions re-check locks and password changes (5..=3600)
 [accounts.throttle.name_address] # one name from one address: always applies
-free = 5
-base_ms = 1000
-max_ms = 900000
-forget_ms = 86400000
+free = 5                         # failures that never delay
+base_ms = 1000                   # the first delay, in ms
+max_ms = 900000                  # the longest delay, in ms (at most a day)
+forget_ms = 86400000             # a quiet spell this long forgets every failure, in ms
 [accounts.throttle.name]         # one name from addresses it never logged in from
-free = 10
-base_ms = 1000
-max_ms = 300000
-forget_ms = 86400000
+free = 10                        # failures that never delay
+base_ms = 1000                   # the first delay, in ms
+max_ms = 300000                  # the longest delay, in ms (at most a day)
+forget_ms = 86400000             # a quiet spell this long forgets every failure, in ms
 [accounts.throttle.address]      # one address over names it never logged in as
-free = 20
-base_ms = 1000
-max_ms = 900000
-forget_ms = 3600000
+free = 20                        # failures that never delay
+base_ms = 1000                   # the first delay, in ms
+max_ms = 900000                  # the longest delay, in ms (at most a day)
+forget_ms = 3600000              # a quiet spell this long forgets every failure, in ms
 [accounts.throttle.work]         # bcrypt checks from one address, pass or fail
-free = 60
-base_ms = 1000
-max_ms = 60000
-forget_ms = 600000
+free = 60                        # failures that never delay
+base_ms = 1000                   # the first delay, in ms
+max_ms = 60000                   # the longest delay, in ms (at most a day)
+forget_ms = 600000               # a quiet spell this long forgets every failure, in ms

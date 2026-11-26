@@ -76,6 +76,18 @@ lands.
   `overlay_active` that names the new `head`.
 - **Open: dropping a queued activate whose client is gone (ask 15).** It
   would end the late list.
+- **Open: a version and features answer before the config (ask 18).**
+  `lg --version` prints `lg 0.1.0` for every build, and there is no
+  `features` request (ask 10), so the MUD cannot ask an `lg` what it reads
+  before it writes an `lg.toml`. An `lg` built before littleguy #108
+  exited at start on `[compaction]`, and every wake of its agent failed.
+  The MUD now reads lg's `unknown field` message from `lg.log`, leaves an
+  optional part out (`compaction`, `max_request_bytes`) and warns, and
+  fails with the minimum commit for any other part (`mud_supervisor::littleguy::compat`). The ask: `lg
+  --version` with the commit and the cargo features of the build, or an
+  `lg features` command that lists the config sections and keys the
+  build reads. Then the MUD checks before it writes a config, and drops
+  the log parse.
 - **Open:** a ledger row for the proposer (ask 1), `[refine] parts` (2),
   a guardrails ceiling (3), provenance of a web move (4), idempotency keys
   (5), a loop probe (6), goal fields (7), a decide reason (8), tick pause
