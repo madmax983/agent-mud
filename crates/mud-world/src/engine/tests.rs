@@ -375,6 +375,26 @@ fn a_heavy_hit_knocks_out_on_a_failed_ht_roll() {
 }
 
 #[test]
+fn the_engines_lines_about_a_body_are_body_lines() {
+    let mut w = world();
+    let ada = w.login("ada", 1).unwrap();
+    place(&mut w, &ada, "wine_vault");
+    ok(&mut w, &ada, "equip torch");
+    w.drain_fresh();
+    w.fix_dice([2, 2, 2, 6, 6, 6, 6, 6, 6, 6]);
+    ok(&mut w, &ada, "attack rat");
+    let evs = w.drain_fresh();
+    let collapse = evs
+        .iter()
+        .find(|e| e.narrative.contains("collapses"))
+        .unwrap();
+    assert!(collapse.is_body_line());
+    assert!(collapse.is_by(&id("giant_rat_1")), "the body is its actor");
+    let attack = evs.iter().find(|e| e.is_by(&ada)).unwrap();
+    assert!(!attack.is_body_line(), "the attack is ada's own act");
+}
+
+#[test]
 fn a_dead_mob_drops_loot_and_respawns() {
     let mut w = world();
     let ada = w.login("ada", 1).unwrap();

@@ -214,6 +214,61 @@ async fn a_reply_after_the_wake_was_given_up_is_still_charged() {
     }
     assert_eq!(late.tokens(), 5_200);
     assert_eq!(late.calls, 3);
+    assert!(
+        sink.take_answered_late(&torin),
+        "the late reply is an answer: the wake's close drops what it read"
+    );
+    assert!(!sink.take_answered_late(&torin), "taken once");
+}
+
+#[tokio::test]
+async fn a_late_no_answer_or_error_is_not_an_answer() {
+    // The op read its events, then the model failed: the wake that gave up
+    // on it still owes them.
+    for answer in [
+        r#"{"kind":"no_answer","reason":"provider error"}"#,
+        r#"{"kind":"waiting","approval":4}"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("lg.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut req = String::new();
+            reader.read_line(&mut req).await.unwrap();
+            go_rx.await.unwrap();
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(format!("{answer}\n").as_bytes()).await;
+        });
+        let torin = EntityId::from("torin");
+        let sink = Arc::new(UsageSink::default());
+        let in_flight = InFlight::default();
+        let charge = Charge {
+            until_settled: Some(Arc::new(in_flight.start(&torin))),
+            ..no_ledger(&dir)
+        };
+        let cut = tokio::time::timeout(
+            Duration::from_millis(100),
+            chat_charged(
+                sock.clone(),
+                "wake-torin-9".into(),
+                "hello".into(),
+                torin.clone(),
+                Arc::clone(&sink),
+                charge,
+            ),
+        )
+        .await;
+        assert!(cut.is_err(), "the wake timed out");
+        go_tx.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), in_flight.settled(&torin))
+            .await
+            .expect("the op was read");
+        assert!(!sink.take_answered_late(&torin), "{answer}");
+    }
 }
 
 #[tokio::test]
@@ -237,7 +292,12 @@ async fn a_reply_in_time_is_not_charged_twice() {
     .await
     .unwrap();
     assert_eq!(r.usage.tokens(), 12);
+    assert!(!r.unanswered);
     assert!(sink.take(&torin).is_zero());
+    assert!(
+        !sink.take_answered_late(&torin),
+        "an answer in time is in the reply"
+    );
 }
 
 /// A charge with no ledger file: the daemon's reported usage stands.
@@ -288,6 +348,7 @@ async fn a_no_answer_is_charged_from_the_ledger() {
     )
     .await
     .unwrap();
+    assert!(r.unanswered, "a no_answer is not an answer");
     assert!(r.text.unwrap().contains("every tool round"));
     assert_eq!(r.usage.tokens(), 7_000);
     assert_eq!(r.usage.calls, 2);
@@ -497,6 +558,134 @@ async fn a_timed_out_wake_settles_only_once_its_op_is_read() {
         .await
         .expect("settled once the op was read");
     mind.shutdown().await;
+}
+
+/// A daemon that holds its first op until told, and answers the rest at
+/// once: the chats it was sent, the signal that answers the first, and
+/// its task.
+fn holding_daemon(
+    sock: &Path,
+) -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = UnixListener::bind(sock).unwrap();
+    let chats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let counted = Arc::clone(&chats);
+    let server = tokio::spawn(async move {
+        let mut go = Some(go_rx);
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let mut req = String::new();
+            reader.read_line(&mut req).await.unwrap();
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(go) = go.take() {
+                go.await.unwrap();
+            }
+            let _ = reader
+                .into_inner()
+                .write_all(b"{\"kind\":\"reply\",\"text\":\"done\"}\n")
+                .await;
+        }
+    });
+    (chats, go_tx, server)
+}
+
+/// The owner's log: a wake given up while its op still ran was followed at
+/// once by a second chat, so two ops of one daemon overlapped. The entity
+/// stays busy until the op is read: a tell that comes meanwhile waits, and
+/// its chat starts only after the first op answered.
+#[tokio::test]
+async fn no_second_chat_starts_while_an_op_is_live() {
+    use std::sync::atomic::Ordering;
+
+    use crate::runtime::{ObserverEvent, Supervisor, SupervisorConfig};
+    use crate::scripted::FallbackMind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let torin = EntityId::from("torin");
+    let cfg = LittleguyConfig {
+        bin: dir.path().join("no-such-lg"),
+        data_dir: dir.path().to_path_buf(),
+        ..LittleguyConfig::default()
+    };
+    let mind = LittleguyMind::new(cfg, HashMap::from([(torin.clone(), persona())]));
+    let sock = dir.path().join("fake.sock");
+    let (chats, go_tx, server) = holding_daemon(&sock);
+    mind.daemons.lock().await.insert(
+        torin.clone(),
+        Daemon {
+            child: stand_in(&sock),
+            socket: sock.clone(),
+        },
+    );
+    let pack = Arc::new(WorldPack::crypt_v01().unwrap());
+    let clock = Arc::new(ManualClock::new(NOW));
+    let game = Game::new(World::new(Arc::clone(&pack), 1), None, clock.clone());
+    let typing = Gate::new(Arc::clone(&game), 1, 0.0);
+    let mind = Arc::new(mind);
+    let sup = Supervisor::new(
+        Arc::clone(&game),
+        typing,
+        HashMap::from([(torin.clone(), Arc::clone(&mind) as Arc<dyn Mind>)]),
+        Arc::new(FallbackMind::from_cast(&pack.cast)),
+        SupervisorConfig {
+            wake_timeout_ms: 100,
+            first_macro_tick_secs: [3_600, 3_600],
+            ..SupervisorConfig::default()
+        },
+    );
+    let mut obs = sup.subscribe();
+    let mut rx = game.subscribe();
+    sup.fire_macro_tick(&torin);
+    let first = sup.step();
+    assert_eq!(first.len(), 1);
+    // The wake gives up; its op is still out.
+    let timed_out = loop {
+        if let ObserverEvent::WakeFinished { ok, .. } = obs.recv().await.unwrap().as_ref() {
+            break !*ok;
+        }
+    };
+    assert!(timed_out, "the first wake timed out");
+    let ada = game.login("ada").unwrap();
+    assert!(game.execute(&ada, "tell torin got ore").ok);
+    let torin_started = |obs: &mut tokio::sync::broadcast::Receiver<Arc<ObserverEvent>>| {
+        std::iter::from_fn(|| obs.try_recv().ok())
+            .filter(
+                |e| matches!(&**e, ObserverEvent::WakeStarted { entity, .. } if entity == &torin),
+            )
+            .count()
+    };
+    for _ in 0..10 {
+        while let Ok(ev) = rx.try_recv() {
+            sup.observe(&ev);
+        }
+        clock.advance(1_000);
+        // Other NPCs' wakes (ada's arrival) end at once: they have no mind.
+        for h in sup.step() {
+            h.await.unwrap();
+        }
+        assert_eq!(torin_started(&mut obs), 0, "busy while the op is live");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(chats.load(Ordering::SeqCst), 1, "no second chat");
+    go_tx.send(()).unwrap();
+    for h in first {
+        h.await.unwrap();
+    }
+    clock.advance(1_000);
+    for h in sup.step() {
+        h.await.unwrap();
+    }
+    assert_eq!(torin_started(&mut obs), 1, "the tell's wake goes out now");
+    assert_eq!(chats.load(Ordering::SeqCst), 2);
+    mind.shutdown().await;
+    server.abort();
 }
 
 /// Runs a real `lg serve` when `LG_BIN` names one (the CI job that builds

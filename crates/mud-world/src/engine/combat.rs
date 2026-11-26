@@ -9,7 +9,7 @@ use mud_rules::{
 use serde_json::{Value, json};
 
 use super::{Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
-use crate::event::EventKind;
+use crate::event::{EventKind, VERB_COLLAPSE, VERB_DIE, VERB_RESPAWN, VERB_STAGGER};
 use crate::ids::{EntityId, RoomId, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WeaponDamage};
 use crate::state::{Entity, Holder};
@@ -173,7 +173,7 @@ impl World {
                     Some(t.room.clone()),
                     format!("{} collapses.", t.name),
                 )
-                .actor(target, "collapse")
+                .actor(target, VERB_COLLAPSE)
                 .tags(["combat".to_owned()]);
                 self.emit(ctx, spec);
             }
@@ -184,7 +184,7 @@ impl World {
                 Some(t.room.clone()),
                 format!("{} staggers, badly hurt.", t.name),
             )
-            .actor(target, "stagger")
+            .actor(target, VERB_STAGGER)
             .tags(["combat".to_owned()]);
             self.emit(ctx, spec);
         }
@@ -199,7 +199,7 @@ impl World {
             Some(v.room.clone()),
             format!("{} dies.", v.name),
         )
-        .actor(victim, "die")
+        .actor(victim, VERB_DIE)
         .target(by)
         .tags(["combat".to_owned(), "death".to_owned()]);
         self.emit(ctx, spec);
@@ -276,7 +276,7 @@ impl World {
                 v.name
             ),
         )
-        .actor(victim, "respawn");
+        .actor(victim, VERB_RESPAWN);
         self.emit(ctx, spec);
     }
 

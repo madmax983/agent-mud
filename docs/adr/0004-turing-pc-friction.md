@@ -24,8 +24,10 @@ supervisor adds friction:
   held `reaction(800..2200) + chars/5 words at wpm, ×jitter(0.85..1.15)`
   ms; moves and attacks 600–1400 ms. If combat breaks out around it while
   a line is held, the line is dropped with `INTERRUPTED` and the PC is
-  woken at once. `typing_delay_ms` is proved in Verus (no overflow,
-  monotonic in length).
+  woken at once, unless a wake of it is still running and reads the
+  result (ADR 0014). `typing_delay_ms` is proved in Verus (no overflow,
+  monotonic in length). The time a line is held never counts toward the
+  wake's timeout (ADR 0014).
 - **Style.** The persona asks for lowercase fragments and MUD idioms and
   forbids assistant-isms; the goal is concrete and mildly selfish
   ("never split loot less than 50/50").

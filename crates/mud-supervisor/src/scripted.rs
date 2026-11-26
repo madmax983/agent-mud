@@ -139,6 +139,7 @@ impl Mind for PlanMind {
                 text: Some(notes.join("; ")),
                 usage: crate::mind::Usage::default(),
                 commands: u32::try_from(ran).unwrap_or(u32::MAX),
+                unanswered: false,
             })
         })
     }
@@ -542,6 +543,7 @@ impl Mind for ScriptedMind {
                 text: (!notes.is_empty()).then(|| notes.join("; ")),
                 usage: crate::mind::Usage::default(),
                 commands: u32::try_from(plan.len()).unwrap_or(u32::MAX),
+                unanswered: false,
             })
         })
     }
@@ -603,6 +605,7 @@ impl Mind for FallbackMind {
                 )),
                 usage: crate::mind::Usage::default(),
                 commands: 1,
+                unanswered: false,
             })
         })
     }

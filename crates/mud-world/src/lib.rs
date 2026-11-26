@@ -26,7 +26,9 @@ pub use engine::{
     Audit, CAME_TO_TAG, CommandResult, ErrorCode, HookStatus, HooksChange, LoginError, StateChange,
     TickOutcome, World,
 };
-pub use event::{ActorRef, Event, EventKind};
+pub use event::{
+    ActorRef, BODY_VERBS, Event, EventKind, VERB_COLLAPSE, VERB_DIE, VERB_RESPAWN, VERB_STAGGER,
+};
 pub use game::{
     Clock, CommitProbe, Durability, Game, ManualClock, RELOAD_EVENTS, Retained, Retention,
     SideError, SystemClock,

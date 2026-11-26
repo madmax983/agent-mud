@@ -4,7 +4,9 @@
 //! room counts the agent events emitted while no human is present. Any
 //! human event and any macro-tick reset the count. Past
 //! [`MAX_AGENT_ONLY_TURNS`], the router drops every cross-agent wake in
-//! the room until the next reset.
+//! the room until the next reset. [`chatter_input_for`] says what an event
+//! is to the counter; the engine's own line about a body (a collapse, a
+//! death) is the world's, never its actor's turn (ADR 0014).
 
 /// The default bound on agent-only turns.
 pub const MAX_AGENT_ONLY_TURNS: u8 = 2;
@@ -25,6 +27,42 @@ pub enum ChatterInput {
     World,
 }
 // mirror-end chatter_input
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "four independent facts about one event, as the proof states them"
+)]
+// mirror-begin chatter_input_for
+/// What an event in a room is to its chatter counter.
+///
+/// `body_line`: the engine's own line about a body (a collapse, a stagger,
+/// a death, a respawn), whoever's body it is, is the world: it neither
+/// spends an agent's turn nor resets the room as a human would. Otherwise
+/// a player's event (an agent PC counts as a player) is a human's; an
+/// agent-played NPC's counts by whether a player is there (`player_here`);
+/// anything else (a mob, a script) is the world.
+#[must_use]
+pub const fn chatter_input_for(
+    body_line: bool,
+    player_actor: bool,
+    agent_actor: bool,
+    player_here: bool,
+) -> ChatterInput {
+    if body_line {
+        ChatterInput::World
+    } else if player_actor {
+        ChatterInput::Human
+    } else if agent_actor {
+        if player_here {
+            ChatterInput::AgentWithHuman
+        } else {
+            ChatterInput::AgentAlone
+        }
+    } else {
+        ChatterInput::World
+    }
+}
+// mirror-end chatter_input_for
 
 // mirror-begin chatter_step
 /// One step: the new count and whether the event may wake other agents.
@@ -87,6 +125,37 @@ mod tests {
         assert!(r.step(ChatterInput::AgentAlone, 255));
         assert!(!r.step(ChatterInput::AgentAlone, 255));
         assert!(!r.step(ChatterInput::AgentAlone, 255));
+    }
+
+    #[test]
+    fn a_body_line_is_the_world_whoever_falls() {
+        for (player, agent, here) in [
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                chatter_input_for(true, player, agent, here),
+                ChatterInput::World
+            );
+        }
+        assert_eq!(
+            chatter_input_for(false, true, false, false),
+            ChatterInput::Human
+        );
+        assert_eq!(
+            chatter_input_for(false, false, true, false),
+            ChatterInput::AgentAlone
+        );
+        assert_eq!(
+            chatter_input_for(false, false, true, true),
+            ChatterInput::AgentWithHuman
+        );
+        assert_eq!(
+            chatter_input_for(false, false, false, true),
+            ChatterInput::World
+        );
     }
 
     #[test]

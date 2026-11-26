@@ -6,6 +6,10 @@
 //! No bound is needed. An agent-only event is allowed iff the count before
 //! it is under `max`, so the saturating count cannot let events through at
 //! `max == 255` (the proof found that hole in an earlier `next <= max`).
+//!
+//! `chatter_input_for` classifies a room event (ADR 0014): the engine's
+//! line about a body is the world whoever's body it is, so it never moves
+//! a count and never stops a wake (`lemma_a_body_line_never_counts`).
 
 use vstd::prelude::*;
 
@@ -27,6 +31,71 @@ pub enum ChatterInput {
     World,
 }
 // mirror-end chatter_input
+
+/// The classification over plain values.
+pub open spec fn spec_input_for(
+    body_line: bool,
+    player_actor: bool,
+    agent_actor: bool,
+    player_here: bool,
+) -> ChatterInput {
+    if body_line {
+        ChatterInput::World
+    } else if player_actor {
+        ChatterInput::Human
+    } else if agent_actor {
+        if player_here {
+            ChatterInput::AgentWithHuman
+        } else {
+            ChatterInput::AgentAlone
+        }
+    } else {
+        ChatterInput::World
+    }
+}
+
+// mirror-begin chatter_input_for
+/// What an event in a room is to its chatter counter.
+///
+/// `body_line`: the engine's own line about a body (a collapse, a stagger,
+/// a death, a respawn), whoever's body it is, is the world: it neither
+/// spends an agent's turn nor resets the room as a human would. Otherwise
+/// a player's event (an agent PC counts as a player) is a human's; an
+/// agent-played NPC's counts by whether a player is there (`player_here`);
+/// anything else (a mob, a script) is the world.
+#[must_use]
+pub const fn chatter_input_for(
+    body_line: bool,
+    player_actor: bool,
+    agent_actor: bool,
+    player_here: bool,
+) -> (r: ChatterInput)
+    ensures
+        r == spec_input_for(body_line, player_actor, agent_actor, player_here),
+        // A body's line is always the world.
+        body_line ==> r is World,
+        // Only a player's own act resets the room.
+        (r is Human) <==> (!body_line && player_actor),
+        // Only an agent-played NPC's own act, with no player there, counts.
+        (r is AgentAlone) <==> (!body_line && !player_actor && agent_actor && !player_here),
+        (r is AgentWithHuman) <==> (!body_line && !player_actor && agent_actor && player_here),
+        !(r is MacroTick),
+{
+    if body_line {
+        ChatterInput::World
+    } else if player_actor {
+        ChatterInput::Human
+    } else if agent_actor {
+        if player_here {
+            ChatterInput::AgentWithHuman
+        } else {
+            ChatterInput::AgentAlone
+        }
+    } else {
+        ChatterInput::World
+    }
+}
+// mirror-end chatter_input_for
 
 /// The step over plain values.
 pub open spec fn spec_step(turns: u8, input: ChatterInput, max: u8) -> (u8, bool) {
@@ -66,6 +135,24 @@ pub const fn chatter_step(turns: u8, input: ChatterInput, max: u8) -> (r: (u8, b
     }
 }
 // mirror-end chatter_step
+
+/// A body's line (a collapse, a stagger, a death, a respawn) never moves
+/// a room's counter and never stops a wake, whoever's body it is and
+/// whatever the room's count: it spends no agent's turn and resets none.
+pub proof fn lemma_a_body_line_never_counts(
+    turns: u8,
+    player_actor: bool,
+    agent_actor: bool,
+    player_here: bool,
+    max: u8,
+)
+    ensures
+        spec_step(turns, spec_input_for(true, player_actor, agent_actor, player_here), max) == (
+        turns,
+        true,
+        ),
+{
+}
 
 /// A room run from a fresh counter: the count after `inputs`, and how many
 /// agent-only events were allowed since the last reset (human or tick).

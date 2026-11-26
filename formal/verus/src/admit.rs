@@ -17,7 +17,12 @@
 //!   can act again, free and due, delivers everything held in one wake
 //!   (`lemma_one_wake_carries_the_hold`).
 //!
-//! No bound: comparisons only.
+//! - `wake_expired` (ADR 0014): a running wake is past its bound exactly
+//!   when the time it ran outside the gate's holds reaches it. Holds only
+//!   extend the bound (`lemma_holds_only_extend`), and a wake past it
+//!   stays past it (`lemma_expired_stays_expired`).
+//!
+//! No bound: comparisons and a saturating subtraction.
 
 use vstd::prelude::*;
 
@@ -70,6 +75,38 @@ pub const fn wake_admit(can_act: bool, free: bool, due_ms: u64, now_ms: u64) -> 
     }
 }
 // mirror-end wake_admit
+
+/// The time of a wake that counts toward its bound: what it ran outside
+/// the gate's holds.
+pub open spec fn spec_active(elapsed_ms: u64, held_ms: u64) -> int {
+    if held_ms < elapsed_ms {
+        elapsed_ms - held_ms
+    } else {
+        0
+    }
+}
+
+// mirror-begin wake_expired
+/// Whether a wake is past its bound of `timeout_ms`.
+///
+/// It has run `elapsed_ms`, `held_ms` of them with a line of its entity
+/// held at the gate (a hidden PC typing). Only the time outside the holds
+/// counts: a slow typist is not a mind that hangs.
+#[must_use]
+pub const fn wake_expired(elapsed_ms: u64, held_ms: u64, timeout_ms: u64) -> (r: bool)
+    ensures
+        r <==> spec_active(elapsed_ms, held_ms) >= timeout_ms,
+        // A wake that spent all its time typing never runs out, unless its
+        // bound is 0.
+        elapsed_ms <= held_ms ==> (r <==> timeout_ms == 0),
+        // Without a hold the bound is the plain one.
+        held_ms == 0 ==> (r <==> elapsed_ms >= timeout_ms),
+        // The holds only ever extend the bound, never shorten it.
+        r ==> elapsed_ms >= timeout_ms,
+{
+    elapsed_ms.saturating_sub(held_ms) >= timeout_ms
+}
+// mirror-end wake_expired
 
 /// One step of an entity's history: an item joins its waiting wake (an
 /// event, a booking that came due, a macro tick), or the router polls.
@@ -193,6 +230,28 @@ pub proof fn lemma_one_wake_carries_the_hold(s: HoldState, free: bool, due: u64,
 pub proof fn lemma_a_held_poll_keeps_everything(s: HoldState, free: bool, due: u64, now: u64)
     ensures
         hold_step(s, HoldStep::Poll(false, free, due, now)) == s,
+{
+}
+
+/// Once a wake is past its bound it stays past it as time goes on, while
+/// no further hold is counted.
+pub proof fn lemma_expired_stays_expired(e1: u64, e2: u64, held_ms: u64, timeout_ms: u64)
+    requires
+        e1 <= e2,
+        spec_active(e1, held_ms) >= timeout_ms,
+    ensures
+        spec_active(e2, held_ms) >= timeout_ms,
+{
+}
+
+/// More time held never makes a wake run out sooner: a wake past its bound
+/// with more held time is past it with less.
+pub proof fn lemma_holds_only_extend(elapsed_ms: u64, h1: u64, h2: u64, timeout_ms: u64)
+    requires
+        h1 <= h2,
+        spec_active(elapsed_ms, h2) >= timeout_ms,
+    ensures
+        spec_active(elapsed_ms, h1) >= timeout_ms,
 {
 }
 

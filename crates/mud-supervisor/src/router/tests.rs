@@ -221,6 +221,137 @@ fn macro_ticks_wait_while_an_agent_pc_is_in_the_room() {
 }
 
 #[test]
+fn a_hidden_pc_alone_gets_its_macro_tick() {
+    // Regression (log 7:59:08): kestrel's own tick was always "deferred:
+    // a player is present", the player being kestrel.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 1);
+    let note = r.macro_tick(&kestrel, &w, 5);
+    assert!(matches!(note, RouteNote::Queued { .. }), "{note:?}");
+    assert!(
+        r.due(5)
+            .iter()
+            .any(|wake| wake.entity == kestrel && wake.macro_tick)
+    );
+    let ada = w.login("ada", 6).unwrap();
+    w.drain_fresh();
+    run(&mut w, &mut r, &HashMap::new(), &ada, "e", 7);
+    r.finish(&kestrel, 7);
+    r.pending.clear();
+    let note = r.macro_tick(&kestrel, &w, 8);
+    assert!(
+        matches!(note, RouteNote::Dropped { ref why, .. } if why.contains("player")),
+        "another player still defers it: {note:?}"
+    );
+}
+
+/// The engine's line about `who`'s body, as combat emits it: `who` is its
+/// actor, with `verb`, in its room, perceived by the room.
+fn body_line(w: &World, who: &str, verb: &str, kind: EventKind) -> Event {
+    let e = w.entity(&id(who)).unwrap();
+    let room = e.room.clone();
+    Event {
+        seq: Seq(w.last_seq().0 + 1),
+        at_ms: 0,
+        room: Some(room.clone()),
+        kind,
+        tags: vec!["combat".into()],
+        actor: Some(mud_world::ActorRef {
+            id: e.id.clone(),
+            name: e.name.clone(),
+        }),
+        verb: Some(verb.into()),
+        target: None,
+        untrusted_text: None,
+        narrative: format!("{} collapses.", e.name),
+        data: serde_json::Value::Null,
+        recipients: w.present_in(&room).map(|p| p.id.clone()).collect(),
+        human_actor: e.human,
+        player_actor: e.kind == EntityKind::Player,
+        party_rooms: Vec::new(),
+    }
+}
+
+#[test]
+fn martas_collapse_spends_no_agent_turn_in_the_wine_vault() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let vault = RoomId::from("wine_vault");
+    let mut s = w.snapshot();
+    for who in ["marta", "vich"] {
+        if let Some(e) = s.entities.get_mut(&id(who)) {
+            e.room = vault.clone();
+        }
+    }
+    let recent: Vec<Event> = w.logged().cloned().collect();
+    w = World::from_state(Arc::clone(w.pack()), s, recent);
+    r.rooms.insert(
+        vault.clone(),
+        RoomChatter {
+            agent_only_turns: 1,
+        },
+    );
+    for (verb, kind) in [
+        (mud_world::VERB_STAGGER, EventKind::Combat),
+        (mud_world::VERB_COLLAPSE, EventKind::Combat),
+        (mud_world::VERB_DIE, EventKind::Death),
+    ] {
+        let ev = body_line(&w, "marta", verb, kind);
+        assert!(ev.is_body_line());
+        let notes = r.observe(&ev, &w, &rt, 100);
+        assert_eq!(r.agent_only_turns(&vault), 1, "{verb}: no turn spent");
+        assert!(
+            dropped_for(&notes, "vich").is_none(),
+            "{verb}: never dropped as chatter"
+        );
+    }
+    // Her own say is a turn; the room holds at the bound after it.
+    let mut say = body_line(&w, "marta", "say", EventKind::Speech);
+    say.untrusted_text = Some("help".into());
+    r.observe(&say, &w, &rt, 200);
+    assert_eq!(r.agent_only_turns(&vault), 2, "an act still counts");
+    let ev = body_line(&w, "marta", mud_world::VERB_COLLAPSE, EventKind::Combat);
+    let notes = r.observe(&ev, &w, &rt, 300);
+    assert!(
+        queued_for(&notes, "vich").is_some(),
+        "a held room still lets the world's line through: {notes:?}"
+    );
+}
+
+#[test]
+fn a_pcs_collapse_does_not_reset_the_room_as_a_human_would() {
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 1);
+    w.drain_fresh();
+    let room = w.entity(&kestrel).unwrap().room.clone();
+    r.rooms.insert(
+        room.clone(),
+        RoomChatter {
+            agent_only_turns: 2,
+        },
+    );
+    let ev = body_line(
+        &w,
+        "pc_kestrel",
+        mud_world::VERB_COLLAPSE,
+        EventKind::Combat,
+    );
+    r.observe(&ev, &w, &rt, 10);
+    assert_eq!(r.agent_only_turns(&room), 2, "kestrel did not act");
+    let respawn = body_line(&w, "pc_kestrel", mud_world::VERB_RESPAWN, EventKind::Enter);
+    r.observe(&respawn, &w, &rt, 20);
+    assert_eq!(r.agent_only_turns(&room), 2);
+    run(&mut w, &mut r, &rt, &kestrel, "say back on my feet", 30);
+    assert_eq!(r.agent_only_turns(&room), 0, "kestrel's own say does");
+}
+
+#[test]
 fn agent_tells_count_as_agent_only_turns() {
     // Regression: a tell has no room, so agent-to-agent tells skipped the
     // anti-chatter counter and could ping-pong forever.

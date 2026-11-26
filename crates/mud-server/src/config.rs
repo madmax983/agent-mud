@@ -663,6 +663,12 @@ pub struct SupervisorSection {
     pub first_macro_tick_secs: [u64; 2],
     /// How often the supervisor steps, in ms.
     pub step_ms: u64,
+    /// The bound on one wake, in ms (1 s to 1 h). The time a hidden PC
+    /// spends typing (a line held at the gate) does not count.
+    pub wake_timeout_ms: u64,
+    /// The bound on one wake of a tier, in ms, where it differs:
+    /// `ambient`, `persistent` or `turing` (1 s to 1 h each).
+    pub wake_timeout_ms_by_tier: mud_supervisor::runtime::TierTimeouts,
     /// A reactive plan older than this at boot is abandoned, and an
     /// addressed event (a tell, an attack, a mention by name) older than
     /// this is not replayed (0 to 1 day). An errand (a plan of a macro
@@ -687,6 +693,8 @@ impl Default for SupervisorSection {
             macro_tick_scale: 1.0,
             first_macro_tick_secs: [30, 120],
             step_ms: 250,
+            wake_timeout_ms: d.wake_timeout_ms,
+            wake_timeout_ms_by_tier: d.wake_timeout_ms_by_tier,
             replay_max_age_ms: d.replay_max_age_ms,
             booking_max_late_ms: d.booking_max_late_ms,
             catchup_spread_ms: d.catchup_spread_ms,
@@ -695,7 +703,7 @@ impl Default for SupervisorSection {
 }
 
 impl SupervisorSection {
-    /// Checks the restart settings.
+    /// Checks the restart settings and the wake bounds.
     ///
     /// # Errors
     /// A value is out of bounds; the message names it.
@@ -716,6 +724,20 @@ impl SupervisorSection {
             "[supervisor] catchup_spread_ms must be 0 to 3600000, not {}",
             self.catchup_spread_ms
         );
+        let t = &self.wake_timeout_ms_by_tier;
+        for (key, ms) in [
+            ("wake_timeout_ms", Some(self.wake_timeout_ms)),
+            ("wake_timeout_ms_by_tier.ambient", t.ambient),
+            ("wake_timeout_ms_by_tier.persistent", t.persistent),
+            ("wake_timeout_ms_by_tier.turing", t.turing),
+        ] {
+            if let Some(ms) = ms {
+                ensure!(
+                    (1_000..=3_600_000).contains(&ms),
+                    "[supervisor] {key} must be 1000 to 3600000, not {ms}"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -1012,6 +1034,41 @@ mod tests {
             bad(&|s| s.booking_max_late_ms = 30 * 86_400_000 + 1).contains("booking_max_late_ms")
         );
         assert!(bad(&|s| s.catchup_spread_ms = 3_600_001).contains("catchup_spread_ms"));
+    }
+
+    #[test]
+    fn wake_bounds_by_tier_parse_and_are_checked() {
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        assert_eq!(ex.supervisor.wake_timeout_ms, 120_000);
+        assert_eq!(ex.supervisor.wake_timeout_ms_by_tier.turing, Some(180_000));
+        assert_eq!(ex.supervisor.wake_timeout_ms_by_tier.persistent, None);
+        ex.supervisor.check_restart().unwrap();
+        let own: MudConfig = toml::from_str(
+            "[supervisor]\nwake_timeout_ms = 90000\n[supervisor.wake_timeout_ms_by_tier]\nambient = 30000",
+        )
+        .unwrap();
+        let t = own.supervisor.wake_timeout_ms_by_tier;
+        assert_eq!(t.for_tier(mud_world::pack::Tier::Ambient, 90_000), 30_000);
+        assert_eq!(
+            t.for_tier(mud_world::pack::Tier::Turing, 90_000),
+            90_000,
+            "a tier left out falls back"
+        );
+        assert!(
+            toml::from_str::<MudConfig>("[supervisor.wake_timeout_ms_by_tier]\nmob = 1000")
+                .is_err(),
+            "only the agent tiers have a bound"
+        );
+        let bad = |edit: &dyn Fn(&mut SupervisorSection)| {
+            let mut s = SupervisorSection::default();
+            edit(&mut s);
+            s.check_restart().unwrap_err().to_string()
+        };
+        assert!(bad(&|s| s.wake_timeout_ms = 999).contains("wake_timeout_ms"));
+        assert!(
+            bad(&|s| s.wake_timeout_ms_by_tier.turing = Some(3_600_001))
+                .contains("wake_timeout_ms_by_tier.turing")
+        );
     }
 
     #[test]

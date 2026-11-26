@@ -9,7 +9,7 @@
 //! | Immediate | attack on it, a tell, a nudge, speech naming it | 0–500 ms |
 //! | `RoomBatch` | human speech, emotes, arrivals, drops | 2–4 s rolling |
 //! | Ambient   | agent activity while a human is present | 5–10 s + cooldown |
-//! | `MacroTick` | the slow timer, only with no human in the room | none |
+//! | `MacroTick` | the slow timer, only with no other player in the room | none |
 //!
 //! It also runs the per-room anti-chatter counter, the budget breakers,
 //! the Turing attention filter and distracted spells.
@@ -18,6 +18,9 @@
 //! [`Router::due_where`] holds it ([`crate::admit::wake_admit`]), and what
 //! comes meanwhile merges into it. When the entity comes to, one
 //! Immediate "came to" wake ([`Router::came_to`]) delivers everything.
+//!
+//! A wake that waited while its entity was busy no longer carries the
+//! events the busy wake's mind read ([`Router::finish_seen`], ADR 0014).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -28,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::admit::{Admit, CAME_TO, wake_admit};
 use crate::budget::BudgetLevel;
-use crate::chatter::{ChatterInput, MAX_AGENT_ONLY_TURNS, RoomChatter};
+use crate::chatter::{ChatterInput, MAX_AGENT_ONLY_TURNS, RoomChatter, chatter_input_for};
 use crate::replay::replay_due;
 use crate::turing::{Salience, has_keyword, mix, notices, pick};
 
@@ -163,6 +166,40 @@ struct Pending {
     afk_until_ms: Option<u64>,
     /// Booked wakes it delivers.
     booked: Vec<crate::wakes::Booking>,
+    /// Each event it carries with the priority and reason that event alone
+    /// gave it, so a wake whose events the mind already saw falls back to
+    /// what is left ([`Router::finish_seen`]).
+    causes: Vec<(Seq, Priority, String)>,
+    /// The most urgent cause outside the event stream (a session start, an
+    /// interrupted line, a come-to, a booking, a macro tick, a wake given
+    /// back), with its reason. Such a wake is never dropped as seen.
+    forced: Option<(Priority, String)>,
+}
+
+impl Pending {
+    /// A wake waiting from `now`, due at `due_ms`, carrying nothing yet.
+    const fn new(priority: Priority, reason: String, now: u64, due_ms: u64) -> Self {
+        Self {
+            priority,
+            seqs: Vec::new(),
+            first_ms: now,
+            due_ms,
+            reason,
+            macro_tick: false,
+            cooldown_ms: 0,
+            afk_until_ms: None,
+            booked: Vec::new(),
+            causes: Vec::new(),
+            forced: None,
+        }
+    }
+
+    /// Records a cause outside the event stream.
+    fn force_cause(&mut self, priority: Priority, reason: &str) {
+        if self.forced.as_ref().is_none_or(|(p, _)| priority >= *p) {
+            self.forced = Some((priority, reason.to_owned()));
+        }
+    }
 }
 
 /// The router.
@@ -368,10 +405,14 @@ impl Router {
     /// safe direction (`lemma_fold_holds_at_least`).
     fn chatter(&mut self, ev: &Event, world: &World, presence: Presence) -> (bool, bool) {
         let actor = ev.actor.as_ref().and_then(|a| world.entity(&a.id));
+        // The engine's line about a body (a collapse, a death, a respawn)
+        // is the world's, not its actor's turn (`chatter_input_for`).
+        let body_line = ev.is_body_line();
         // An agent here is an agent-played NPC. A player character counts
         // as a player whoever plays it, so an agent PC resets the room and
         // is answered exactly as a human would be.
-        let actor_is_agent = !ev.player_actor
+        let actor_is_agent = !body_line
+            && !ev.player_actor
             && actor.is_some_and(|a| {
                 !a.human && matches!(a.tier, Tier::Ambient | Tier::Persistent | Tier::Turing)
             });
@@ -386,21 +427,12 @@ impl Router {
         let allow_cross = if let Some(room) = &ev.room
             && ev.kind != EventKind::SelfControlNudge
         {
-            let input = if ev.player_actor {
-                ChatterInput::Human
-            } else if actor_is_agent {
-                let here = match presence {
+            let here = actor_is_agent
+                && match presence {
                     Presence::Live => world.player_present(room),
                     Presence::Recipients => player_saw(),
                 };
-                if here {
-                    ChatterInput::AgentWithHuman
-                } else {
-                    ChatterInput::AgentAlone
-                }
-            } else {
-                ChatterInput::World
-            };
+            let input = chatter_input_for(body_line, ev.player_actor, actor_is_agent, here);
             self.room(room).step(input, max)
         } else if ev.room.is_none()
             && actor_is_agent
@@ -661,18 +693,11 @@ impl Router {
                 }
             }
             let entry = self.pending.entry(r.clone());
-            let p = entry.or_insert_with(|| Pending {
-                priority,
-                seqs: Vec::new(),
-                first_ms: now,
-                due_ms: due.max(floor),
-                reason: reason(ev, replay.is_some()),
-                macro_tick: false,
-                cooldown_ms: 0,
-                afk_until_ms: None,
-                booked: Vec::new(),
-            });
+            let why = reason(ev, replay.is_some());
+            let p =
+                entry.or_insert_with(|| Pending::new(priority, why.clone(), now, due.max(floor)));
             p.seqs.push(ev.seq);
+            p.causes.push((ev.seq, priority, why.clone()));
             if priority < Priority::Immediate {
                 p.cooldown_ms = p.cooldown_ms.max(cooldown_ms);
                 p.afk_until_ms = p.afk_until_ms.max(state.afk_until_ms);
@@ -680,7 +705,7 @@ impl Router {
             if priority > p.priority {
                 p.priority = priority;
                 p.due_ms = p.due_ms.min(due);
-                p.reason = reason(ev, replay.is_some());
+                p.reason = why;
             } else if p.priority == Priority::RoomBatch && priority == Priority::RoomBatch {
                 // Rolling window: each new line pushes the wake back, up to the cap.
                 p.due_ms = due
@@ -701,7 +726,9 @@ impl Router {
         notes
     }
 
-    /// A macro-tick for `entity`. It fires only with no player in its room.
+    /// A macro-tick for `entity`. It fires only with no player in its room
+    /// but the entity itself: a hidden PC is a player, and alone it still
+    /// gets its quiet wakes.
     pub fn macro_tick(&mut self, entity: &EntityId, world: &World, now: u64) -> RouteNote {
         let seq = world.last_seq();
         let Some(e) = world.entity(entity) else {
@@ -711,7 +738,7 @@ impl Router {
                 why: "unknown entity".into(),
             };
         };
-        if world.player_present(&e.room) {
+        if world.player_present_except(&e.room, entity) {
             return RouteNote::Dropped {
                 entity: entity.clone(),
                 seq,
@@ -724,19 +751,10 @@ impl Router {
         let p = self
             .pending
             .entry(entity.clone())
-            .or_insert_with(|| Pending {
-                priority: Priority::MacroTick,
-                seqs: Vec::new(),
-                first_ms: now,
-                due_ms: now,
-                reason: "macro-tick".into(),
-                macro_tick: true,
-                cooldown_ms: 0,
-                afk_until_ms: None,
-                booked: Vec::new(),
-            });
+            .or_insert_with(|| Pending::new(Priority::MacroTick, "macro-tick".into(), now, now));
         // The tick keeps its identity even inside a more urgent wake.
         p.macro_tick = true;
+        p.force_cause(Priority::MacroTick, "macro-tick");
         p.due_ms = p.due_ms.min(now);
         RouteNote::Queued {
             entity: entity.clone(),
@@ -752,17 +770,8 @@ impl Router {
         let p = self
             .pending
             .entry(entity.clone())
-            .or_insert_with(|| Pending {
-                priority,
-                seqs: Vec::new(),
-                first_ms: now,
-                due_ms: now,
-                reason: reason.to_owned(),
-                macro_tick: false,
-                cooldown_ms: 0,
-                afk_until_ms: None,
-                booked: Vec::new(),
-            });
+            .or_insert_with(|| Pending::new(priority, reason.to_owned(), now, now));
+        p.force_cause(priority, reason);
         if priority >= p.priority {
             p.priority = priority;
             reason.clone_into(&mut p.reason);
@@ -812,17 +821,9 @@ impl Router {
         let p = self
             .pending
             .entry(wake.entity.clone())
-            .or_insert_with(|| Pending {
-                priority: wake.priority,
-                seqs: Vec::new(),
-                first_ms: 0,
-                due_ms: 0,
-                reason: wake.reason.clone(),
-                macro_tick: false,
-                cooldown_ms: 0,
-                afk_until_ms: None,
-                booked: Vec::new(),
-            });
+            .or_insert_with(|| Pending::new(wake.priority, wake.reason.clone(), 0, 0));
+        // A wake given back carries what its entity never saw.
+        p.force_cause(wake.priority, &wake.reason);
         let mut seqs = wake.seqs;
         for s in std::mem::take(&mut p.seqs) {
             if !seqs.contains(&s) {
@@ -930,6 +931,45 @@ impl Router {
         }
         out.sort_by_key(|w| std::cmp::Reverse(w.priority));
         out
+    }
+
+    /// Marks a wake finished, as [`Router::finish`], once its mind saw the
+    /// events up to `seen` (the newest it was handed, [`Game::read_mark`]
+    /// of mud-world). The wake waiting for the entity drops the events at
+    /// or below `seen`: the mind already read and answered them, and
+    /// replaying them would feed it stale input. Its priority and reason
+    /// fall back to what is left; a wake left with no event and no cause
+    /// outside the event stream is dropped.
+    ///
+    /// [`Game::read_mark`]: mud_world::Game::read_mark
+    pub fn finish_seen(&mut self, entity: &EntityId, now: u64, seen: Seq) {
+        if let Some(p) = self.pending.get_mut(entity)
+            && p.seqs.iter().any(|s| *s <= seen)
+        {
+            p.seqs.retain(|s| *s > seen);
+            p.causes.retain(|(s, _, _)| *s > seen);
+            let best = p
+                .causes
+                .iter()
+                .map(|(_, pr, why)| (*pr, why))
+                .chain(p.forced.as_ref().map(|(pr, why)| (*pr, why)))
+                .fold(None::<(Priority, &String)>, |best, c| match best {
+                    Some(b) if b.0 >= c.0 => Some(b),
+                    _ => Some(c),
+                })
+                .map(|(pr, why)| (pr, why.clone()));
+            match best {
+                Some((priority, why)) => {
+                    p.priority = priority;
+                    p.reason = why;
+                }
+                None if p.seqs.is_empty() => {
+                    self.pending.remove(entity);
+                }
+                None => {}
+            }
+        }
+        self.finish(entity, now);
     }
 
     /// Marks a wake finished; its cooldown starts now. A non-urgent wake

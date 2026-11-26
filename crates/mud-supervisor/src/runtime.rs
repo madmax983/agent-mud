@@ -3,8 +3,11 @@
 //! One task reads every world event and feeds the router. Another steps
 //! the clock: world ticks (respawns, regeneration), Turing sessions and
 //! distracted spells, macro-ticks, and due wakes. Each wake runs on its
-//! own task, one at a time per entity, under a timeout, and its spend
-//! goes into the entity's daily budget.
+//! own task, one at a time per entity, under its tier's timeout, which
+//! leaves out the time the entity spends typing at the gate (ADR 0014),
+//! and its spend goes into the entity's daily budget. The entity stays
+//! busy until its mind has really finished; its next wake then drops the
+//! events that mind already read.
 //!
 //! What a restart must not lose lives in the world store (ADR 0011): the
 //! bookings, the macro schedule and count, the plan of a scripted wake with
@@ -42,6 +45,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::admit::wake_expired;
 use crate::budget::{Budget, BudgetLevel, DAY_MS, SpendSource};
 use crate::gate::Gate;
 use crate::held::{assert_none_held, lock};
@@ -70,8 +74,14 @@ pub struct SupervisorConfig {
     pub first_macro_tick_secs: [u64; 2],
     /// How often the world ticks, in ms.
     pub world_tick_ms: u64,
-    /// The bound on one wake, in ms.
+    /// The bound on one wake, in ms, for a tier [`TierTimeouts`] does not
+    /// name. Time the entity spends with a line held at the gate (a hidden
+    /// PC typing) does not count ([`crate::admit::wake_expired`]).
     pub wake_timeout_ms: u64,
+    /// The bound on one wake of each tier, in ms, where it differs from
+    /// `wake_timeout_ms`.
+    #[serde(default)]
+    pub wake_timeout_ms_by_tier: TierTimeouts,
     /// A reactive plan (one a wake made that carried no macro tick, booking
     /// or login) older than this at boot is abandoned, not resumed, and an
     /// addressed event older than this is not replayed (phase 4). An
@@ -85,6 +95,36 @@ pub struct SupervisorConfig {
     /// this many ms of boot.
     #[serde(default = "default_catchup_spread_ms")]
     pub catchup_spread_ms: u64,
+}
+
+/// A wake bound per tier, in ms; `None` falls back to
+/// [`SupervisorConfig::wake_timeout_ms`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TierTimeouts {
+    /// Light agents (`ambient`).
+    pub ambient: Option<u64>,
+    /// Durable littleguy agents (`persistent`).
+    pub persistent: Option<u64>,
+    /// Hidden agent PCs (`turing`).
+    pub turing: Option<u64>,
+}
+
+impl TierTimeouts {
+    /// The bound of `tier`, or `default`.
+    #[must_use]
+    pub const fn for_tier(&self, tier: Tier, default: u64) -> u64 {
+        let own = match tier {
+            Tier::Ambient => self.ambient,
+            Tier::Persistent => self.persistent,
+            Tier::Turing => self.turing,
+            Tier::None | Tier::Mob => None,
+        };
+        match own {
+            Some(ms) => ms,
+            None => default,
+        }
+    }
 }
 
 const fn default_replay_max_age_ms() -> u64 {
@@ -110,6 +150,7 @@ impl Default for SupervisorConfig {
             first_macro_tick_secs: [30, 120],
             world_tick_ms: 5_000,
             wake_timeout_ms: 120_000,
+            wake_timeout_ms_by_tier: TierTimeouts::default(),
             replay_max_age_ms: default_replay_max_age_ms(),
             booking_max_late_ms: default_booking_max_late_ms(),
             catchup_spread_ms: default_catchup_spread_ms(),
@@ -171,6 +212,17 @@ pub enum ObserverEvent {
     Interrupted {
         /// Who.
         entity: EntityId,
+    },
+    /// Spend charged after its wake's `WakeFinished` line: an op that
+    /// outlived a timeout, a model call that ended late, a heartbeat. The
+    /// budget had it all along; this line shows it.
+    LateSpend {
+        /// Whose.
+        entity: EntityId,
+        /// What came in late.
+        usage: Usage,
+        /// Its budget level afterwards.
+        budget: BudgetLevel,
     },
     /// A booking restored at boot was overdue past `booking_max_late_ms`
     /// and was dropped. The note stays out of the feed.
@@ -723,11 +775,17 @@ impl Supervisor {
     pub fn observe(&self, ev: &Event) {
         let now = self.game.now_ms();
         let rt = self.runtimes(now);
-        // Combat near a hidden PC that is typing drops the line and wakes it.
+        // Combat near a hidden PC that is typing drops the line and wakes
+        // it. A PC whose wake is still running is not woken again: its mind
+        // reads the INTERRUPTED result of the line and goes on.
         if matches!(ev.kind, EventKind::Combat | EventKind::Death) {
             for r in &ev.recipients {
                 if self.gate.is_holding(r) && self.gate.interrupt(r) {
-                    lock(&self.router).force(r, Priority::Immediate, "interrupted by combat", now);
+                    let mut router = lock(&self.router);
+                    if !router.is_busy(r) {
+                        router.force(r, Priority::Immediate, "interrupted by combat", now);
+                    }
+                    drop(router);
                     self.publish(ObserverEvent::Interrupted { entity: r.clone() });
                 }
             }
@@ -995,19 +1053,34 @@ impl Supervisor {
     /// ops that store the new tallies. They carry no harvest mark: only a
     /// wake's close, after its mind settled, knows the mark matches what
     /// was charged.
+    ///
+    /// Each spend is late, after its wake's `WakeFinished` line: one that
+    /// is not zero is published as [`ObserverEvent::LateSpend`], so the
+    /// feed shows what a timed-out wake really cost.
     fn charge(&self, now: u64, spends: Vec<(EntityId, Usage)>) -> Vec<SideOp> {
         let sources: Vec<SpendSource> = spends.iter().map(|(e, _)| self.source(e)).collect();
         let mut st = lock(&self.state);
-        let ops = spends
+        let (ops, late): (Vec<SideOp>, Vec<ObserverEvent>) = spends
             .into_iter()
             .zip(sources)
             .filter_map(|((id, u), source)| {
                 let s = st.get_mut(&id)?;
                 s.budget.spend(now, source, u.tally());
-                Some(spend_op(&id, &s.budget, None))
+                let op = spend_op(&id, &s.budget, None);
+                let note = ObserverEvent::LateSpend {
+                    budget: s.budget.level(now),
+                    entity: id,
+                    usage: u,
+                };
+                Some((op, note))
             })
-            .collect();
+            .unzip();
         drop(st);
+        for note in late {
+            if matches!(&note, ObserverEvent::LateSpend { usage, .. } if !usage.is_zero()) {
+                self.publish(note);
+            }
+        }
         ops
     }
 
@@ -1154,21 +1227,27 @@ impl Supervisor {
         )
         .with_usage_sink(Arc::clone(&self.usage))
         .with_wakes(Arc::clone(&self.wakes));
-        let res = tokio::time::timeout(
-            Duration::from_millis(self.cfg.wake_timeout_ms),
-            mind.wake(ctx, tools),
-        )
-        .await;
+        let res = self
+            .bounded(
+                &wake.entity,
+                self.wake_timeout_of(&wake.entity),
+                mind.wake(ctx, tools),
+            )
+            .await;
+        // Whether the mind finished its turn: a reply that is an answer. A
+        // failure, littleguy's `no_answer` or a timeout is not one, unless
+        // the op answered once read late (checked when it settles).
+        let answered = matches!(&res, Some(Ok(r)) if !r.unanswered);
         let (ok, reply) = match res {
-            Ok(Ok(r)) => (true, r),
-            Ok(Err(e)) => (
+            Some(Ok(r)) => (true, r),
+            Some(Err(e)) => (
                 false,
                 MindReply {
                     text: Some(e.to_string()),
                     ..MindReply::default()
                 },
             ),
-            Err(_) => (
+            None => (
                 false,
                 MindReply {
                     text: Some("timed out".into()),
@@ -1199,32 +1278,106 @@ impl Supervisor {
             took_ms: end.saturating_sub(start),
         });
         mind.settled(&wake.entity).await;
+        let late = self.usage.take_answered_late(&wake.entity);
+        self.close_wake(&wake.entity, &turn, answered || late);
+    }
+
+    /// Closes a wake whose mind has really finished ([`Mind::settled`]):
+    /// charges its late spend, stores the day's tallies, the harvest mark
+    /// and, if the mind `answered`, what it read, with its turn's close, and
+    /// frees the entity.
+    fn close_wake(&self, entity: &EntityId, turn: &str, answered: bool) {
         // What the mind spent after the timeout (a job or an op read late)
         // is in the sink by now: charge it, so the close stores the day's
         // tallies and the harvest mark together, and they agree.
-        let late = self.usage.take(&wake.entity);
-        let mark = self
-            .minds
-            .get(&wake.entity)
-            .and_then(|m| m.tokens_seen(&wake.entity));
+        let late = self.usage.take(entity);
+        let mark = self.minds.get(entity).and_then(|m| m.tokens_seen(entity));
         let now = self.game.now_ms();
-        self.charge(now, vec![(wake.entity.clone(), late)]);
-        let spend = lock(&self.state)
-            .get(&wake.entity)
-            .map(|s| spend_op(&wake.entity, &s.budget, mark));
+        self.charge(now, vec![(entity.clone(), late)]);
+        // The newest event the mind was handed (`mud_events`): a mind that
+        // answered saw that far, so neither its next wake nor a boot replay
+        // owes it those events again. Reading is not answering: a wake that
+        // failed or ended with no answer still owes all it was handed.
+        let seen = if answered {
+            self.game.read_mark(entity)
+        } else {
+            Seq(0)
+        };
+        let spend = lock(&self.state).get_mut(entity).map(|s| {
+            s.seen_seq = s.seen_seq.max(seen.0);
+            spend_op(entity, &s.budget, mark)
+        });
         assert_none_held("closing a turn");
         let mut ops: Vec<SideOp> = spend.into_iter().collect();
+        if seen.0 > 0 {
+            ops.push(SideOp::SeenSeq {
+                entity: entity.clone(),
+                seq: seen.0,
+            });
+        }
         ops.push(SideOp::PlanDone {
-            entity: wake.entity.clone(),
-            wake_id: turn.clone(),
+            entity: entity.clone(),
+            wake_id: turn.to_owned(),
         });
-        let closed = self.game.close_turn(&wake.entity, &turn, ops);
-        if let Err(e) = closed {
+        if let Err(e) = self.game.close_turn(entity, turn, ops) {
             // The store logged and counted it; the close's ops wait in its
             // backlog for the next commit.
-            tracing::warn!(entity = %wake.entity, error = %e, "a wake's turn did not close");
+            tracing::warn!(entity = %entity, error = %e, "a wake's turn did not close");
         }
-        lock(&self.router).finish(&wake.entity, self.game.now_ms());
+        // The mind has really finished: its next wake no longer carries
+        // what it read and answered.
+        let now = self.game.now_ms();
+        if answered {
+            lock(&self.router).finish_seen(entity, now, seen);
+        } else {
+            lock(&self.router).finish(entity, now);
+        }
+    }
+
+    /// The wake bound of `entity`'s tier, in ms: its tier's entry in
+    /// `wake_timeout_ms_by_tier`, else `wake_timeout_ms` (the server and
+    /// tests read it).
+    #[must_use]
+    pub fn wake_timeout_of(&self, entity: &EntityId) -> u64 {
+        let tier = self
+            .game
+            .read(|w| w.entity(entity).map(|e| e.tier))
+            .unwrap_or_default();
+        self.cfg
+            .wake_timeout_ms_by_tier
+            .for_tier(tier, self.cfg.wake_timeout_ms)
+    }
+
+    /// Runs `fut`, a wake of `entity`, until it ends or has run `timeout_ms`
+    /// outside the gate's holds ([`wake_expired`]): the time the entity
+    /// spends with a line held (a hidden PC typing a notice) stops the
+    /// clock. `None` when it ran out; the future is dropped then.
+    async fn bounded<F: std::future::Future>(
+        &self,
+        entity: &EntityId,
+        timeout_ms: u64,
+        fut: F,
+    ) -> Option<F::Output> {
+        let start = tokio::time::Instant::now();
+        let held_at_start = self.gate.held_ms(entity);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let held = self.gate.held_ms(entity).saturating_sub(held_at_start);
+            if wake_expired(elapsed, held, timeout_ms) {
+                return None;
+            }
+            // Not expired, so the time that counts is below the bound: wait
+            // for the rest of it, then look again (a hold meanwhile moves
+            // the end out).
+            let left = timeout_ms
+                .saturating_sub(elapsed.saturating_sub(held))
+                .max(1);
+            tokio::select! {
+                out = &mut fut => return Some(out),
+                () = tokio::time::sleep(Duration::from_millis(left)) => {}
+            }
+        }
     }
 
     /// Runs the supervisor: an event task and a clock task. Abort the
@@ -1375,6 +1528,8 @@ fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>
 mod budget_tests;
 #[cfg(test)]
 mod downed_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod persist_tests;
 #[cfg(test)]

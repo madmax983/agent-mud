@@ -73,6 +73,9 @@ typing_scale = 1.0               # Turing PC typing holds; 0 for demos
 macro_tick_scale = 1.0           # 2–6 h macro-ticks; 0.001 makes them seconds
 first_macro_tick_secs = [30, 120]
 step_ms = 250
+# The bound on one wake (1 s..=1 h). Time a hidden PC spends typing a line does
+# not count, so a long notice never times a wake out. A tier can have its own.
+wake_timeout_ms = 120000
 # After a restart (ADR 0011): bookings, the macro schedule, rule counters,
 # plans and budgets come back from world.db. A plan of a macro tick, a booking
 # or a login (an errand) resumes at its cursor however long the server was
@@ -81,6 +84,8 @@ step_ms = 250
 replay_max_age_ms = 120000       # such an event, or a reactive plan, older than this is not replayed (0..=1 day)
 booking_max_late_ms = 86400000   # a booking overdue by more is dropped (0..=30 days)
 catchup_spread_ms = 120000       # a missed macro tick fires once, within this of boot (0..=1 h)
+[supervisor.wake_timeout_ms_by_tier] # ambient, persistent, turing; unset: wake_timeout_ms
+turing = 180000
 [supervisor.budgets]                 # by entity id; 0 is unlimited
 pc_kestrel = 600000
 

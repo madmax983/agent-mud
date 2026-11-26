@@ -5,7 +5,7 @@
 //! same surface any MCP client gets. Its reply text is never shown to
 //! anyone; only its commands change the world.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -84,9 +84,14 @@ impl Usage {
 /// trips the breakers.
 ///
 /// Each unit of spend goes in exactly one place: the reply, or the sink.
+/// The same holds for an answer: an op read after its wake gave up marks
+/// here that it answered ([`UsageSink::answered_late`]), so the wake's
+/// close knows the mind finished its turn.
 #[derive(Debug, Default)]
 pub struct UsageSink {
     owed: Mutex<HashMap<EntityId, Usage>>,
+    /// The entities whose op, read after its wake gave up, answered.
+    answered_late: Mutex<HashSet<EntityId>>,
 }
 
 impl UsageSink {
@@ -110,6 +115,24 @@ impl UsageSink {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(entity)
             .unwrap_or_default()
+    }
+
+    /// Records that `entity`'s op, read after its wake gave up on it (a
+    /// timeout), answered: the mind finished its turn after all.
+    pub fn answered_late(&self, entity: &EntityId) {
+        self.answered_late
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(entity.clone());
+    }
+
+    /// Whether `entity`'s op answered after its wake gave up on it, since
+    /// the last call; the mark is cleared.
+    pub fn take_answered_late(&self, entity: &EntityId) -> bool {
+        self.answered_late
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(entity)
     }
 
     /// Takes what everyone owes.
@@ -196,6 +219,12 @@ pub struct MindReply {
     pub usage: Usage,
     /// How many commands it ran through the in-process tools.
     pub commands: u32,
+    /// The mind ended its turn without an answer: littleguy's `no_answer`
+    /// (a provider error, a refusal, the tool rounds ran out). The wake
+    /// still ends ok, but it owes the events its mind read: reading an
+    /// event is not answering it.
+    #[serde(default)]
+    pub unanswered: bool,
 }
 
 /// A mind failure.

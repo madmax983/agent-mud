@@ -87,6 +87,16 @@ block of its own HP. Dying costs more than collapsing: the dead wake in the
 square with a third of their HP, and their purse stays where they fell for
 anyone to pick up.
 
+A wake ends when its mind does (ADR 0014). An agent stays busy until its
+littleguy op has really finished, so a slow op never overlaps a second
+chat. A wake's timeout (`[supervisor] wake_timeout_ms`, or per tier in
+`[supervisor.wake_timeout_ms_by_tier]`) leaves out the time a hidden PC
+spends typing, so kestrel can type a long notice without its wake failing.
+The next wake carries only the events the mind did not already read with
+`mud_events` and answer (a wake that failed after reading still owes
+them), and spend that arrives after a wake's line shows up in the
+observer feed as its own `late` line.
+
 A shop keeps its stock in the shop (ADR 0013): Marta's ale is on the shelf
 behind the bar, not on Marta, and it sells while she stands there to sell
 it. A keeper may roam; a soft post in the pack makes her quiet wakes give

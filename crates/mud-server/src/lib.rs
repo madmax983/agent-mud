@@ -265,6 +265,8 @@ pub async fn build(cfg: &MudConfig) -> anyhow::Result<Built> {
         replay_max_age_ms: s.replay_max_age_ms,
         booking_max_late_ms: s.booking_max_late_ms,
         catchup_spread_ms: s.catchup_spread_ms,
+        wake_timeout_ms: s.wake_timeout_ms,
+        wake_timeout_ms_by_tier: s.wake_timeout_ms_by_tier,
         ..SupervisorConfig::default()
     };
     // Then the supervisor restores the rows (bookings, the macro schedule,
@@ -828,6 +830,24 @@ mod tests {
             assert_eq!(built.tokens.cursors_of(&e), [floor], "{e}");
             assert!(floor <= last, "{e}: never past the world");
         }
+    }
+
+    #[tokio::test]
+    async fn the_wake_bounds_of_mud_toml_reach_the_supervisor() {
+        // The example's `turing = 180000` must not fall back silently to
+        // the default bound.
+        let ex: MudConfig = toml::from_str(include_str!("../../../mud.toml.example")).unwrap();
+        let mut cfg = MudConfig::default();
+        cfg.world.db = None;
+        cfg.accounts.bcrypt_cost = 4;
+        cfg.supervisor.wake_timeout_ms = 90_000;
+        cfg.supervisor.wake_timeout_ms_by_tier = ex.supervisor.wake_timeout_ms_by_tier;
+        cfg.supervisor.wake_timeout_ms_by_tier.ambient = Some(30_000);
+        let built = build(&cfg).await.unwrap();
+        let bound = |e: &str| built.mud.sup.wake_timeout_of(&EntityId::from(e));
+        assert_eq!(bound("pc_kestrel"), 180_000, "turing, from the example");
+        assert_eq!(bound("marta"), 90_000, "persistent: the default bound");
+        assert_eq!(bound("guard_01"), 30_000, "ambient, set here");
     }
 
     #[test]
