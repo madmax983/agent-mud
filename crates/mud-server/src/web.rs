@@ -196,11 +196,12 @@ function fmt(k,m){
   if(k==='script')return `script  ${m.text}`;
   if(k==='booking')return `booking ${m.entity}  #${m.id} ${m.action} · due ${new Date(m.due_ms).toLocaleString()}`;
   if(k==='steward'){const v=m.votes?` · votes ${m.votes[0]} yes, ${m.votes[1]} no`:'';const r=(m.reasons||[]).length?` · ${m.reasons.join(' | ')}`:'';return `steward ${m.entity}  ${m.item}${m.id!=null?' #'+m.id:''} ${m.action} (${m.code})${v}${m.text?' · '+m.text:''}${r}`;}
+  if(k==='notice'){const n=m.notice||{};return `NOTICE  ${n.entity}  ${m.mind} ${n.code} · ${n.text}`;}
   if(k==='session')return m.kind==='afk'?`afk     ${m.entity}  until ${new Date(m.until_ms).toLocaleTimeString()}`:`session ${m.entity}  ${m.online?'logged in':'logged out'}`;
   return `world   [${m.room||'-'}] ${m.who}${m.human?' (human)':''}: ${m.text}`;
 }
-function cls(k,m){if(k==='roll')return 'soft';if(k==='world')return m.kind==='tell'?'tell':'muted';return '';}
-['route','wake','roll','world','session','script','booking','steward'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
+function cls(k,m){if(k==='roll')return 'soft';if(k==='notice')return 'error';if(k==='world')return m.kind==='tell'?'tell':'muted';return '';}
+['route','wake','roll','world','session','script','notice','booking','steward'].forEach(k=>es.addEventListener(k,e=>{const m=JSON.parse(e.data);row(cls(k,m),fmt(k,m));}));
 ";
 
 /// The page scripts are files, not inline: the app's CSP allows
@@ -1023,6 +1024,7 @@ fn feed(app: &Mud) -> impl Stream<Item = Result<SseEvent, Infallible>> + Send + 
                 ObserverEvent::Session { .. } | ObserverEvent::Afk { .. } => "session",
                 ObserverEvent::Booking { .. } => "booking",
                 ObserverEvent::Steward(_) => "steward",
+                ObserverEvent::MindNotice { .. } => "notice",
             };
             Some(sse(name, &serde_json::to_value(&*e).ok()?))
         });
@@ -1374,6 +1376,10 @@ mod tests {
         assert!(!text.contains('<') && !text.contains('>') && !text.contains('&'));
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), v);
         assert!(OBSERVER_JS.contains("k==='steward'"));
+        assert!(
+            OBSERVER_JS.contains("k==='notice'")
+                && OBSERVER_JS.contains("'script','notice','booking'")
+        );
     }
 
     #[test]

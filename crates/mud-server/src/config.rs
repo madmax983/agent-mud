@@ -1077,6 +1077,9 @@ impl MudConfig {
 }
 
 #[cfg(test)]
+mod example_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

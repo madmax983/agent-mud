@@ -10,6 +10,64 @@ MCP endpoint), [autumn-harvest](https://github.com/autumn-foundation/autumn-harv
 The design is in [`docs/design-v0.1.md`](docs/design-v0.1.md); the decisions
 the build made are in [`docs/adr/`](docs/adr/).
 
+## Install littleguy
+
+`lg`, the littleguy binary, is needed only when a `[minds]` tier in
+`mud.toml` is `"littleguy"`, as in [`mud.toml.example`](mud.toml.example).
+`mud serve` with no `mud.toml` (below), and the `scripted`, `harvest` and
+`plugin-agent` runtimes, need no `lg`.
+
+The MUD needs littleguy at commit
+`c507731f7a8930444931c60169931d657cecec73` or later: the commit that CI
+pins (`.github/workflows/ci.yml`) and the MUD is tested against. Build it
+with the features the MUD uses:
+
+```sh
+git clone https://github.com/autumn-foundation/littleguy
+cd littleguy
+git checkout c507731f7a8930444931c60169931d657cecec73
+cargo build --release -p littleguy --no-default-features \
+  --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction,refine"
+```
+
+Then do one of these:
+
+- put it on your `PATH`, and keep `[littleguy] bin = "lg"`:
+
+  ```sh
+  install -m 755 target/release/lg ~/.local/bin/lg
+  command -v lg   # must print the lg you just installed
+  ```
+
+- or point `[littleguy] bin` at the build:
+
+  ```toml
+  [littleguy]
+  bin = "/path/to/littleguy/target/release/lg"
+  ```
+
+`refine` is needed while `[littleguy] refine` is `menu` (the default) or
+`free`: lg refuses to start a `[refine]` config without it. Set
+`refine = "off"` to run an `lg` built without it.
+
+**An older `lg` on your `PATH` fails to start.** `bin = "lg"` runs the
+first `lg` on `PATH`, and `lg --version` prints `lg 0.1.0` for every
+build, so it cannot tell you which build that is. The MUD writes each
+agent's `lg.toml`, and lg refuses a config that holds a part it does not
+know: an `lg` built before littleguy #108 exits at start with
+`` unknown field `compaction` `` in `data/agents/<id>/lg.log`, and every
+wake of its agent fails.
+
+The MUD reads that message. When the refused part is one it writes only
+as an extra (`compaction`, `max_request_bytes` or `heartbeat.research`),
+it leaves the part out for that binary until the MUD restarts, starts the
+daemon again, and warns once per binary and part: a `WARN` line in the
+MUD's log and a `NOTICE` line on the observer, each naming the part, the
+binary and the commit above. The agent then plays without that part. Any
+other refused part, or a start that still fails after the MUD left a part
+out, fails the wake with an error that says the `lg` is older than the
+MUD needs and points here. Rebuild `lg` as above to get every part back.
+
 ## Try it
 
 ```sh
@@ -183,25 +241,16 @@ per tier:
 | `harvest` | a durable autumn-harvest agent in process | `[models.<alias>]` and its key |
 | `plugin-agent` | an autumn-plugin-agent loop (ambient NPCs) | `[models.<alias>]` and its key |
 
-With littleguy, build `lg` from the littleguy repository at commit
-`c507731f7a8930444931c60169931d657cecec73` (the one CI pins and the MUD
-is tested against; littleguy #122, whose `overlay_activate` refuses a
-move from a pointer that moved since the Steward read it) and point
-`[littleguy] bin` at it:
-
-```sh
-git -C littleguy checkout c507731f7a8930444931c60169931d657cecec73
-cargo build --release -p littleguy --no-default-features \
-  --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction,refine"
-```
-
-`refine` is needed while `[littleguy] refine` is `menu` (the default) or
-`free`: lg refuses to start a `[refine]` config without it. Set
-`refine = "off"` to run an `lg` built without it.
+With littleguy, install `lg` first: [Install littleguy](#install-littleguy)
+gives the commit, the features and the `[littleguy] bin` to set. The
+commit is littleguy #122, whose `overlay_activate` refuses a move from a
+pointer that moved since the Steward read it.
 
 Each agent's daemon takes notes, keeps goals and ideas, researches them on
 its heartbeat, and compacts a long op (the `[littleguy]` keys in
-`mud.toml.example`; all on by default). A heartbeat tick is a quiet moment:
+`mud.toml.example`; all on by default; `compaction = false`,
+`max_request_bytes = 0` and `heartbeat_minutes = 0` leave each part out of
+`lg.toml`). A heartbeat tick is a quiet moment:
 it may read and book a wake through the `world` MCP server, but lg refuses
 `mud__mud_command` on it. `notes = true` also gives each agent lg's
 workspace file tools in its own folder (ADR 0002).
