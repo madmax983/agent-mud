@@ -11,6 +11,11 @@
 # the fallback when a budget is spent or no model is configured). Each rule
 # fires on one trigger and runs its commands through the same parser as a
 # human. `{actor}` is the name of the entity that caused the trigger.
+#
+# A mob with `respawn_minutes` comes back that many minutes after it dies.
+# It drops its non-hidden gear where it fell, as loot, and comes back with
+# its `inventory` and `equip` made new (ADR 0012). `respawn_kit = false`
+# keeps its gear one-off; unset means yes, and only such a mob may set it.
 
 # ------------------------------------------------------- trait library
 # A trait with `control` rolls 3d6 against it when a trigger reaches the

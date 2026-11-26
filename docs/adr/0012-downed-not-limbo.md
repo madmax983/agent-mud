@@ -94,3 +94,63 @@ that, death was a free full heal at the square, cheaper than collapsing.
 - Shop stock lived on the keeper's body, and keepers roamed with it;
   ADR 0013 moves the stock into a shop fixture and gives keepers a soft
   post.
+
+## Amended: a respawned mob comes back with its kit
+
+### Context
+
+A balance study of crypt-v01 on the real engine found that the skeletal
+warden fights with its grave-blade only once per world. When a mob dies,
+`kill` drops its non-hidden kit where it fell. The respawn in
+`World::tick` restored HP and the home room, but not the kit. So every
+later warden fought bare-handed (brawling at its DX default, thr-1
+crushing), and every later warren rat came back without its tail. The
+odds the study measured held for the first spawn only, and one blade
+ever existed for the bounty that asks for it.
+
+### Decision
+
+- **A respawned mob gets its starting gear back, made new.** At respawn
+  the engine makes each piece of the cast entry's `inventory` that the
+  mob no longer carries, from the pack as it is now, and wields or wears
+  what `equip` names in a free slot. A hidden natural weapon never falls,
+  so it is kept, not made again. An item that holds money (a prototype
+  with `currency`) is never made, so money stays conserved. Shop stock
+  is not part of a kit: it lives in a fixture (ADR 0013).
+- **It is the rule for every mob that respawns, with a pack switch.**
+  `[cast.x] respawn_kit` is unset by default, which means yes. A mob
+  that respawns is a new one of its kind, and a new one carries what its
+  kind carries; a pack should not need a line per mob to say so.
+  `respawn_kit = false` keeps a one-off piece one-off (a unique key, a
+  named relic). The pack check refuses `respawn_kit` on an entry that is
+  not a mob with `respawn_minutes`, because it would mean nothing there.
+  The switch is pack data, so the engine names no mob and no item.
+- **The old kit stays where it fell, as loot.** Each death drops one kit
+  and each respawn makes one. Loot accrues once per kill, and the mob's
+  respawn timer bounds how often that happens (the warden: one blade per
+  two hours at most). Anyone may take it, sell it or wield it.
+- **The kit is a ledgered mint.** It goes into the same ledger as a
+  script's reward (ADR 0010), under the engine's own pool `@respawn`
+  (`rewards::RESPAWN_POOL`). `@` is not in a pool id, so no pack can
+  declare it. The pool has no budget and no period (period 0). One
+  respawn with something to make is one `MintRecord`: its `seq` is the
+  respawn line, its `hook` is `respawn`, its entity is the mob, and its
+  currency is 0. The tick's changes carry an `item` change from nowhere
+  for each piece, an `equipped` change for each slot filled and a
+  `minted` change; the observer feed gets an `Audit::Minted` entry; the
+  snapshot counts it in `WorldState.minted`. So "items are conserved
+  except for ledgered mints" still holds, and `check_rewards` checks the
+  respawn rows as it checks a script's.
+- **Determinism.** The mint reads no dice and no clock: it makes the
+  missing pieces in the order the entry lists them, with `next_item`
+  ids from the state. A restart between the death and the respawn makes
+  the same kit with the same ids.
+
+### Consequences
+
+- A second warden fights with its blade, so the study's warden odds hold
+  for every spawn. Each kill of the warden leaves a blade to loot.
+- giant_rat_2 comes back with a tail, so tails come back every 30
+  minutes, one per kill.
+- The ledger grows by one row per respawn that makes something, as it
+  grows by one row per scripted reward.

@@ -1441,9 +1441,9 @@ impl World {
         }
     }
 
-    /// Advances world time: respawns mobs, and runs a recovery step for
-    /// every entity in the world each `[recovery] every_secs` (a minute
-    /// by default).
+    /// Advances world time: respawns mobs, each with its kit made new
+    /// (`respawn_kit`), and runs a recovery step for every entity in the
+    /// world each `[recovery] every_secs` (a minute by default).
     pub fn tick(&mut self, now: u64) -> TickOutcome {
         let mut ctx = Ctx {
             now,
@@ -1470,7 +1470,8 @@ impl World {
                     format!("A {name} crawls out of the dark."),
                 )
                 .actor(&id, crate::event::VERB_RESPAWN);
-                self.emit(&mut ctx, spec);
+                let seq = self.emit(&mut ctx, spec);
+                self.restore_kit(&mut ctx, &id, seq);
             }
         }
         if now.saturating_sub(self.state.last_regen_ms) >= self.pack.recovery.every_ms() {
@@ -1542,3 +1543,6 @@ mod shops_tests;
 
 #[cfg(test)]
 mod retreat_tests;
+
+#[cfg(test)]
+mod respawn_tests;
