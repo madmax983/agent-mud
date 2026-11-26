@@ -1362,6 +1362,22 @@ impl Supervisor {
         (turn, ticks)
     }
 
+    /// The tools one wake of `entity` gets: its spend goes to the usage
+    /// sink, and it may book wakes when its tier allows that.
+    fn wake_tools(&self, entity: &EntityId) -> MudTools {
+        let tools = MudTools::new(
+            Arc::clone(&self.game),
+            Arc::clone(&self.gate),
+            entity.clone(),
+        )
+        .with_usage_sink(Arc::clone(&self.usage));
+        if self.can_book(entity) {
+            tools.with_wakes(Arc::clone(&self.wakes))
+        } else {
+            tools
+        }
+    }
+
     /// Runs one wake to the end and records it.
     ///
     /// The order is open, run, settle, close: the entity stays busy until
@@ -1406,15 +1422,7 @@ impl Supervisor {
                 ctx.goals = self.goal_lines(&wake.entity);
             }
         }
-        let mut tools = MudTools::new(
-            Arc::clone(&self.game),
-            Arc::clone(&self.gate),
-            wake.entity.clone(),
-        )
-        .with_usage_sink(Arc::clone(&self.usage));
-        if self.can_book(&wake.entity) {
-            tools = tools.with_wakes(Arc::clone(&self.wakes));
-        }
+        let tools = self.wake_tools(&wake.entity);
         let res = self
             .bounded(
                 &wake.entity,
@@ -1429,23 +1437,7 @@ impl Supervisor {
         // Whether the wake failed: an error, not a timeout. A timeout is
         // never a lost tick, because the mind was running.
         let failed = matches!(&res, Some(Err(_)));
-        let (ok, reply) = match res {
-            Some(Ok(r)) => (true, r),
-            Some(Err(e)) => (
-                false,
-                MindReply {
-                    text: Some(e.to_string()),
-                    ..MindReply::default()
-                },
-            ),
-            None => (
-                false,
-                MindReply {
-                    text: Some("timed out".into()),
-                    ..MindReply::default()
-                },
-            ),
-        };
+        let (ok, reply) = reply_of(res);
         for notice in mind.take_notices() {
             self.report(ObserverEvent::MindNotice {
                 mind: mind.kind().to_owned(),
@@ -1893,6 +1885,28 @@ impl Supervisor {
 /// The `Spend` op that stores `budget`'s day: absolute tallies, joined in
 /// the store by the proved [`crate::persist::budget_join`], so a retried,
 /// reordered or lost op never stores more than memory holds.
+/// Whether a wake's mind answered, and its reply: an error or a timeout
+/// becomes a reply that says so, with nothing to apply.
+fn reply_of<E: std::fmt::Display>(res: Option<Result<MindReply, E>>) -> (bool, MindReply) {
+    match res {
+        Some(Ok(r)) => (true, r),
+        Some(Err(e)) => (
+            false,
+            MindReply {
+                text: Some(e.to_string()),
+                ..MindReply::default()
+            },
+        ),
+        None => (
+            false,
+            MindReply {
+                text: Some("timed out".into()),
+                ..MindReply::default()
+            },
+        ),
+    }
+}
+
 fn spend_op(entity: &EntityId, budget: &Budget, harvest_tokens_seen: Option<u64>) -> SideOp {
     SideOp::Spend {
         entity: entity.clone(),
