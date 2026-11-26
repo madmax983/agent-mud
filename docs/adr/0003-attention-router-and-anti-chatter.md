@@ -141,13 +141,19 @@ anyway. So a player now defers an agent's macro tick only while it acts:
   player other than the entity acted in its room less than
   `[supervisor] macro_defer_ms` (default 600000, 10 minutes of game time)
   before it. An act is an event of the room whose actor is a player
-  present there now (`World::last_player_act`). With no such act it never
+  present there now (`World::last_player_act`). The world keeps each
+  player's last act in each room beside the event log, so an act the
+  log has dropped (it holds 10000 events) still counts. A boot knows the
+  acts of the log it reloaded: when that log does not reach the world's
+  first event, its oldest time stands in for an act a present player may
+  have made before it, so a tick waits at most one window past that
+  time. With no such act it never
   waits, and once the room is quiet for the window it stays undeferred as
   the clock runs on (`lemma_quiet_stays_quiet`), so an idle player holds a
   tick back for at most the window. A tick that waits is tried again in 2
   to 10 minutes, as before.
 - **Players, not humans.** The rule reads who acted and when, from the
-  event log (`player_actor`, `at_ms`), never `human` or a tier: a human
+  events (`player_actor`, `at_ms`), never `human` or a tier: a human
   and an agent PC defer a tick alike, and an NPC beside either gets the
   same wakes. It is deterministic: the times are the game clock's.
 - **A lost tick comes again soon (`tick_retry_ms`, proved).** A wake that
@@ -169,10 +175,15 @@ anyway. So a player now defers an agent's macro tick only while it acts:
   `Unavailable` when the daemon exits or its socket fails mid-turn, after
   model calls ran. That wake reached the mind, and a retry in minutes
   would spend again, so it keeps the normal schedule.
-- **A retry does not reset the room.** A tick resets its room's
-  agent-only count (`ChatterInput::MacroTick`). A retry fires while the
-  entity's run of losses goes on, and it skips that reset: the tick it
-  retries reset the room already. Otherwise a mind that stays down would
-  reopen a held room at each retry, about every 3 to 96 minutes, and hand
-  the other agents there a fresh set of cross-agent turns each time, while
-  the broken entity never takes one.
+- **A retry resets the room only when its mind acts.** A tick resets its
+  room's agent-only count (`ChatterInput::MacroTick`). A retry fires
+  while the entity's run of losses goes on, and it owes that reset
+  instead: the router pays it at the entity's first act, before the act
+  counts. A mind that stays down acts nothing, so it does not reopen a
+  held room at each retry, about every 3 to 96 minutes, and hand the
+  other agents there a fresh set of cross-agent turns each time. The
+  retry that reaches the mind and acts reopens the room as a tick does.
+  The reset lapses when the wake that carries the tick ends
+  (`Router::tick_wake_ended`): an act of a later wake is not the tick's
+  turn. The router may read the wake's own acts after the wake ends, so
+  the bound is the world's last seq at that end, not the time.

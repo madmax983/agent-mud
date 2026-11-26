@@ -175,7 +175,8 @@ these points and checks it.
 A macro tick whose wake never reached the mind (it failed before any
 spend: lg did not start, say) comes again in about 3 minutes, then twice
 as long after each loss in a row, up to the cast's shortest interval. A
-retry does not reset the room's anti-chatter count again. The
+retry resets the room's anti-chatter count only at its mind's first act,
+so a mind that stays down never reopens a held room. The
 `runtime::tick_tests` of `mud-supervisor` check it. When the server stops,
 the terminal sessions and the wakes still running end first, within 5 s
 each, and then it closes `world.db` and `accounts.db`, so the main files

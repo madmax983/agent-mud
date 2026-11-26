@@ -614,6 +614,58 @@ fn a_retried_macro_tick_does_not_reopen_a_held_room() {
 }
 
 #[test]
+fn a_retried_tick_resets_its_room_at_the_minds_first_act() {
+    // Review (round 2): the retry that reached the mind was still a retry,
+    // so its room stayed held until the next scheduled tick, hours later.
+    // The reset it owes comes with the entity's first act, before the act
+    // counts.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let smithy = RoomId::from("smithy");
+    let max = r.config().max_agent_only_turns;
+    r.rooms.insert(
+        smithy.clone(),
+        RoomChatter {
+            agent_only_turns: max,
+        },
+    );
+    r.macro_tick(&id("torin"), &w, 5, true);
+    assert_eq!(r.agent_only_turns(&smithy), max, "nothing reset yet");
+    run(&mut w, &mut r, &rt, &id("torin"), "say back again", 6);
+    assert_eq!(r.agent_only_turns(&smithy), 1, "reset, then one turn");
+    run(&mut w, &mut r, &rt, &id("torin"), "say and again", 7);
+    assert_eq!(r.agent_only_turns(&smithy), 2, "paid once");
+}
+
+#[test]
+fn a_reset_owed_by_a_lost_retry_ends_with_its_wake() {
+    // A retry whose wake never reached the mind acts nothing. A later act
+    // (a booked wake, say) is not the tick's turn: it reopens nothing.
+    let mut w = world();
+    let mut r = Router::new(RouterConfig::default());
+    let rt = HashMap::new();
+    let smithy = RoomId::from("smithy");
+    let max = r.config().max_agent_only_turns;
+    r.rooms.insert(
+        smithy.clone(),
+        RoomChatter {
+            agent_only_turns: max,
+        },
+    );
+    r.macro_tick(&id("torin"), &w, 5, true);
+    r.tick_wake_ended(&id("torin"), w.last_seq());
+    run(&mut w, &mut r, &rt, &id("torin"), "say later", 6);
+    assert!(r.agent_only_turns(&smithy) >= max, "the room stays held");
+    // An act the router reads late, from inside the wake, still gets it.
+    r.macro_tick(&id("torin"), &w, 7, true);
+    assert!(w.execute(&id("torin"), "say inside the wake", 8).ok);
+    r.tick_wake_ended(&id("torin"), w.last_seq());
+    feed(&mut w, &mut r, &rt, 9);
+    assert_eq!(r.agent_only_turns(&smithy), 1, "read late, paid");
+}
+
+#[test]
 fn a_macro_tick_keeps_its_identity_inside_a_merged_wake() {
     let w = world();
     let mut r = Router::new(RouterConfig::default());

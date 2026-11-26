@@ -18,11 +18,13 @@ const HOUR: u64 = 3_600_000;
 
 /// A mind that is up or down: down, every wake fails as an `lg serve`
 /// that exits at start does. With `spends`, a down wake fails only after
-/// it spent, as an `lg serve` that exits mid-turn does.
+/// it spent, as an `lg serve` that exits mid-turn does. Up, with `acts`,
+/// the mind says one line in its wake.
 #[derive(Debug, Default)]
 struct Switch {
     down: AtomicBool,
     spends: AtomicBool,
+    acts: AtomicBool,
     wakes: AtomicU32,
 }
 
@@ -44,7 +46,11 @@ impl Mind for Switch {
                 },
             );
         }
+        let acts = !down && self.acts.load(Ordering::SeqCst);
         Box::pin(async move {
+            if acts {
+                assert!(tools.command("say back on my feet").await.ok);
+            }
             if down {
                 Err(MindError::Unavailable(
                     "lg serve for torin exited (exit status: 2)".into(),
@@ -262,7 +268,8 @@ async fn a_retried_tick_does_not_reopen_a_room_held_at_the_bound() {
     assert_eq!(mind.wakes.load(Ordering::SeqCst), 2, "the retry fired");
     assert_eq!(last_wake_end(&r.feed(), &mut at), Some(false));
     assert_eq!(lock(&r.sup.router).agent_only_turns(&smithy), held);
-    // Once a wake reaches the mind, the next scheduled tick resets it.
+    // The mind is back but says nothing: the retry pays no reset. The
+    // next scheduled tick resets the room.
     mind.down.store(false, Ordering::SeqCst);
     let due = next_macro(&r);
     r.clock.advance(due - r.game.now_ms());
@@ -277,4 +284,34 @@ async fn a_retried_tick_does_not_reopen_a_room_held_at_the_bound() {
     r.run_for(1_000, 500).await;
     assert_eq!(mind.wakes.load(Ordering::SeqCst), 4);
     assert_eq!(lock(&r.sup.router).agent_only_turns(&smithy), 0);
+}
+
+#[tokio::test]
+async fn the_retry_that_reaches_the_mind_reopens_its_room() {
+    // Review (round 2): the first retry to reach the mind was still a
+    // retry, so its room stayed held until the next scheduled tick.
+    let disk = Disk::new();
+    let mind = Arc::new(Switch::default());
+    mind.down.store(true, Ordering::SeqCst);
+    let mut r = start(&disk, T0, ticking(), only_torin(&mind));
+    let mut at = 0;
+    r.run_for(2_000, 500).await;
+    assert_eq!(last_wake_end(&r.feed(), &mut at), Some(false));
+    for l in ["say one", "say two", "say three"] {
+        assert!(r.game.execute(&torin(), l).ok, "{l}");
+    }
+    r.run_for(0, 1).await;
+    let max = r.sup.cfg.router.max_agent_only_turns;
+    let smithy = RoomId::from("smithy");
+    assert!(lock(&r.sup.router).agent_only_turns(&smithy) >= max);
+    // The mind is back: the retry's wake says one line. The room resets
+    // before that line counts.
+    mind.down.store(false, Ordering::SeqCst);
+    mind.acts.store(true, Ordering::SeqCst);
+    let due = next_macro(&r);
+    r.clock.advance(due - r.game.now_ms());
+    r.run_for(1_000, 500).await;
+    assert_eq!(last_wake_end(&r.feed(), &mut at), Some(true));
+    assert_eq!(mind.wakes.load(Ordering::SeqCst), 2);
+    assert_eq!(lock(&r.sup.router).agent_only_turns(&smithy), 1);
 }

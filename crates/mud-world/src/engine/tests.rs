@@ -1117,3 +1117,61 @@ fn a_keeper_sees_its_own_prices_on_its_sheet() {
     let (text, _) = w.sheet(&id("marta"));
     assert!(text.contains("mug of ale - 1s"), "{text}");
 }
+
+#[test]
+fn a_players_last_act_outlives_the_event_log_cap() {
+    // Review (round 2): the act was read from the in-memory log alone. A
+    // busy world pushed it out within the defer window, and the tick it
+    // should defer fired early.
+    let mut w = world();
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 0);
+    place(&mut w, &kestrel, "notice_market");
+    assert!(w.execute(&kestrel, "say still here", 1_000).ok);
+    let market = RoomId::from("notice_market");
+    let torin = id("torin");
+    assert_eq!(w.last_player_act(&market, &torin, 0), Some(1_000));
+    assert_ne!(w.entity(&torin).unwrap().room, market);
+    for i in 0..EVENT_LOG_CAP + 5 {
+        assert!(w.execute(&torin, &format!("say {i}"), 2_000).ok);
+    }
+    assert!(w.logged().all(|e| e.at_ms == 2_000), "the act left the log");
+    assert_eq!(w.last_player_act(&market, &torin, 0), Some(1_000));
+    assert_eq!(w.last_player_act(&market, &torin, 1_001), None);
+    assert_eq!(
+        w.last_player_act(&market, &kestrel, 0),
+        None,
+        "its own act does not count"
+    );
+}
+
+#[test]
+fn a_reloaded_log_that_starts_late_says_when_its_knowledge_starts() {
+    // A boot reloads at most `RELOAD_EVENTS`: an act older than the
+    // reloaded log is unknown. A present player may have acted then, so
+    // the oldest reloaded time stands in for it.
+    let mut w = world();
+    let kestrel = id("pc_kestrel");
+    w.bring_online(&kestrel, 0);
+    place(&mut w, &kestrel, "notice_market");
+    assert!(w.execute(&kestrel, "say still here", 1_000).ok);
+    let torin = id("torin");
+    for i in 0..50 {
+        assert!(w.execute(&torin, &format!("say {i}"), 2_000 + i).ok);
+    }
+    let recent: Vec<Event> = w.logged().cloned().collect();
+    let tail = recent[recent.len() - 20..].to_vec();
+    let oldest = tail[0].at_ms;
+    let market = RoomId::from("notice_market");
+    let all = World::from_state(Arc::clone(&w.pack), w.snapshot(), recent);
+    assert_eq!(all.last_player_act(&market, &torin, 0), Some(1_000));
+    let late = World::from_state(Arc::clone(&w.pack), w.snapshot(), tail);
+    assert_eq!(late.last_player_act(&market, &torin, 0), Some(oldest));
+    assert_eq!(late.last_player_act(&market, &torin, oldest), Some(oldest));
+    assert_eq!(late.last_player_act(&market, &torin, oldest + 1), None);
+    assert_eq!(
+        late.last_player_act(&RoomId::from("smithy"), &torin, 0),
+        None,
+        "no player stands in the smithy"
+    );
+}

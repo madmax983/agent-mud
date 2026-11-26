@@ -967,8 +967,9 @@ impl Supervisor {
     /// without queuing another.
     ///
     /// A tick fired while the entity's earlier ticks keep getting lost
-    /// ([`Supervisor::after_tick`]) is a retry: it does not reset the
-    /// room's anti-chatter count again ([`Router::macro_tick`]).
+    /// ([`Supervisor::after_tick`]) is a retry: it resets the room's
+    /// anti-chatter count only at the entity's first act in its wake
+    /// ([`Router::macro_tick`]).
     pub fn fire_macro_tick(&self, entity: &EntityId) -> RouteNote {
         let now = self.game.now_ms();
         let retry = lock(&self.state)
@@ -1494,7 +1495,14 @@ impl Supervisor {
     /// Regression (the owner's run of 2026-11-26): kestrel's one tick
     /// fired at boot while lg was too old to start, and the next came 2 to
     /// 6 hours later.
+    ///
+    /// The wake's end also bounds the room reset a retried tick owes
+    /// ([`Router::tick_wake_ended`]).
     fn after_tick(&self, entity: &EntityId, carried: bool, lost: bool, now: u64) {
+        if carried {
+            let seq = self.game.read(mud_world::World::last_seq);
+            lock(&self.router).tick_wake_ended(entity, seq);
+        }
         if !lost {
             if let Some(s) = lock(&self.state).get_mut(entity) {
                 s.tick_retry_ms = 0;
