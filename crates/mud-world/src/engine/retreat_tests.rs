@@ -236,13 +236,13 @@ fn the_second_mob_of_a_round_leaves_a_collapsed_body_alone() {
     place(&mut w, &ada, "cellar_landing");
     place(&mut w, &id("giant_rat_2"), "wine_vault");
     w.state.entities.get_mut(&ada).unwrap().pools.hp = 1;
-    // The first rat: attack 6 hits, Ada's dodge 18 fails, damage 6-1 = 5
-    // cut = 7 injury, to -6; her consciousness roll of 18 fails.
+    // The first rat: attack 6 hits, Ada's dodge 18 fails, damage 6-2 = 4
+    // cut = 6 injury, to -5; her consciousness roll of 18 fails.
     w.fix_dice([2, 2, 2, 6, 6, 6, 6, 6, 6, 6]);
     let r = ok(&mut w, &ada, "w");
     let e = w.entity(&ada).unwrap();
     assert!(e.unconscious, "{r:?}");
-    assert_eq!(e.pools.hp, -6);
+    assert_eq!(e.pools.hp, -5);
     assert_eq!(r.resolution["ambush"].as_array().map(Vec::len), Some(1));
     assert_eq!(strikes_on(&w, &r, &ada), 1, "one strike, not two");
 }

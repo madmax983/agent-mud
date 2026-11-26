@@ -229,6 +229,17 @@ and Hale, has a soft post: away from it, the macro-tick cue gives the way
 back. Torin wields a broadsword and wears a jerkin; every player starts
 with a lit torch.
 
+Balance: a test holds it (`crates/mud-world/src/engine/balance_tests.rs`).
+It plays seeded duels through `World::execute` and checks each matchup
+against a band: a fresh player beats one giant rat about 75% of the time,
+often wounded; both rats in one run about 40%, more with a bandage or a
+draught between them; the skeletal warden under 10% alone, and about
+30%, 70% and 90% for one, two and three players with a shortsword and a
+leather jerkin. A broadsword (the template has broadsword-10) does a
+little better, and a respawned warden fights the same as the first. The
+ignored `balance_table` test prints the full table; `BAL_PACK` points it
+at an edited copy of a pack.
+
 Since v0.2 the pack also ships Rhai world scripts (`scripts.toml`,
 `scripts/`): `pray` in the ossuary, `listen` in the alley and on the
 cellar stair, the fence's curtain, the warden's blade over the ore, the

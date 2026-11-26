@@ -36,7 +36,7 @@ description = "A plain iron dagger."
 value = 12
 slot = "weapon"
 skill = "shortsword"
-damage = "thr-1"
+damage = "thr"
 damage_type = "imp"
 
 [items.leather_jerkin]
@@ -179,10 +179,12 @@ description = "Yellow incisors, long as a thumb."
 value = 0
 slot = "weapon"
 skill = "brawling"
-damage = "1d-1"
+damage = "1d-2"
 damage_type = "cut"
 hidden = true
 
+# Notched and green with age: it serves the warden's strength, and it is a
+# poor blade in a player's hand.
 [items.warden_blade]
 name = "notched grave-blade"
 aliases = ["grave-blade", "blade"]
@@ -190,6 +192,6 @@ description = "A broad, notched blade green with age."
 value = 35
 slot = "weapon"
 skill = "broadsword"
-damage = "sw"
+damage = "sw-3"
 damage_type = "cut"
 tags = ["loot"]
