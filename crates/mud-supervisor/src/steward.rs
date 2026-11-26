@@ -431,6 +431,9 @@ struct Run {
     reload_owed: bool,
     /// The row changed since it was last written.
     dirty: bool,
+    /// The daemon of `checked` answered an activate without `guarded` (an
+    /// lg before littleguy #122), and the Steward said so.
+    old_lg: bool,
 }
 
 /// A goal listing, as `plans` answered it.
@@ -707,6 +710,8 @@ impl Steward {
             }
             self.check_approvals(e, socket).await;
             run.checked = key;
+            // A new daemon may be another lg build: it is asked afresh.
+            run.old_lg = false;
         }
         if !self.cfg.refine.is_on() {
             self.refine_off(e, run, now);

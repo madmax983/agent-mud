@@ -521,6 +521,7 @@ async fn lg_runs_the_menu_text(socket: &Path, want: &str) -> u64 {
     let OwnerResponse::Overlays {
         active: Some(active),
         entries,
+        ..
     } = listed
     else {
         panic!("{listed:?}");
@@ -545,32 +546,28 @@ async fn lg_runs_the_menu_text(socket: &Path, want: &str) -> u64 {
     active
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_real_refine_propose_reaches_a_menu_activation() {
-    let Ok(bin) = std::env::var("LG_BIN") else {
-        eprintln!("LG_BIN is not set: skipping the real refine check");
-        return;
-    };
-    let stub = ModelStub::start(Arc::new(|req: &Value| {
-        if is_proposer(req) {
-            Reply::Text(r#"{"guardrails":"Answer buyers in one short line.","max_steps":9}"#.into())
-        } else if is_menu_ballot(req) {
-            Reply::Text(r#"{"ids": ["brevity"], "reason": "keeps it short"}"#.into())
-        } else if model_stub::after_tools(req) {
-            Reply::Text("noted".into())
-        } else {
-            Reply::Calls(vec![(
-                "add_idea".into(),
-                json!({ "title": "Ore prices", "body": "Ask who sells ore." }),
-            )])
-        }
-    }))
-    .await
-    .unwrap();
-    let bins = tempfile::tempdir().unwrap();
-    let lg = lg_on_stub(&bin, bins.path());
-    let mut s = serve(&lg, |cfg| {
-        on_stub(cfg, &stub);
+/// The stub's play for menu refine: lg's proposer writes an overlay, the
+/// council picks `brevity`, and a wake files an idea.
+fn menu_reply(req: &Value) -> Reply {
+    if is_proposer(req) {
+        Reply::Text(r#"{"guardrails":"Answer buyers in one short line.","max_steps":9}"#.into())
+    } else if is_menu_ballot(req) {
+        Reply::Text(r#"{"ids": ["brevity"], "reason": "keeps it short"}"#.into())
+    } else if model_stub::after_tools(req) {
+        Reply::Text("noted".into())
+    } else {
+        Reply::Calls(vec![(
+            "add_idea".into(),
+            json!({ "title": "Ore prices", "body": "Ask who sells ore." }),
+        )])
+    }
+}
+
+/// A MUD on `lg` and the stub, with menu refine due after one wake and a
+/// Steward pass every second.
+async fn serve_menu_refine(lg: &Path, stub: &ModelStub) -> Served {
+    serve(lg, |cfg| {
+        on_stub(cfg, stub);
         cfg.littleguy.refine = mud_supervisor::littleguy::RefineMode::Menu;
         cfg.littleguy.steward.every_secs = 1;
         cfg.littleguy.steward.refine_min_wakes = 1;
@@ -583,7 +580,19 @@ async fn a_real_refine_propose_reaches_a_menu_activation() {
             },
         );
     })
-    .await;
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_refine_propose_reaches_a_menu_activation() {
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real refine check");
+        return;
+    };
+    let stub = ModelStub::start(Arc::new(menu_reply)).await.unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let lg = lg_on_stub(&bin, bins.path());
+    let mut s = serve_menu_refine(&lg, &stub).await;
     let steward = s.built.steward.clone().expect("the Steward runs");
     let torin = EntityId::from("torin");
     let mut obs = s.built.mud.sup.subscribe();
@@ -624,6 +633,10 @@ async fn a_real_refine_propose_reaches_a_menu_activation() {
         "lg's proposer answered proposed, not kept or error: {seen:?}"
     );
     assert!(seen.iter().any(|l| l == "activated baseline"), "{seen:?}");
+    assert!(
+        !seen.iter().any(|l| l == "unguarded old_lg"),
+        "this lg checks the pointer each activate expects: {seen:?}"
+    );
     let menu = mud_supervisor::steward::vet::default_menu();
     let want = mud_supervisor::steward::vet::render_guardrails(&menu, &["brevity".to_owned()]);
     assert!(
@@ -643,6 +656,139 @@ async fn a_real_refine_propose_reaches_a_menu_activation() {
     let row = steward.row(&torin).await.unwrap();
     assert_eq!(row.overlay.pointer, Some(active));
     assert!(row.overlay.baseline.is_some() && row.overlay.paused.is_none());
+    s.stop().await;
+}
+
+/// One owner line to lg's socket at `socket`, blocking, and its answer:
+/// what a person's click on lg's pages sends. `None` when lg does not
+/// answer.
+fn blocking_owner_line(socket: &Path, line: &str) -> Option<Value> {
+    use std::io::{BufRead as _, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .ok()?;
+    stream.write_all(format!("{line}\n").as_bytes()).ok()?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut buf = String::new();
+    reader.read_line(&mut buf).ok()?;
+    serde_json::from_str(buf.trim()).ok()
+}
+
+/// Called right after the Steward wrote an intent and before it sends it:
+/// once lg holds the MUD's baseline and its text (and the text is not
+/// active), the intent is the text's activate. A person then activates
+/// lg's own proposal on its pages, unguarded, as the pages do. Returns
+/// the version the person chose.
+fn human_activates_the_proposal_first(socket: &Path) -> Option<u64> {
+    let listed = blocking_owner_line(socket, r#"{"kind":"overlays"}"#)?;
+    let entries = listed["entries"].as_array()?;
+    let ours = entries
+        .iter()
+        .filter(|e| e["author"] == "operator:mud")
+        .count();
+    if ours < 2 || listed["active"].is_null() {
+        return None;
+    }
+    let proposal = entries
+        .iter()
+        .find(|e| e["author"] == "operator:lg-refine")?["version"]
+        .as_u64()?;
+    let moved = blocking_owner_line(
+        socket,
+        &format!(r#"{{"kind":"overlay_activate","version":{proposal}}}"#),
+    )?;
+    (moved["kind"] == "overlay_active").then_some(proposal)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_human_move_before_a_real_guarded_activate_is_refused_and_pauses() {
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real guarded activation check");
+        return;
+    };
+    let stub = ModelStub::start(Arc::new(menu_reply)).await.unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let lg = lg_on_stub(&bin, bins.path());
+    let mut s = serve_menu_refine(&lg, &stub).await;
+    let steward = s.built.steward.clone().expect("the Steward runs");
+    let torin = EntityId::from("torin");
+    // The daemon's socket, by the supervisor's layout.
+    let socket = s.dir.path().join("torin").join("lg.sock");
+    let chose = Arc::new(std::sync::Mutex::new(None::<u64>));
+    {
+        let socket = socket.clone();
+        let chose = Arc::clone(&chose);
+        steward.set_probe(Some(Arc::new(move |pt, e: &EntityId| {
+            if pt != mud_supervisor::steward::StewardPoint::IntentWritten || e.as_str() != "torin" {
+                return;
+            }
+            let mut chose = chose
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if chose.is_none() {
+                *chose = human_activates_the_proposal_first(&socket);
+            }
+        })));
+    }
+    let mut obs = s.built.mud.sup.subscribe();
+    s.tasks.extend(steward.spawn());
+    s.built.mud.sup.fire_macro_tick(&torin);
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match obs.recv().await {
+                Ok(ev) => {
+                    if let ObserverEvent::Steward(e) = &*ev
+                        && e.entity == torin
+                        && e.item == "overlay"
+                    {
+                        seen.push(format!("{} {}", e.action, e.code));
+                        if e.action == "paused" {
+                            return;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "refine never paused: {seen:?}\n{:#?}\n{}",
+            stub.requests(),
+            s.log("torin")
+        )
+    });
+    let proposal = chose.lock().unwrap().expect("the person moved the pointer");
+    assert!(seen.iter().any(|l| l == "activated baseline"), "{seen:?}");
+    assert!(
+        seen.iter().any(|l| l == "moved overlay_moved"),
+        "the real lg refused the Steward's activate: {seen:?}"
+    );
+    assert!(seen.iter().any(|l| l == "paused rolled_back"), "{seen:?}");
+    for never in ["activated text", "restored restored", "unguarded old_lg"] {
+        assert!(!seen.iter().any(|l| l == never), "{never}: {seen:?}");
+    }
+    let row = steward.row(&torin).await.unwrap();
+    assert_eq!(row.overlay.pointer, Some(proposal));
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back")
+    );
+    assert!(row.intent.is_none() && row.overlay.late.is_empty());
+    // Passes go on; the person's choice stands, and nothing moves it.
+    let before = blocking_owner_line(&socket, r#"{"kind":"overlays"}"#).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = blocking_owner_line(&socket, r#"{"kind":"overlays"}"#).unwrap();
+    assert_eq!(
+        after["active"].as_u64(),
+        Some(proposal),
+        "lg runs the person's choice"
+    );
+    assert_eq!(after["head"], before["head"], "no move since");
     s.stop().await;
 }
 

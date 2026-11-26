@@ -1,5 +1,6 @@
 //! Refine (ADR 0015, phase 4) against fake daemons that keep an lg-like
-//! overlay pointer and answer `previous` as lg does.
+//! overlay pointer: lg's of littleguy #122, which checks the pointer an
+//! activate expects, or an older lg's, which answers `previous` only.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -190,9 +191,117 @@ fn has_overlay(events: &[StewardEvent], action: &str, code: &str) -> bool {
         .any(|e| e.item == "overlay" && e.action == action && e.code == code)
 }
 
+fn count_overlay(events: &[StewardEvent], action: &str, code: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| e.item == "overlay" && e.action == action && e.code == code)
+        .count()
+}
+
 #[tokio::test]
-async fn a_human_move_between_read_and_activate_is_restored() {
+async fn every_activate_sends_the_pointer_it_read() {
     let mut r = refine_rig();
+    baseline_then_text(&r, &["brevity"]).await;
+    assert_eq!(
+        r.d().expecteds(),
+        [
+            Some(serde_json::json!({ "active": null, "head": null })),
+            Some(serde_json::json!({ "active": 1, "head": 1 })),
+        ],
+        "first contact from nothing, then the text from the baseline"
+    );
+    let row = r.row().await;
+    assert_eq!(row.overlay.rollback_to, Some(1), "a guarded move is exact");
+    assert!(row.overlay.paused.is_none() && row.intent.is_none());
+    let ev = r.steward_events();
+    assert!(has_overlay(&ev, "activated", "text"), "{ev:?}");
+    assert_eq!(count_overlay(&ev, "unguarded", "old_lg"), 0);
+    assert_eq!(count_overlay(&ev, "moved", "overlay_moved"), 0);
+}
+
+#[tokio::test]
+async fn a_human_move_between_read_and_activate_is_refused_by_lg_and_pauses() {
+    let mut r = refine_rig();
+    r.pass().await;
+    // A version a human chose on lg's refine tab (v2).
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    // The human activates theirs after the re-read and before ours runs:
+    // lg's guard refuses ours.
+    r.d().activate_modes(&[ActivateMode::HumanFirst(human)]);
+    r.pass().await;
+    assert_eq!(
+        r.d().activates(),
+        [1, 4],
+        "nothing restored, nothing resent"
+    );
+    assert_eq!(
+        r.d().moves(),
+        [(None, 1), (Some(1), human)],
+        "lg moved only for the human"
+    );
+    assert_eq!(r.d().active(), Some(human), "the human's choice stands");
+    let row = r.row().await;
+    assert_eq!(row.overlay.pointer, Some(human));
+    assert_eq!(row.overlay.paused.as_ref().unwrap().code, "rolled_back");
+    assert!(row.intent.is_none() && row.overlay.late.is_empty());
+    assert!(row.overlay.active.is_none() && row.overlay.pending.is_none());
+    let ev = r.steward_events();
+    assert!(has_overlay(&ev, "moved", "overlay_moved"), "{ev:?}");
+    assert!(has_overlay(&ev, "paused", "rolled_back"));
+    assert!(!has_overlay(&ev, "restored", "restored"));
+    assert!(!has_overlay(&ev, "activated", "text"));
+    r.d().clear_lines();
+    for _ in 0..3 {
+        r.advance(200 * HOUR);
+        r.pass().await;
+    }
+    assert_eq!(r.d().count("overlay_activate"), 0, "no further activate");
+    assert_eq!(r.d().count("refine_propose"), 0);
+}
+
+#[tokio::test]
+async fn a_lost_answer_after_a_move_away_and_back_is_a_human_veto() {
+    let mut r = refine_rig();
+    r.pass().await;
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    // A human activates theirs and rolls it back while ours waits, so lg
+    // is on the baseline again with a new head; ours is refused, and its
+    // answer is lost.
+    r.d()
+        .activate_modes(&[ActivateMode::AwayAndBackSilently(human)]);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 4], "never sent again");
+    assert_eq!(r.d().active(), Some(1));
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "the head moved: a human acted, though lg shows the version read: {row:?}"
+    );
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert!(row.intent.is_none());
+    assert!(
+        row.overlay.late.is_empty(),
+        "a guarded activate is refused once the head moved: never late"
+    );
+    let ev = r.steward_events();
+    assert!(has_overlay(&ev, "paused", "rolled_back"), "{ev:?}");
+    assert!(!has_overlay(&ev, "unconfirmed", "unconfirmed"));
+    r.d().clear_lines();
+    r.advance(200 * HOUR);
+    r.pass().await;
+    assert_eq!(r.d().count("overlay_activate"), 0);
+}
+
+#[tokio::test]
+async fn a_human_move_between_read_and_activate_on_an_older_lg_is_restored() {
+    let mut r = refine_rig();
+    // An lg before #122 drops `expected` and moves unchecked.
+    r.d().make_old();
     r.pass().await;
     // A version a human chose on lg's refine tab (v2).
     let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
@@ -214,6 +323,11 @@ async fn a_human_move_between_read_and_activate_is_restored() {
     let ev = r.steward_events();
     assert!(has_overlay(&ev, "restored", "restored"), "{ev:?}");
     assert!(has_overlay(&ev, "paused", "rolled_back"));
+    assert_eq!(
+        count_overlay(&ev, "unguarded", "old_lg"),
+        1,
+        "said once per daemon start, over three unguarded answers"
+    );
     r.d().clear_lines();
     for _ in 0..3 {
         r.advance(200 * HOUR);
@@ -929,6 +1043,8 @@ async fn a_restore_whose_intent_is_not_written_still_pauses() {
         cfg: menu_cfg(),
         ..Opts::default()
     });
+    // The restore exists for an lg before #122 only.
+    r.d().make_old();
     r.pass().await;
     let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
     r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
@@ -1078,6 +1194,7 @@ async fn a_restart_after_a_clear_lg_shows_applied_pauses_and_vetoes() {
         IntentAction::Activate {
             version: 1,
             expected_previous: Some(2),
+            guard: None,
             purpose: super::state::Purpose::Clear,
         },
         super::tests::T0,
@@ -1133,6 +1250,7 @@ async fn refine_off_settles_an_open_overlay_intent() {
         IntentAction::Activate {
             version: 3,
             expected_previous: Some(1),
+            guard: None,
             purpose: super::state::Purpose::Clear,
         },
         super::tests::T0,
@@ -1233,4 +1351,124 @@ async fn an_edited_menu_text_is_shown_as_lg_runs_it_and_put_again() {
     );
     let view = r.sup.autonomy(&torin()).unwrap().overlay.unwrap();
     assert_eq!(view.chain[0].text, "- Be terse.");
+}
+
+/// A Steward restarted over a row whose guarded activate of the text v2,
+/// read at head 1 from the baseline v1, was sent before a crash and never
+/// answered. With `away_and_back`, a human activated v2 and rolled it back
+/// meanwhile, so lg is on v1 at head 3; otherwise lg never ran it.
+/// The temp dir holds the store, so it lives as long as the rig.
+async fn restart_with_a_lost_guarded_text(away_and_back: bool) -> (Rig, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("world.db");
+    let fake = FakeDaemons::new(&["torin"], TOKEN);
+    let text = text_of(&["brevity"]);
+    {
+        let mut st = fake.of("torin").state.lock().unwrap();
+        st.store(super::refine::MUD_AUTHOR, "{}");
+        st.store(
+            super::refine::MUD_AUTHOR,
+            &serde_json::json!({ "guardrails": text }).to_string(),
+        );
+        st.activate(1);
+        if away_and_back {
+            st.activate(2);
+            st.rollback();
+        }
+    }
+    let mut row = StewardRow::default();
+    row.overlay.baseline = Some(1);
+    row.overlay.pointer = Some(1);
+    let digest = overlay_digest(&text);
+    let source = OverlaySource::Menu {
+        ids: vec!["brevity".into()],
+    };
+    row.overlay.authored = vec![
+        super::state::Authored {
+            version: 1,
+            digest: overlay_digest(""),
+            source: OverlaySource::Baseline,
+            text: String::new(),
+        },
+        super::state::Authored {
+            version: 2,
+            digest,
+            source: source.clone(),
+            text: text.clone(),
+        },
+    ];
+    row.overlay.last_refine_ms = Some(super::tests::T0);
+    row.open(
+        IntentAction::Activate {
+            version: 2,
+            expected_previous: Some(1),
+            guard: Some(super::state::Guard { head: Some(1) }),
+            purpose: super::state::Purpose::Text {
+                digest,
+                source,
+                text,
+            },
+        },
+        super::tests::T0,
+    );
+    let r = rig(Opts {
+        db: Some(db.clone()),
+        fake: Some(Arc::clone(&fake)),
+        cfg: menu_cfg(),
+        ..Opts::default()
+    });
+    r.game
+        .act(&[mud_world::SideOp::Steward {
+            entity: torin(),
+            rev: 1,
+            schema: ROW_SCHEMA,
+            body: row.body(),
+        }])
+        .unwrap();
+    drop(r);
+    let r = rig(Opts {
+        db: Some(db),
+        fake: Some(fake),
+        cfg: menu_cfg(),
+        now: super::tests::T0 + MIN,
+        ..Opts::default()
+    });
+    r.d().clear_lines();
+    r.pass().await;
+    (r, dir)
+}
+
+#[tokio::test]
+async fn a_lost_guarded_activate_with_an_unmoved_head_is_late_after_a_restart() {
+    let (mut r, _dir) = restart_with_a_lost_guarded_text(false).await;
+    let row = r.row().await;
+    assert!(row.intent.is_none(), "{row:?}");
+    assert!(row.overlay.is_late(2), "not applied, and it may still run");
+    assert!(row.overlay.paused.is_none());
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert_eq!(r.d().count("overlay_activate"), 0, "never sent again");
+    assert!(has_overlay(
+        &r.steward_events(),
+        "unconfirmed",
+        "unconfirmed"
+    ));
+}
+
+#[tokio::test]
+async fn a_lost_guarded_activate_after_a_move_away_and_back_pauses_after_a_restart() {
+    let (mut r, _dir) = restart_with_a_lost_guarded_text(true).await;
+    let row = r.row().await;
+    assert!(row.intent.is_none(), "{row:?}");
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back")
+    );
+    assert!(
+        !row.overlay.is_late(2),
+        "lg's guard refuses it if it still waits"
+    );
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert_eq!(r.d().count("overlay_activate"), 0);
+    assert_eq!(r.d().active(), Some(1), "lg is left as the human left it");
+    assert!(has_overlay(&r.steward_events(), "paused", "rolled_back"));
 }

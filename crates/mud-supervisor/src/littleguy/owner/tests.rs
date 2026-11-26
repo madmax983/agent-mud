@@ -33,8 +33,15 @@ fn scripted(
 
 const SOON: Duration = Duration::from_secs(5);
 
-/// Each request, the exact line it sends, and an answer lg gives.
+/// Each request, the exact line it sends, and an answer lg gives: the
+/// plain ones, then the guarded activations of lg #122.
 fn protocol_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
+    let mut cases = plain_cases();
+    cases.extend(guarded_cases());
+    cases
+}
+
+fn plain_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
     vec![
         (
             OwnerRequest::Approvals,
@@ -70,7 +77,7 @@ fn protocol_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
         (
             OwnerRequest::Overlays,
             r#"{"kind":"overlays"}"#,
-            r#"{"kind":"overlays","active":1,"entries":[{"version":1,"author":"operator:mud","created_at":"2026-11-25T00:00:00Z","active":true,"parts":["guardrails"]}]}"#,
+            r#"{"kind":"overlays","active":1,"head":4,"entries":[{"version":1,"author":"operator:mud","created_at":"2026-11-25T00:00:00Z","active":true,"parts":["guardrails"]}]}"#,
         ),
         (
             OwnerRequest::OverlayShow { version: 1 },
@@ -90,7 +97,10 @@ fn protocol_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
             r#"{"kind":"overlay_stored","version":2}"#,
         ),
         (
-            OwnerRequest::OverlayActivate { version: 2 },
+            OwnerRequest::OverlayActivate {
+                version: 2,
+                expected: None,
+            },
             r#"{"kind":"overlay_activate","version":2}"#,
             r#"{"kind":"overlay_active","version":2,"previous":null}"#,
         ),
@@ -103,6 +113,45 @@ fn protocol_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
             OwnerRequest::UiLink,
             r#"{"kind":"ui_link"}"#,
             r#"{"kind":"connect_link","link":"http://127.0.0.1:4123/login?token=t"}"#,
+        ),
+    ]
+}
+
+/// The guarded activation of lg #122: both keys, nulls included.
+fn guarded_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
+    vec![
+        (
+            OwnerRequest::OverlayActivate {
+                version: 3,
+                expected: Some(ExpectedPointer {
+                    active: Some(2),
+                    head: Some(7),
+                }),
+            },
+            r#"{"kind":"overlay_activate","version":3,"expected":{"active":2,"head":7}}"#,
+            r#"{"kind":"overlay_active","version":3,"previous":2,"guarded":true}"#,
+        ),
+        (
+            OwnerRequest::OverlayActivate {
+                version: 1,
+                expected: Some(ExpectedPointer {
+                    active: None,
+                    head: None,
+                }),
+            },
+            r#"{"kind":"overlay_activate","version":1,"expected":{"active":null,"head":null}}"#,
+            r#"{"kind":"overlay_moved","version":1,"active":2,"head":8}"#,
+        ),
+        (
+            OwnerRequest::OverlayActivate {
+                version: 1,
+                expected: Some(ExpectedPointer {
+                    active: Some(2),
+                    head: Some(8),
+                }),
+            },
+            r#"{"kind":"overlay_activate","version":1,"expected":{"active":2,"head":8}}"#,
+            r#"{"kind":"overlay_moved","version":1,"active":null,"head":null}"#,
         ),
     ]
 }
@@ -140,7 +189,7 @@ async fn owner_requests_speak_the_socket_protocol() {
     );
     assert!(matches!(&answers[4], OwnerResponse::Notes { notes } if notes[0].name == "ore"));
     assert!(
-        matches!(&answers[5], OwnerResponse::Overlays { active: Some(1), entries } if entries[0].parts == ["guardrails"])
+        matches!(&answers[5], OwnerResponse::Overlays { active: Some(1), head: Some(4), entries } if entries[0].parts == ["guardrails"])
     );
     assert!(matches!(
         &answers[6],
@@ -155,8 +204,10 @@ async fn owner_requests_speak_the_socket_protocol() {
         answers[9],
         OwnerResponse::OverlayActive {
             version: 2,
-            previous: None
-        }
+            previous: None,
+            guarded: false,
+        },
+        "an lg before #122 writes no guarded: unchecked"
     );
     assert_eq!(
         answers[10],
@@ -167,6 +218,55 @@ async fn owner_requests_speak_the_socket_protocol() {
         }
     );
     assert!(matches!(&answers[11], OwnerResponse::ConnectLink { .. }));
+    assert_eq!(
+        answers[12],
+        OwnerResponse::OverlayActive {
+            version: 3,
+            previous: Some(2),
+            guarded: true,
+        }
+    );
+    assert_eq!(
+        answers[13],
+        OwnerResponse::OverlayMoved {
+            version: 1,
+            active: Some(2),
+            head: Some(8),
+        }
+    );
+    assert_eq!(
+        answers[14],
+        OwnerResponse::OverlayMoved {
+            version: 1,
+            active: None,
+            head: None,
+        }
+    );
+}
+
+#[test]
+fn an_older_overlays_answer_reads_with_no_head() {
+    let old: OwnerResponse =
+        serde_json::from_str(r#"{"kind":"overlays","active":1,"entries":[]}"#).unwrap();
+    assert_eq!(
+        old,
+        OwnerResponse::Overlays {
+            active: Some(1),
+            head: None,
+            entries: Vec::new(),
+        }
+    );
+    let fresh: OwnerResponse =
+        serde_json::from_str(r#"{"kind":"overlays","active":null,"head":null,"entries":[]}"#)
+            .unwrap();
+    assert!(matches!(
+        fresh,
+        OwnerResponse::Overlays {
+            active: None,
+            head: None,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -264,7 +364,10 @@ async fn a_slow_loop_job_answers_on_its_connection() {
     let started = std::time::Instant::now();
     let r = request(
         &sock,
-        &OwnerRequest::OverlayActivate { version: 4 },
+        &OwnerRequest::OverlayActivate {
+            version: 4,
+            expected: None,
+        },
         Duration::from_secs(10),
     )
     .await
@@ -274,7 +377,8 @@ async fn a_slow_loop_job_answers_on_its_connection() {
         r,
         OwnerResponse::OverlayActive {
             version: 4,
-            previous: Some(3)
+            previous: Some(3),
+            guarded: false,
         }
     );
     task.await.unwrap();
@@ -323,7 +427,10 @@ fn every_request() -> Vec<OwnerRequest> {
         OwnerRequest::OverlayPut {
             overlay: "{}".into(),
         },
-        OwnerRequest::OverlayActivate { version: 1 },
+        OwnerRequest::OverlayActivate {
+            version: 1,
+            expected: None,
+        },
         OwnerRequest::Reload,
         OwnerRequest::UiLink,
     ];
@@ -387,7 +494,10 @@ fn a_loop_job_waits_behind_a_wake_and_a_read_does_not() {
         OwnerRequest::OverlayPut {
             overlay: "{}".into(),
         },
-        OwnerRequest::OverlayActivate { version: 1 },
+        OwnerRequest::OverlayActivate {
+            version: 1,
+            expected: None,
+        },
         OwnerRequest::Reload,
         OwnerRequest::UiLink,
     ] {

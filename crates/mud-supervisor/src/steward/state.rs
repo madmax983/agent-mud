@@ -268,8 +268,13 @@ pub enum IntentAction {
     Activate {
         /// The version.
         version: u64,
-        /// The version lg should report as `previous`.
+        /// The version lg should report as `previous`: the `active` of the
+        /// pointer the activate expects.
         expected_previous: Option<u64>,
+        /// The head of the pointer the activate expects, sent as lg's
+        /// guard. `None` in an intent written before the Steward sent one.
+        #[serde(default)]
+        guard: Option<Guard>,
         /// Why.
         purpose: Purpose,
     },
@@ -305,6 +310,15 @@ impl IntentAction {
             Self::Propose => "refine_propose",
         }
     }
+}
+
+/// The head of lg's pointer that a guarded `overlay_activate` expects
+/// (lg #122). With `expected_previous` it is the whole `expected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guard {
+    /// The `seq` of the last move of the pointer, as `overlays` named it;
+    /// `None` before the first move, and from an lg before #122.
+    pub head: Option<u64>,
 }
 
 /// An owner action written before it is sent: the journal that makes a
@@ -764,6 +778,7 @@ mod tests {
             IntentAction::Activate {
                 version: 4,
                 expected_previous: Some(1),
+                guard: Some(Guard { head: Some(6) }),
                 purpose: Purpose::Text {
                     digest: 9,
                     source: OverlaySource::Menu {
@@ -782,7 +797,19 @@ mod tests {
         row.veto(3);
         let body = row.body();
         assert_eq!(body["intent"]["action"]["kind"], "activate");
+        assert_eq!(body["intent"]["action"]["guard"]["head"], 6);
         assert_eq!(StewardRow::from_body(ROW_SCHEMA, &body), Some(row.clone()));
+        // An intent written before the guard reads as unguarded.
+        let mut old = body;
+        old["intent"]["action"]
+            .as_object_mut()
+            .unwrap()
+            .remove("guard");
+        let back = StewardRow::from_body(ROW_SCHEMA, &old).unwrap();
+        assert!(matches!(
+            back.intent.unwrap().action,
+            IntentAction::Activate { guard: None, .. }
+        ));
         let action = row.intent.unwrap().action;
         assert_eq!((action.goal(), action.is_overlay()), (None, true));
         assert_eq!(action.name(), "overlay_activate");
@@ -828,6 +855,7 @@ mod tests {
             IntentAction::Activate {
                 version: 4,
                 expected_previous: Some(1),
+                guard: None,
                 purpose: Purpose::Text {
                     digest: 11,
                     source: free.clone(),

@@ -19,8 +19,11 @@
 //! entity (the operator set `menu`, or it is Turing-tier), the next pass
 //! withdraws its free text the same way, with no ballot and no veto.
 //!
-//! lg's `overlay_activate` takes no expected version, so the Steward keeps
-//! its own view of lg's active version (`pointer`) and checks every move:
+//! The Steward keeps its own view of lg's active version (`pointer`) and
+//! checks every move. Each `overlay_activate` names the pointer it read
+//! (`expected`: lg's `active` and `head`, littleguy #122), and lg moves
+//! the pointer only when nothing moved since, checked in its swap
+//! transaction:
 //!
 //! - **The pointer check.** Every pass reads `overlays`. A version the
 //!   Steward did not set and did not give up on is a human's move (lg's
@@ -29,11 +32,23 @@
 //!   pointer away from the human's choice. Only the operator resumes
 //!   (`resume_refine`).
 //! - **Activate.** It re-reads the pointer right before, writes the intent
-//!   durably, and checks the `previous` lg reports. A human move in between
-//!   is restored at once, then refine pauses. A lost answer is never sent
-//!   again: lg's pointer settles it (not applied: the version goes on the
-//!   late list; applied: a move to `{}` is adopted, a text is undone and
-//!   refine pauses, `unconfirmed`).
+//!   (with the head it read) durably, and sends the pointer it read as
+//!   `expected`. `overlay_active` with `guarded` is exactly the move meant.
+//!   `overlay_moved` is a move after the read, a human's veto: nothing
+//!   changed on lg, so nothing is restored, nothing is sent again, and
+//!   refine pauses as for any human move. A lost answer is never sent
+//!   again: lg's pointer settles it ([`vet::lost_verdict`]). The head
+//!   unmoved: not applied, and the version goes on the late list. The
+//!   head moved and lg back on the read version: a move away and back, a
+//!   human's veto. lg on the activate's version: applied, or a human's
+//!   move to that very version, which the protocol cannot tell apart, so
+//!   the fail-safe below decides (a move to `{}` is adopted, a text is
+//!   undone and refine pauses, `unconfirmed`).
+//! - **An older lg.** An lg before #122 drops `expected` and moves the
+//!   pointer unchecked; its answer has no `guarded` (said once per daemon
+//!   start). For it the Steward checks the `previous` lg reports: a human
+//!   move in between is restored at once, then refine pauses. Its listing
+//!   has no head, so a lost answer is settled by the version alone.
 //! - **One move above the baseline.** First contact puts and activates an
 //!   empty `{}` baseline (or pauses as `preexisting` when lg already has an
 //!   active overlay). Every text goes on from the baseline, so one Roll
@@ -57,11 +72,13 @@ use mud_world::pack::Tier;
 use serde_json::Value;
 
 use super::council::Ballot;
-use super::state::{Authored, IntentAction, OverlaySource, Pause, Purpose};
-use super::vet::{self, EntityName, OverlayVerdict, PointerVerdict};
+use super::state::{Authored, Guard, IntentAction, OverlaySource, Pause, Purpose};
+use super::vet::{self, EntityName, LostVerdict, OverlayVerdict, PointerVerdict};
 use super::{OwnedDaemons, Run, Steward, StewardEvent, StewardNote, StewardPoint};
 use crate::budget::BudgetLevel;
-use crate::littleguy::owner::{self, OverlayEntry, OwnerError, OwnerRequest, OwnerResponse};
+use crate::littleguy::owner::{
+    self, ExpectedPointer, OverlayEntry, OwnerError, OwnerRequest, OwnerResponse,
+};
 use crate::littleguy::{PersonaText, RefineMode};
 use crate::mind::Usage;
 use crate::runtime::Supervisor;
@@ -78,6 +95,9 @@ pub const LATE_WAITS: u64 = 6;
 pub(super) struct Overlays {
     /// lg's active version.
     pub active: Option<u64>,
+    /// The `seq` of lg's last pointer move, read with `active`; `None`
+    /// before the first move and from an lg before #122.
+    pub head: Option<u64>,
     /// Every version, oldest first.
     pub entries: Vec<OverlayEntry>,
 }
@@ -96,8 +116,15 @@ pub(super) enum Activated {
 
 /// What an `overlay_activate` got back.
 enum Sent {
-    /// `overlay_active`.
-    Answer { version: u64, previous: Option<u64> },
+    /// `overlay_active`; `guarded` when lg checked the expected pointer.
+    Answer {
+        version: u64,
+        previous: Option<u64>,
+        guarded: bool,
+    },
+    /// `overlay_moved`: the pointer moved after the read, to `active`, and
+    /// lg moved nothing.
+    Moved { active: Option<u64> },
     /// lg refused it.
     Refused(String),
     /// No answer; the intent stays open.
@@ -355,7 +382,15 @@ impl Steward {
     /// off in that daemon).
     pub(super) async fn read_overlays(&self, socket: &Path) -> Option<Overlays> {
         match owner::request(socket, &OwnerRequest::Overlays, self.read_timeout).await {
-            Ok(OwnerResponse::Overlays { active, entries }) => Some(Overlays { active, entries }),
+            Ok(OwnerResponse::Overlays {
+                active,
+                head,
+                entries,
+            }) => Some(Overlays {
+                active,
+                head,
+                entries,
+            }),
             other => {
                 tracing::debug!(answer = ?other, "no overlay listing");
                 None
@@ -754,12 +789,29 @@ impl Steward {
             let _ = self.judge_pointer(e, run, ov.active, now);
             return Activated::Not;
         }
-        // 2 and 3. The intent, then the activate.
+        // 2 and 3. The intent, then the activate, guarded by the pointer
+        // just read.
+        let expected = ExpectedPointer {
+            active: ov.active,
+            head: ov.head,
+        };
         match self
-            .send_activate(e, socket, run, v, from, purpose.clone(), now)
+            .send_activate(e, socket, run, v, expected, purpose.clone(), now)
             .await
         {
-            Sent::Answer { version, previous } => {
+            Sent::Answer { guarded: true, .. } => {
+                // lg checked the pointer in its swap: the move was exactly
+                // from `from`, and nothing came in between.
+                self.applied(e, run, v, from, &purpose);
+                Activated::Done
+            }
+            Sent::Answer {
+                version,
+                previous,
+                guarded: false,
+            } => {
+                // An lg before #122 moved it unchecked: check `previous`.
+                self.unguarded(e, run);
                 if vet::pointer_verdict(previous, from, false) == PointerVerdict::Same {
                     self.applied(e, run, v, from, &purpose);
                     return Activated::Done;
@@ -788,6 +840,10 @@ impl Steward {
                 }
                 Activated::Not
             }
+            Sent::Moved { active } => {
+                self.moved(e, run, v, from, active, now);
+                Activated::Not
+            }
             Sent::Refused(message) => {
                 tracing::warn!(entity = %e, version = v, %message, "lg refused an overlay activate");
                 self.publish(
@@ -802,15 +858,55 @@ impl Steward {
                 Activated::Not
             }
             Sent::Lost => {
-                self.settle_lost(e, socket, run, v, from, purpose, now)
+                let guard = Some(Guard {
+                    head: expected.head,
+                });
+                self.settle_lost(e, socket, run, v, from, guard, purpose, now)
                     .await
             }
             Sent::NotWritten => Activated::Not,
         }
     }
 
-    /// Writes the `Activate` intent and sends it, waiting on the connection
-    /// up to `activate_wait_secs`. It is never sent again.
+    /// lg refused an activate of `v` from `from` with `overlay_moved`: its
+    /// pointer moved after the Steward read it, and is on `lg` now. Nothing
+    /// changed on lg, so nothing is restored and nothing is sent again.
+    /// Back on `from` is a move away and back, a human's veto. Any other
+    /// version goes to the pointer check, which takes it as a human's veto
+    /// too, unless it is a late activate of the Steward's own that ran in
+    /// between.
+    fn moved(
+        &self,
+        e: &EntityId,
+        run: &mut Run,
+        v: u64,
+        from: Option<u64>,
+        lg: Option<u64>,
+        now: u64,
+    ) {
+        tracing::info!(entity = %e, version = v, active = ?lg, "lg's overlay pointer moved after the Steward read it; nothing was activated");
+        self.publish(e, "overlay", as_id(v), "moved", "overlay_moved", None, None);
+        if lg == from {
+            self.human_moved(e, run, lg, now, "rolled_back");
+        } else {
+            let _ = self.judge_pointer(e, run, lg, now);
+        }
+    }
+
+    /// An lg before littleguy #122 answered an activate without `guarded`:
+    /// it dropped `expected` and moved the pointer unchecked. The Steward
+    /// says so once per daemon start, and checks `previous` instead.
+    fn unguarded(&self, e: &EntityId, run: &mut Run) {
+        if std::mem::replace(&mut run.old_lg, true) {
+            return;
+        }
+        tracing::warn!(entity = %e, "this lg moves its overlay pointer unchecked (it predates littleguy #122); the Steward checks the previous version it reports instead");
+        self.publish(e, "overlay", None, "unguarded", "old_lg", None, None);
+    }
+
+    /// Writes the `Activate` intent and sends it with `expected`, waiting
+    /// on the connection up to `activate_wait_secs`. It is never sent
+    /// again.
     #[expect(
         clippy::too_many_arguments,
         reason = "one move's context, passed down rather than stored"
@@ -821,14 +917,17 @@ impl Steward {
         socket: &Path,
         run: &mut Run,
         v: u64,
-        from: Option<u64>,
+        expected: ExpectedPointer,
         purpose: Purpose,
         now: u64,
     ) -> Sent {
         run.row.open(
             IntentAction::Activate {
                 version: v,
-                expected_previous: from,
+                expected_previous: expected.active,
+                guard: Some(Guard {
+                    head: expected.head,
+                }),
                 purpose,
             },
             now,
@@ -838,12 +937,28 @@ impl Steward {
             return Sent::NotWritten;
         }
         self.point(StewardPoint::IntentWritten, e);
-        let req = OwnerRequest::OverlayActivate { version: v };
+        let req = OwnerRequest::OverlayActivate {
+            version: v,
+            expected: Some(expected),
+        };
         match owner::request(socket, &req, self.activate_wait).await {
-            Ok(OwnerResponse::OverlayActive { version, previous }) => {
+            Ok(OwnerResponse::OverlayActive {
+                version,
+                previous,
+                guarded,
+            }) => {
                 run.row.intent = None;
                 run.dirty = true;
-                Sent::Answer { version, previous }
+                Sent::Answer {
+                    version,
+                    previous,
+                    guarded,
+                }
+            }
+            Ok(OwnerResponse::OverlayMoved { active, .. }) => {
+                run.row.intent = None;
+                run.dirty = true;
+                Sent::Moved { active }
             }
             Ok(other) => {
                 run.row.intent = None;
@@ -907,7 +1022,7 @@ impl Steward {
     /// Activates `to`, a version someone else chose, undoing the Steward's
     /// own move to `from`. Returns whether lg is back on `to` exactly. It
     /// never chains: anything else adopts lg's pointer and pauses
-    /// (`unconfirmed`).
+    /// (`unconfirmed`), and a move after its read is a human's veto.
     async fn restore(
         &self,
         e: &EntityId,
@@ -925,21 +1040,50 @@ impl Steward {
             self.adopt_unconfirmed(e, run, ov.active, now);
             return false;
         }
+        let expected = ExpectedPointer {
+            active: ov.active,
+            head: ov.head,
+        };
         match self
-            .send_activate(e, socket, run, to, from, Purpose::Restore, now)
+            .send_activate(e, socket, run, to, expected, Purpose::Restore, now)
             .await
         {
-            Sent::Answer { version, previous } => {
-                if version == to
-                    && vet::pointer_verdict(previous, from, false) == PointerVerdict::Same
-                {
+            Sent::Answer {
+                version,
+                previous,
+                guarded,
+            } => {
+                if !guarded {
+                    self.unguarded(e, run);
+                }
+                // A guarded move is exactly from `from`; an older lg's is
+                // checked by its `previous`.
+                let exact = version == to
+                    && (guarded
+                        || vet::pointer_verdict(previous, from, false) == PointerVerdict::Same);
+                if exact {
                     self.applied(e, run, to, from, &Purpose::Restore);
                     self.publish(e, "overlay", as_id(to), "restored", "restored", None, None);
-                    true
                 } else {
                     self.adopt_unconfirmed(e, run, Some(version), now);
-                    false
                 }
+                exact
+            }
+            Sent::Moved { active } => {
+                // Someone moved it again after the read: their choice
+                // stands, and nothing more moves.
+                tracing::info!(entity = %e, version = to, ?active, "lg's overlay pointer moved before a restore; nothing was activated");
+                self.publish(
+                    e,
+                    "overlay",
+                    as_id(to),
+                    "moved",
+                    "overlay_moved",
+                    None,
+                    None,
+                );
+                self.human_moved(e, run, active, now, "rolled_back");
+                false
             }
             Sent::Refused(_) => {
                 self.publish(
@@ -991,7 +1135,14 @@ impl Steward {
     }
 
     /// An activate of `v` from `from` got no answer (9.2 step 6), now or
-    /// before a restart. It is never sent again; lg's pointer settles it.
+    /// before a restart. It is never sent again; lg's pointer settles it
+    /// ([`vet::lost_verdict`]). `guard` holds the head the activate sent as
+    /// lg's guard (`None` for an intent written before the guard).
+    ///
+    /// The head tells "not applied" apart from a move away and back, but
+    /// not the Steward's own move to `v` from a human's move to `v`: both
+    /// are one move that lands on `v`, and the protocol names no mover.
+    /// There the phase 4 fail-safe decides, as for an older lg.
     #[expect(
         clippy::too_many_arguments,
         reason = "one move's context, passed down rather than stored"
@@ -1003,6 +1154,7 @@ impl Steward {
         run: &mut Run,
         v: u64,
         from: Option<u64>,
+        guard: Option<Guard>,
         purpose: Purpose,
         now: u64,
     ) -> Activated {
@@ -1012,23 +1164,24 @@ impl Steward {
         run.row.intent = None;
         run.dirty = true;
         let lg = ov.active;
-        if lg == from {
-            // Not applied; it may still wait in lg's queue. If it applies
-            // later, the pointer check undoes it.
-            run.row.overlay.add_late(v, now);
-            self.publish(
-                e,
-                "overlay",
-                as_id(v),
-                "unconfirmed",
-                "unconfirmed",
-                None,
-                None,
-            );
-            return Activated::Not;
-        }
-        if lg == Some(v) {
-            return match purpose {
+        let sent_head = guard.and_then(|g| g.head);
+        match vet::lost_verdict(lg, ov.head, from, sent_head, guard.is_some(), v) {
+            LostVerdict::NotApplied => {
+                // Not applied; it may still wait in lg's queue. If it
+                // applies later, the pointer check undoes it.
+                run.row.overlay.add_late(v, now);
+                self.publish(
+                    e,
+                    "overlay",
+                    as_id(v),
+                    "unconfirmed",
+                    "unconfirmed",
+                    None,
+                    None,
+                );
+                Activated::Not
+            }
+            LostVerdict::AtTarget => match purpose {
                 Purpose::Baseline | Purpose::Clear if run.row.overlay.active.is_some() => {
                     // A move to `{}` off a text of the Steward's, applied:
                     // a human's Roll back off that text, run just before
@@ -1043,9 +1196,8 @@ impl Steward {
                     Activated::Done
                 }
                 Purpose::Text { .. } => {
-                    // Applied, and its `previous` is unknown: a human move
-                    // inside the window cannot be ruled out. Back to the
-                    // baseline, and pause.
+                    // Applied, or a human's move to this very version: one
+                    // cannot be ruled out. Back to the baseline, and pause.
                     run.row.overlay.pointer = Some(v);
                     run.row.overlay.active = None;
                     run.row.overlay.rollback_to = None;
@@ -1063,15 +1215,22 @@ impl Steward {
                     self.adopt_unconfirmed(e, run, lg, now);
                     Activated::Not
                 }
-            };
+            },
+            LostVerdict::Human => {
+                if purpose == Purpose::Restore {
+                    self.adopt_unconfirmed(e, run, lg, now);
+                    return Activated::Not;
+                }
+                // A guarded activate still in lg's queue is refused once
+                // the head moved: the head only rises. Unguarded, it may
+                // still apply, so it goes on the late list.
+                if guard.is_none_or(|g| g.head == ov.head) {
+                    run.row.overlay.add_late(v, now);
+                }
+                self.human_moved(e, run, lg, now, "rolled_back");
+                Activated::Not
+            }
         }
-        if purpose == Purpose::Restore {
-            self.adopt_unconfirmed(e, run, lg, now);
-            return Activated::Not;
-        }
-        run.row.overlay.add_late(v, now);
-        self.human_moved(e, run, lg, now, "rolled_back");
-        Activated::Not
     }
 
     /// Settles an open overlay intent at the start of a pass (step 0).
@@ -1104,6 +1263,7 @@ impl Steward {
             IntentAction::Activate {
                 version,
                 expected_previous,
+                guard,
                 purpose,
             } => {
                 if level == BudgetLevel::Hard {
@@ -1117,8 +1277,17 @@ impl Steward {
                     self.adopt_unconfirmed(e, run, ov.active, now);
                     return true;
                 }
-                self.settle_lost(e, socket, run, version, expected_previous, purpose, now)
-                    .await
+                self.settle_lost(
+                    e,
+                    socket,
+                    run,
+                    version,
+                    expected_previous,
+                    guard,
+                    purpose,
+                    now,
+                )
+                .await
                     != Activated::Open
             }
             IntentAction::Put { digest, source } => {

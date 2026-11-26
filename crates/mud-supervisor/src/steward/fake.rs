@@ -5,6 +5,12 @@
 //! line, and can drop a `decide` (no answer, not applied), answer it late
 //! (applied at once, answered long after the client gave up), or answer
 //! it with lg's "not a proposed goal" after something else decided first.
+//!
+//! Its overlay pointer is lg's of littleguy #122: `overlays` names the
+//! `head` (the number of the last move), and an `overlay_activate` with
+//! `expected` moves only from that pointer, else it answers
+//! `overlay_moved`. With [`FakeState::old`] it is an lg before #122: no
+//! head, `expected` dropped, every move unchecked.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -64,9 +70,13 @@ pub enum ActivateMode {
     /// A human activates this version first, then ours runs: its
     /// `previous` is the human's version.
     HumanFirst(u64),
-    /// A human presses Roll back first, then ours applies and is never
-    /// answered.
+    /// A human presses Roll back first, then ours runs (refused by the
+    /// guard, or applied on an older lg) and is never answered.
     RollbackFirstSilently,
+    /// A human activates this version and rolls it back, so the pointer is
+    /// where ours read it, with a new head; then ours runs (refused by the
+    /// guard) and is never answered.
+    AwayAndBackSilently(u64),
 }
 
 /// What the daemon does with the next `refine_propose`.
@@ -113,8 +123,10 @@ pub struct FakeState {
     pub moves: Vec<(Option<u64>, u64)>,
     /// One mode per `overlay_activate`, in order; then answer.
     pub activate_modes: VecDeque<ActivateMode>,
-    /// Activates held in the queue.
-    pub held: Vec<u64>,
+    /// Activates held in the queue, with the `expected` each sent.
+    pub held: Vec<(u64, Option<Value>)>,
+    /// An lg before littleguy #122: no `head`, no guard, no `guarded`.
+    pub old: bool,
     /// Whether the next `overlay_put` is stored but never answered.
     pub drop_put: bool,
     /// One mode per `refine_propose`; then `kept`.
@@ -136,6 +148,7 @@ impl Default for FakeState {
             moves: Vec::new(),
             activate_modes: VecDeque::new(),
             held: Vec::new(),
+            old: false,
             drop_put: false,
             propose_modes: VecDeque::new(),
         }
@@ -200,6 +213,39 @@ impl FakeState {
         previous
     }
 
+    /// The head of lg #122: the number of the last move, `None` before the
+    /// first (and from an older lg).
+    pub fn head(&self) -> Option<u64> {
+        if self.old || self.moves.is_empty() {
+            None
+        } else {
+            u64::try_from(self.moves.len()).ok()
+        }
+    }
+
+    /// Whether an activate that sent `expected` may move now: always on an
+    /// older lg, which drops it, and on lg #122 only from that pointer.
+    fn may_move(&self, expected: Option<&Value>) -> bool {
+        let Some(x) = expected.filter(|_| !self.old) else {
+            return true;
+        };
+        x["active"].as_u64() == self.active && x["head"].as_u64() == self.head()
+    }
+
+    /// lg's activate of `version` against `expected`: the answer it writes.
+    fn guarded_activate(&mut self, version: u64, expected: Option<&Value>) -> String {
+        if !self.may_move(expected) {
+            return json!({ "kind": "overlay_moved", "version": version, "active": self.active, "head": self.head() }).to_string();
+        }
+        let previous = self.activate(version);
+        if expected.is_some() && !self.old {
+            json!({ "kind": "overlay_active", "version": version, "previous": previous, "guarded": true }).to_string()
+        } else {
+            json!({ "kind": "overlay_active", "version": version, "previous": previous })
+                .to_string()
+        }
+    }
+
     /// lg's Roll back: reverses the last move.
     pub fn rollback(&mut self) {
         if let Some(&(Some(from), _)) = self.moves.last() {
@@ -211,7 +257,7 @@ impl FakeState {
         if !self.refine {
             return json!({ "kind": "off", "message": "refine is off" });
         }
-        json!({
+        let mut listing = json!({
             "kind": "overlays",
             "active": self.active,
             "entries": self.versions.iter().map(|v| json!({
@@ -221,7 +267,11 @@ impl FakeState {
                     .and_then(|o| o.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()))
                     .unwrap_or_default(),
             })).collect::<Vec<_>>(),
-        })
+        });
+        if !self.old {
+            listing["head"] = json!(self.head());
+        }
+        listing
     }
 
     fn overlay_answer(&mut self, kind: &str, v: &Value) -> (Option<Duration>, String) {
@@ -266,33 +316,37 @@ impl FakeState {
                         json!({ "kind": "error", "message": "no such version" }).to_string(),
                     );
                 }
+                let expected = v.get("expected").cloned();
+                let expected = expected.as_ref();
                 match self
                     .activate_modes
                     .pop_front()
                     .unwrap_or(ActivateMode::Answer)
                 {
                     ActivateMode::Hold => {
-                        self.held.push(version);
+                        self.held.push((version, expected.cloned()));
                         (None, String::new())
                     }
                     ActivateMode::ApplySilently => {
-                        self.activate(version);
+                        let _ = self.guarded_activate(version, expected);
                         (None, String::new())
                     }
                     ActivateMode::RollbackFirstSilently => {
                         self.rollback();
-                        self.activate(version);
+                        let _ = self.guarded_activate(version, expected);
+                        (None, String::new())
+                    }
+                    ActivateMode::AwayAndBackSilently(h) => {
+                        self.activate(h);
+                        self.rollback();
+                        let _ = self.guarded_activate(version, expected);
                         (None, String::new())
                     }
                     ActivateMode::HumanFirst(h) => {
                         self.activate(h);
-                        let previous = self.activate(version);
-                        (now, json!({ "kind": "overlay_active", "version": version, "previous": previous }).to_string())
+                        (now, self.guarded_activate(version, expected))
                     }
-                    ActivateMode::Answer => {
-                        let previous = self.activate(version);
-                        (now, json!({ "kind": "overlay_active", "version": version, "previous": previous }).to_string())
-                    }
+                    ActivateMode::Answer => (now, self.guarded_activate(version, expected)),
                 }
             }
             "refine_propose" => match self.propose_modes.pop_front() {
@@ -558,13 +612,29 @@ impl FakeDaemon {
     /// Applies the activates held in the queue, as lg's loop would.
     pub fn apply_held(&self) {
         let mut st = self.state.lock().unwrap();
-        for v in std::mem::take(&mut st.held) {
-            st.activate(v);
+        for (v, expected) in std::mem::take(&mut st.held) {
+            let _ = st.guarded_activate(v, expected.as_ref());
         }
     }
 
     pub fn active(&self) -> Option<u64> {
         self.state.lock().unwrap().active
+    }
+
+    /// Makes this an lg before littleguy #122.
+    pub fn make_old(&self) {
+        self.state.lock().unwrap().old = true;
+    }
+
+    /// The `expected` of every `overlay_activate` line, in order.
+    pub fn expecteds(&self) -> Vec<Option<Value>> {
+        self.lines()
+            .iter()
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).ok()?;
+                (v["kind"] == "overlay_activate").then(|| v.get("expected").cloned())
+            })
+            .collect()
     }
 
     pub fn moves(&self) -> Vec<(Option<u64>, u64)> {
