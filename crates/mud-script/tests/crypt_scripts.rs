@@ -101,7 +101,7 @@ fn the_shipped_scripts_pass_check_and_dry_run() {
     assert_eq!(host.dry_run(&pack), Vec::<String>::new());
     let summary = host.summary();
     assert!(
-        summary.ends_with("(7 files: 1 mind, 2 rooms, 2 items, 3 verbs)"),
+        summary.ends_with("(11 files: 1 mind, 2 rooms, 2 items, 11 verbs)"),
         "{summary}"
     );
     let bundled = ScriptHost::bundled_crypt_v01(&pack).unwrap();
@@ -116,7 +116,7 @@ fn the_shipped_scripts_pass_check_and_dry_run() {
         [EntityId::from("guard_01")]
     );
     assert_eq!(host.mind_memory_schema(&EntityId::from("guard_01")), 1);
-    assert_eq!(host.hook_keys().len(), 7);
+    assert_eq!(host.hook_keys().len(), 15);
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn pray_heals_once_a_day_and_never_while_the_warden_stands() {
 }
 
 #[test]
-fn listen_reports_rats_and_warden_until_they_die() {
+fn listen_reports_what_lives_below_until_it_dies() {
     let (mut w, ids) = world_with(&[("ada", "dark_alley")], |_, _| {});
     let ada = &ids[0];
     w.fix_dice([1, 1, 1]);
@@ -225,7 +225,7 @@ fn listen_reports_rats_and_warden_until_they_die() {
     assert_eq!(r.resolution["script"], "verbs.listen");
     assert_eq!(
         r.narrative,
-        "You hold still and listen: claws skittering over broken glass, and far below, something dragging metal over stone."
+        "You hold still and listen: claws skittering over broken glass, small things squeaking to the south of the stair, far below, something dragging metal over stone, and deeper still, a dry clicking of many legs."
     );
     w.fix_dice([6, 6, 6]);
     assert_eq!(
@@ -236,6 +236,9 @@ fn listen_reports_rats_and_warden_until_they_die() {
         kill(s, "giant_rat_1");
         kill(s, "giant_rat_2");
         kill(s, "skeletal_warden");
+        kill(s, "rat_pup_1");
+        kill(s, "rat_pup_2");
+        kill(s, "cave_crawler");
     });
     w.fix_dice([1, 1, 1]);
     let r = w.execute(&ids[0], "listen", at(2));

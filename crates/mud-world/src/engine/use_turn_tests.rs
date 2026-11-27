@@ -246,6 +246,7 @@ fn locked_vault() -> World {
             crate::pack::LockDef {
                 lock: "alley_grate".into(),
                 pick: 0,
+                pickable: true,
                 describe: None,
                 relock_minutes: None,
             },

@@ -95,7 +95,8 @@ statements, `let` or `const` are refused, so constants go in `config`.
 `kind` is `player`, `npc` or `mob`: a human and an agent PC are both
 `player`, and nothing tells them apart. Views are read-only, and reading a
 key that does not exist faults (`no property "x"`), so a dry run catches
-typos. Test with `"key" in view`.
+typos. Test with `"key" in view`. `for x in view` walks a list's
+elements, or a map's keys (`for k in ctx.flags`); a view has no `keys()`.
 
 ## What a hook returns
 
@@ -194,7 +195,7 @@ pack pool with what is left and its running totals. Money in the world is
 always the start plus the ledger's currency, and every item made after the
 start is a new player's kit or named by the ledger. The property tests
 check exactly that. A reward is not a sale: shops and `POLICY_TRADE_REQUIRED` are
-unchanged.
+unchanged. A shop can buy with a pool, though (below).
 
 The engine writes to the same ledger without a script: a respawned mob's
 kit (`[cast.x] respawn_kit`, ADR 0012) is one row in the pool `@respawn`
@@ -203,6 +204,21 @@ no budget. No pack can declare that pool, because `@` is not in a pool
 id. Its rows reach the `mints` table, `WorldState.minted`, `state_changes`
 and the feed as a script's do, and `check_rewards` checks them. The
 Scripts panel shows pack pools only, so `@respawn` is not in it.
+
+A shop can buy with a pack pool. `buy_pool = "<pool>"` on a shop of
+`economy.toml` pays for what the shop buys from the pool, while the pool
+has the price left in its period: the seller gets the price as one ledger
+row (hook `shops.<shop>`, currency only, `seq` of the sale's `trade`
+event, whose data names the `pool`), and the keeper's purse does not
+move. The shop uses up what the pool pays for: the item leaves the world
+and never goes on sale, so no item is paid from the pool twice and
+selling it back and forth makes no money. Goods that hold something (a
+container with contents, a purse with coins) never go to the pool. When
+the pool cannot pay, the
+keeper's purse pays as it always does, the goods go on sale, and a
+keeper short of the price buys nothing. crypt-v01's Torin
+buys ore with `ore_bounty`, 60s a day, so the drift's daily ore never
+empties his purse.
 
 ## Natives
 
@@ -310,25 +326,62 @@ running when you reset does not save its memory over the reset.
 
 ```sh
 cargo run -p mud-server --bin mud -- check worlds/crypt-v01
-# crypt-v01: 11 rooms, 23 items, 14 skills, 8 cast, 3 shops, 1 reward pool — ok
-# scripts rhai-… (7 files: 1 mind, 2 rooms, 2 items, 3 verbs) — ok
+# crypt-v01: 13 rooms, 27 items, 15 skills, 11 cast, 3 shops, 6 reward pools — ok
+# scripts rhai-… (11 files: 1 mind, 2 rooms, 2 items, 11 verbs) — ok
 ```
 
 It compiles, validates and dry-runs every hook once and every mind twice on
 probe inputs, and lists every problem. `mud serve` does the same and will
 not start on a problem.
 
+## Patterns
+
+These come from crypt-v01's scripts, and each one keeps a rule above.
+
+- **Once per kill.** A world flag holds the death a reward paid for
+  (`ctx.cast.<mob>.deaths`), and the reward checks it. A respawned mob
+  that dies again has a new count, so it pays again. `report` and
+  `search` do this.
+- **One try each.** A mark on the player holds the death, the day or
+  the count it already used. `search` marks the body a player searched,
+  so a failed roll is not tried again, and the next player can try.
+- **A count a day.** A mark that holds `day * 100 + n` counts up to `n`
+  today and starts at 0 the next day, in one mark (`count_today` and
+  `count_mark` in crypt-v01's `lib.rhai`).
+- **State that others read.** A hook writes marks on its actor only, and
+  `ctx.room.present` shows no marks. So state that a later hook reads for
+  someone else goes in a world flag named for that player, such as
+  `bones.<id>`. Ids are lowercase words, so the name is valid. Give such a
+  flag a day in its value (or a round that holds the day, as `bones`
+  does), and sweep stale ones as you go, so the 256 flags last. Put the
+  sweep's `clear_flag`s before the new `set_flag`: admission counts the
+  list in order, so a full table still takes the new flag.
+- **Content of the day.** `day_utc(ctx.now_ms)` through a small hash picks
+  the day's room and spot. Every player and every mind sees the same pick
+  all day, it changes at midnight of the game clock, and no wall clock
+  or new dice are used.
+- **Tables in config.** A loot table is data: nested tables under
+  `[verbs.config]` in `scripts.toml`. When several bindings share one
+  table, it is a function in one file instead, because each binding has
+  its own config.
+- **Pay what the pool can.** Read `ctx.pools.<pool>` before you ask, and
+  say so in a `msg` when the day's budget is spent, as `search`, `dig` and
+  `mine` do. The guard flags and marks go in the same list as the reward.
+
 ## crypt-v01, walked through
 
-- `lib.rhai`: `warden_here(ctx)`, `done_today(marks, key, now_ms)` and
-  `carries(actor, proto)`.
+- `lib.rhai`: `warden_here(ctx)`, `done_today(marks, key, now_ms)`,
+  `carries(actor, proto)`, `hostile_here(ctx)` (a mob that can fight is
+  here), `dark_mod(ctx, dark)` (the darkness modifier of a roll) and the
+  counting marks `count_today` and `count_mark`.
 - `rooms/ossuary.rhai`: the first visitor is remembered in a flag and the
   room narrates dust falling; the warden turns its head (or scrapes in the
   dark). `pray` heals once a day (a mark holds the day), never while the
   warden stands (`refuse`), and a critical failure hurts.
 - `rooms/alley.rhai`: saying "vich" or "fence" in the Dark Alley twitches
   the fence's curtain, without repeating a word; `listen` on the alley or
-  the cellar stair hears the rats and the warden until they die.
+  the cellar stair hears the rats, the pups, the warden and the crawler
+  until they die.
 - `rooms/square.rhai`: the watch's bounty. Put the skeletal warden down,
   bring its notched grave-blade to Hale in the square, and `report`: while
   the ossuary is quiet he pays 20s and a healing draught from the
@@ -337,6 +390,34 @@ not start on a problem.
 - `items/iron_ore.rhai`: taking ore under the warden's eye can cost blood.
 - `items/bone_charm.rhai`: the charm, loot with no use until now, hums near
   the warden and answers `use charm on warden`.
+- `rooms/loot.rhai`: `search` in the vault, the warren, the root cellar,
+  the ossuary and the drift. The first good searcher of each death (an
+  IQ roll, -3 in the dark) rolls once on the mob's loot table and is paid
+  from a per-day pool: `vermin_loot` for the rats, the pups and the
+  crawler, `warden_hoard` for the warden. A failed roll leaves the body
+  for the next player. When the pool is spent, the body yields nothing.
+- `rooms/flagon.rhai`: liar's bones in the taproom. `bones` shakes five
+  dice that only the shaker sees, eight rounds a day. A cup down stays as
+  it fell until the call: a second shake is refused. `call` shows every
+  cup of the round at the table, with a tally of each face, and ends the
+  round (the flag `bones_round`), so every cup of it goes stale at once.
+  A cup whose owner left the table stays out of the count, and the call
+  says how many. Alone, `call` tips the caller's dice back. Bids are
+  `say` and stakes are `give`.
+- `rooms/rumor.rhai`: the rumor of the day. The day picks one of five
+  rooms and one of three spots. `eavesdrop` in the taproom (IQ, once a
+  day) hints at the room, and a critical failure hints at a wrong one.
+  `case` in the backroom (Streetwise, or IQ-1; once a day, with Vich
+  there) names the spot. `dig <corner|floor|wall>`, two tries a day, pays
+  the first finder 15s and a draught from `rumor_cache`.
+- `rooms/drift.rhai`: the old dwarf drift. `clear` in the ossuary (ST,
+  with nothing standing there) unlocks the rubble on the stair, which
+  locks itself again an hour later. The rubble's lock has
+  `pickable = false` in `world.toml`, so `attempt lockpicking` on it is
+  refused before it rolls, and `clear` is the only way down. `mine` in
+  the drift needs a miner's pick and the crawler down: one HT roll a day
+  per player (-3 in the dark), and a success mints one chunk of ore from
+  `drift_ore`, four a day in all. Torin's `ore_bounty` buys them.
 - `minds/hale.rhai`: Hale (on Rhai through `runtime = "rhai"`) warns
   players off the alley, by night by name, remembers who he warned today,
   and answers talk of the grate. He says it is locked only when he stands

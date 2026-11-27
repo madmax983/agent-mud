@@ -39,6 +39,29 @@ skill = "shortsword"
 damage = "thr"
 damage_type = "imp"
 
+# The cheap blade between the dagger and a sword. It swings like a
+# shortsword with the Axe/Mace skill, which the template has one level
+# lower than Shortsword. So it does about as well as the dagger against a
+# rat, and better against the warden's bone and the crawler's chitin
+# (balance_tests.rs checks all three).
+[items.hatchet]
+name = "hatchet"
+aliases = ["axe", "hand axe"]
+description = "A short-hafted hatchet with a bearded head, more tool than weapon, and sharp all the same."
+value = 20
+slot = "weapon"
+skill = "axe"
+damage = "sw"
+damage_type = "cut"
+
+# A tool, not a weapon: `mine` in the collapsed drift needs one carried.
+[items.miners_pick]
+name = "miner's pick"
+aliases = ["pick", "pickaxe", "mattock"]
+description = "A narrow iron pick on an ash haft, the kind dwarves used to follow a seam."
+value = 20
+tags = ["tool"]
+
 [items.leather_jerkin]
 name = "leather jerkin"
 aliases = ["jerkin", "leather"]
@@ -176,6 +199,26 @@ tags = ["loot"]
 [items.rat_teeth]
 name = "rat teeth"
 description = "Yellow incisors, long as a thumb."
+value = 0
+slot = "weapon"
+skill = "brawling"
+damage = "1d-2"
+damage_type = "cut"
+hidden = true
+
+[items.pup_teeth]
+name = "pup teeth"
+description = "Needle teeth, more nuisance than danger."
+value = 0
+slot = "weapon"
+skill = "brawling"
+damage = "1d-3"
+damage_type = "cut"
+hidden = true
+
+[items.crawler_mandibles]
+name = "crawler mandibles"
+description = "Two curved hooks of black chitin."
 value = 0
 slot = "weapon"
 skill = "brawling"

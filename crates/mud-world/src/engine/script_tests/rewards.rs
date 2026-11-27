@@ -373,8 +373,13 @@ fn hook_input_shows_what_is_left_of_each_pool() {
     );
     let v = serde_json::to_value(&inputs[1].pools).unwrap();
     assert_eq!(
-        v,
-        serde_json::json!({ "warden_bounty": { "per": "day", "currency": 40, "items": { "healing_draught": 2 } } })
+        v["warden_bounty"],
+        serde_json::json!({ "per": "day", "currency": 40, "items": { "healing_draught": 2 } })
+    );
+    assert_eq!(
+        v["drift_ore"],
+        serde_json::json!({ "per": "day", "currency": 0, "items": { "iron_ore": 4 } }),
+        "a pool nobody asked shows its whole budget"
     );
 }
 

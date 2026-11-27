@@ -24,6 +24,17 @@ fn body_stock_world() -> World {
         shop.fixture = None;
         shop.room = None;
         shop.unattended = false;
+        shop.buy_pool = None;
+    }
+    World::new(Arc::new(pack), 42)
+}
+
+/// crypt-v01 with no buy pools: every keeper pays from its own purse,
+/// and what it buys goes on sale.
+fn purse_world() -> World {
+    let mut pack = WorldPack::crypt_v01().unwrap();
+    for shop in pack.economy.shops.values_mut() {
+        shop.buy_pool = None;
     }
     World::new(Arc::new(pack), 42)
 }
@@ -849,7 +860,7 @@ fn a_shopkeeper_cannot_use_merchandise_without_a_sale() {
 
 #[test]
 fn selling_and_buying_back_never_makes_money() {
-    let mut w = world();
+    let mut w = purse_world();
     let ada = w.login("ada", 1).unwrap();
     ok(&mut w, &ada, "w");
     give_item(&mut w, &ada, "iron_ore");

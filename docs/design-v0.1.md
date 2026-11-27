@@ -215,11 +215,34 @@ agent's MCP cursor starts at the last event its committed wakes consumed.
 
 Town (safe; guards intervene): Notice Board and Market, Smithy, Town
 Square, Rusty Flagon, Dark Alley, Fence's Backroom. Cellar and crypt
-(dark, −3 without a light): Cellar Landing, Wine Vault, Rat Warren,
-Flooded Cistern, Ossuary Crypt. The alley grate is locked (lockpicking −2
-or the key) and locks itself again 30 minutes after it is opened. Giant
-rats in the vault and warren, a rusted lockbox in the cistern, a skeletal
-warden and a dwarven iron-ore cache in the ossuary.
+(dark, −3 without a light): Cellar Landing, Root Cellar, Wine Vault, Rat
+Warren, Flooded Cistern, Ossuary Crypt, Collapsed Drift. The alley grate
+is locked (lockpicking −2 or the key) and locks itself again 30 minutes
+after it is opened. Two rat pups in the root cellar (the way in for a new
+player), giant rats in the vault and warren, a rusted lockbox in the
+cistern, a skeletal warden and a dwarven iron-ore cache in the ossuary.
+Rubble chokes the ossuary's dwarf stair: no pick opens it
+(`pickable = false` on the lock), and `clear` opens it while the warden
+is down, for an hour. Below it, a cave crawler guards a seam of
+ore.
+
+What the pack's scripts add (docs/scripting.md walks through each):
+
+- `search` the fallen: each death of a mob pays its first good searcher
+  one roll on the mob's loot table, from a per-day pool.
+- Liar's bones at the Flagon: `bones` and `call`; bids are `say`, stakes
+  are `give`, and Marta can hold the pot. A cup down stays as it fell
+  until the call, and the call ends the round for every cup of it.
+- The rumor of the day: the day picks a cache's room and spot.
+  `eavesdrop` at the Flagon hints at the room, `case` in Vich's backroom
+  at the spot, and the first `dig` in the right place pays.
+- The dwarf drift: `mine` with a miner's pick (Torin sells three) gives
+  each miner a chunk a day, four a day in all. Torin pays 15s a chunk.
+  His shop's `buy_pool`, the town's `ore_bounty` of 60s a day, pays for
+  four chunks a day, as many as the seam yields, and he smelts them. His
+  own purse pays only past that. So ore comes back each day, and his bounty keeps its
+  worth however long the world runs. Torin also sells a hatchet, the
+  cheap step between the dagger and a sword.
 
 Shops (ADR 0013): Marta's stock sits on the shelf behind the bar, Torin's
 on the weapon rack, Vich's in his crate of oddments. A shop sells while
@@ -248,12 +271,23 @@ world:
 - The warden's grave-blade is a poor weapon in a player's hand: the
   starting dagger beats it by 10 points or more against a rat. Its value
   is 0, so no keeper buys it, and farming the warden empties no purse.
+- A fresh player beats both root-cellar pups in one fight 85-95% of the
+  time, 10 points more often than one giant rat, and dies of it 2% of
+  the time or less (no death in 2000 seeds).
+- A fresh player beats the drift's cave crawler 45-60% of the time, and
+  85% or more with a shortsword and a jerkin. Against its chitin (DR 1) a
+  hatchet beats the dagger by 8 points or more, and the sword beats the
+  hatchet by 20 or more. Against the warden's bone (DR 2) one player with
+  a hatchet beats one with the dagger by 8 points or more (about 12% to
+  2%). Against a rat the hatchet stays within 8 points of the dagger
+  (about 72% to 77%).
 
 The fast test, `crypt_v01_holds_its_balance`, plays 400 seeds per row and
-checks wider bands, that each heal works, and the orderings with a
-smaller margin (the broadsword rows summed over the party sizes). The ignored `balance_table` test plays 2000 seeds per
-row, prints the full table and a `MISS` line for each target it misses;
-`BAL_PACK` points it at an edited copy of a pack.
+checks wider bands, the pups' death share, that each heal works, and the
+orderings and the close pair with a looser margin (the broadsword rows
+summed over the party sizes). The ignored `balance_table` test plays 2000
+seeds per row, prints the full table and a `MISS` line for each target it
+misses; `BAL_PACK` points it at an edited copy of a pack.
 
 These targets hold for a world made under this pack. A saved world keeps
 the attrs and skills its cast and players had when it was saved:
@@ -269,6 +303,13 @@ the balance test measure that world. To get the balance, start a fresh
 world (a new database). A later engine step may refresh cast stats at
 load.
 
+A saved world does pick up the first content pack's rooms, mobs, locks,
+verbs and pools: reconcile adds a room or a cast entry that the save
+lacks. It does not add new stock to a shop that it already has, so a
+saved Torin has no hatchet or miner's pick on his rack. In that world a
+pick turns up only as rare loot on the crawler (at most one a day), and
+players made before keep no Axe/Mace skill.
+
 Since v0.2 the pack also ships Rhai world scripts (`scripts.toml`,
 `scripts/`): `pray` in the ossuary, `listen` in the alley and on the
 cellar stair, the fence's curtain, the warden's blade over the ore, the
@@ -277,9 +318,9 @@ bone charm, and Hale's mind. See [docs/scripting.md](scripting.md) and ADR
 
 | Entity | Role and tier | ST/DX/IQ/HT | Key skills | Traits | Seeded goal |
 |---|---|---|---|---|---|
-| marta | barkeep, persistent | 10/10/12/11 | fast_talk-13, detect_lies-12, merchant-11 | gossip(12), pacifist_self_defense | track who enters the cellar; sell rumors |
-| torin | blacksmith, persistent | 13/11/10/12 | smith-14, merchant-12, broadsword-11 | stubborn(12), honest(12) | out of ore; 15s a chunk; posts a bounty on macro-tick 1 |
-| vich | alley fence, persistent | 9/12/12/10 | stealth-13, lockpicking-13, streetwise-13 | greedy(12), cowardly(12) | buys loot at 60%; sells the grate key for 20s |
+| marta | barkeep, persistent | 10/10/12/11 | fast_talk-13, detect_lies-12, merchant-11 | gossip(12), pacifist_self_defense | track who enters the cellar; eavesdrop daily and sell the cache's room; run liar's bones |
+| torin | blacksmith, persistent | 13/11/10/12 | smith-14, merchant-12, broadsword-11 | stubborn(12), honest(12) | out of ore; 15s a chunk; posts a bounty on macro-tick 1; sells picks and hatchets for the drift |
+| vich | alley fence, persistent | 9/12/12/10 | stealth-13, lockpicking-13, streetwise-13 | greedy(12), cowardly(12) | buys loot at 60%; sells the grate key for 20s; cases the cache's spot daily |
 | guard_01 (Hale) | square guard, ambient | 12/11/9/11 | spear-12, intimidate-11, observation-10 | duty(12), blunt | keep the peace; warn people off the alley |
 | kestrel | hidden Turing PC | 10/12/11/11 | shortsword-13, lockpicking-12, stealth-12, merchant-10 | curious(12), impatient(12) | 40s for a lantern and jerkin; recruit a human; never split under 50/50 |
 

@@ -8,7 +8,7 @@ use mud_rules::{
 };
 use serde_json::{Value, json};
 
-use super::{Audit, Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
+use super::{Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
 use crate::event::{EventKind, VERB_COLLAPSE, VERB_DIE, VERB_RESPAWN, VERB_STAGGER};
 use crate::ids::{EntityId, PoolId, ProtoId, RoomId, Seq, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WeaponDamage};
@@ -361,24 +361,9 @@ impl World {
         if made.is_empty() {
             return;
         }
-        let pool = PoolId::from(RESPAWN_POOL);
-        ctx.changes.push(StateChange::Minted {
-            pool: pool.clone(),
-            entity: id.clone(),
-            currency: 0,
-            items: made.iter().map(|i| i.id).collect(),
-        });
-        self.audit.push(Audit::Minted {
-            hook: VERB_RESPAWN.to_owned(),
-            entity: id.clone(),
-            pool: pool.clone(),
-            currency: 0,
-            items: made.iter().map(|i| i.proto.clone()).collect(),
-            at_ms: ctx.now,
-        });
         let record = MintRecord {
             seq,
-            pool: pool.clone(),
+            pool: PoolId::from(RESPAWN_POOL),
             period: 0,
             hook: VERB_RESPAWN.to_owned(),
             entity: id.clone(),
@@ -386,9 +371,7 @@ impl World {
             items: made,
             at_ms: ctx.now,
         };
-        let totals = self.state.minted.entry(pool).or_default();
-        *totals = totals.with(&record);
-        self.mints.push(record);
+        self.record_mint(ctx, record);
     }
 
     /// Moves everything `victim` carries in its purse into one purse item

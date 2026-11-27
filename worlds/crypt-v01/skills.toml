@@ -23,6 +23,12 @@ attr = "dx"
 difficulty = "average"
 combat = true
 
+[skills.axe]
+name = "Axe/Mace"
+attr = "dx"
+difficulty = "average"
+combat = true
+
 [skills.brawling]
 name = "Brawling"
 attr = "dx"

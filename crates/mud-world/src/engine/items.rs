@@ -8,6 +8,7 @@ use super::{Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
 use crate::event::EventKind;
 use crate::ids::{EntityId, ItemId, ShopId};
 use crate::pack::{Direction, ShopDef};
+use crate::rewards::MintRecord;
 use crate::state::Holder;
 
 impl World {
@@ -536,28 +537,52 @@ impl World {
             Fail::new(ErrorCode::NotBuying, format!("{kname} does not buy {name}"))
         })?;
         let cur = self.pack.economy.currency.clone();
-        if self.state.entities[&kid].currency < price {
+        // The shop's buy pool pays while it has the price left today; the
+        // keeper's purse pays the rest of the time. Goods that hold
+        // something (contents, or sealed coins) never go to the pool, so
+        // using them up never loses an item or a coin.
+        let empty =
+            self.state.items.get(&item).is_some_and(|it| {
+                it.contents.is_empty() && it.sealed_currency(&self.pack).is_none()
+            });
+        let pooled = shop.buy_pool.as_ref().filter(|_| empty).and_then(|p| {
+            let def = self.pack.economy.rewards.get(p)?;
+            let none = std::collections::BTreeMap::new();
+            def.admit(self.state.pool_spent.get(p), ctx.now, price, &none)
+                .ok()
+                .map(|spent| (p.clone(), spent))
+        });
+        if pooled.is_none() && self.state.entities[&kid].currency < price {
             return Err(Fail::new(
                 ErrorCode::KeeperShort,
                 format!("{kname} cannot pay {price}{} right now", cur.short),
             ));
         }
-        self.change_currency(ctx, &kid, -price);
-        self.change_currency(ctx, actor, price);
-        let to = here.fixture.map_or_else(
-            || Holder::Entity {
-                entity: kid.clone(),
-            },
-            |f| Holder::Container { item: f },
-        );
-        self.relocate_item(ctx, item, to);
-        if let Some(it) = self.state.items.get_mut(&item) {
-            it.stock = true;
-            it.paid = Some(price);
+        if pooled.is_none() {
+            self.change_currency(ctx, &kid, -price);
         }
-        let me = self.me(actor)?.clone();
+        self.change_currency(ctx, actor, price);
         let mut tags = vec!["trade".to_owned(), "coin".to_owned()];
         tags.extend(self.item_tags(item));
+        if pooled.is_some() {
+            // What the pool pays for, the shop uses up: it never goes on
+            // sale, so no item is paid from the pool twice, and selling
+            // it back and forth never makes money.
+            self.destroy_item(ctx, item);
+        } else {
+            let to = here.fixture.map_or_else(
+                || Holder::Entity {
+                    entity: kid.clone(),
+                },
+                |f| Holder::Container { item: f },
+            );
+            self.relocate_item(ctx, item, to);
+            if let Some(it) = self.state.items.get_mut(&item) {
+                it.stock = true;
+                it.paid = Some(price);
+            }
+        }
+        let me = self.me(actor)?.clone();
         let spec = Emit::new(
             EventKind::Trade,
             Some(me.room.clone()),
@@ -569,8 +594,27 @@ impl World {
         .actor(actor, "sell")
         .target(&kid)
         .tags(tags)
-        .data(json!({ "item": { "id": item, "name": name }, "price": price }));
-        self.emit(ctx, spec);
+        .data(json!({
+            "item": { "id": item, "name": name },
+            "price": price,
+            "pool": pooled.as_ref().map(|(p, _)| p),
+        }));
+        let seq = self.emit(ctx, spec);
+        if let Some((pool, spent)) = pooled {
+            let period = spent.period;
+            self.state.pool_spent.insert(pool.clone(), spent);
+            let record = MintRecord {
+                seq,
+                pool,
+                period,
+                hook: format!("shops.{}", here.id),
+                entity: actor.clone(),
+                currency: price,
+                items: Vec::new(),
+                at_ms: ctx.now,
+            };
+            self.record_mint(ctx, record);
+        }
         Ok((
             format!("You sell the {name} for {price}{}.", cur.short),
             json!({ "item": item, "price": price, "to": kid }),
@@ -929,7 +973,11 @@ impl World {
                     .as_deref()
                     .is_some_and(|x| x.to_ascii_lowercase().contains(word));
             if named && self.exit_is_locked(&me.room, *d) {
-                return Some(Lockable::Exit(*d, l.pick));
+                return Some(if l.pickable {
+                    Lockable::Exit(*d, l.pick)
+                } else {
+                    Lockable::Sealed(*d)
+                });
             }
         }
         let pool: Vec<ItemId> = self
@@ -994,4 +1042,6 @@ pub enum Lockable {
     Exit(Direction, i32),
     /// A container and its modifier.
     Container(ItemId, i32),
+    /// A locked exit whose lock no pick opens (`pickable = false`).
+    Sealed(Direction),
 }

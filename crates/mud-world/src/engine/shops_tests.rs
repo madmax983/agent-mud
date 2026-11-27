@@ -259,7 +259,11 @@ fn a_sold_out_fixture_says_so() {
 
 #[test]
 fn goods_sold_to_a_fixture_shop_go_onto_its_fixture() {
-    let mut w = crypt();
+    let mut w = with_pack(|p| {
+        for shop in p.economy.shops.values_mut() {
+            shop.buy_pool = None;
+        }
+    });
     let ada = w.login("ada", 1).unwrap();
     ok(&mut w, &ada, "w");
     let pack = Arc::clone(&w.pack);
@@ -284,6 +288,122 @@ fn goods_sold_to_a_fixture_shop_go_onto_its_fixture() {
     let r = ok(&mut w, &ada, "buy ore");
     assert_eq!(r.resolution["price"], 15);
     assert_eq!(w.state.check(), Vec::<String>::new());
+}
+
+#[test]
+fn a_buy_pool_pays_while_it_lasts_and_then_the_keepers_purse() {
+    const DAY: u64 = crate::rewards::DAY_MS;
+    let mut w = crypt();
+    let ada = w.login("ada", 1).unwrap();
+    ok(&mut w, &ada, "w");
+    let pack = Arc::clone(&w.pack);
+    for _ in 0..7 {
+        let ore = w.state.new_item(&ProtoId::from("iron_ore"), &pack);
+        let to = Holder::Entity {
+            entity: ada.clone(),
+        };
+        w.state.attach(ore, &to);
+    }
+    let torin = id("torin");
+    let purse = w.state.entities[&torin].currency;
+    let sell = |w: &mut World, at: u64| w.execute(&ada, "sell ore", at);
+    // The day's 60s of `ore_bounty` pays for four chunks, as mints.
+    for _ in 0..4 {
+        let r = sell(&mut w, 1_000);
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.resolution["price"], 15);
+    }
+    assert_eq!(w.state.entities[&torin].currency, purse);
+    let mints = w.drain_mints();
+    assert_eq!(mints.len(), 4);
+    for m in &mints {
+        assert_eq!(
+            (
+                m.pool.as_str(),
+                m.hook.as_str(),
+                m.currency,
+                m.entity.as_str()
+            ),
+            ("ore_bounty", "shops.torin", 15, ada.as_str())
+        );
+        assert_eq!(m.items, []);
+    }
+    let sold = w
+        .log
+        .iter()
+        .rev()
+        .find(|e| e.verb.as_deref() == Some("sell"))
+        .unwrap();
+    assert_eq!(sold.data["pool"], "ore_bounty");
+    assert_eq!(mints[3].seq, sold.seq, "the sale announces its mint");
+    // The shop uses up what the pool paid for: nothing to buy back and
+    // sell again, so the pool never pays for one chunk twice.
+    assert_eq!(
+        w.execute(&ada, "buy ore", 1_000).error_code,
+        Some(ErrorCode::NotForSale)
+    );
+    // The bounty is spent: the fifth chunk comes out of his purse, and
+    // goes on his rack as stock.
+    let r = sell(&mut w, 1_000);
+    assert!(r.ok, "{r:?}");
+    assert_eq!(w.state.entities[&torin].currency, purse - 15);
+    assert_eq!(w.drain_mints(), []);
+    let rack = w.state.shop_fixtures[&ShopId::from("torin")];
+    let on_rack = |w: &World| {
+        w.state.items[&rack]
+            .contents
+            .iter()
+            .filter(|i| w.state.items[i].proto.as_str() == "iron_ore")
+            .count()
+    };
+    assert_eq!(on_rack(&w), 1);
+    // An empty purse with the bounty spent buys nothing.
+    w.state.entities.get_mut(&torin).unwrap().currency = 0;
+    let r = sell(&mut w, 1_000);
+    assert_eq!(r.error_code, Some(ErrorCode::KeeperShort), "{r:?}");
+    // The next day the bounty pays again, purse or no purse.
+    let r = sell(&mut w, 1_000 + DAY);
+    assert!(r.ok, "{r:?}");
+    assert_eq!(w.state.entities[&torin].currency, 0);
+    let ledger = [mints, w.drain_mints()].concat();
+    assert_eq!(
+        w.state.check_rewards(&w.pack, &ledger),
+        Vec::<String>::new()
+    );
+    assert_eq!(w.state.check(), Vec::<String>::new());
+}
+
+#[test]
+fn goods_that_hold_something_never_go_to_a_buy_pool() {
+    let mut w = with_pack(|p| {
+        p.economy
+            .shops
+            .get_mut(&ShopId::from("marta"))
+            .unwrap()
+            .buy_pool = Some(crate::ids::PoolId::from("ore_bounty"));
+        p.items
+            .get_mut(&ProtoId::from("old_coin_pouch"))
+            .unwrap()
+            .value = 10;
+    });
+    let ada = ada_at_the_flagon(&mut w);
+    let pack = Arc::clone(&w.pack);
+    let pouch = w.state.new_item(&ProtoId::from("old_coin_pouch"), &pack);
+    let to = Holder::Entity {
+        entity: ada.clone(),
+    };
+    w.state.attach(pouch, &to);
+    let money = w.state.total_currency(&w.pack);
+    let purse = w.state.entities[&id("marta")].currency;
+    let r = ok(&mut w, &ada, "sell pouch");
+    assert_eq!(r.resolution["price"], 4);
+    assert_eq!(w.drain_mints(), []);
+    assert_eq!(w.state.entities[&id("marta")].currency, purse - 4);
+    assert_eq!(
+        w.state.holder_of(pouch),
+        Some(Holder::Container { item: shelf(&w) })
+    );
+    assert_eq!(w.state.total_currency(&w.pack), money);
 }
 
 #[test]
@@ -573,6 +693,15 @@ fn the_pack_checks_fixtures_posts_and_relocks() {
         e.contains("cast torin: post needs at least one room"),
         "{e}"
     );
+    let e = problems_of(
+        "economy",
+        "buy_pool = \"ore_bounty\"",
+        "buy_pool = \"ore_fund\"",
+    );
+    assert!(
+        e.contains("shop torin buy_pool names unknown pool \"ore_fund\""),
+        "{e}"
+    );
     let e = problems_of("world", "relock_minutes = 30", "relock_minutes = 0");
     assert!(e.contains("relock_minutes is at least 1"), "{e}");
     let e = problems_of("world", "retreat_free = true", "retreat_frees = true");
@@ -666,8 +795,8 @@ fn an_older_save_gives_the_existing_cast_its_new_starting_gear() {
     let rack = w.state.shop_fixtures[&ShopId::from("torin")];
     assert_eq!(
         w.state.items[&rack].contents.len(),
-        6,
-        "the rack keeps all six"
+        11,
+        "the rack keeps all eleven"
     );
     let kestrel = id("pc_kestrel");
     assert_eq!(

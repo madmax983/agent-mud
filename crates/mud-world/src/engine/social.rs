@@ -8,7 +8,7 @@ use serde_json::json;
 use super::items::Lockable;
 use super::{Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
 use crate::event::EventKind;
-use crate::ids::{EntityId, SkillId};
+use crate::ids::{EntityId, RoomId, SkillId};
 use crate::pack::SkillEffect;
 use crate::state::BoardPost;
 
@@ -162,15 +162,8 @@ impl World {
         let mut target_entity = None;
         match (def.effect, on) {
             (Some(SkillEffect::PickLock), Some(w)) => {
-                let l = self.find_lockable(actor, w).ok_or_else(|| {
-                    Fail::new(
-                        ErrorCode::NoSuchTarget,
-                        format!("there is no lock on {w:?} here"),
-                    )
-                })?;
-                modifier = match l {
-                    Lockable::Exit(_, m) | Lockable::Container(_, m) => m,
-                };
+                let (l, m) = self.pick_target(actor, &me.room, w)?;
+                modifier = m;
                 lockable = Some(l);
             }
             (Some(SkillEffect::PickLock), None) => {
@@ -245,6 +238,38 @@ impl World {
         ))
     }
 
+    /// The lock `word` names for a lockpicking attempt, and its modifier.
+    /// A lock that no pick opens is refused here, before any roll: no
+    /// try, no turn and no lucky critical.
+    fn pick_target(
+        &self,
+        actor: &EntityId,
+        room: &RoomId,
+        word: &str,
+    ) -> Result<(Lockable, i32), Fail> {
+        let l = self.find_lockable(actor, word).ok_or_else(|| {
+            Fail::new(
+                ErrorCode::NoSuchTarget,
+                format!("there is no lock on {word:?} here"),
+            )
+        })?;
+        match l {
+            Lockable::Exit(_, m) | Lockable::Container(_, m) => Ok((l, m)),
+            Lockable::Sealed(d) => {
+                let lock = self
+                    .pack
+                    .rooms
+                    .get(room)
+                    .and_then(|r| r.locks.get(&d))
+                    .map_or(word, |l| l.lock.as_str());
+                Err(Fail::new(
+                    ErrorCode::Refused,
+                    format!("no pick can open the {lock}"),
+                ))
+            }
+        }
+    }
+
     /// Applies the engine effect of a skill roll. Returns the extra text
     /// for the actor and any structured result.
     fn skill_effect(
@@ -271,7 +296,7 @@ impl World {
                     extra = self.unlock_container(ctx, item);
                     let _ = write!(text, " The {} clicks open.", self.item_name(item));
                 }
-                None => {}
+                Some(Lockable::Sealed(_)) | None => {}
             },
             (Some(SkillEffect::Hide), true) => {
                 if let Some(e) = self.state.entities.get_mut(actor) {
