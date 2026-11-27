@@ -8,7 +8,7 @@
 use mud_rules::{DamageDice, DamageType, DiceRng as _, EFFECTIVE_LIMIT, Outcome, success_roll};
 use std::collections::BTreeMap;
 
-use mud_world::hooks::{FlagValue, ScriptEffect};
+use mud_world::hooks::{FlagValue, ScriptEffect, USE_UP_MAX};
 use mud_world::pack::Direction;
 use mud_world::rewards::REWARD_ITEMS_MAX;
 use mud_world::{PoolId, ProtoId};
@@ -136,6 +136,23 @@ fn register_rewards(e: &mut Engine) {
     );
 }
 
+/// `use_up(proto, n)`: n is a count of 1 to [`USE_UP_MAX`]. The engine
+/// checks the prototype and what the actor carries.
+fn use_up(ctx: &NativeCallContext, proto: String, n: i64) -> RhaiResult<Effect> {
+    let count = u32::try_from(n)
+        .ok()
+        .filter(|n| (1..=USE_UP_MAX).contains(n))
+        .ok_or_else(|| fault(format!("use_up(): n is a count of 1 to {USE_UP_MAX}")))?;
+    hook_only(
+        ctx,
+        "use_up",
+        ScriptEffect::UseUp {
+            proto: ProtoId::new(proto),
+            count,
+        },
+    )
+}
+
 fn register_effects(e: &mut Engine) {
     e.register_type_with_name::<Effect>("Effect");
     e.register_fn("to_string", |fx: &mut Effect| fx.0.describe());
@@ -195,6 +212,12 @@ fn register_effects(e: &mut Engine) {
     });
     e.register_fn("unmark", |ctx: NativeCallContext, n: String| {
         hook_only(&ctx, "unmark", ScriptEffect::Unmark(n))
+    });
+    e.register_fn("use_up", |ctx: NativeCallContext, p: String| {
+        use_up(&ctx, p, 1)
+    });
+    e.register_fn("use_up", |ctx: NativeCallContext, p: String, n: i64| {
+        use_up(&ctx, p, n)
     });
     e.register_fn("heal", |ctx: NativeCallContext, d: &str| {
         let d = script_dice(d).map_err(fault)?;

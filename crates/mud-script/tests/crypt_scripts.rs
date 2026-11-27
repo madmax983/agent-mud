@@ -72,10 +72,15 @@ fn kill(state: &mut WorldState, who: &str) {
 }
 
 /// The world again, after the warden came back and was put down once more.
-fn warden_dies_again(w: &World, ids: &[EntityId]) -> World {
+/// Each warden brings a new blade (its respawn kit), and its killer
+/// `looter`, if any, picks it up.
+fn warden_dies_again(w: &World, ids: &[EntityId], looter: Option<&str>) -> World {
     let pack = pack();
     let mut state = w.snapshot();
     kill(&mut state, "skeletal_warden");
+    if let Some(who) = looter {
+        give(&mut state, &pack, who, "warden_blade");
+    }
     let mut again = World::from_state(Arc::clone(&pack), state, Vec::new());
     let host = Arc::new(ScriptHost::bundled_crypt_v01(&pack).unwrap());
     again.set_hooks(Some(host as Arc<dyn WorldHooks>), at(1), HooksChange::Start);
@@ -356,6 +361,11 @@ fn hale_pays_a_ledgered_bounty_for_the_wardens_blade() {
     });
     let r = w.execute(&ids[0], "report", at(2));
     assert!(r.narrative.contains("walks again"), "{r:?}");
+    assert_eq!(
+        carried(&w, &ids[0], "warden_blade"),
+        1,
+        "a refusal takes nothing"
+    );
     let (mut w, ids) = world_with(&[("ada", "town_square")], |s, _| {
         kill(s, "skeletal_warden");
     });
@@ -368,18 +378,16 @@ fn hale_pays_a_ledgered_bounty_for_the_wardens_blade() {
     );
     assert_eq!(w.fresh_mints(), []);
 
-    // The ossuary is quiet, and ada brings back the one grave-blade.
-    let names = [
-        ("ada", "town_square"),
-        ("bo", "town_square"),
-        ("cy", "town_square"),
-        ("di", "town_square"),
-    ];
+    // The ossuary is quiet, and ada brings back a grave-blade. bo holds
+    // another one.
+    let names = [("ada", "town_square"), ("bo", "town_square")];
     let (mut w, ids) = world_with(&names, |s, p| {
         kill(s, "skeletal_warden");
         give(s, p, "pc_ada", "warden_blade");
+        give(s, p, "pc_bo", "warden_blade");
     });
     let money = w.state().total_currency(w.pack());
+    let items = w.state().items.len();
     let purse = w.entity(&ids[0]).unwrap().currency;
     let r = w.execute(&ids[0], "report", at(2));
     assert!(r.ok, "{r:?}");
@@ -389,14 +397,28 @@ fn hale_pays_a_ledgered_bounty_for_the_wardens_blade() {
         r.narrative
     );
     assert!(
-        r.narrative
-            .ends_with("You receive 20s and a healing draught."),
+        r.narrative.ends_with(
+            "You give up a notched grave-blade.\nYou receive 20s and a healing draught."
+        ),
         "{}",
         r.narrative
     );
     assert_eq!(w.entity(&ids[0]).unwrap().currency, purse + 20);
     assert_eq!(carried(&w, &ids[0], "healing_draught"), 1);
-    assert_eq!(carried(&w, &ids[0], "warden_blade"), 1, "he keeps no proof");
+    assert_eq!(
+        carried(&w, &ids[0], "warden_blade"),
+        0,
+        "Hale keeps the proof"
+    );
+    assert_eq!(
+        w.state().items.len(),
+        items,
+        "one blade gone, one draught made"
+    );
+    assert!(r.state_changes.iter().any(|c| matches!(
+        c,
+        StateChange::Item { proto, to: None, .. } if proto.as_str() == "warden_blade"
+    )));
     assert!(r.state_changes.iter().any(|c| matches!(
         c,
         StateChange::Minted { pool, currency: 20, .. } if *pool == PoolId::from("warden_bounty")
@@ -406,27 +428,34 @@ fn hale_pays_a_ledgered_bounty_for_the_wardens_blade() {
         (mint.hook.as_str(), &mint.entity, mint.currency),
         ("verbs.report", &ids[0], 20)
     );
-    // The others in the square see silver counted, not the ledger.
+    // The others in the square see the blade go and silver counted, not
+    // the ledger.
     let seen: Vec<String> = w
         .drain_fresh()
         .into_iter()
         .filter(|e| e.reaches(&ids[1]))
         .map(|e| e.narrative)
         .collect();
-    assert_eq!(seen, ["Hale counts silver into ada's hand."]);
+    assert_eq!(
+        seen,
+        ["Hale takes a notched grave-blade from ada and counts silver into their hand."]
+    );
+    // Without the blade, ada has no proof left to show.
     let r = w.execute(&ids[0], "report", at(3));
-    assert!(r.narrative.contains("already paid"), "{}", r.narrative);
-    // One bounty per death: ada cannot claim the same kill twice, and the
-    // blade passed from hand to hand pays no one else for it.
-    assert!(w.execute(&ids[0], "give blade to bo", at(3)).ok);
+    assert!(r.narrative.contains("Bring me proof"), "{}", r.narrative);
+    // One bounty per death: bo's blade does not pay for the same kill, and
+    // he keeps it.
     let r = w.execute(&ids[1], "report", at(3));
     assert!(r.narrative.contains("already paid"), "{}", r.narrative);
-    assert!(w.execute(&ids[1], "give blade to cy", at(3)).ok);
-    let r = w.execute(&ids[2], "report", at(3));
-    assert!(r.narrative.contains("already paid"), "{}", r.narrative);
+    assert_eq!(carried(&w, &ids[1], "warden_blade"), 1);
     assert_eq!(w.fresh_mints().len(), 1);
-    assert_eq!(carried(&w, &ids[2], "healing_draught"), 0);
+    assert_eq!(carried(&w, &ids[1], "healing_draught"), 0);
     assert_eq!(w.state().total_currency(w.pack()), money + 20);
+    assert_eq!(w.state().check(), Vec::<String>::new());
+    assert_eq!(
+        w.state().check_rewards(w.pack(), w.fresh_mints()),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -443,28 +472,31 @@ fn the_watch_pays_once_per_death_three_a_day_and_once_a_day_each() {
     });
     let money = w.state().total_currency(w.pack());
     assert!(w.execute(&ids[2], "report", at(3)).ok);
+    assert_eq!(carried(&w, &ids[2], "warden_blade"), 0);
     let mut ledger = w.drain_mints();
     assert_eq!(ledger.len(), 1);
 
-    // The warden walks again and is put down again: one more bounty, for
-    // whoever brings the blade. The pool pays three a day: the fourth
-    // death that day finds the purse empty, and the hook does not fault.
-    let mut w = warden_dies_again(&w, &ids);
+    // The warden walks again and is put down again, and each death leaves
+    // a new blade: one more bounty, for whoever brings it. The pool pays
+    // three a day: the fourth death that day finds the purse empty, and
+    // the hook does not fault.
+    let mut w = warden_dies_again(&w, &ids, Some("pc_cy"));
     let r = w.execute(&ids[2], "report", at(4));
     assert!(r.narrative.contains("Once a day"), "{}", r.narrative);
+    assert_eq!(carried(&w, &ids[2], "warden_blade"), 1, "cy keeps it");
     assert!(w.execute(&ids[2], "give blade to ada", at(4)).ok);
     assert!(w.execute(&ids[0], "report", at(4)).ok);
     assert_eq!(carried(&w, &ids[0], "healing_draught"), 1);
-    assert!(w.execute(&ids[0], "give blade to di", at(4)).ok);
+    assert_eq!(carried(&w, &ids[0], "warden_blade"), 0);
     ledger.extend(w.drain_mints());
-    let mut w = warden_dies_again(&w, &ids);
+    let mut w = warden_dies_again(&w, &ids, Some("pc_di"));
     assert!(w.execute(&ids[3], "report", at(5)).ok);
-    assert!(w.execute(&ids[3], "give blade to bo", at(5)).ok);
     ledger.extend(w.drain_mints());
-    let mut w = warden_dies_again(&w, &ids);
+    let mut w = warden_dies_again(&w, &ids, Some("pc_bo"));
     let r = w.execute(&ids[1], "report", at(6));
     assert!(r.ok && r.narrative.contains("purse is empty"), "{r:?}");
     assert_eq!(carried(&w, &ids[1], "healing_draught"), 0);
+    assert_eq!(carried(&w, &ids[1], "warden_blade"), 1, "bo keeps it");
     assert!(w.state().hook_faults.is_empty());
     assert_eq!(ledger.len(), 3);
     assert_eq!(w.state().total_currency(w.pack()), money + 60);
@@ -473,16 +505,17 @@ fn the_watch_pays_once_per_death_three_a_day_and_once_a_day_each() {
         w.state().check_rewards(w.pack(), &ledger),
         Vec::<String>::new()
     );
-    // The next game day that unpaid death pays bo, once.
+    // The next game day that unpaid death pays bo, once: Hale keeps the
+    // blade.
     let r = w.execute(&ids[1], "report", at(26));
     assert!(r.narrative.contains("The watch pays"), "{}", r.narrative);
     assert_eq!(carried(&w, &ids[1], "healing_draught"), 1);
     let r = w.execute(&ids[1], "report", at(26));
-    assert!(r.narrative.contains("already paid"), "{}", r.narrative);
+    assert!(r.narrative.contains("Bring me proof"), "{}", r.narrative);
     ledger.extend(w.drain_mints());
     // Once a day per player, whatever the deaths: bo is paid no more today,
     // but cy, paid yesterday, is.
-    let mut w = warden_dies_again(&w, &ids);
+    let mut w = warden_dies_again(&w, &ids, Some("pc_bo"));
     let r = w.execute(&ids[1], "report", at(27));
     assert!(r.narrative.contains("Once a day"), "{}", r.narrative);
     assert!(w.execute(&ids[1], "give blade to cy", at(27)).ok);
@@ -499,10 +532,96 @@ fn the_watch_pays_once_per_death_three_a_day_and_once_a_day_each() {
 }
 
 #[test]
+fn one_blade_pays_once_however_often_the_warden_dies() {
+    // ada reports with the one blade, then tries to pass it on: it is
+    // gone. The warden dies again, and nobody here holds proof of it.
+    let names = [("ada", "town_square"), ("bo", "town_square")];
+    let (mut w, ids) = world_with(&names, |s, p| {
+        kill(s, "skeletal_warden");
+        give(s, p, "pc_ada", "warden_blade");
+    });
+    let money = w.state().total_currency(w.pack());
+    assert!(w.execute(&ids[0], "report", at(2)).ok);
+    assert!(!w.execute(&ids[0], "give blade to bo", at(2)).ok);
+    let mut ledger = w.drain_mints();
+    let mut w = warden_dies_again(&w, &ids, None);
+    for (who, hour) in [(0, 26), (1, 26), (0, 50)] {
+        let r = w.execute(&ids[who], "report", at(hour));
+        assert!(r.narrative.contains("Bring me proof"), "{}", r.narrative);
+    }
+    ledger.extend(w.drain_mints());
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(w.state().total_currency(w.pack()), money + 20);
+    assert_eq!(w.state().check(), Vec::<String>::new());
+    assert_eq!(
+        w.state().check_rewards(w.pack(), &ledger),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn two_blades_over_two_deaths_pay_twice() {
+    let (mut w, ids) = world_with(&[("ada", "town_square")], |s, p| {
+        kill(s, "skeletal_warden");
+        give(s, p, "pc_ada", "warden_blade");
+    });
+    let money = w.state().total_currency(w.pack());
+    assert!(w.execute(&ids[0], "report", at(2)).ok);
+    let mut ledger = w.drain_mints();
+    let mut w = warden_dies_again(&w, &ids, Some("pc_ada"));
+    // The daily mark holds her to one a day.
+    let r = w.execute(&ids[0], "report", at(3));
+    assert!(r.narrative.contains("Once a day"), "{}", r.narrative);
+    let r = w.execute(&ids[0], "report", at(26));
+    assert!(r.narrative.contains("The watch pays"), "{}", r.narrative);
+    ledger.extend(w.drain_mints());
+    assert_eq!(ledger.len(), 2);
+    assert_eq!(carried(&w, &ids[0], "warden_blade"), 0);
+    assert_eq!(carried(&w, &ids[0], "healing_draught"), 2);
+    assert_eq!(w.state().total_currency(w.pack()), money + 40);
+    assert_eq!(w.state().check(), Vec::<String>::new());
+    assert_eq!(
+        w.state().check_rewards(w.pack(), &ledger),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn hale_takes_a_wielded_blade_out_of_the_hand() {
+    let (mut w, ids) = world_with(&[("ada", "town_square")], |s, p| {
+        kill(s, "skeletal_warden");
+        give(s, p, "pc_ada", "warden_blade");
+    });
+    assert!(w.execute(&ids[0], "wield blade", at(2)).ok);
+    let blade = *w
+        .entity(&ids[0])
+        .unwrap()
+        .equipped
+        .values()
+        .find(|i| w.state().items[*i].proto.as_str() == "warden_blade")
+        .unwrap();
+    let r = w.execute(&ids[0], "report", at(2));
+    assert!(r.ok, "{r:?}");
+    let unequip = r.state_changes.iter().position(
+        |c| matches!(c, StateChange::Equipped { entity, item: None, .. } if *entity == ids[0]),
+    );
+    let gone = r
+        .state_changes
+        .iter()
+        .position(|c| matches!(c, StateChange::Item { item, to: None, .. } if *item == blade));
+    assert!(unequip.unwrap() < gone.unwrap(), "{:?}", r.state_changes);
+    let ada = w.entity(&ids[0]).unwrap();
+    assert!(!ada.equipped.values().any(|i| *i == blade));
+    assert!(!w.state().items.contains_key(&blade));
+    assert_eq!(w.fresh_mints().len(), 1);
+    assert_eq!(w.state().check(), Vec::<String>::new());
+}
+
+#[test]
 fn a_full_mark_table_never_lets_a_player_claim_twice() {
     // ada already holds 32 marks: her once-a-day mark could not be kept,
-    // so Hale pays her nothing (rather than every time), and the hook
-    // stays up.
+    // so Hale pays her nothing (rather than every time), keeps no blade,
+    // and the hook stays up.
     let (mut w, ids) = world_with(&[("ada", "town_square")], |s, p| {
         kill(s, "skeletal_warden");
         give(s, p, "pc_ada", "warden_blade");
@@ -517,6 +636,7 @@ fn a_full_mark_table_never_lets_a_player_claim_twice() {
     }
     assert_eq!(w.fresh_mints(), []);
     assert_eq!(carried(&w, &ids[0], "healing_draught"), 0);
+    assert_eq!(carried(&w, &ids[0], "warden_blade"), 1);
     assert!(w.state().hook_faults.is_empty());
 }
 
@@ -538,4 +658,5 @@ fn nobody_is_paid_while_hale_is_away() {
         r.narrative
     );
     assert_eq!(w.fresh_mints(), []);
+    assert_eq!(carried(&w, &ids[0], "warden_blade"), 1);
 }

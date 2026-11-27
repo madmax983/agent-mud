@@ -55,7 +55,8 @@ fn = "on_listen"
 config = { modifier = 0 }
 
 # The watch's bounty on the warden: a ledgered reward from the
-# `warden_bounty` pool of economy.toml.
+# `warden_bounty` pool of economy.toml. Hale keeps the blade
+# (`use_up`), so each blade pays once.
 [[verbs]]
 name = "report"
 usage = "report"

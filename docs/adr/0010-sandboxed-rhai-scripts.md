@@ -329,11 +329,80 @@ items are conserved **except for ledgered mints, which it counts exactly**.
   draughts a day), **once per warden death** (the world flag
   `warden_bounty.paid` holds the `ctx.cast.skeletal_warden.deaths` it paid
   for; `Entity.deaths` counts every death and survives respawn), once a
-  day per player (a mark), and says so when the purse is spent. The warden
-  drops its only blade and respawns without one, so a blade is a token
-  that outlives its kill; the per-death guard is what makes the bounty pay
-  for putting the warden down, not for holding the blade. The guards and
-  the reward are one admitted list.
+  day per player (a mark), and says so when the purse is spent. The
+  per-death guard makes the bounty pay for putting the warden down, not
+  for holding a blade. Since the respawn kit (ADR 0012) each death drops
+  a new blade, so Hale keeps the blade he pays for (`use_up`, below):
+  each blade pays once. The guards, the blade and the reward are one
+  admitted list.
+
+## Amended: a script may use up what the actor carries
+
+### Context
+
+Hale's bounty checked that the actor carried a warden blade, and never
+took it. Once every warden death dropped a new blade (ADR 0012), every
+past killer could claim each later death with an old blade, and one
+blade served forever. The flag and the mark bounded the payouts, but the
+proof was never used up. No effect could take an item.
+
+### Decision
+
+- **`use_up(proto)` and `use_up(proto, n)`.** A new script effect,
+  `ScriptEffect::UseUp { proto, count }`, takes n (1 to 16,
+  `hooks::USE_UP_MAX`) items of a prototype the actor carries out of the
+  world, through the engine's own `destroy_item`. It is allowed in every
+  hook kind, as `reward` is.
+- **What may go.** The prototype is in the pack, is not `hidden` (a
+  natural weapon) and has no `currency` (a purse is emptied with `use`).
+  The actor is present. Only items that are not merchandise, hold nothing
+  and hold no coins of their own count. Each of those rules is pack data
+  or item state: no item id is in the engine. An item in use counts: it
+  is put away (an `equipped` change), then used up, at once and with no
+  turn of its own.
+- **Admission.** A bad ask faults. Too few to give declines the whole
+  list, as a spent pool does: nothing applies, the dice are untouched,
+  and the breaker does not move. Two calls of one prototype count
+  together, against the state before the list. A `use_up` after a
+  `reward` faults, so a reward's items are never the price. The list is
+  admitted whole, so there is no pay without the proof and no proof
+  taken without pay. At apply time a `use_up` that finds too little
+  takes nothing and skips any later reward in the list.
+- **State class, no kernel change.** `use_up` counts as
+  `EffectClass::State` in the proved admission tally, as a flag or a mark
+  does: it makes nothing, so it needs no new class and no Verus change.
+- **No ledger.** A used-up item is a sink, like a heal's draught, an
+  emptied purse or ore a shop's pool buys, none of which the engine
+  ledgers. Money stays the start plus the ledger, and items grow only by
+  ledgered mints. The actor-only event (with the item ids) and the
+  `state_changes` in the events table are the durable record. No
+  snapshot field, no store schema and no migration change, so old
+  world.db files load unchanged, and blades players already hold stay
+  where they are.
+
+### Alternatives rejected
+
+- **A hand-over to an NPC.** Hale would carry every blade he is given:
+  his inventory grows without bound, and the proof comes back into
+  circulation when he dies or trades. A pack that needs a real hand-over
+  can add a separate effect with its own cap; `use_up` does not rule it
+  out.
+- **A burn ledger.** A table of used-up items is a schema change, and an
+  invariant the engine does not keep for its own sinks.
+
+### Consequences and known limits
+
+- Payouts never exceed warden deaths, and each blade pays once. A held
+  old blade can still claim one later death before the real killer
+  reports.
+- A `hurt()` placed between `use_up` and `reward` that kills the actor
+  takes the item and skips the reward. Keep `hurt` out of hand-in lists;
+  in a safe room, as the square is, `hurt` faults anyway.
+- Using up an equipped weapon or armor mid-fight takes effect at once,
+  with no turn cost. The owner accepts this.
+- `mud check` reports a bare `use_up` of something the probe lacks,
+  because the dry run's probe carries only the template kit. A hand-in
+  checks `carries()` first and says why with a `msg`.
 
 ## Consequences
 

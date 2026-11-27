@@ -677,6 +677,44 @@ fn reward_builds_one_ledgered_ask_and_checks_its_shape() {
 }
 
 #[test]
+fn use_up_builds_a_count_of_one_to_sixteen() {
+    use mud_world::ProtoId;
+    let fx = effects("[use_up(\"warden_blade\"), use_up(\"iron_ore\", 3), use_up(\"ale\", 16)]");
+    assert_eq!(
+        fx,
+        [
+            ScriptEffect::UseUp {
+                proto: ProtoId::from("warden_blade"),
+                count: 1,
+            },
+            ScriptEffect::UseUp {
+                proto: ProtoId::from("iron_ore"),
+                count: 3,
+            },
+            ScriptEffect::UseUp {
+                proto: ProtoId::from("ale"),
+                count: 16,
+            },
+        ]
+    );
+    for n in ["0", "-1", "17"] {
+        let e = fault(&format!("[use_up(\"ale\", {n})]"));
+        assert!(e.contains("use_up(): n is a count of 1 to 16"), "{n}: {e}");
+    }
+    // A mind cannot use things up.
+    let e = mind_host("[use_up(\"ale\")]")
+        .on_wake(&wake(Vec::new(), Vec::new(), 1))
+        .outcome
+        .unwrap_err();
+    assert!(
+        e.contains(
+            "use_up() is for room, item and verb scripts; a mind script returns command lines"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
 fn mind_returns_follow_the_contract() {
     let ok = |body: &str| {
         mind_host(body)

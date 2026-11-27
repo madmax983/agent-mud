@@ -112,6 +112,7 @@ elements, or a map's keys (`for k in ctx.flags`); a view has no `keys()`.
 | `mark(name, v)`, `unmark(name)` | marks on the actor (at most 32: a new mark past that declines the list): per-player state goes here |
 | `heal(dice)`, `hurt(dice)` | the actor; `1d` to `6d` with adds; at most one per hook; no `hurt` in a safe room. A hook runs only for an actor that can act, so a heal never meets one out cold; the effect still brings to any actor it lifts above 0 HP, with the room line and the wake of its mind that any coming to has (ADR 0012) |
 | `reward(pool, #{ currency: n, items: #{ proto: n } })`, `reward(pool, n)` | money and items for the actor from a pack reward pool, recorded in the ledger; at most one per hook, never with `refuse` (see [Rewards](#rewards-ledgered-mints)) |
+| `use_up(proto)`, `use_up(proto, n)` | use up n (1 to 16) items of a prototype the actor carries: they leave the world. Never money, contents, merchandise or a hidden item. Before any `reward`. Too few to give declines the whole list (see [Using up items](#using-up-items)) |
 
 Names are lowercase words of `[a-z0-9_]` joined by `.`, `:` or `-`. Texts
 are 1 to 500 printable characters. The list is admitted all-or-nothing: one
@@ -193,7 +194,9 @@ receive 20s and a healing draught.` (in the command's narrative and as a
 The observer's feed shows a `minted` row, and the Scripts panel lists each
 pack pool with what is left and its running totals. Money in the world is
 always the start plus the ledger's currency, and every item made after the
-start is a new player's kit or named by the ledger. The property tests
+start is a new player's kit or named by the ledger. Items leave the world
+only when used up: by the engine (a heal, a purse, a pool sale) or by
+`use_up`. The property tests
 check exactly that. A reward is not a sale: shops and `POLICY_TRADE_REQUIRED` are
 unchanged. A shop can buy with a pool, though (below).
 
@@ -219,6 +222,72 @@ keeper's purse pays as it always does, the goods go on sale, and a
 keeper short of the price buys nothing. crypt-v01's Torin
 buys ore with `ore_bounty`, 60s a day, so the drift's daily ore never
 empties his purse.
+
+## Using up items
+
+A hook can take what the actor carries out of the world with
+`use_up(proto)` or `use_up(proto, n)`: a hand-in, a price in goods, the
+ingredients of a recipe. crypt-v01's `report` uses up the warden's blade,
+so each blade proves one kill, once.
+
+What can be used up, checked in `check_effects` before anything applies:
+
+- `n` is 1 to 16; anything else faults (in the script, and again in the
+  engine);
+- the prototype is in `items.toml`, is not `hidden` (a natural weapon,
+  which a script never sees) and has no `currency` (a purse is emptied
+  with `use`, not used up); anything else faults;
+- `use_up` comes before any `reward` in the list, or the hook faults. So
+  a reward's items can never be the price;
+- the actor is present, or the hook faults;
+- the actor carries at least `n` items of the prototype that are not
+  shop merchandise, hold nothing (a container with contents) and hold no
+  coins of their own (a dropped purse). Too few is a **decline**, not a
+  fault: the world cannot take the list now, so nothing applies, the
+  dice are untouched, the breaker does not move, and a verb answers with
+  the engine's `Nothing comes of that just now.` Two calls of one
+  prototype count together, against what the actor carries before the
+  list.
+
+The engine takes spares first and an item in use last, each in inventory
+order. An item the actor wields or wears is put away and then used up, at
+once and with no turn of its own; the command's own rules decide turns.
+
+The whole list is admitted together, so a hand-in pays only with its
+proof, and the proof goes only with its pay: when a guard mark or flag
+cannot be kept, or the pool is spent, the item stays. The actor reads
+`You give up a notched grave-blade.` (or `3 x chunk of dwarven iron ore`)
+at the effect's place in the list, and a `system` event only the actor
+perceives carries `proto` and the `items` used up (`id`, `proto`) in its
+data. `state_changes` holds an `equipped` change for an item in use, then
+an `item` change to nowhere. The observer's effects row lists
+`use_up(warden_blade)`.
+
+Using up is not ledgered. Like a drunk draught, an emptied purse or ore
+a shop's pool buys, a used-up item leaves the world and makes nothing, so
+money stays the start plus the ledger, and only making things is
+ledgered.
+
+Check first, and say why with a `msg`: a hand-in that meets a player with
+nothing to give should not leave them the bare decline. The dry run's
+probe carries only the template kit, so `mud check` reports a bare
+`use_up` of anything else.
+
+```rhai
+// Torin forges a pick from three chunks of ore and his own stock.
+fn on_forge(ctx) {
+    let ore = 0;
+    for p in ctx.actor.inventory {
+        if p == "iron_ore" { ore += 1; }
+    }
+    if ore < 3 {
+        return [msg("Torin shakes his head. \"Three chunks, and I make you a pick.\"")];
+    }
+    [msg("Torin takes the ore to the forge."),
+     use_up("iron_ore", 3),
+     reward("forge", #{ items: #{ miners_pick: 1 } })]
+}
+```
 
 ## Natives
 
@@ -364,6 +433,11 @@ These come from crypt-v01's scripts, and each one keeps a rule above.
   `[verbs.config]` in `scripts.toml`. When several bindings share one
   table, it is a function in one file instead, because each binding has
   its own config.
+- **A hand-in.** Check `carries(ctx.actor, proto)` (or `ctx.item`)
+  first and say why with a `msg` when the player has nothing to give.
+  Then put the guards, the `use_up` and the `reward` in one list, with
+  `use_up` before `reward`: the proof goes only with the pay. `report`
+  does this.
 - **Pay what the pool can.** Read `ctx.pools.<pool>` before you ask, and
   say so in a `msg` when the day's budget is spent, as `search`, `dig` and
   `mine` do. The guard flags and marks go in the same list as the reward.
@@ -386,6 +460,7 @@ These come from crypt-v01's scripts, and each one keeps a rule above.
   bring its notched grave-blade to Hale in the square, and `report`: while
   the ossuary is quiet he pays 20s and a healing draught from the
   `warden_bounty` pool (60s and 3 draughts a day), once a day per player.
+  Hale keeps the blade: each blade pays once.
   When the pool is spent he says so; when he is away, `report` is refused.
 - `items/iron_ore.rhai`: taking ore under the warden's eye can cost blood.
 - `items/bone_charm.rhai`: the charm, loot with no use until now, hums near

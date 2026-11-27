@@ -52,7 +52,8 @@ sell_markup = 1.0
 #
 # Hale pays the watch's bounty to whoever brings back the skeletal
 # warden's notched grave-blade while the ossuary is quiet
-# (scripts/rooms/square.rhai, `report`). Three bounties a day.
+# (scripts/rooms/square.rhai, `report`). He keeps the blade, so each
+# blade pays once, and he pays once for each death. Three bounties a day.
 [rewards.warden_bounty]
 currency = 60
 items = { healing_draught = 3 }

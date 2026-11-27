@@ -41,6 +41,8 @@ pub const EFFECT_TEXT_MAX: usize = 500;
 pub const MAX_EFFECTS_CEILING: u8 = 16;
 /// The longest fault message kept in the audit.
 pub const FAULT_MESSAGE_MAX: usize = 300;
+/// The most items one `use_up()` takes.
+pub const USE_UP_MAX: u32 = 16;
 
 /// The dice of a world: seeded in play, fixed in tests.
 ///
@@ -401,6 +403,15 @@ pub enum ScriptEffect {
         /// The items, by prototype.
         items: BTreeMap<ProtoId, u32>,
     },
+    /// Use up items of a prototype the actor carries: they leave the
+    /// world, as a drunk draught does. Never money, contents, merchandise
+    /// or a hidden item. Not ledgered: only making things is.
+    UseUp {
+        /// The prototype.
+        proto: ProtoId,
+        /// How many, 1 to [`USE_UP_MAX`].
+        count: u32,
+    },
 }
 
 impl ScriptEffect {
@@ -412,7 +423,9 @@ impl ScriptEffect {
             Self::Refuse(_) => EffectClass::Refuse,
             Self::Heal(_) | Self::Hurt(_) => EffectClass::Body,
             Self::Reward { .. } => EffectClass::Mint,
-            Self::Unlock(_)
+            // use_up makes nothing, so it counts as state.
+            Self::UseUp { .. }
+            | Self::Unlock(_)
             | Self::Lock(_)
             | Self::SetFlag(..)
             | Self::ClearFlag(_)
@@ -452,6 +465,8 @@ impl ScriptEffect {
                 ask.extend(items.iter().map(|(p, n)| format!("{p} x{n}")));
                 format!("reward({pool}, {})", ask.join(", "))
             }
+            Self::UseUp { proto, count: 1 } => format!("use_up({proto})"),
+            Self::UseUp { proto, count } => format!("use_up({proto}, {count})"),
         }
     }
 }
@@ -749,6 +764,22 @@ mod tests {
             "reward(bounty, currency 20, healing_draught x1)"
         );
         assert_eq!(reward.class(), Mint);
+    }
+
+    #[test]
+    fn use_up_describes_its_count_and_counts_as_state() {
+        let one = ScriptEffect::UseUp {
+            proto: ProtoId::from("warden_blade"),
+            count: 1,
+        };
+        assert_eq!(one.describe(), "use_up(warden_blade)");
+        assert_eq!(one.class(), State);
+        let three = ScriptEffect::UseUp {
+            proto: ProtoId::from("iron_ore"),
+            count: 3,
+        };
+        assert_eq!(three.describe(), "use_up(iron_ore, 3)");
+        assert_eq!(three.class(), State);
     }
 
     fn class() -> impl Strategy<Value = EffectClass> {
