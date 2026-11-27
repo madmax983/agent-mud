@@ -966,6 +966,12 @@ pub struct CastDef {
     /// Minutes until a dead mob returns.
     #[serde(default)]
     pub respawn_minutes: Option<u32>,
+    /// Whether a respawned mob comes back with its starting gear
+    /// (`inventory`, wielding or wearing what `equip` names), made new.
+    /// Unset means yes. Only a mob with `respawn_minutes` may set it;
+    /// `false` keeps a one-off piece, such as a unique key, one-off.
+    #[serde(default)]
+    pub respawn_kit: Option<bool>,
     /// A soft post: the rooms it keeps. Nothing holds it there; away from
     /// it, its macro-tick cue says the way back.
     #[serde(default)]
@@ -985,6 +991,21 @@ pub struct CastDef {
     /// Its deterministic script.
     #[serde(default)]
     pub script: Vec<ScriptRule>,
+}
+
+impl CastDef {
+    /// Whether it is a mob that respawns.
+    #[must_use]
+    pub const fn respawns(&self) -> bool {
+        matches!(self.kind, EntityKind::Mob) && self.respawn_minutes.is_some()
+    }
+
+    /// Whether it gets its starting gear back when it respawns: a mob that
+    /// respawns, unless its entry sets `respawn_kit = false`.
+    #[must_use]
+    pub fn respawns_with_kit(&self) -> bool {
+        self.respawns() && self.respawn_kit.unwrap_or(true)
+    }
 }
 
 /// A soft post of a cast entry (`post = { rooms = [...] }`).
@@ -1318,6 +1339,11 @@ impl WorldPack {
             {
                 problems.push(format!("cast {id} keeps unknown shop {shop:?}"));
             }
+            if c.respawn_kit.is_some() && !c.respawns() {
+                problems.push(format!(
+                    "cast {id} sets respawn_kit, but only a mob with respawn_minutes respawns"
+                ));
+            }
             // `find_here` reads these words as the viewer, so an entity
             // answering to one could never be targeted by it.
             let words = c
@@ -1648,6 +1674,38 @@ traits = [{ name = "nope", control = 12 }]
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn respawn_kit_is_for_a_mob_that_respawns() {
+        let world = "[world]\nname = \"x\"\ntitle = \"x\"\nstart_room = \"a\"\nrespawn_room = \"a\"\n[[rooms]]\nid = \"a\"\ntitle = \"A\"\ndescription = \"a\"\n";
+        let economy = "[currency]\nname = \"gold\"\nshort = \"g\"\n";
+        let load = |cast: &str| {
+            WorldPack::from_sources(PackSources {
+                world,
+                skills: "",
+                items: "",
+                economy,
+                cast,
+            })
+        };
+        let bad = "[cast.bob]\nname = \"bob\"\nkind = \"npc\"\nroom = \"a\"\nrespawn_kit = true\n\
+                   [cast.ghoul]\nname = \"ghoul\"\nkind = \"mob\"\nroom = \"a\"\nrespawn_kit = false\n";
+        let err = load(bad).unwrap_err().to_string();
+        for id in ["bob", "ghoul"] {
+            assert!(
+                err.contains(&format!("cast {id} sets respawn_kit")),
+                "{err}"
+            );
+        }
+        let good = "[cast.rat]\nname = \"rat\"\nkind = \"mob\"\nroom = \"a\"\nrespawn_minutes = 5\n\
+                    [cast.ghoul]\nname = \"ghoul\"\nkind = \"mob\"\nroom = \"a\"\nrespawn_minutes = 5\nrespawn_kit = false\n\
+                    [cast.bob]\nname = \"bob\"\nkind = \"npc\"\nroom = \"a\"\n";
+        let pack = load(good).unwrap();
+        let kit = |id: &str| pack.cast[&EntityId::from(id)].respawns_with_kit();
+        assert!(kit("rat"), "unset means yes");
+        assert!(!kit("ghoul"));
+        assert!(!kit("bob"), "an NPC does not respawn as a mob does");
     }
 
     #[test]

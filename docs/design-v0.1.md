@@ -162,7 +162,9 @@ unconscious entity comes to above 0 HP, or on a successful come-to roll
 (crypt-v01: HT) each step while above −HP, and the room sees it stir.
 Death (pack `[death]`): the dead wake at the respawn room with a share of
 their HP (crypt-v01: a third) and drop their purse where they fell; mobs
-respawn on their own timer. Leaving a fight (ADR 0013, pack `[combat]`):
+respawn on their own timer, with the kit their cast entry lists made new
+and ledgered, while the old kit stays where it fell as loot (ADR 0012,
+`[cast.x] respawn_kit`, unset means yes). Leaving a fight (ADR 0013, pack `[combat]`):
 with a hostile in the room every way out needs `flee` (DX; each hostile
 strikes on a failure), except that with `retreat_free` (crypt-v01) the
 way you came in is a normal walk; a bare `flee` runs back the way you

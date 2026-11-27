@@ -246,7 +246,8 @@ pub enum StateChange {
         /// The event.
         seq: Seq,
     },
-    /// A script's reward was minted from a pack pool and recorded in the
+    /// A script's reward from a pack pool, or a respawned mob's kit
+    /// ([`crate::rewards::RESPAWN_POOL`]), was minted and recorded in the
     /// ledger. The money and the new items also appear as `currency` and
     /// `item` changes (an item from nowhere).
     Minted {
@@ -390,9 +391,11 @@ pub enum Audit {
         /// When.
         at_ms: u64,
     },
-    /// A world hook's reward was minted and recorded in the ledger.
+    /// A world hook's reward, or a respawned mob's kit
+    /// ([`crate::rewards::RESPAWN_POOL`]), was minted and recorded in the
+    /// ledger.
     Minted {
-        /// The hook key.
+        /// The hook key, or `respawn` for a respawned mob's kit.
         hook: String,
         /// Who received it.
         entity: EntityId,
@@ -1441,9 +1444,9 @@ impl World {
         }
     }
 
-    /// Advances world time: respawns mobs, and runs a recovery step for
-    /// every entity in the world each `[recovery] every_secs` (a minute
-    /// by default).
+    /// Advances world time: respawns mobs, each with its kit made new
+    /// (`respawn_kit`), and runs a recovery step for every entity in the
+    /// world each `[recovery] every_secs` (a minute by default).
     pub fn tick(&mut self, now: u64) -> TickOutcome {
         let mut ctx = Ctx {
             now,
@@ -1470,7 +1473,8 @@ impl World {
                     format!("A {name} crawls out of the dark."),
                 )
                 .actor(&id, crate::event::VERB_RESPAWN);
-                self.emit(&mut ctx, spec);
+                let seq = self.emit(&mut ctx, spec);
+                self.restore_kit(&mut ctx, &id, seq);
             }
         }
         if now.saturating_sub(self.state.last_regen_ms) >= self.pack.recovery.every_ms() {
@@ -1542,3 +1546,6 @@ mod shops_tests;
 
 #[cfg(test)]
 mod retreat_tests;
+
+#[cfg(test)]
+mod respawn_tests;

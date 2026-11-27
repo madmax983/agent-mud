@@ -8,7 +8,9 @@
 //! ledger: a [`MintRecord`] the store appends to its `mints` table with
 //! the command's events, while the snapshot keeps only bounded counts
 //! (`WorldState.pool_spent` and the per-pool [`MintTotals`]). Money and
-//! items are conserved except for ledgered mints.
+//! items are conserved except for ledgered mints. The engine itself
+//! mints into the same ledger in one place: the kit of a respawned mob
+//! ([`RESPAWN_POOL`]).
 //!
 //! Three kernels here are mirrored in `formal/verus/src/rewards.rs`:
 //! [`pool_period`], [`pool_roll`] and [`pool_admit`].
@@ -27,6 +29,13 @@ pub const POOL_ITEMS_MAX: u32 = 1_000;
 pub const REWARD_ITEMS_MAX: u32 = 16;
 /// The longest pool id.
 pub const POOL_ID_MAX: usize = 32;
+/// The ledger's pool for the gear a respawned mob gets back.
+///
+/// It serves `[cast.x] respawn_kit` (ADR 0012). The engine owns it: `@`
+/// is not in a pool id, so no pack can declare it. It has no budget and
+/// no period. Each death of a mob pays for one kit at most, and the mob's
+/// respawn timer bounds how often it dies.
+pub const RESPAWN_POOL: &str = "@respawn";
 
 // mirror-begin pool_period
 /// One day of the game clock, in milliseconds.
@@ -323,7 +332,8 @@ pub struct MintedItem {
 }
 
 /// One mint, as the ledger keeps it. Every item and every coin a script
-/// ever made is in exactly one of these.
+/// ever made, and every piece of a respawned mob's kit, is in exactly one
+/// of these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MintRecord {
     /// The event that announced it.

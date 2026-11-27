@@ -8,10 +8,11 @@ use mud_rules::{
 };
 use serde_json::{Value, json};
 
-use super::{Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
+use super::{Audit, Ctx, Done, Emit, ErrorCode, Fail, StateChange, World};
 use crate::event::{EventKind, VERB_COLLAPSE, VERB_DIE, VERB_RESPAWN, VERB_STAGGER};
-use crate::ids::{EntityId, RoomId, SkillId};
+use crate::ids::{EntityId, PoolId, ProtoId, RoomId, Seq, SkillId};
 use crate::pack::{Direction, EntityKind, Slot, WeaponDamage};
+use crate::rewards::{MintRecord, MintedItem, RESPAWN_POOL};
 use crate::state::{Entity, Holder};
 
 /// How long an attack counts as provocation for `no_first_strike`, in ms.
@@ -278,6 +279,116 @@ impl World {
         )
         .actor(victim, VERB_RESPAWN);
         self.emit(ctx, spec);
+    }
+
+    /// Gives a respawned mob back the starting gear of its cast entry
+    /// (`inventory`), made new from the pack, and wields or wears what its
+    /// `equip` names in a free slot. It makes only the pieces the mob no
+    /// longer carries: a hidden natural weapon never fell. An item that
+    /// holds money is never made. The gear the mob dropped when it died
+    /// stays where it fell, as loot. The kit is one ledgered mint from the
+    /// engine's own pool ([`RESPAWN_POOL`]), announced by the respawn line
+    /// `seq`, so items stay conserved except for ledgered mints. A mob
+    /// whose entry sets `respawn_kit = false` gets nothing back.
+    ///
+    /// The caller has just respawned the mob, so the saved entity decides
+    /// whether it respawns (`respawn_minutes`, which reconcile keeps in
+    /// line with the pack). Only the switch comes from the entry here, so
+    /// a mob that comes back always comes back with its kit.
+    pub(super) fn restore_kit(&mut self, ctx: &mut Ctx, id: &EntityId, seq: Seq) {
+        let pack = Arc::clone(&self.pack);
+        let Some(def) = pack.cast.get(id).filter(|d| d.respawn_kit != Some(false)) else {
+            return;
+        };
+        let Some(e) = self.state.entities.get(id) else {
+            return;
+        };
+        let mut held: Vec<&ProtoId> = e
+            .inventory
+            .iter()
+            .filter_map(|i| self.state.items.get(i))
+            .filter(|i| !i.stock)
+            .map(|i| &i.proto)
+            .collect();
+        let mut missing = Vec::new();
+        for p in &def.inventory {
+            if let Some(pos) = held.iter().position(|h| *h == p) {
+                held.remove(pos);
+            } else if pack.items.get(p).is_some_and(|d| d.currency.is_none()) {
+                missing.push(p.clone());
+            }
+        }
+        let to = Holder::Entity { entity: id.clone() };
+        let mut made = Vec::new();
+        for proto in missing {
+            let item = self.state.new_item(&proto, &pack);
+            self.state.attach(item, &to);
+            ctx.changes.push(StateChange::Item {
+                item,
+                proto: proto.clone(),
+                from: None,
+                to: Some(to.clone()),
+            });
+            made.push(MintedItem { id: item, proto });
+        }
+        for p in &def.equip {
+            let Some(slot) = pack.items.get(p).and_then(|d| d.slot) else {
+                continue;
+            };
+            let Some(e) = self.state.entities.get(id) else {
+                return;
+            };
+            if e.equipped.contains_key(&slot) {
+                continue;
+            }
+            let spare = e.inventory.iter().copied().find(|i| {
+                !e.equipped.values().any(|q| q == i)
+                    && self
+                        .state
+                        .items
+                        .get(i)
+                        .is_some_and(|it| &it.proto == p && !it.stock)
+            });
+            if let (Some(item), Some(e)) = (spare, self.state.entities.get_mut(id)) {
+                e.equipped.insert(slot, item);
+                ctx.changes.push(StateChange::Equipped {
+                    entity: id.clone(),
+                    slot,
+                    item: Some(item),
+                });
+            }
+        }
+        if made.is_empty() {
+            return;
+        }
+        let pool = PoolId::from(RESPAWN_POOL);
+        ctx.changes.push(StateChange::Minted {
+            pool: pool.clone(),
+            entity: id.clone(),
+            currency: 0,
+            items: made.iter().map(|i| i.id).collect(),
+        });
+        self.audit.push(Audit::Minted {
+            hook: VERB_RESPAWN.to_owned(),
+            entity: id.clone(),
+            pool: pool.clone(),
+            currency: 0,
+            items: made.iter().map(|i| i.proto.clone()).collect(),
+            at_ms: ctx.now,
+        });
+        let record = MintRecord {
+            seq,
+            pool: pool.clone(),
+            period: 0,
+            hook: VERB_RESPAWN.to_owned(),
+            entity: id.clone(),
+            currency: 0,
+            items: made,
+            at_ms: ctx.now,
+        };
+        let totals = self.state.minted.entry(pool).or_default();
+        *totals = totals.with(&record);
+        self.mints.push(record);
     }
 
     /// Moves everything `victim` carries in its purse into one purse item
