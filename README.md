@@ -310,8 +310,9 @@ commit is littleguy #124. Since #122, `overlay_activate` refuses a move
 from a pointer that moved since the Steward read it; #124 names the head
 of each move in `overlay_active`, so a person who rolls an agent's
 overlay back and activates it again between two Steward passes pauses
-refine as any other veto does. An lg at #122 runs too, with only the
-version checked between passes.
+refine as any other veto does. An lg at #122 runs too: its answer names
+no head, so the Steward takes the head that the guard of its move
+implies, and checks heads between passes as with #124.
 
 Each agent's daemon takes notes, keeps goals and ideas, researches them on
 its heartbeat, and compacts a long op (the `[littleguy]` keys in
