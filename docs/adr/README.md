@@ -21,5 +21,6 @@ number, and the number is assigned when the ADR merges.
 | [0014](0014-a-wake-ends-when-its-mind-does.md) | A wake ends when its mind does, and owes only what it did not read |
 | [0015](0015-the-supervisor-is-every-daemons-owner.md) | The supervisor is every daemon's owner: the Steward decides goals with guards and a council, and owns refine overlays with a baseline and the human veto |
 | [0016](0016-council-approved-guardrails-text.md) | Exception: council-approved model text in an agent's guardrails (`refine = "free"`), bounded, guarded and vetoable |
+| [0017](0017-using-an-item-in-a-fight-costs-a-turn.md) | Using an item in a fight costs a turn (`[combat] use_draws_strike`, `foe_memory_minutes`) |
 
 Planned work that these decisions shape is in [the roadmap](../roadmap.md).

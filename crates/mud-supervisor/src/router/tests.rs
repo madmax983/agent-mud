@@ -1244,6 +1244,8 @@ fn bystanders_notice_someone_stir_and_a_heal_on_an_agent_wakes_it() {
     torin.room = RoomId::from("rusty_flagon_taproom");
     torin.pools.hp = 0;
     torin.unconscious = true;
+    // Marta is hurt, so the bandage has something to heal.
+    snap.entities.get_mut(&id("marta")).unwrap().pools.hp -= 3;
     let bandage = snap.new_item(&mud_world::ProtoId::from("bandage"), w.pack());
     snap.attach(
         bandage,

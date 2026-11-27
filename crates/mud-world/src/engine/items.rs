@@ -655,9 +655,11 @@ impl World {
         let carried = me.inventory.contains(&item);
         // A key opens a lock on an exit or a container.
         if let Some(lock_id) = &def.key {
-            return self.use_key(ctx, actor, lock_id, on);
+            let done = self.use_key(ctx, actor, lock_id, on);
+            return self.use_turn(ctx, actor, &me.room, done);
         }
-        // A container shows what it holds.
+        // A container shows what it holds. It is a look, so it takes no
+        // turn in a fight.
         if def.container {
             let it = &self.state.items[&item];
             if it.locked {
@@ -708,41 +710,68 @@ impl World {
         }
         // Money sealed in an item.
         if let Some(n) = sealed {
-            self.destroy_item(ctx, item);
-            self.change_currency(ctx, actor, n);
-            let cur = self.pack.economy.currency.short.clone();
-            let spec = Emit::new(
-                EventKind::Gear,
-                Some(me.room.clone()),
-                format!(
-                    "{} empties the {} into a palm. Coins clink.",
-                    me.name, def.name
-                ),
-            )
-            .actor(actor, "use")
-            .tags(["coin".to_owned(), "loot".to_owned()])
-            .data(json!({ "amount": n }));
-            self.emit(ctx, spec);
-            return Ok((
-                format!("You empty the {} and find {n}{cur}.", def.name),
-                json!({ "amount": n }),
-            ));
+            let done = self.empty_purse(ctx, &me, item, &def, n);
+            return self.use_turn(ctx, actor, &me.room, Ok(done));
         }
         // Healing.
         if let Some(dice) = def.heal_dice() {
-            return self.heal_with(ctx, &me, item, &def, dice, on);
+            let target = match on {
+                None => actor.clone(),
+                Some(w) => self.find_here(actor, w).ok_or_else(|| {
+                    Fail::new(ErrorCode::NoSuchTarget, format!("you see no {w:?} here"))
+                })?,
+            };
+            let done = self.heal_with(ctx, &me, item, &def, dice, &target);
+            let (text, mut v) = self.use_turn(ctx, actor, &me.room, done)?;
+            // The turn may wound the one healed: `hp` is its HP after it.
+            if let (Some(t), Some(o)) = (self.state.entities.get(&target), v.as_object_mut()) {
+                o.insert("hp".to_owned(), json!(t.pools.hp));
+            }
+            return Ok((text, v));
         }
+        // Gear: `use` is `equip`, and follows its rule.
         if def.slot.is_some() {
             return self.equip(ctx, actor, word);
         }
         // A world script may give an item with no engine use one.
         if let Some(done) = self.use_hook(ctx, actor, item, on) {
-            return done;
+            return self.use_turn(ctx, actor, &me.room, done);
         }
         Err(Fail::new(
             ErrorCode::CannotUse,
             format!("you cannot think of a use for the {}", def.name),
         ))
+    }
+
+    /// Empties an item that holds `n` coins into `me`'s purse.
+    fn empty_purse(
+        &mut self,
+        ctx: &mut Ctx,
+        me: &crate::state::Entity,
+        item: ItemId,
+        def: &crate::pack::ItemDef,
+        n: i64,
+    ) -> (String, Value) {
+        let actor = &me.id;
+        self.destroy_item(ctx, item);
+        self.change_currency(ctx, actor, n);
+        let cur = self.pack.economy.currency.short.clone();
+        let spec = Emit::new(
+            EventKind::Gear,
+            Some(me.room.clone()),
+            format!(
+                "{} empties the {} into a palm. Coins clink.",
+                me.name, def.name
+            ),
+        )
+        .actor(actor, "use")
+        .tags(["coin".to_owned(), "loot".to_owned()])
+        .data(json!({ "amount": n }));
+        self.emit(ctx, spec);
+        (
+            format!("You empty the {} and find {n}{cur}.", def.name),
+            json!({ "amount": n }),
+        )
     }
 
     fn heal_with(
@@ -752,15 +781,26 @@ impl World {
         item: ItemId,
         def: &crate::pack::ItemDef,
         dice: mud_rules::DamageDice,
-        on: Option<&str>,
+        target: &EntityId,
     ) -> Done {
         let actor = &me.id;
-        let target = match on {
-            None => actor.clone(),
-            Some(w) => self.find_here(actor, w).ok_or_else(|| {
-                Fail::new(ErrorCode::NoSuchTarget, format!("you see no {w:?} here"))
-            })?,
-        };
+        // A heal on someone unhurt would waste the item and, in a fight,
+        // the turn. It is refused before it rolls, so it costs nothing.
+        if let Some(t) = self.state.entities.get(target)
+            && t.pools.hp >= t.pools.hp_max
+            && !t.unconscious
+        {
+            let who = if target == actor {
+                "you are".to_owned()
+            } else {
+                format!("{} is", t.name)
+            };
+            return Err(Fail::new(
+                ErrorCode::CannotUse,
+                format!("{who} not hurt; the {} would be wasted", def.name),
+            ));
+        }
+        let target = target.clone();
         let mut amount = dice
             .roll(&mut self.dice, mud_rules::DamageType::Crushing)
             .max(0);

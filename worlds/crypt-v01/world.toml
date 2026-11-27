@@ -25,8 +25,22 @@ purse_item = "dropped_purse"
 # Leaving a fight: with a hostile in the room, walking back out the way
 # you came in is a normal move, with no flee roll and no strike. Any other
 # way needs `flee`. The strike on entering a lair stays.
+#
+# A turn in a fight: with a hostile in the room, a `use` that acts (a
+# bandage, a draught, a purse, a key, a scripted use) takes your turn, as
+# `attack` and `defend` do. The item works first, then each hostile that
+# can act strikes you once. Looking into a container and putting on gear
+# stay free. Unset means false: `use` is free (ADR 0017).
+#
+# A hostile remembers a body it fought (one it struck, or one that struck
+# it) for this many minutes. A remembered body that walks back in hidden
+# is seen, and each hostile there strikes it once, so walking out to heal
+# and slipping back in hidden still costs the strike on entering. Unset:
+# hiding always slips past that strike (ADR 0017).
 [combat]
 retreat_free = true
+use_draws_strike = true
+foe_memory_minutes = 5
 
 # ------------------------------------------------------------------ town
 [[rooms]]

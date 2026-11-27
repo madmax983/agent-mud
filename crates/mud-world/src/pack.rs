@@ -351,11 +351,12 @@ impl DeathRules {
     }
 }
 
-/// `[combat]` in `world.toml`: how a fight lets go of you.
+/// `[combat]` in `world.toml`: how a fight lets go of you, and what takes
+/// a turn in one.
 ///
 /// A pack without the table keeps the strict rule: with a hostile in the
-/// room, every way out needs `flee`. A key the table does not know fails
-/// the pack, as for `[recovery]`.
+/// room, every way out needs `flee`, and `use` is free. A key the table
+/// does not know fails the pack, as for `[recovery]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CombatRules {
@@ -365,14 +366,30 @@ pub struct CombatRules {
     /// stays.
     #[serde(default)]
     pub retreat_free: bool,
+    /// Whether a `use` that acts takes the user's turn in a fight: each
+    /// hostile in the room that can act strikes the user once after the
+    /// item works, as after `attack` or `defend`. A heal, a purse, a key
+    /// and a scripted use act. Looking into a container and putting gear
+    /// on (`use` on a worn item is `equip`) do not. Unset means false, so
+    /// a pack that does not say keeps a free `use`.
+    #[serde(default)]
+    pub use_draws_strike: bool,
+    /// Minutes a hostile remembers a body it fought: one it struck, or one
+    /// that struck it. A remembered body that walks into its room hidden is
+    /// seen. It enters as if it were not hidden, and each hostile there
+    /// strikes it once. So a retreat to heal and a hidden return still
+    /// cost the strike on entering. Unset: hiding always slips past the
+    /// strike on entering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foe_memory_minutes: Option<u32>,
 }
 
 impl CombatRules {
-    /// How to leave a fight, in two sentences, as `help` and an agent's
-    /// system prompt say it.
+    /// How to leave a fight, and what using an item in one costs, in a few
+    /// sentences, as `help` and an agent's system prompt say it.
     #[must_use]
-    pub const fn rule(&self) -> &'static str {
-        if self.retreat_free {
+    pub fn rule(&self) -> String {
+        let leave = if self.retreat_free {
             "With a hostile in the room, you may walk back out the way you came in; any other \
              way needs flee, a DX check, and each hostile strikes you if it fails. A bare flee \
              runs back the way you came when no hostile waits there, else to a room with no \
@@ -381,7 +398,23 @@ impl CombatRules {
             "With a hostile in the room, every way out needs flee, a DX check, and each hostile \
              strikes you if it fails. A bare flee runs back the way you came when no hostile \
              waits there, else to a room with no hostile in it."
+        };
+        let mut rule = leave.to_owned();
+        if self.use_draws_strike {
+            rule.push_str(
+                " With a hostile in the room, use takes your turn as attack and defend do: the \
+                 item works, then each hostile strikes you once. Looking into a container or \
+                 putting on gear stays free.",
+            );
         }
+        if let Some(minutes) = self.foe_memory_minutes {
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            rule = format!(
+                "{rule} Hiding does not shake a hostile you fought in the last {minutes} \
+                 {unit}: walk back in hidden and it sees you and strikes."
+            );
+        }
+        rule
     }
 }
 

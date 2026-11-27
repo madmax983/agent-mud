@@ -1125,6 +1125,109 @@ fn on_use_runs_only_for_carried_items_without_an_engine_use() {
     assert_eq!(h.calls(), 1);
 }
 
+/// With `[combat] use_draws_strike` (crypt-v01), a scripted use beside
+/// the rat takes Ada's turn, after the script's text. A refused one does
+/// not.
+#[test]
+fn a_scripted_use_beside_a_hostile_takes_a_turn_and_a_refused_one_does_not() {
+    let combat = |w: &World, r: &CommandResult| {
+        w.logged()
+            .filter(|e| r.events.contains(&e.seq))
+            .filter(|e| e.kind == crate::event::EventKind::Combat)
+            .count()
+    };
+    for (fx, struck) in [
+        (ScriptEffect::Msg("It hums.".into()), 1),
+        (ScriptEffect::Refuse("Not here.".into()), 0),
+    ] {
+        let h = Arc::new(FakeHooks::new(
+            vec![HookId::Use(ProtoId::from("bone_charm"))],
+            effects(vec![fx]),
+        ));
+        let mut w = world_with(&h);
+        let ada = w.login("ada", 1).unwrap();
+        w.state.entities.get_mut(&ada).unwrap().room = RoomId::from("wine_vault");
+        let pack = Arc::clone(&w.pack);
+        let charm = w.state.new_item(&ProtoId::from("bone_charm"), &pack);
+        w.state.attach(
+            charm,
+            &Holder::Entity {
+                entity: ada.clone(),
+            },
+        );
+        w.fix_dice([6, 6, 6]);
+        let r = run(&mut w, &ada, "use charm");
+        assert_eq!(h.calls(), 1);
+        assert_eq!(combat(&w, &r), struck, "{r:?}");
+        if struck == 1 {
+            assert!(r.narrative.starts_with("It hums.\n"), "{}", r.narrative);
+            assert_eq!(r.resolution["script"], "items.bone_charm.on_use");
+            assert_eq!(r.resolution["attacks"].as_array().map(Vec::len), Some(1));
+        } else {
+            assert_eq!(r.error_code, Some(ErrorCode::Refused));
+        }
+    }
+}
+
+/// A scripted use that kills its user ends the turn there. The user wakes
+/// at the respawn point, and no hostile there strikes the body that just
+/// woke. The narrative is the same with `use_draws_strike` on and off.
+#[test]
+fn a_scripted_use_that_kills_its_user_draws_no_round_where_it_wakes() {
+    let mut narratives = Vec::new();
+    for draws in [true, false] {
+        let h = Arc::new(FakeHooks::new(
+            vec![HookId::Use(ProtoId::from("bone_charm"))],
+            effects(vec![
+                ScriptEffect::Msg("The charm bites back.".into()),
+                ScriptEffect::Hurt(DamageDice::new(6, 0)),
+            ]),
+        ));
+        let mut pack = WorldPack::crypt_v01().unwrap();
+        pack.combat.use_draws_strike = draws;
+        let mut w = World::new(Arc::new(pack), 42);
+        w.set_hooks(
+            Some(Arc::clone(&h) as Arc<dyn WorldHooks>),
+            1,
+            HooksChange::Start,
+        );
+        let ada = w.login("ada", 1).unwrap();
+        w.state.entities.get_mut(&ada).unwrap().room = RoomId::from("wine_vault");
+        w.state.entities.get_mut(&ada).unwrap().pools.hp = 1;
+        // A hostile waits at the respawn point.
+        w.state.entities.get_mut(&id("giant_rat_2")).unwrap().room = RoomId::from("town_square");
+        let pack = Arc::clone(&w.pack);
+        let charm = w.state.new_item(&ProtoId::from("bone_charm"), &pack);
+        w.state.attach(
+            charm,
+            &Holder::Entity {
+                entity: ada.clone(),
+            },
+        );
+        w.fix_dice([6; 40]);
+        let r = run(&mut w, &ada, "use charm");
+        assert!(r.ok, "{r:?}");
+        assert_eq!(
+            w.entity(&ada).unwrap().room,
+            RoomId::from("town_square"),
+            "she died and woke at the respawn point"
+        );
+        let strikes = w
+            .logged()
+            .filter(|e| r.events.contains(&e.seq))
+            .filter(|e| {
+                e.kind == crate::event::EventKind::Combat && e.verb.as_deref() == Some("attack")
+            })
+            .count();
+        assert_eq!(strikes, 0, "draws {draws}: {r:?}");
+        if draws {
+            assert_eq!(r.resolution["attacks"], serde_json::json!([]));
+        }
+        narratives.push(r.narrative);
+    }
+    assert_eq!(narratives[0], narratives[1]);
+}
+
 #[test]
 fn use_on_passes_a_resolved_target_and_refuses_an_unknown_one() {
     let h = Arc::new(FakeHooks::new(
