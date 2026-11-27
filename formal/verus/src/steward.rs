@@ -26,9 +26,9 @@
 //! - `head_verdict` (lg #124): the pointer check with heads. The Steward's
 //!   own version at its own head is `Same` (`lemma_an_unmoved_head_is_same`);
 //!   at another head, with both heads known, it is a human's move away and
-//!   back (`lemma_a_move_away_and_back_is_human`), unless it is the one
-//!   move of a late activate of that version; with a head unknown on
-//!   either side, or another version, it is exactly `pointer_verdict`
+//!   back, late list or not (`lemma_a_move_away_and_back_is_human`): lg
+//!   logs no move to the active version. With a head unknown on either
+//!   side, or another version, it is exactly `pointer_verdict`
 //!   (`lemma_an_unknown_head_is_the_version_check`,
 //!   `lemma_another_version_is_the_version_check`). `head_went_back`
 //!   says a reset store: lg names a head below the Steward's own, or none;
@@ -440,11 +440,7 @@ pub open spec fn spec_head_verdict(
     lg_is_late: bool,
 ) -> PointerVerdict {
     if lg == expected && spec_head_moved(lg_head, lg_named, own_head) {
-        if lg is Some && lg_is_late && spec_one_move(own_head, lg_head) {
-            PointerVerdict::OwnLate
-        } else {
-            PointerVerdict::Human
-        }
+        PointerVerdict::Human
     } else {
         spec_pointer_verdict(lg, expected, lg_is_late)
     }
@@ -458,9 +454,10 @@ pub open spec fn spec_head_verdict(
 /// `lg_named` says lg named a head now, and `own_head` is `None` while the
 /// Steward knows no head of its own. With both known, the same version at
 /// another head is a move since the Steward's own and back to it: a
-/// human's, unless it is the one move of a late activate of that version
-/// ([`one_move`] from `own_head`). Every other case is the version check
-/// of [`pointer_verdict`], as before #124.
+/// human's, late list or not. lg logs no move to the active version, so no
+/// late activate of the Steward's ends on its own version at a new head.
+/// Every other case is the version check of [`pointer_verdict`], as before
+/// #124.
 #[must_use]
 pub const fn head_verdict(
     lg: Option<u64>,
@@ -475,7 +472,7 @@ pub const fn head_verdict(
         !lg_named || own_head is None ==> r == spec_pointer_verdict(lg, expected, lg_is_late),
         lg != expected ==> r == spec_pointer_verdict(lg, expected, lg_is_late),
         (r is Same) ==> lg == expected && !spec_head_moved(lg_head, lg_named, own_head),
-        (r is OwnLate) ==> lg_is_late && lg is Some,
+        (r is OwnLate) ==> lg_is_late && lg is Some && lg != expected,
 {
     let same_version = match (lg, expected) {
         (None, None) => true,
@@ -492,15 +489,7 @@ pub const fn head_verdict(
         false
     };
     if same_version && moved {
-        let own_late = match lg {
-            Some(_) => lg_is_late && one_move(own_head, lg_head),
-            None => false,
-        };
-        if own_late {
-            PointerVerdict::OwnLate
-        } else {
-            PointerVerdict::Human
-        }
+        PointerVerdict::Human
     } else {
         pointer_verdict(lg, expected, lg_is_late)
     }
@@ -515,8 +504,8 @@ pub proof fn lemma_an_unmoved_head_is_same(v: Option<u64>, h: u64, lg_is_late: b
 }
 
 /// The Steward's own version at another head, with both heads known, is a
-/// human's move away and back, unless it is the one move of a late
-/// activate of that version.
+/// human's move away and back, late list or not: lg logs no move to the
+/// active version, so no late move of the Steward's explains it.
 pub proof fn lemma_a_move_away_and_back_is_human(
     v: Option<u64>,
     lg_head: Option<u64>,
@@ -525,7 +514,6 @@ pub proof fn lemma_a_move_away_and_back_is_human(
 )
     requires
         lg_head != Some(own),
-        !(lg_is_late && spec_one_move(Some(own), lg_head)),
     ensures
         spec_head_verdict(v, lg_head, true, v, Some(own), lg_is_late) is Human,
 {

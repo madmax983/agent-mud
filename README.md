@@ -22,10 +22,10 @@ The MUD needs littleguy at commit
 pins (`.github/workflows/ci.yml`) and the MUD is tested against. It is
 littleguy #124, whose `overlay_active` names the head of each move, so
 the Steward sees a person move an agent's overlay away and back between
-two of its passes. An lg at littleguy #122 still works: the Steward then
-checks that pointer by version alone, as before #124, and says so once
-per daemon start (`no_head old_lg`). Build it with the features the MUD
-uses:
+two of its passes. An lg at littleguy #122 still works: its answer names
+no head, so the Steward takes the head that the guard of its move
+implies, and says so once per daemon start (`no_head old_lg`). Build it
+with the features the MUD uses:
 
 ```sh
 git clone https://github.com/autumn-foundation/littleguy

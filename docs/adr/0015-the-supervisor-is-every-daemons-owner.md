@@ -422,7 +422,13 @@ steady-state pass was not.
 - **The row stores the head of its own move** (`pointer_head`, next to
   `pointer`, with a serde default so an older row loads with it unknown).
   It is set from the `head` of each guarded `overlay_active` the Steward
-  gets (the baseline, a Clear, a text, an undo, a restore), from the read
+  gets (the baseline, a Clear, a text, an undo, a restore). When that
+  answer names no head (lg #122, or lg #124 when another process moved
+  right after the swap or the read after it failed), the guard implies
+  it: lg checked the read pointer in its swap, so the move was the first
+  after the read, one past its head (1 after none; the read head itself
+  for a move to the active version, which logs nothing). It is also set
+  from the read
   head of a lost guarded move to `{}` that `lost_verdict` takes as applied
   (one move past the guard, so the head is that move's), and from the
   pointer the Steward adopts after a human's move. A store reset forgets
@@ -434,10 +440,10 @@ steady-state pass was not.
   pauses (`moved away_and_back`, then `paused rolled_back`), the pointer
   is never moved, the text the person returned to stays theirs and is not
   vetoed, and each late text sent from the Steward's pointer, which may
-  have run and been rolled back, is vetoed. The exception is the one move
-  of a late activate of that very version (one move past its guard and
-  the Steward's head, the late-list rule): it is the Steward's own, and
-  nothing is undone. The same version at the same head is `Same`. A head
+  have run and been rolled back, is vetoed. This holds with a late
+  activate of that very version on the list too: lg logs no move to the
+  active version, so no late move of the Steward's ends there at a new
+  head. The same version at the same head is `Same`. A head
   unknown on either side, or another version, is exactly
   `pointer_verdict`, the version check of before #124; proved
   (`lemma_an_unmoved_head_is_same`, `lemma_a_move_away_and_back_is_human`,
@@ -446,18 +452,24 @@ steady-state pass was not.
 - **A head that went down or vanished** while lg names one is a reset
   store (the proved `head_went_back`; the head only rises in one store),
   even when the versions and authors match: the existing reset path runs.
+- **A restore checks the head too.** The undo of a late activate, and of
+  a lost text that lg shows applied, re-reads the pointer right before
+  its activate and needs it exactly as the pointer check judged it. The
+  same version at another head is a person's move away and back since,
+  their later choice of that version: it stands, nothing moves, and
+  refine pauses (`unconfirmed`).
 - **Adoption.** When the row knows no head of its own (a row from before
-  #124, an answer without a head, an unguarded or lost answer), a pass
+  #124, an unguarded or lost answer, a store reset), a pass
   whose read agrees with the pointer takes the read head as its own. That
   read races a person: a move away and back after the Steward's move and
   before that read is taken as the Steward's own. This is exactly what
   every pass did before #124, so adoption loses nothing; it misses only a
   move away and back before the first read that names a head, and sees
-  every move after it. The answer's own head has no such race, which is
-  why #124 puts it in the answer.
+  every move after it. A guarded move has no such race: its head is the
+  answer's or the one its guard implies, never a later move's.
 - **An older lg.** An lg at #122 answers a guarded activate without a
   head: the Steward logs and publishes `no_head old_lg` once per daemon
-  start and adopts the head from the next agreeing read. An lg before
+  start and takes the head its guard implies. An lg before
   #122 names no head anywhere: the check is by version alone, as before,
   and nothing is adopted. #124 adds no part to `lg.toml`, so
   `compat::Optional` is unchanged.
@@ -470,11 +482,14 @@ Tests: `a_move_away_and_back_between_passes_is_a_human_veto`,
 `a_move_away_and_back_between_the_pass_read_and_the_activate_read_is_seen`,
 `a_late_text_run_and_rolled_back_between_passes_is_vetoed`,
 `no_move_between_passes_is_the_same_pointer_and_refine_goes_on`,
-`an_answer_without_a_head_checks_by_version_until_a_read_gives_one`,
+`a_guarded_answer_without_a_head_keeps_the_head_its_guard_implies`,
+`a_guarded_undo_without_a_head_keeps_the_head_its_guard_implies`,
+`a_move_away_and_back_before_an_undo_s_read_is_never_undone`,
+`a_move_away_and_back_before_a_settled_restore_s_read_is_never_undone`,
 `an_older_lg_names_no_head_and_is_checked_by_version`,
 `an_older_row_adopts_the_head_of_the_first_agreeing_read`,
 `an_own_late_activate_one_move_past_its_guard_is_still_its_own`,
-`a_late_move_onto_the_version_the_steward_holds_is_its_own`,
+`a_late_activate_of_the_version_the_steward_holds_moves_nothing`,
 `a_head_below_the_steward_s_own_is_a_reset_store` and
 `a_reset_store_forgets_the_head` against the fake daemon; the wire test
 `an_activation_answer_reads_the_head_of_its_move`; the row test

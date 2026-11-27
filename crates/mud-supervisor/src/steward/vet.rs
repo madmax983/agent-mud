@@ -222,9 +222,10 @@ pub const fn one_move(before: Option<u64>, after: Option<u64>) -> bool {
 /// `lg_named` says lg named a head now, and `own_head` is `None` while the
 /// Steward knows no head of its own. With both known, the same version at
 /// another head is a move since the Steward's own and back to it: a
-/// human's, unless it is the one move of a late activate of that version
-/// ([`one_move`] from `own_head`). Every other case is the version check
-/// of [`pointer_verdict`], as before #124.
+/// human's, late list or not. lg logs no move to the active version, so no
+/// late activate of the Steward's ends on its own version at a new head.
+/// Every other case is the version check of [`pointer_verdict`], as before
+/// #124.
 #[must_use]
 pub const fn head_verdict(
     lg: Option<u64>,
@@ -249,15 +250,7 @@ pub const fn head_verdict(
         false
     };
     if same_version && moved {
-        let own_late = match lg {
-            Some(_) => lg_is_late && one_move(own_head, lg_head),
-            None => false,
-        };
-        if own_late {
-            PointerVerdict::OwnLate
-        } else {
-            PointerVerdict::Human
-        }
+        PointerVerdict::Human
     } else {
         pointer_verdict(lg, expected, lg_is_late)
     }
@@ -1691,8 +1684,8 @@ mod tests {
         );
         assert_eq!(
             v(3, Some(3), Some(2), true),
-            PointerVerdict::OwnLate,
-            "one late move of this version"
+            PointerVerdict::Human,
+            "lg logs no move to the active version: no late move explains it"
         );
         assert_eq!(
             v(3, Some(9), None, false),
@@ -1860,13 +1853,7 @@ mod tests {
             }
             let moved = named && own_head.is_some() && lg_head != own_head;
             if lg == expected && moved {
-                let next = Some(own_head.map_or(1, |h| h + 1));
-                let own = late && lg.is_some() && lg_head == next;
-                prop_assert_eq!(
-                    v,
-                    if own { PointerVerdict::OwnLate } else { PointerVerdict::Human },
-                    "a move since the Steward's own"
-                );
+                prop_assert_eq!(v, PointerVerdict::Human, "a move since the Steward's own");
             }
         }
 

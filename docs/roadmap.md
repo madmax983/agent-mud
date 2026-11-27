@@ -70,8 +70,8 @@ lands.
   `overlay_active` reports. The Steward stores it as the head of its own
   move and compares it each pass, so a person who moves the pointer away
   and back between two passes is seen as a veto (ADR 0015, amended
-  2026-11-27). An lg at #122 still works, checked by version alone until
-  a read gives a head.
+  2026-11-27). An lg at #122 still works: its answer names no head, and
+  the Steward takes the head that the guard of its move implies.
 - **Open: the activation log on the socket (ask 14).** The head says that
   the pointer moved after a read, which settles a lost answer when lg
   shows the read pointer (not applied) or the read version with a new

@@ -78,7 +78,7 @@ key_env = "OPENROUTER_API_KEY"   # the variable that holds its key
 # later: the one CI pins and the MUD is tested against. It is littleguy
 # #124: `overlay_active` names the head of each move, so the Steward sees
 # a person move an overlay away and back between two passes. An lg at #122
-# still works; the Steward then checks the pointer by version alone.
+# still works; the Steward then takes the head its guarded move implies.
 # `bin = "lg"` runs the first lg on PATH, which may be an older build. An
 # older lg refuses what it does not know in its config, and its daemon
 # exits at start.

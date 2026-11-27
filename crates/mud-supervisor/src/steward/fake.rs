@@ -9,7 +9,8 @@
 //! Its overlay pointer is lg's of littleguy #124: `overlays` names the
 //! `head` (the number of the last move), an `overlay_activate` with
 //! `expected` moves only from that pointer, else it answers
-//! `overlay_moved`, and `overlay_active` names the head of its move. With
+//! `overlay_moved`, and `overlay_active` names the head of its move. A move
+//! to the active version logs nothing, as in lg, so the head stays. With
 //! [`FakeBuild::Guarded`] it is lg #122, whose `overlay_active` names no
 //! head. With [`FakeBuild::Old`] it is an lg before #122: no head,
 //! `expected` dropped, every move unchecked.
@@ -156,6 +157,9 @@ pub struct FakeState {
     pub drop_put: bool,
     /// One mode per `refine_propose`; then `kept`.
     pub propose_modes: VecDeque<ProposeMode>,
+    /// After this many more `overlays` reads, a person activates each of
+    /// these versions in turn.
+    pub after_reads: Option<(usize, Vec<u64>)>,
 }
 
 impl Default for FakeState {
@@ -176,6 +180,7 @@ impl Default for FakeState {
             build: FakeBuild::Head,
             drop_put: false,
             propose_modes: VecDeque::new(),
+            after_reads: None,
         }
     }
 }
@@ -230,12 +235,31 @@ impl FakeState {
         version
     }
 
-    /// Makes `version` active, as lg does; returns the version before.
+    /// Makes `version` active, as lg does; returns the version before. A
+    /// move to the active version logs nothing, as in lg: the head stays.
     pub fn activate(&mut self, version: u64) -> Option<u64> {
         let previous = self.active;
-        self.active = Some(version);
-        self.moves.push((previous, version));
+        if previous != Some(version) {
+            self.active = Some(version);
+            self.moves.push((previous, version));
+        }
         previous
+    }
+
+    /// Counts one `overlays` read. The read that `after_reads` waits for
+    /// is answered first, then its moves run, as a person's would.
+    fn count_read(&mut self) {
+        let Some((n, _)) = self.after_reads.as_mut() else {
+            return;
+        };
+        *n = n.saturating_sub(1);
+        if *n == 0
+            && let Some((_, moves)) = self.after_reads.take()
+        {
+            for v in moves {
+                self.activate(v);
+            }
+        }
     }
 
     /// Whether it answers as an lg before #122.
@@ -317,7 +341,11 @@ impl FakeState {
     fn overlay_answer(&mut self, kind: &str, v: &Value) -> (Option<Duration>, String) {
         let now = Some(Duration::ZERO);
         match kind {
-            "overlays" => (now, self.overlays().to_string()),
+            "overlays" => {
+                let listing = self.overlays().to_string();
+                self.count_read();
+                (now, listing)
+            }
             "overlay_show" => {
                 let version = v["version"].as_u64().unwrap_or_default();
                 let Some(found) = self.versions.iter().find(|x| x.version == version) else {
@@ -656,6 +684,12 @@ impl FakeDaemon {
     /// A human activates `version` on lg's refine tab.
     pub fn human_activate(&self, version: u64) {
         self.state.lock().unwrap().activate(version);
+    }
+
+    /// Once `n` more `overlays` reads are answered, a person activates
+    /// each of `moves` in turn.
+    pub fn after_reads(&self, n: usize, moves: &[u64]) {
+        self.state.lock().unwrap().after_reads = Some((n, moves.to_vec()));
     }
 
     /// A human (or an operator) stores an overlay.

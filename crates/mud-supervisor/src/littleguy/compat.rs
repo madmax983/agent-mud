@@ -26,9 +26,9 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 /// README and `mud.toml.example` name it; a test checks that all of them
 /// agree. It is littleguy #124: `overlay_active` names the head of its
 /// move, so the Steward sees a move away and back between two passes. An
-/// lg at #122 still serves the MUD, and the Steward checks the overlay
-/// pointer by version alone there. No part of `lg.toml` changed, so
-/// [`Optional`] did not.
+/// lg at #122 still serves the MUD: its answer names no head, and the
+/// Steward takes the head that the guard of its move implies. No part of
+/// `lg.toml` changed, so [`Optional`] did not.
 pub const LG_MIN_COMMIT: &str = "6678a9bce1567a0f0bbd4f1f3928f47101a09230";
 
 /// The README section that says how to build and install `lg`.
