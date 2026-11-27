@@ -229,6 +229,46 @@ and Hale, has a soft post: away from it, the macro-tick cue gives the way
 back. Torin wields a broadsword and wears a jerkin; every player starts
 with a lit torch.
 
+Balance: a test holds it (`crates/mud-world/src/engine/balance_tests.rs`).
+It plays seeded duels through `World::execute`. The targets, for a fresh
+world:
+
+- A fresh player beats one giant rat 70-80% of the time, wounded (half HP
+  or less) on 35-65% of the wins.
+- Both rats in one run with no heal: 35-50%. A bandage between them adds
+  5 points or more, a draught 10 or more, and a draught 2 more than a
+  bandage.
+- A fresh player beats the skeletal warden under 10% of the time alone.
+  With a shortsword and a leather jerkin, one, two and three players win
+  20-35%, 60-75% and 85% or more.
+- A broadsword (the template has broadsword-10) beats a shortsword by a
+  point or more at each party size.
+- A respawned warden fights the same as the first: it comes back at full
+  HP with a new blade (ADR 0012).
+- The warden's grave-blade is a poor weapon in a player's hand: the
+  starting dagger beats it by 10 points or more against a rat. Its value
+  is 0, so no keeper buys it, and farming the warden empties no purse.
+
+The fast test, `crypt_v01_holds_its_balance`, plays 400 seeds per row and
+checks wider bands, that each heal works, and the orderings with a
+smaller margin (the broadsword rows summed over the party sizes). The ignored `balance_table` test plays 2000 seeds per
+row, prints the full table and a `MISS` line for each target it misses;
+`BAL_PACK` points it at an edited copy of a pack.
+
+These targets hold for a world made under this pack. A saved world keeps
+the attrs and skills its cast and players had when it was saved:
+reconcile copies a cast entry's new starting gear and `respawn_minutes`
+into a saved world, but not its attrs or skills, and a player keeps the
+skills the template gave at creation. Item damage is read from the pack
+at each strike. So a world saved before the balance step keeps
+brawling-12 rats and a broadsword-12, HT-12 warden, and its players have
+no broadsword skill; there a fresh player beats one rat about 60% of the
+time, the no-heal run about 15%, three shortswords beat the warden about
+half the time, and three broadswords almost never. The "saved" rows of
+the balance test measure that world. To get the balance, start a fresh
+world (a new database). A later engine step may refresh cast stats at
+load.
+
 Since v0.2 the pack also ships Rhai world scripts (`scripts.toml`,
 `scripts/`): `pray` in the ossuary, `listen` in the alley and on the
 cellar stair, the fence's curtain, the warden's blade over the ore, the

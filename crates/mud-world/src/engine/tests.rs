@@ -337,8 +337,8 @@ fn combat_resolves_with_the_dice_and_mobs_fight_back() {
     let ada = w.login("ada", 1).unwrap();
     place(&mut w, &ada, "wine_vault");
     ok(&mut w, &ada, "equip torch");
-    // Ada: dagger (shortsword-11, thr-1 imp). Rat dodges at (12+11)/4+3 = 8.
-    // Attack 2+2+2 hits; dodge 6+6+6 fails; damage 1d-3 with a 1 floors at
+    // Ada: dagger (shortsword-11, thr imp). Rat dodges at (12+11)/4+3 = 8.
+    // Attack 2+2+2 hits; dodge 6+6+6 fails; damage 1d-2 with a 1 floors at
     // 1, ×2 impaling = 2. The rat bites back: 6+6+6 misses.
     w.fix_dice([2, 2, 2, 6, 6, 6, 1, 6, 6, 6]);
     let r = ok(&mut w, &ada, "attack rat");
@@ -362,10 +362,11 @@ fn a_heavy_hit_knocks_out_on_a_failed_ht_roll() {
     let ada = w.login("ada", 1).unwrap();
     place(&mut w, &ada, "wine_vault");
     ok(&mut w, &ada, "equip torch");
-    // Damage 6-3 = 3, ×2 = 6: the rat drops to 0 HP, rolls HT 11 with 6+6+6, and collapses.
+    // Damage 6-2 = 4, ×2 = 8: the rat drops to -2 HP, rolls HT 11 with
+    // 6+6+6, and collapses.
     w.fix_dice([2, 2, 2, 6, 6, 6, 6, 6, 6, 6]);
     let r = ok(&mut w, &ada, "attack rat");
-    assert_eq!(w.entity(&id("giant_rat_1")).unwrap().pools.hp, 0);
+    assert_eq!(w.entity(&id("giant_rat_1")).unwrap().pools.hp, -2);
     assert!(w.entity(&id("giant_rat_1")).unwrap().unconscious);
     assert!(r.narrative.contains("collapses"), "{}", r.narrative);
     assert!(

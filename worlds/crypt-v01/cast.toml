@@ -69,7 +69,7 @@ policy = "no_first_strike"
 # ------------------------------------------------------- player slots
 [player_template]
 attrs = { st = 10, dx = 10, iq = 10, ht = 10 }
-skills = { shortsword = 11, brawling = 11, stealth = 10, first_aid = 10 }
+skills = { shortsword = 11, broadsword = 10, brawling = 11, stealth = 10, first_aid = 10 }
 currency = 25
 inventory = ["dagger", "torch", "bandage"]
 equip = ["dagger", "torch"]
@@ -122,7 +122,7 @@ shop = "torin"
 inventory = ["broadsword", "leather_jerkin"]
 equip = ["broadsword", "leather_jerkin"]
 persona = "Torin is a blacksmith of few words. Gruff, fair, proud of his work, never haggles down."
-goal = "Keep the smithy. (1) You are out of ore: pay 15s a chunk for dwarven iron ore brought to the smithy, or trade a sharpened blade for four. (2) Post a bounty on the board, then come straight back. (3) Your rack sells only while you stand at the forge, so stay at it. (4) Tell those who bring ore where they can spend it: your blades and jerkins keep them alive below."
+goal = "Keep the smithy. (1) You are out of ore: pay 15s a chunk for dwarven iron ore brought to the smithy, or trade a sharpened blade for four. (2) Post a bounty on the board, then come straight back. (3) Your rack sells only while you stand at the forge, so stay at it. (4) Tell those who bring ore where they can spend it: a dagger will do for one rat, but the warden below wants two or three fighters with real blades and leather, and your blades and jerkins keep them alive."
 post = { rooms = ["smithy"] }
 fallback = "Torin grunts and keeps hammering."
 [cast.torin.mind]
@@ -248,6 +248,24 @@ keywords = ["split", "40", "60"]
 do = ["say 50/50 or nothing"]
 
 # ---------------------------------------------------------------- mobs
+# The balance these mobs hold, against the player template, is a test:
+# crates/mud-world/src/engine/balance_tests.rs plays seeded duels through
+# the engine and fails when a row leaves its band. A fresh player beats
+# one rat about three times in four, often wounded, and both rats in one
+# run about two times in five (more with a bandage between). The warden is
+# a group fight: a fresh player almost never wins alone, and with a
+# shortsword and a jerkin one, two and three players win about 30%, 70%
+# and 90%. A broadsword does a little better. A respawned warden fights
+# the same. design-v0.1 section 7 lists the targets. Run the ignored
+# `balance_table` test after an edit here: it checks them.
+#
+# The balance holds for a world made under this file. A saved world keeps
+# the attrs and skills its mobs and players had when it was saved, because
+# reconcile copies only new gear and `respawn_minutes` into it. A world
+# saved before the balance step keeps brawling-12 rats and a
+# broadsword-12, HT-12 warden, and its players have no broadsword skill,
+# so the fights there are much harder (the "saved" rows of the test
+# measure them). Start a fresh world to get this balance.
 [cast.giant_rat_1]
 name = "giant rat"
 aliases = ["rat"]
@@ -256,7 +274,7 @@ description = "Patchy fur, yellow teeth, and far too much confidence."
 kind = "mob"
 room = "wine_vault"
 attrs = { st = 6, dx = 12, iq = 3, ht = 11 }
-skills = { brawling = 12 }
+skills = { brawling = 11 }
 inventory = ["rat_teeth"]
 equip = ["rat_teeth"]
 hostile = true
@@ -271,8 +289,8 @@ short = "A giant rat crouches in the nesting, eyes catching the light."
 description = "Bigger than the other one. Fatter, too."
 kind = "mob"
 room = "rat_warren"
-attrs = { st = 7, dx = 12, iq = 3, ht = 12 }
-skills = { brawling = 12 }
+attrs = { st = 7, dx = 12, iq = 3, ht = 11 }
+skills = { brawling = 10 }
 inventory = ["rat_teeth", "rat_tail"]
 equip = ["rat_teeth"]
 hostile = true
@@ -287,8 +305,8 @@ short = "A skeletal warden stands over the ore cache, grave-blade raised."
 description = "Bones bound with tarnished wire, a crown of rust, and nothing at all in its eye sockets."
 kind = "mob"
 room = "ossuary_crypt"
-attrs = { st = 13, dx = 11, iq = 6, ht = 12 }
-skills = { broadsword = 12 }
+attrs = { st = 13, dx = 11, iq = 6, ht = 11 }
+skills = { broadsword = 10 }
 inventory = ["warden_blade"]
 equip = ["warden_blade"]
 dr = 2

@@ -36,7 +36,7 @@ description = "A plain iron dagger."
 value = 12
 slot = "weapon"
 skill = "shortsword"
-damage = "thr-1"
+damage = "thr"
 damage_type = "imp"
 
 [items.leather_jerkin]
@@ -179,17 +179,24 @@ description = "Yellow incisors, long as a thumb."
 value = 0
 slot = "weapon"
 skill = "brawling"
-damage = "1d-1"
+damage = "1d-2"
 damage_type = "cut"
 hidden = true
 
+# Notched and green with age: it serves the warden's strength, and it is a
+# poor blade in a player's hand, worse than the starting dagger. Its value
+# is 0, so its price says so, and no keeper buys it. A respawned warden
+# brings a new one each time (ADR 0012), so a blade with a price would
+# let a party that farms the warden empty the purses that pay for the
+# town's other loot. It is Hale's proof for the bounty (square.rhai), not
+# a trophy to sell. balance_tests.rs checks that it fights worse than the
+# dagger, and respawn_tests.rs that farming it leaves the purses whole.
 [items.warden_blade]
 name = "notched grave-blade"
 aliases = ["grave-blade", "blade"]
-description = "A broad, notched blade green with age."
-value = 35
+description = "A broad, notched blade green with age. The edge is gone to rust and nicks; no fence would give a coin for it, but the watch knows it on sight."
+value = 0
 slot = "weapon"
 skill = "broadsword"
-damage = "sw"
+damage = "sw-3"
 damage_type = "cut"
-tags = ["loot"]

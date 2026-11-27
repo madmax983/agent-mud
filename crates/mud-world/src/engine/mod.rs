@@ -1552,3 +1552,6 @@ mod respawn_tests;
 
 #[cfg(test)]
 mod use_turn_tests;
+
+#[cfg(test)]
+mod balance_tests;
