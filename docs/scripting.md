@@ -279,7 +279,7 @@ probe carries only the template kit, so `mud check` reports a bare
 
 The example below is not in crypt-v01. It needs a `forge` reward pool in
 `economy.toml` that offers `miners_pick`; without the pool, the hook
-faults with `no such pool in economy.toml`.
+faults when it reads `ctx.pools.forge`.
 
 ```rhai
 // Torin forges a pick from three chunks of ore. The pick comes from
