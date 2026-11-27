@@ -65,9 +65,10 @@ jobs:
           repository: autumn-foundation/littleguy
           # The commit whose protocol and config this repository is tested
           # against; bump it on purpose, with the real-lg tests. It is
-          # littleguy #122: `overlay_activate` takes the pointer the
-          # Steward read (`expected`), and `overlays` names its `head`.
-          ref: c507731f7a8930444931c60169931d657cecec73
+          # littleguy #124: `overlay_active` names the head of its move,
+          # on top of #122 (`overlay_activate` takes the pointer the
+          # Steward read, and `overlays` names its `head`).
+          ref: 6678a9bce1567a0f0bbd4f1f3928f47101a09230
           path: littleguy
       - name: Toolchain
         run: rustup show

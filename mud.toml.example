@@ -74,10 +74,14 @@ key_env = "OPENROUTER_API_KEY"   # the variable that holds its key
 # Any [minds] tier set to "littleguy" runs one `lg serve` per agent, from
 # `bin`. The scripted, harvest and plugin-agent runtimes need no lg.
 #
-# Build lg at littleguy commit c507731f7a8930444931c60169931d657cecec73 or
-# later: the one CI pins and the MUD is tested against. `bin = "lg"` runs
-# the first lg on PATH, which may be an older build. An older lg refuses
-# what it does not know in its config, and its daemon exits at start.
+# Build lg at littleguy commit 6678a9bce1567a0f0bbd4f1f3928f47101a09230 or
+# later: the one CI pins and the MUD is tested against. It is littleguy
+# #124: `overlay_active` names the head of each move, so the Steward sees
+# a person move an overlay away and back between two passes. An lg at #122
+# still works; the Steward then takes the head its guarded move implies.
+# `bin = "lg"` runs the first lg on PATH, which may be an older build. An
+# older lg refuses what it does not know in its config, and its daemon
+# exits at start.
 #
 # The MUD writes each agent's lg.toml itself (<data_dir>/<id>/lg.toml) at
 # each start; edits to it are lost. It always writes owner, system, window,

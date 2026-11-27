@@ -1713,13 +1713,18 @@ async fn a_human_rollback_before_a_lost_clear_on_an_older_lg_pauses_and_vetoes()
     r.d().make_old();
     baseline_then_text(&r, &["brevity"]).await;
     // An older lg runs the Clear unchecked after the human's Roll back
-    // (v3 -> v1, then v1 -> v1), and its answer is lost.
+    // (v3 -> v1, then v1 again, which logs no move), and its answer is
+    // lost.
     r.advance(169 * HOUR);
     r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
     pick(&r, &[]);
     r.d().activate_modes(&[ActivateMode::RollbackFirstSilently]);
     r.pass().await;
-    assert_eq!(r.d().moves().last(), Some(&(Some(1), 1)), "it applied");
+    assert_eq!(
+        r.d().moves().last(),
+        Some(&(Some(3), 1)),
+        "the Roll back is the last move"
+    );
     assert_eq!(r.d().active(), Some(1));
     let row = r.row().await;
     assert_eq!(
@@ -1787,7 +1792,7 @@ async fn a_refusal_from_a_newer_build_than_the_read_is_no_human_veto() {
     // The daemon comes back as lg #122 between the read (no head) and the
     // send (the propose, the put, then the activate): it refuses the
     // `expected` an older lg's read gave, though nothing moved.
-    at_intent(&r, 2, |st| st.old = false);
+    at_intent(&r, 2, |st| st.build = super::fake::FakeBuild::Head);
     r.pass().await;
     assert_eq!(r.d().active(), Some(1));
     let row = r.row().await;
@@ -1824,7 +1829,7 @@ async fn an_open_activate_from_an_older_lg_settles_by_version_on_a_newer_build()
     {
         let mut st = r.d().state.lock().unwrap();
         st.refine = true;
-        st.old = false;
+        st.build = super::fake::FakeBuild::Head;
         st.held.clear();
     }
     *r.fake.start_key.lock().unwrap() += 1;
@@ -1837,4 +1842,529 @@ async fn an_open_activate_from_an_older_lg_settles_by_version_on_a_newer_build()
     assert!(!row.is_vetoed(overlay_digest(&text_of(&["brevity"]))));
     assert_eq!(row.overlay.pointer, Some(1));
     assert!(!has_overlay(&r.steward_events(), "paused", "rolled_back"));
+}
+
+// ---- littleguy #124: the head of the Steward's own move ----
+
+#[tokio::test]
+async fn a_move_away_and_back_between_passes_is_a_human_veto() {
+    let mut r = refine_rig();
+    baseline_then_text(&r, &["brevity"]).await;
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.pointer_head,
+        Some(2),
+        "the head lg named for the text's move"
+    );
+    assert_eq!(row.overlay.pointer_head, r.d().head());
+    // Between two passes a person presses Roll back and activates the
+    // text again by hand: lg is on v3 as before, two moves on.
+    r.d().rollback();
+    r.d().human_activate(3);
+    assert_eq!(r.d().active(), Some(3));
+    r.steward_events();
+    r.d().clear_lines();
+    r.pass().await;
+    assert_eq!(r.d().count("overlay_activate"), 0, "nothing moves it");
+    assert_eq!(r.d().active(), Some(3), "the person's choice stands");
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert_eq!(row.overlay.pointer, Some(3));
+    assert_eq!(row.overlay.pointer_head, Some(4), "the person's head");
+    assert_eq!(
+        row.overlay.active.as_ref().map(|a| a.version),
+        Some(3),
+        "the text the person returned to is the active one"
+    );
+    assert!(
+        !row.is_vetoed(overlay_digest(&text_of(&["brevity"]))),
+        "and it is theirs: never vetoed"
+    );
+    assert_eq!(row.overlay.rollback_to, None);
+    let ev = r.steward_events();
+    assert!(has_overlay(&ev, "moved", "away_and_back"), "{ev:?}");
+    assert!(has_overlay(&ev, "paused", "rolled_back"), "{ev:?}");
+    let ctx = r.macro_wake().await;
+    assert!(ctx.steward.iter().any(|n| n.code == "overlay_off"));
+    // While paused, a later move away and back is adopted and says
+    // nothing new.
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    r.d().human_activate(human);
+    r.d().human_activate(3);
+    for _ in 0..3 {
+        r.advance(200 * HOUR);
+        r.pass().await;
+    }
+    let row = r.row().await;
+    assert_eq!(row.overlay.pointer_head, r.d().head(), "adopted");
+    let ev = r.steward_events();
+    assert!(!has_overlay(&ev, "moved", "away_and_back"), "{ev:?}");
+    for kind in ["refine_propose", "overlay_put", "overlay_activate"] {
+        assert_eq!(r.d().count(kind), 0, "{kind} while paused");
+    }
+}
+
+#[tokio::test]
+async fn a_move_away_and_back_on_the_baseline_pauses_before_any_text() {
+    let mut r = refine_rig();
+    r.pass().await;
+    assert_eq!(r.row().await.overlay.pointer_head, Some(1));
+    // A person activates their own version and rolls it back: lg is on
+    // the baseline again at head 3.
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    r.d().human_activate(human);
+    r.d().rollback();
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.d().clear_lines();
+    r.pass().await;
+    for kind in ["refine_propose", "overlay_put", "overlay_activate"] {
+        assert_eq!(r.d().count(kind), 0, "{kind} after the person's veto");
+    }
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert_eq!(
+        (row.overlay.pointer, row.overlay.pointer_head),
+        (Some(1), Some(3))
+    );
+    assert!(row.overlay.active.is_none());
+    assert!(has_overlay(&r.steward_events(), "moved", "away_and_back"));
+}
+
+#[tokio::test]
+async fn a_move_away_and_back_between_the_pass_read_and_the_activate_read_is_seen() {
+    let mut r = refine_rig();
+    r.pass().await;
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    // The pass reads lg on the baseline at head 1; while the proposer
+    // runs, a person activates their version and rolls it back. The
+    // activate's re-read sees the head moved, and nothing is sent.
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    at_intent(&r, 1, move |st| {
+        st.activate(human);
+        st.rollback();
+    });
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1], "the text is never activated");
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert!(row.intent.is_none());
+    assert!(has_overlay(&r.steward_events(), "moved", "away_and_back"));
+}
+
+#[tokio::test]
+async fn no_move_between_passes_is_the_same_pointer_and_refine_goes_on() {
+    let mut r = refine_rig();
+    baseline_then_text(&r, &["brevity"]).await;
+    for _ in 0..3 {
+        r.advance(MIN);
+        r.pass().await;
+        let row = r.row().await;
+        assert!(row.overlay.paused.is_none(), "{row:?}");
+        assert_eq!(row.overlay.pointer_head, Some(2));
+    }
+    r.advance(169 * HOUR);
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["pacing"]);
+    r.pass().await;
+    assert_eq!(r.d().overlay(r.d().active().unwrap()), rails(&["pacing"]));
+    let row = r.row().await;
+    assert!(row.overlay.paused.is_none(), "{row:?}");
+    assert_eq!(
+        row.overlay.pointer_head,
+        r.d().head(),
+        "the head of the text's move, after the Clear's"
+    );
+    assert_eq!(row.overlay.pointer_head, Some(4));
+    let ev = r.steward_events();
+    assert!(!has_overlay(&ev, "moved", "away_and_back"), "{ev:?}");
+    assert_eq!(count_overlay(&ev, "no_head", "old_lg"), 0);
+}
+
+#[tokio::test]
+async fn a_guarded_answer_without_a_head_keeps_the_head_its_guard_implies() {
+    let mut r = refine_rig();
+    // lg #122: guarded, but `overlay_active` names no head of its move. lg
+    // #124 leaves it out too when another process moved right after.
+    r.d().make_no_move_head();
+    r.pass().await;
+    let row = r.row().await;
+    assert_eq!(row.overlay.pointer, Some(1));
+    assert_eq!(
+        row.overlay.pointer_head,
+        Some(1),
+        "the first move after a read with no move yet"
+    );
+    assert_eq!(
+        count_overlay(&r.steward_events(), "no_head", "old_lg"),
+        1,
+        "said once"
+    );
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.pass().await;
+    let row = r.row().await;
+    assert_eq!(row.overlay.pointer, Some(3), "{row:?}");
+    assert!(row.overlay.paused.is_none());
+    assert_eq!(
+        row.overlay.pointer_head,
+        Some(2),
+        "one past the head the guard sent"
+    );
+    assert_eq!(row.overlay.pointer_head, r.d().head());
+    // A move away and back before the next read: the head of the
+    // Steward's own move is known, so it shows.
+    r.d().rollback();
+    r.d().human_activate(3);
+    r.advance(MIN);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 3], "nothing moves it");
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert_eq!(row.overlay.pointer_head, Some(4), "the person's head");
+    assert!(!row.is_vetoed(overlay_digest(&text_of(&["brevity"]))));
+    let ev = r.steward_events();
+    assert!(has_overlay(&ev, "moved", "away_and_back"), "{ev:?}");
+    assert_eq!(
+        count_overlay(&ev, "no_head", "old_lg"),
+        0,
+        "once per daemon start, over two answers without a head"
+    );
+}
+
+#[tokio::test]
+async fn a_guarded_undo_without_a_head_keeps_the_head_its_guard_implies() {
+    let mut r = refine_rig();
+    r.d().make_no_move_head();
+    r.pass().await;
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.d().activate_modes(&[ActivateMode::Hold]);
+    r.pass().await;
+    assert!(r.row().await.overlay.is_late(3));
+    r.d().apply_held();
+    r.advance(MIN);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 3, 1], "undone once");
+    let row = r.row().await;
+    assert!(row.overlay.paused.is_none(), "{row:?}");
+    assert_eq!(
+        (row.overlay.pointer, row.overlay.pointer_head),
+        (Some(1), Some(3)),
+        "the head of the undo, one past the read"
+    );
+    // A person moves away and back before the next read: it shows.
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    r.d().human_activate(human);
+    r.d().rollback();
+    r.advance(MIN);
+    r.pass().await;
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert!(has_overlay(&r.steward_events(), "moved", "away_and_back"));
+}
+
+#[tokio::test]
+async fn an_older_lg_names_no_head_and_is_checked_by_version() {
+    let r = refine_rig();
+    r.d().make_old();
+    baseline_then_text(&r, &["brevity"]).await;
+    assert_eq!(r.row().await.overlay.pointer_head, None);
+    // On an lg before #122 a move away and back cannot be seen at all.
+    r.d().rollback();
+    r.d().human_activate(3);
+    r.pass().await;
+    let row = r.row().await;
+    assert!(row.overlay.paused.is_none(), "{row:?}");
+    assert_eq!(row.overlay.pointer_head, None, "no head to adopt");
+}
+
+/// A row written before littleguy #124: the baseline v1 is the Steward's
+/// pointer, and no head is stored.
+fn row_before_heads() -> StewardRow {
+    let mut row = StewardRow::default();
+    row.overlay.baseline = Some(1);
+    row.overlay.pointer = Some(1);
+    row.overlay.known_max = Some(1);
+    row.overlay.authored = vec![super::state::Authored {
+        version: 1,
+        digest: overlay_digest(""),
+        source: OverlaySource::Baseline,
+        text: String::new(),
+    }];
+    row.overlay.last_refine_ms = Some(super::tests::T0);
+    row
+}
+
+/// A fake daemon whose store holds the baseline v1, active at head 1.
+fn fake_on_the_baseline() -> Arc<FakeDaemons> {
+    let fake = FakeDaemons::new(&["torin"], TOKEN);
+    {
+        let mut st = fake.of("torin").state.lock().unwrap();
+        st.store(super::refine::MUD_AUTHOR, "{}");
+        st.activate(1);
+    }
+    fake
+}
+
+#[tokio::test]
+async fn an_older_row_adopts_the_head_of_the_first_agreeing_read() {
+    let row = row_before_heads();
+    let mut body = row.body();
+    body["overlay"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pointer_head");
+    let seed = StewardRow::from_body(ROW_SCHEMA, &body).unwrap();
+    assert_eq!(seed, row, "an older body loads with no head");
+    let mut r = rig(Opts {
+        fake: Some(fake_on_the_baseline()),
+        cfg: menu_cfg(),
+        seed: Some(seed),
+        ..Opts::default()
+    });
+    r.pass().await;
+    let row = r.row().await;
+    assert_eq!(row.overlay.pointer_head, Some(1), "{row:?}");
+    assert!(row.overlay.paused.is_none());
+    assert_eq!(r.d().count("overlay_activate"), 0);
+    let human = r.d().human_put(r#"{"guardrails":"- a human's"}"#);
+    r.d().human_activate(human);
+    r.d().rollback();
+    r.advance(MIN);
+    r.pass().await;
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert!(has_overlay(&r.steward_events(), "moved", "away_and_back"));
+}
+
+#[tokio::test]
+async fn an_own_late_activate_one_move_past_its_guard_is_still_its_own() {
+    let mut r = refine_rig();
+    r.pass().await;
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.d().activate_modes(&[ActivateMode::Hold]);
+    r.pass().await;
+    let row = r.row().await;
+    assert!(row.overlay.is_late(3));
+    assert_eq!(row.overlay.pointer_head, Some(1));
+    // lg's loop runs it at last, one move past the head it sent.
+    r.d().apply_held();
+    assert_eq!((r.d().active(), r.d().head()), (Some(3), Some(2)));
+    r.advance(MIN);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 3, 1], "undone once");
+    let row = r.row().await;
+    assert!(
+        row.overlay.paused.is_none(),
+        "its own, not a human's: {row:?}"
+    );
+    assert_eq!(
+        (row.overlay.pointer, row.overlay.pointer_head),
+        (Some(1), Some(3)),
+        "the head of the undo"
+    );
+    r.advance(MIN);
+    r.pass().await;
+    let row = r.row().await;
+    assert!(row.overlay.paused.is_none(), "{row:?}");
+    let ev = r.steward_events();
+    assert!(has_overlay(&ev, "late_undone", "unconfirmed"), "{ev:?}");
+    assert!(!has_overlay(&ev, "moved", "away_and_back"), "{ev:?}");
+}
+
+#[tokio::test]
+async fn a_late_activate_of_the_version_the_steward_holds_moves_nothing() {
+    let mut row = row_before_heads();
+    row.overlay.pointer_head = Some(1);
+    row.overlay.add_late(
+        1,
+        super::tests::T0,
+        Some(super::state::Guard { head: Some(1) }),
+    );
+    let fake = fake_on_the_baseline();
+    // The late activate runs from the pointer it read: lg logs no move to
+    // the version that is active already, so the head stays.
+    fake.of("torin").state.lock().unwrap().activate(1);
+    assert_eq!(fake.of("torin").head(), Some(1));
+    let mut r = rig(Opts {
+        fake: Some(fake),
+        cfg: menu_cfg(),
+        seed: Some(row),
+        ..Opts::default()
+    });
+    r.pass().await;
+    let row = r.row().await;
+    assert!(row.overlay.paused.is_none(), "{row:?}");
+    assert_eq!(row.overlay.pointer_head, Some(1));
+    assert_eq!(r.d().count("overlay_activate"), 0);
+    assert!(!has_overlay(&r.steward_events(), "moved", "away_and_back"));
+}
+
+#[tokio::test]
+async fn a_move_away_and_back_before_an_undo_s_read_is_never_undone() {
+    let mut r = refine_rig();
+    r.pass().await;
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.d().activate_modes(&[ActivateMode::Hold]);
+    r.pass().await;
+    // lg's loop runs the late text, one move past its guard: the pass
+    // read sees the Steward's own late move, to undo.
+    r.d().apply_held();
+    assert_eq!((r.d().active(), r.d().head()), (Some(3), Some(2)));
+    // Right after that read, a person presses Roll back and activates the
+    // text again by hand: two moves on, it is their choice.
+    r.d().after_reads(1, &[1, 3]);
+    r.advance(MIN);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 3], "the undo is never sent");
+    assert_eq!((r.d().active(), r.d().head()), (Some(3), Some(4)));
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("unconfirmed"),
+        "{row:?}"
+    );
+    assert_eq!(
+        (row.overlay.pointer, row.overlay.pointer_head),
+        (Some(3), Some(4))
+    );
+    assert_eq!(
+        row.overlay.active.as_ref().map(|a| a.version),
+        Some(3),
+        "the text the person chose stays"
+    );
+    assert!(!has_overlay(&r.steward_events(), "restored", "restored"));
+}
+
+#[tokio::test]
+async fn a_move_away_and_back_before_a_settled_restore_s_read_is_never_undone() {
+    let mut r = refine_rig();
+    r.pass().await;
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    // The text applies and its answer is lost. The pass read, the
+    // activate's re-read, then the settlement's read: lg on the text, one
+    // move on. Right after that read, a person moves away and back.
+    r.d().activate_modes(&[ActivateMode::ApplySilently]);
+    r.d().after_reads(3, &[1, 3]);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 3], "the undo is never sent");
+    assert_eq!((r.d().active(), r.d().head()), (Some(3), Some(4)));
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("unconfirmed"),
+        "{row:?}"
+    );
+    assert_eq!(
+        (row.overlay.pointer, row.overlay.pointer_head),
+        (Some(3), Some(4))
+    );
+    assert!(!has_overlay(&r.steward_events(), "restored", "restored"));
+}
+
+#[tokio::test]
+async fn a_head_below_the_steward_s_own_is_a_reset_store() {
+    let mut r = refine_rig();
+    baseline_then_text(&r, &["brevity"]).await;
+    assert_eq!(r.row().await.overlay.pointer_head, Some(2));
+    // The operator deletes torin's lg data and stores the same versions
+    // by hand: the numbers and authors match, the head does not.
+    r.d().reset_store();
+    {
+        let mut st = r.d().state.lock().unwrap();
+        st.store(super::refine::MUD_AUTHOR, "{}");
+        st.store("operator:lg-refine", PROPOSAL);
+        st.store(super::refine::MUD_AUTHOR, &rails(&["brevity"]));
+        st.activate(3);
+    }
+    r.steward_events();
+    r.d().clear_lines();
+    r.pass().await;
+    assert!(has_overlay(&r.steward_events(), "reset", "store_reset"));
+    let row = r.row().await;
+    assert_eq!(row.overlay.baseline, None, "forgotten: {row:?}");
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("preexisting"),
+        "first contact finds an overlay it did not set"
+    );
+    assert_eq!(
+        (row.overlay.pointer, row.overlay.pointer_head),
+        (Some(3), Some(1))
+    );
+    assert_eq!(r.d().count("overlay_activate"), 0);
+}
+
+#[tokio::test]
+async fn a_reset_store_forgets_the_head() {
+    let mut r = refine_rig();
+    baseline_then_text(&r, &["brevity"]).await;
+    r.d().reset_store();
+    r.pass().await;
+    assert!(has_overlay(&r.steward_events(), "reset", "store_reset"));
+    let row = r.row().await;
+    assert_eq!(row.overlay.baseline, Some(1), "a new baseline");
+    assert_eq!(row.overlay.pointer_head, Some(1), "the head of its move");
+    assert!(row.overlay.paused.is_none());
+}
+
+#[tokio::test]
+async fn a_late_text_run_and_rolled_back_between_passes_is_vetoed() {
+    let mut r = refine_rig();
+    r.pass().await;
+    r.d().propose_mode(ProposeMode::Propose(PROPOSAL.into()));
+    pick(&r, &["brevity"]);
+    r.d().activate_modes(&[ActivateMode::Hold]);
+    r.pass().await;
+    assert!(r.row().await.overlay.is_late(3));
+    // lg's loop runs the late text (head 2), and a person rolls it back
+    // (head 3): lg is on the baseline again, the Steward's own version.
+    r.d().apply_held();
+    r.d().rollback();
+    assert_eq!((r.d().active(), r.d().head()), (Some(1), Some(3)));
+    r.advance(MIN);
+    r.pass().await;
+    assert_eq!(r.d().activates(), [1, 3], "nothing moves it");
+    let row = r.row().await;
+    assert_eq!(
+        row.overlay.paused.as_ref().map(|p| p.code.as_str()),
+        Some("rolled_back"),
+        "{row:?}"
+    );
+    assert!(
+        row.is_vetoed(overlay_digest(&text_of(&["brevity"]))),
+        "the late text may have run and been rolled back"
+    );
+    assert!(row.overlay.late.is_empty(), "it can no longer run");
+    assert_eq!(row.overlay.pointer_head, Some(3));
+    assert!(has_overlay(&r.steward_events(), "moved", "away_and_back"));
 }

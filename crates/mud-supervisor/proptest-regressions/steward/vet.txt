@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c68e3f3ac18088f0b7c2e70aa35003477db05871f69baee207f8ac436bf1aeec # shrinks to pre = "", word = "ai", stem = "agent", mask = [false, false, true, false, false, false, false, false, false, false, false, false], around = ".", suffix = ""
+cc c4c80cc07178830d3715970644d0cc5726443aa1e938ac1960ccf8cf7dfffb9c # shrinks to lg = Some(2), lg_head = Some(3), named = true, expected = Some(2), own_head = Some(2), late = true

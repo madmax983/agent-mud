@@ -12,9 +12,10 @@
 //! `Game::persist`, whose loss the next pass repairs from the listings.
 //!
 //! The overlay part ([`OverlayRow`]) is the Steward's view of lg's active
-//! overlay version. A fresh row has no pointer, so first contact treats
-//! whatever lg has active as a human's (`preexisting`) and pauses refine
-//! until the operator resumes it.
+//! overlay version, and of the head of its own last move there. A fresh
+//! row has no pointer, so first contact treats whatever lg has active as a
+//! human's (`preexisting`) and pauses refine until the operator resumes
+//! it. A row from before littleguy #124 has no head; it reads as unknown.
 
 use std::collections::BTreeMap;
 
@@ -388,6 +389,13 @@ pub struct OverlayRow {
     /// lg's active version as the Steward last confirmed it. Set from
     /// first contact on; any other version lg shows is someone else's move.
     pub pointer: Option<u64>,
+    /// The head of lg's pointer at `pointer` that the Steward holds as its
+    /// own (littleguy #124): the `seq` an `overlay_active` named for the
+    /// Steward's own move, or what a pass read when the Steward knew none.
+    /// Another head on the same version is a move away and back since.
+    /// `None` while it is unknown: in a row from before #124, after an
+    /// answer that named no head, and after a store reset.
+    pub pointer_head: Option<u64>,
     /// The Steward's empty `{}` version, once active.
     pub baseline: Option<u64>,
     /// The Steward's own puts, oldest first, at most [`AUTHORED_CAP`].
@@ -814,6 +822,27 @@ mod tests {
     }
 
     #[test]
+    fn an_older_overlay_row_reads_with_no_head() {
+        let mut row = StewardRow::default();
+        row.overlay.pointer = Some(3);
+        row.overlay.pointer_head = Some(4);
+        let body = row.body();
+        assert_eq!(body["overlay"]["pointer_head"], 4);
+        assert_eq!(StewardRow::from_body(ROW_SCHEMA, &body), Some(row));
+        let mut old = body;
+        old["overlay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pointer_head");
+        let back = StewardRow::from_body(ROW_SCHEMA, &old).unwrap();
+        assert_eq!(back.overlay.pointer, Some(3));
+        assert_eq!(
+            back.overlay.pointer_head, None,
+            "a row before #124: unknown"
+        );
+    }
+
+    #[test]
     fn an_older_late_entry_reads_as_unguarded() {
         let late: Late = serde_json::from_str(r#"{"version":3,"at_ms":7}"#).unwrap();
         assert_eq!(late.guard, None);
@@ -824,6 +853,7 @@ mod tests {
         let mut ov = OverlayRow {
             known_max: Some(9),
             pointer: Some(3),
+            pointer_head: Some(5),
             baseline: Some(1),
             last_refine_ms: Some(5),
             rollback_to: Some(1),

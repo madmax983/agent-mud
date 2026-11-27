@@ -18,14 +18,19 @@ the build made are in [`docs/adr/`](docs/adr/).
 `plugin-agent` runtimes, need no `lg`.
 
 The MUD needs littleguy at commit
-`c507731f7a8930444931c60169931d657cecec73` or later: the commit that CI
-pins (`.github/workflows/ci.yml`) and the MUD is tested against. Build it
+`6678a9bce1567a0f0bbd4f1f3928f47101a09230` or later: the commit that CI
+pins (`.github/workflows/ci.yml`) and the MUD is tested against. It is
+littleguy #124, whose `overlay_active` names the head of each move, so
+the Steward sees a person move an agent's overlay away and back between
+two of its passes. An lg at littleguy #122 still works: its answer names
+no head, so the Steward takes the head that the guard of its move
+implies, and says so once per daemon start (`no_head old_lg`). Build it
 with the features the MUD uses:
 
 ```sh
 git clone https://github.com/autumn-foundation/littleguy
 cd littleguy
-git checkout c507731f7a8930444931c60169931d657cecec73
+git checkout 6678a9bce1567a0f0bbd4f1f3928f47101a09230
 cargo build --release -p littleguy --no-default-features \
   --features "claude,openai,mcp,plans,heartbeat,reflection,notes,compaction,refine"
 ```
@@ -301,8 +306,13 @@ per tier:
 With littleguy, install `lg` first: [Install littleguy](#install-littleguy)
 gives the commit, the features and the `[littleguy] bin` to set, and
 [Run littleguy minds](#run-littleguy-minds) the model key to export. The
-commit is littleguy #122, whose `overlay_activate` refuses a move from a
-pointer that moved since the Steward read it.
+commit is littleguy #124. Since #122, `overlay_activate` refuses a move
+from a pointer that moved since the Steward read it; #124 names the head
+of each move in `overlay_active`, so a person who rolls an agent's
+overlay back and activates it again between two Steward passes pauses
+refine as any other veto does. An lg at #122 runs too: its answer names
+no head, so the Steward takes the head that the guard of its move
+implies, and checks heads between passes as with #124.
 
 Each agent's daemon takes notes, keeps goals and ideas, researches them on
 its heartbeat, and compacts a long op (the `[littleguy]` keys in

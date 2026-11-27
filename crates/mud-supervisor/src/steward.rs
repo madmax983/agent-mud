@@ -431,9 +431,21 @@ struct Run {
     reload_owed: bool,
     /// The row changed since it was last written.
     dirty: bool,
-    /// The daemon of `checked` answered an activate without `guarded` (an
-    /// lg before littleguy #122), and the Steward said so.
+    /// What the daemon of `checked` showed of its lg build, and the
+    /// Steward said once.
+    build: Build,
+}
+
+/// What a daemon's answers showed of its lg build, said once per daemon
+/// start.
+#[derive(Debug, Clone, Copy, Default)]
+struct Build {
+    /// It answered an activate without `guarded`: an lg before littleguy
+    /// #122.
     old_lg: bool,
+    /// It answered a guarded activate with no head of its move: an lg
+    /// before littleguy #124, or a move it could not tell apart.
+    no_head: bool,
 }
 
 /// A goal listing, as `plans` answered it.
@@ -711,7 +723,7 @@ impl Steward {
             self.check_approvals(e, socket).await;
             run.checked = key;
             // A new daemon may be another lg build: it is asked afresh.
-            run.old_lg = false;
+            run.build = Build::default();
         }
         if !self.cfg.refine.is_on() {
             self.refine_off(e, run, now);
