@@ -5,7 +5,9 @@
 // in the ledger. The watch pays once for each time the warden is put down
 // (the world flag `warden_bounty.paid` holds the death it paid for, from
 // ctx.cast.skeletal_warden.deaths), once a day per player, and the pool
-// pays three a day.
+// pays three a day. Hale keeps the blade he weighs, so each blade proves
+// one kill, once. The per-death flag still makes him pay once for each
+// death.
 
 fn on_report(ctx) {
     let hale = ctx.cast.guard_01;
@@ -30,10 +32,11 @@ fn on_report(ctx) {
     if purse.currency < pay || purse.items.healing_draught < 1 {
         return [msg("Hale spreads empty hands. \"The watch's purse is empty till tomorrow. Good work, all the same.\"")];
     }
-    // The guards and the reward are admitted together, or not at all.
+    // The guards, the blade and the reward are admitted together, or not at all.
     [set_flag("warden_bounty.paid", warden.deaths),
      mark("bounty_day", day_utc(ctx.now_ms)),
-     msg("Hale weighs the notched grave-blade and nods. \"The ossuary is quiet, then. The watch pays for that.\""),
-     narrate(`Hale counts silver into ${ctx.actor.name}'s hand.`),
+     msg("Hale takes the notched grave-blade, weighs it, and keeps it. \"The ossuary is quiet, then. The watch pays for that.\""),
+     use_up("warden_blade"),
+     narrate(`Hale takes a notched grave-blade from ${ctx.actor.name} and counts silver into their hand.`),
      reward("warden_bounty", #{ currency: pay, items: #{ healing_draught: 1 } })]
 }

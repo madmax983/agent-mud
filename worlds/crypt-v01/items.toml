@@ -232,7 +232,8 @@ hidden = true
 # brings a new one each time (ADR 0012), so a blade with a price would
 # let a party that farms the warden empty the purses that pay for the
 # town's other loot. It is Hale's proof for the bounty (square.rhai), not
-# a trophy to sell. balance_tests.rs checks that it fights worse than the
+# a trophy to sell: he keeps the blade he pays for (`use_up`), so each
+# blade pays once. balance_tests.rs checks that it fights worse than the
 # dagger, and respawn_tests.rs that farming it leaves the purses whole.
 [items.warden_blade]
 name = "notched grave-blade"

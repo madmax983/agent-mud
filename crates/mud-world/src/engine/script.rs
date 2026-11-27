@@ -18,8 +18,8 @@ use crate::event::EventKind;
 use crate::hooks::{
     ActorFacts, CastFacts, EFFECT_TEXT_MAX, ExitFacts, FAULT_MESSAGE_MAX, FLAG_CAP, FLAG_TEXT_MAX,
     FlagValue, HookId, HookInput, HookOutcome, HookReply, ItemFacts, MARK_CAP, RoomFacts,
-    ScriptEffect, TargetFacts, VIEW_LIST_CAP, WorldHooks, hook_allowed, hook_step, tally,
-    tally_admissible, tally_reason, valid_flag_name,
+    ScriptEffect, TargetFacts, USE_UP_MAX, VIEW_LIST_CAP, WorldHooks, hook_allowed, hook_step,
+    tally, tally_admissible, tally_reason, valid_flag_name,
 };
 use crate::ids::{EntityId, ItemId, PoolId, ProtoId, RoomId};
 use crate::pack::{Direction, EntityKind};
@@ -92,7 +92,7 @@ pub struct HookCall {
 }
 
 impl HookCall {
-    const fn new(hook: HookId, room: RoomId) -> Self {
+    pub(super) const fn new(hook: HookId, room: RoomId) -> Self {
         Self {
             hook,
             room,
@@ -489,6 +489,13 @@ impl World {
             .map(|e| e.marks.keys().map(String::as_str).collect())
             .unwrap_or_default();
         let mut flags: BTreeSet<&str> = self.state.flags.keys().map(String::as_str).collect();
+        // What the list uses up so far, by prototype, against what the
+        // actor carries before the list.
+        let mut using: BTreeMap<&ProtoId, u32> = BTreeMap::new();
+        let mut rewarded = false;
+        // A hurt after a use_up: a death there would take the price and
+        // skip any later reward, while a player keeps their gear on death.
+        let mut hurt_after_price = false;
         for fx in effects {
             match fx {
                 ScriptEffect::Msg(t) | ScriptEffect::Narrate(t) | ScriptEffect::Refuse(t) => {
@@ -545,29 +552,126 @@ impl World {
                     if !self.state.entities.get(actor).is_some_and(Entity::present) {
                         return Err(Inadmissible::Fault("the actor is not here".to_owned()));
                     }
+                    if matches!(fx, ScriptEffect::Hurt(_)) && !using.is_empty() {
+                        hurt_after_price = true;
+                    }
                 }
                 ScriptEffect::Reward {
                     pool,
                     currency,
                     items,
                 } => {
-                    let def = self.pack.economy.rewards.get(pool).ok_or_else(|| {
-                        Inadmissible::Fault(format!("reward({pool}): no such pool in economy.toml"))
-                    })?;
-                    def.admit(self.state.pool_spent.get(pool), now_ms, *currency, items)
-                        .map_err(|e| match e {
-                            AskError::Bad(m) => Inadmissible::Fault(format!("reward({pool}): {m}")),
-                            AskError::Spent(m) => {
-                                Inadmissible::Declined(format!("reward({pool}): {m}"))
-                            }
-                        })?;
-                    if !self.state.entities.get(actor).is_some_and(Entity::present) {
-                        return Err(Inadmissible::Fault("the actor is not here".to_owned()));
+                    // The proof goes only with its pay.
+                    if hurt_after_price {
+                        return Err(Inadmissible::Fault(
+                            "hurt() comes before use_up()".to_owned(),
+                        ));
                     }
+                    rewarded = true;
+                    self.check_reward(actor, pool, *currency, items, now_ms)?;
+                }
+                ScriptEffect::UseUp { proto, count } => {
+                    self.check_use_up(actor, proto, *count, rewarded, &mut using)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Checks one `reward` against its pool's budget at game time
+    /// `now_ms` and the actor. A bad ask is a fault; a spent pool is a
+    /// decline.
+    fn check_reward(
+        &self,
+        actor: &EntityId,
+        pool: &PoolId,
+        currency: i64,
+        items: &BTreeMap<ProtoId, u32>,
+        now_ms: u64,
+    ) -> Result<(), Inadmissible> {
+        let def = self.pack.economy.rewards.get(pool).ok_or_else(|| {
+            Inadmissible::Fault(format!("reward({pool}): no such pool in economy.toml"))
+        })?;
+        def.admit(self.state.pool_spent.get(pool), now_ms, currency, items)
+            .map_err(|e| match e {
+                AskError::Bad(m) => Inadmissible::Fault(format!("reward({pool}): {m}")),
+                AskError::Spent(m) => Inadmissible::Declined(format!("reward({pool}): {m}")),
+            })?;
+        if !self.state.entities.get(actor).is_some_and(Entity::present) {
+            return Err(Inadmissible::Fault("the actor is not here".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Checks one `use_up` against the pack and the actor. A bad ask is a
+    /// fault; too few to give is a decline, as a spent pool is. `using`
+    /// sums the calls of the list so far, so two calls of one prototype
+    /// count together.
+    fn check_use_up<'a>(
+        &self,
+        actor: &EntityId,
+        proto: &'a ProtoId,
+        count: u32,
+        rewarded: bool,
+        using: &mut BTreeMap<&'a ProtoId, u32>,
+    ) -> Result<(), Inadmissible> {
+        let fault = |m: String| Err(Inadmissible::Fault(m));
+        if !(1..=USE_UP_MAX).contains(&count) {
+            return fault(format!(
+                "use_up({proto}): n is a count of 1 to {USE_UP_MAX}"
+            ));
+        }
+        // A reward's items can then never be the price, and the rule
+        // reads in list order.
+        if rewarded {
+            return fault("use_up() comes before reward()".to_owned());
+        }
+        let Some(def) = self.pack.items.get(proto) else {
+            return fault(format!("use_up({proto}): no such item in items.toml"));
+        };
+        if def.hidden {
+            return fault(format!("use_up({proto}): a hidden item"));
+        }
+        if def.currency.is_some() {
+            return fault(format!(
+                "use_up({proto}): it holds money; a purse is emptied with use"
+            ));
+        }
+        if !self.state.entities.get(actor).is_some_and(Entity::present) {
+            return fault("the actor is not here".to_owned());
+        }
+        let need = using.entry(proto).or_insert(0);
+        *need = need.saturating_add(count);
+        let have = u32::try_from(self.use_up_candidates(actor, proto).len()).unwrap_or(u32::MAX);
+        if *need > have {
+            return Err(Inadmissible::Declined(format!(
+                "use_up({proto}): carries {have}, asks {need}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The items of `proto` that `actor` can give up, in the order
+    /// `use_up` takes them: the spares first, then the ones in use, each in
+    /// inventory order. Never merchandise, a container that holds
+    /// something, or an item with money sealed in it. Admission and apply
+    /// both ask this, so they agree.
+    pub(super) fn use_up_candidates(&self, actor: &EntityId, proto: &ProtoId) -> Vec<ItemId> {
+        let Some(e) = self.state.entities.get(actor) else {
+            return Vec::new();
+        };
+        let fits = |i: &&ItemId| {
+            self.state.items.get(*i).is_some_and(|it| {
+                it.proto == *proto
+                    && !it.stock
+                    && it.contents.is_empty()
+                    && it.sealed_currency(&self.pack).is_none()
+            })
+        };
+        let in_use = |i: &ItemId| e.equipped.values().any(|q| q == i);
+        let (used, spare): (Vec<ItemId>, Vec<ItemId>) =
+            e.inventory.iter().filter(fits).partition(|i| in_use(i));
+        spare.into_iter().chain(used).collect()
     }
 
     // ------------------------------------------------------------ running
@@ -675,7 +779,7 @@ impl World {
         });
     }
 
-    fn apply_effects(
+    pub(super) fn apply_effects(
         &mut self,
         ctx: &mut Ctx,
         actor: &EntityId,
@@ -686,6 +790,9 @@ impl World {
         let mut msgs = Vec::new();
         let mut refused = None;
         let mut died = false;
+        // A use_up that found too little: no later reward pays without
+        // its price.
+        let mut short = false;
         for fx in effects {
             if died && !matches!(fx, ScriptEffect::Msg(_)) {
                 let line = format!("skipped {}: the actor died", fx.describe());
@@ -741,6 +848,17 @@ impl World {
                 }
                 ScriptEffect::Heal(dice) => self.heal_actor(ctx, actor, dice),
                 ScriptEffect::Hurt(dice) => died = self.hurt_actor(ctx, actor, dice),
+                ScriptEffect::UseUp { proto, count } => {
+                    if let Some(line) = self.use_up(ctx, actor, call, key, &proto, count) {
+                        msgs.push(line);
+                    } else {
+                        short = true;
+                    }
+                }
+                ScriptEffect::Reward { pool, .. } if short => {
+                    let line = format!("skipped reward({pool}): its price was not paid");
+                    self.script_log(ctx, key, actor, line);
+                }
                 ScriptEffect::Reward {
                     pool,
                     currency,
@@ -760,6 +878,60 @@ impl World {
             }
         }
         HookRun::Applied { msgs, refused }
+    }
+
+    /// Uses up `count` items of `proto` that the actor carries: each leaves
+    /// the world, unequipped first if in use, and an event tells the
+    /// actor. Returns the line for the actor, or `None` (logged) when the
+    /// actor no longer carries enough, and then takes nothing.
+    fn use_up(
+        &mut self,
+        ctx: &mut Ctx,
+        actor: &EntityId,
+        call: &HookCall,
+        key: &str,
+        proto: &ProtoId,
+        count: u32,
+    ) -> Option<String> {
+        let ids = self.use_up_candidates(actor, proto);
+        let n = usize::try_from(count).unwrap_or(usize::MAX);
+        if ids.len() < n {
+            let line = format!("skipped use_up({proto}): the actor no longer carries it");
+            self.script_log(ctx, key, actor, line);
+            return None;
+        }
+        let mut used = Vec::new();
+        for id in ids.into_iter().take(n) {
+            let slot = self
+                .state
+                .entities
+                .get(actor)
+                .and_then(|e| e.equipped.iter().find(|(_, i)| **i == id).map(|(s, _)| *s));
+            // detach clears the slot without a word, so the change that
+            // says so comes first.
+            if let Some(slot) = slot {
+                ctx.changes.push(StateChange::Equipped {
+                    entity: actor.clone(),
+                    slot,
+                    item: None,
+                });
+            }
+            self.destroy_item(ctx, id);
+            used.push(json!({ "id": id, "proto": proto }));
+        }
+        let line = format!(
+            "You give up {}.",
+            self.item_phrase(&BTreeMap::from([(proto.clone(), count)]))
+        );
+        let spec = Emit {
+            only: Some(vec![actor.clone()]),
+            ..Emit::new(EventKind::System, Some(call.room.clone()), line.clone())
+                .actor(actor, "use_up")
+                .tags(["script".to_owned(), key.to_owned(), "use_up".to_owned()])
+                .data(json!({ "proto": proto, "items": used }))
+        };
+        self.emit(ctx, spec);
+        Some(line)
     }
 
     /// Mints an admitted reward for the actor: the pool's spent count
@@ -844,11 +1016,24 @@ impl World {
 
     /// The line a reward tells its receiver, such as `You receive 20s and
     /// a healing draught.` Server text: pack names and numbers only.
-    fn reward_line(&self, currency: i64, items: &BTreeMap<ProtoId, u32>) -> String {
+    pub(super) fn reward_line(&self, currency: i64, items: &BTreeMap<ProtoId, u32>) -> String {
         let mut parts = Vec::new();
         if currency > 0 {
             parts.push(format!("{currency}{}", self.pack.economy.currency.short));
         }
+        parts.extend(self.item_parts(items));
+        format!("You receive {}.", join_list(&parts))
+    }
+
+    /// Items by prototype as a reader says them, such as `a notched
+    /// grave-blade` or `3 x iron ore`, joined with `, ` and ` and `.
+    /// Server text: pack names and numbers only.
+    pub(super) fn item_phrase(&self, items: &BTreeMap<ProtoId, u32>) -> String {
+        join_list(&self.item_parts(items))
+    }
+
+    fn item_parts(&self, items: &BTreeMap<ProtoId, u32>) -> Vec<String> {
+        let mut parts = Vec::new();
         for (proto, n) in items.iter().filter(|(_, n)| **n > 0) {
             let name = self
                 .pack
@@ -866,11 +1051,7 @@ impl World {
                 format!("{n} x {name}")
             });
         }
-        let list = match parts.split_last() {
-            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-            _ => parts.concat(),
-        };
-        format!("You receive {list}.")
+        parts
     }
 
     /// Locks or unlocks an exit and its far side.
@@ -1113,6 +1294,14 @@ const fn condition(e: &Entity) -> &'static str {
         "unconscious"
     } else {
         wound_word(e.pools.wound_state())
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_list(parts: &[String]) -> String {
+    match parts.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => parts.concat(),
     }
 }
 

@@ -14,6 +14,7 @@ use crate::hooks::{
 use crate::state::Holder;
 
 mod rewards;
+mod use_up;
 
 type Answer = dyn Fn(&HookId, &HookInput, WorldDice) -> HookReply + Send + Sync;
 

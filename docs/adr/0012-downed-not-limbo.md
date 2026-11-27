@@ -164,16 +164,14 @@ odds the study measured held for the first spawn only.
   proof and a poor weapon, not a trophy to sell
   (`respawn_tests::farming_the_warden_leaves_the_loot_buyers_their_purses`).
   A pack that gives a respawning mob a priced kit takes on that loop.
-- This step does not fix Hale's bounty. Its proof (`report` in the
-  square) is any warden blade, and the report does not take the blade.
-  Before this step only one blade existed, so at most one player could
-  claim a kill someone else made. Now every past killer holds a blade
-  and can claim each later death, once a day, before the real killer
-  walks back. The payouts do not grow: each death still pays once, and
-  the pool caps the day. Making the proof single-use (the report takes
-  the blade, or only the killer is paid) needs a script effect that
-  crypt-v01 does not have yet. It belongs to a later balance or content
-  step.
+- Fixed later: `report` uses up the blade (`use_up`, ADR 0010
+  amendment). Before that fix, the proof was any warden blade, and the
+  report did not take it, so every past killer could claim each later
+  death with an old blade. Now Hale keeps the blade he pays for. Payouts
+  never exceed warden deaths, and one blade pays once. A held old blade
+  can still claim a later death before the killer reports, so it is not
+  "only the killer is paid". The per-death flag still makes Hale pay
+  once for each death, and the pool caps the day.
 - giant_rat_2 comes back with a tail, so tails come back every 30
   minutes, one per kill.
 - The ledger grows by one row per respawn that makes something, as it

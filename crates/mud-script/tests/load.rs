@@ -377,3 +377,30 @@ fn no_floats(v: &serde_json::Value) -> bool {
         _ => true,
     }
 }
+
+#[test]
+fn a_bare_use_up_of_what_the_probe_lacks_is_reported() {
+    // The dry run's probe carries only the template kit, so a hand-in that
+    // never checks carries() first is caught by `mud check`.
+    let dry_run = |body: &str| {
+        let mut s = ScriptSources {
+            manifest: Some(
+                "[[verbs]]\nname = \"hand\"\nusage = \"hand\"\nfile = \"v.rhai\"\n".into(),
+            ),
+            ..ScriptSources::default()
+        };
+        s.files
+            .insert("v.rhai".into(), format!("fn on_hand(ctx) {{\n{body}\n}}"));
+        ScriptHost::from_sources(&s, &pack())
+            .unwrap()
+            .dry_run(&pack())
+    };
+    assert_eq!(
+        dry_run("[use_up(\"warden_blade\")]"),
+        ["dry run verbs.hand: use_up(warden_blade): carries 0, asks 1"]
+    );
+    let checked = "if !(\"warden_blade\" in ctx.actor.inventory) { return [msg(\"Bring proof.\")]; }\n[use_up(\"warden_blade\")]";
+    assert_eq!(dry_run(checked), Vec::<String>::new());
+    // The kit itself can be used up.
+    assert_eq!(dry_run("[use_up(\"bandage\")]"), Vec::<String>::new());
+}

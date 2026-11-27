@@ -271,6 +271,8 @@ world:
 - The warden's grave-blade is a poor weapon in a player's hand: the
   starting dagger beats it by 10 points or more against a rat. Its value
   is 0, so no keeper buys it, and farming the warden empties no purse.
+  It is Hale's proof for the bounty, and he keeps each blade he pays
+  for, so each blade pays once.
 - A fresh player beats both root-cellar pups in one fight 85-95% of the
   time, 10 points more often than one giant rat, and dies of it 2% of
   the time or less (no death in 2000 seeds).
