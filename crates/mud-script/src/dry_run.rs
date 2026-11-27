@@ -51,7 +51,7 @@ impl Compiled {
                 // A fresh world declines nothing a sound hook asks: its
                 // pools are full and the probe holds no marks. It carries
                 // only the template kit, so a use_up() of anything else
-                // declines, and the problem says to check carries() first.
+                // declines, and mud check reports it.
                 world
                     .check_effects(&room, &probe, &fx, DRY_RUN_NOW_MS)
                     .map_err(|e| e.to_string())

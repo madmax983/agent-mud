@@ -43,13 +43,15 @@ flowchart LR
 - **World hooks** (a room's `on_enter`/`on_speech`, an item's
   `on_take`/`on_use`, a custom verb) return a closed list of effects:
   `msg`, `narrate`, `refuse`, `unlock`, `lock`, `set_flag`, `clear_flag`,
-  `mark`, `unmark`, `heal`, `hurt`, `reward`. The engine admits the list
-  all-or-nothing through `tally_step`/`tally_admissible` (at most
-  `max_effects`, at most one heal/hurt, at most one reward, a `refuse`
-  only alone and only in a verb or `on_use` hook), then `check_effects`
-  validates each effect against the world (texts 1 to 500 printable
-  characters, a lock on that exit, valid flag names, no `hurt` in a safe
-  room, the actor present, a reward within its pool's budget).
+  `mark`, `unmark`, `heal`, `hurt`, `reward`, `use_up`. The engine admits
+  the list all-or-nothing through `tally_step`/`tally_admissible` (at
+  most `max_effects`, at most one heal/hurt, at most one reward, a
+  `refuse` only alone and only in a verb or `on_use` hook), then
+  `check_effects` validates each effect against the world (texts 1 to
+  500 printable characters, a lock on that exit, valid flag names, no
+  `hurt` in a safe room, the actor present, a reward within its pool's
+  budget, a `use_up` only of what the actor carries and only before any
+  reward, no `hurt` between a `use_up` and a reward).
   Only then does it apply them with its own helpers, in the same `Ctx`,
   `CommandResult`, events and commit.
 - **Mind scripts** return command lines (and optionally memory and a
@@ -364,10 +366,12 @@ proof was never used up. No effect could take an item.
   list, as a spent pool does: nothing applies, the dice are untouched,
   and the breaker does not move. Two calls of one prototype count
   together, against the state before the list. A `use_up` after a
-  `reward` faults, so a reward's items are never the price. The list is
-  admitted whole, so there is no pay without the proof and no proof
-  taken without pay. At apply time a `use_up` that finds too little
-  takes nothing and skips any later reward in the list.
+  `reward` faults, so a reward's items are never the price. A `hurt`
+  after a `use_up` faults when a `reward` follows it: a death there
+  would take the price and skip the pay, while a player keeps their gear
+  on death. The list is admitted whole, so there is no pay without the
+  proof and no proof taken without pay. At apply time a `use_up` that
+  finds too little takes nothing and skips any later reward in the list.
 - **State class, no kernel change.** `use_up` counts as
   `EffectClass::State` in the proved admission tally, as a flag or a mark
   does: it makes nothing, so it needs no new class and no Verus change.
@@ -395,9 +399,9 @@ proof was never used up. No effect could take an item.
 - Payouts never exceed warden deaths, and each blade pays once. A held
   old blade can still claim one later death before the real killer
   reports.
-- A `hurt()` placed between `use_up` and `reward` that kills the actor
-  takes the item and skips the reward. Keep `hurt` out of hand-in lists;
-  in a safe room, as the square is, `hurt` faults anyway.
+- A `hurt()` placed between `use_up` and `reward` faults at admission,
+  so a death never takes the item and skips the reward. A `hurt()` before
+  the `use_up` is admitted: a death there skips both.
 - Using up an equipped weapon or armor mid-fight takes effect at once,
   with no turn cost. The owner accepts this.
 - `mud check` reports a bare `use_up` of something the probe lacks,

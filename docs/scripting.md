@@ -112,7 +112,7 @@ elements, or a map's keys (`for k in ctx.flags`); a view has no `keys()`.
 | `mark(name, v)`, `unmark(name)` | marks on the actor (at most 32: a new mark past that declines the list): per-player state goes here |
 | `heal(dice)`, `hurt(dice)` | the actor; `1d` to `6d` with adds; at most one per hook; no `hurt` in a safe room. A hook runs only for an actor that can act, so a heal never meets one out cold; the effect still brings to any actor it lifts above 0 HP, with the room line and the wake of its mind that any coming to has (ADR 0012) |
 | `reward(pool, #{ currency: n, items: #{ proto: n } })`, `reward(pool, n)` | money and items for the actor from a pack reward pool, recorded in the ledger; at most one per hook, never with `refuse` (see [Rewards](#rewards-ledgered-mints)) |
-| `use_up(proto)`, `use_up(proto, n)` | use up n (1 to 16) items of a prototype the actor carries: they leave the world. Never money, contents, merchandise or a hidden item. Before any `reward`. Too few to give declines the whole list (see [Using up items](#using-up-items)) |
+| `use_up(proto)`, `use_up(proto, n)` | use up n (1 to 16) items of a prototype the actor carries: they leave the world. Never money, contents, merchandise or a hidden item. Before any `reward`, with no `hurt` between them. Too few to give declines the whole list (see [Using up items](#using-up-items)) |
 
 Names are lowercase words of `[a-z0-9_]` joined by `.`, `:` or `-`. Texts
 are 1 to 500 printable characters. The list is admitted all-or-nothing: one
@@ -239,6 +239,10 @@ What can be used up, checked in `check_effects` before anything applies:
   with `use`, not used up); anything else faults;
 - `use_up` comes before any `reward` in the list, or the hook faults. So
   a reward's items can never be the price;
+- a `hurt` comes before the `use_up`, not between it and a `reward`, or
+  the hook faults. A death there would take the price and skip the pay,
+  while a player keeps their gear on death. A `hurt` before the
+  `use_up` is fine: a death there skips both;
 - the actor is present, or the hook faults;
 - the actor carries at least `n` items of the prototype that are not
   shop merchandise, hold nothing (a container with contents) and hold no
@@ -273,8 +277,13 @@ nothing to give should not leave them the bare decline. The dry run's
 probe carries only the template kit, so `mud check` reports a bare
 `use_up` of anything else.
 
+The example below is not in crypt-v01. It needs a `forge` reward pool in
+`economy.toml` that offers `miners_pick`; without the pool, the hook
+faults with `no such pool in economy.toml`.
+
 ```rhai
-// Torin forges a pick from three chunks of ore and his own stock.
+// Torin forges a pick from three chunks of ore. The pick comes from
+// the forge reward pool, not from his shop's stock.
 fn on_forge(ctx) {
     let ore = 0;
     for p in ctx.actor.inventory {
@@ -282,6 +291,9 @@ fn on_forge(ctx) {
     }
     if ore < 3 {
         return [msg("Torin shakes his head. \"Three chunks, and I make you a pick.\"")];
+    }
+    if ctx.pools.forge.items.miners_pick < 1 {
+        return [msg("Torin waves at the cold forge. \"No more picks today.\"")];
     }
     [msg("Torin takes the ore to the forge."),
      use_up("iron_ore", 3),
@@ -436,8 +448,8 @@ These come from crypt-v01's scripts, and each one keeps a rule above.
 - **A hand-in.** Check `carries(ctx.actor, proto)` (or `ctx.item`)
   first and say why with a `msg` when the player has nothing to give.
   Then put the guards, the `use_up` and the `reward` in one list, with
-  `use_up` before `reward`: the proof goes only with the pay. `report`
-  does this.
+  `use_up` before `reward` and no `hurt` between them: the proof goes
+  only with the pay. `report` does this.
 - **Pay what the pool can.** Read `ctx.pools.<pool>` before you ask, and
   say so in a `msg` when the day's budget is spent, as `search`, `dig` and
   `mine` do. The guard flags and marks go in the same list as the reward.

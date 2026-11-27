@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use mud_rules::DamageDice;
+
 use super::super::script::{HookCall, HookRun};
 use super::*;
 use crate::hooks::USE_UP_MAX;
@@ -186,6 +188,43 @@ fn a_bad_use_up_is_a_script_fault() {
     assert_eq!(r.error_code, Some(ErrorCode::ScriptFailed));
     assert_eq!(w.state.hook_faults["verbs.hand"], 1);
     assert_eq!(w.snapshot().dice_state, before);
+}
+
+#[test]
+fn a_hurt_between_use_up_and_reward_is_a_script_fault() {
+    // A fatal hurt there would take the price and skip the pay, and a
+    // player keeps their gear on death. So admission asks for the hurt
+    // first.
+    let hurt = || ScriptEffect::Hurt(DamageDice::new(6, 0));
+    let (_, mut w, ada) = handing(vec![]);
+    let room = RoomId::from("cellar_landing");
+    w.state.entities.get_mut(&ada).unwrap().room = room.clone();
+    assert_eq!(
+        w.check_effects(&room, &ada, &[use_up("bandage", 1), hurt(), bounty()], DAY),
+        faulted("hurt() comes before use_up()")
+    );
+    assert_eq!(
+        w.check_effects(&room, &ada, &[hurt(), use_up("bandage", 1), bounty()], DAY),
+        Ok(())
+    );
+    // With no reward after it, a hurt after a use_up costs no pay.
+    assert_eq!(
+        w.check_effects(&room, &ada, &[use_up("bandage", 1), hurt()], DAY),
+        Ok(())
+    );
+    assert_eq!(
+        w.check_effects(&room, &ada, &[bounty(), use_up("bandage", 1), hurt()], DAY),
+        faulted("use_up() comes before reward()")
+    );
+    // Through a command, the faulted list keeps the item and pays nothing.
+    let (_, mut w, ada) = handing(vec![use_up("bandage", 1), hurt(), bounty()]);
+    w.state.entities.get_mut(&ada).unwrap().room = room;
+    w.state.entities.get_mut(&ada).unwrap().pools.hp = 1;
+    w.fix_dice([6; 40]);
+    let r = w.execute(&ada, "hand", DAY);
+    assert_eq!(r.error_code, Some(ErrorCode::ScriptFailed));
+    assert_eq!(carried(&w, &ada, "bandage").len(), 1);
+    assert!(w.fresh_mints().is_empty() && w.state.pool_spent.is_empty());
 }
 
 #[test]

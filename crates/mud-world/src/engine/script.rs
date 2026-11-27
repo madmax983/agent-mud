@@ -493,6 +493,9 @@ impl World {
         // actor carries before the list.
         let mut using: BTreeMap<&ProtoId, u32> = BTreeMap::new();
         let mut rewarded = false;
+        // A hurt after a use_up: a death there would take the price and
+        // skip any later reward, while a player keeps their gear on death.
+        let mut hurt_after_price = false;
         for fx in effects {
             match fx {
                 ScriptEffect::Msg(t) | ScriptEffect::Narrate(t) | ScriptEffect::Refuse(t) => {
@@ -549,31 +552,53 @@ impl World {
                     if !self.state.entities.get(actor).is_some_and(Entity::present) {
                         return Err(Inadmissible::Fault("the actor is not here".to_owned()));
                     }
+                    if matches!(fx, ScriptEffect::Hurt(_)) && !using.is_empty() {
+                        hurt_after_price = true;
+                    }
                 }
                 ScriptEffect::Reward {
                     pool,
                     currency,
                     items,
                 } => {
-                    rewarded = true;
-                    let def = self.pack.economy.rewards.get(pool).ok_or_else(|| {
-                        Inadmissible::Fault(format!("reward({pool}): no such pool in economy.toml"))
-                    })?;
-                    def.admit(self.state.pool_spent.get(pool), now_ms, *currency, items)
-                        .map_err(|e| match e {
-                            AskError::Bad(m) => Inadmissible::Fault(format!("reward({pool}): {m}")),
-                            AskError::Spent(m) => {
-                                Inadmissible::Declined(format!("reward({pool}): {m}"))
-                            }
-                        })?;
-                    if !self.state.entities.get(actor).is_some_and(Entity::present) {
-                        return Err(Inadmissible::Fault("the actor is not here".to_owned()));
+                    // The proof goes only with its pay.
+                    if hurt_after_price {
+                        return Err(Inadmissible::Fault(
+                            "hurt() comes before use_up()".to_owned(),
+                        ));
                     }
+                    rewarded = true;
+                    self.check_reward(actor, pool, *currency, items, now_ms)?;
                 }
                 ScriptEffect::UseUp { proto, count } => {
                     self.check_use_up(actor, proto, *count, rewarded, &mut using)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Checks one `reward` against its pool's budget at game time
+    /// `now_ms` and the actor. A bad ask is a fault; a spent pool is a
+    /// decline.
+    fn check_reward(
+        &self,
+        actor: &EntityId,
+        pool: &PoolId,
+        currency: i64,
+        items: &BTreeMap<ProtoId, u32>,
+        now_ms: u64,
+    ) -> Result<(), Inadmissible> {
+        let def = self.pack.economy.rewards.get(pool).ok_or_else(|| {
+            Inadmissible::Fault(format!("reward({pool}): no such pool in economy.toml"))
+        })?;
+        def.admit(self.state.pool_spent.get(pool), now_ms, currency, items)
+            .map_err(|e| match e {
+                AskError::Bad(m) => Inadmissible::Fault(format!("reward({pool}): {m}")),
+                AskError::Spent(m) => Inadmissible::Declined(format!("reward({pool}): {m}")),
+            })?;
+        if !self.state.entities.get(actor).is_some_and(Entity::present) {
+            return Err(Inadmissible::Fault("the actor is not here".to_owned()));
         }
         Ok(())
     }
