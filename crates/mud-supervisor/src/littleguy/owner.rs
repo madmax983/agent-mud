@@ -15,7 +15,10 @@
 //! An `overlay_activate` names the pointer it read (`expected`, lg #122,
 //! ADR 0013 of littleguy): lg moves the pointer only when no move came in
 //! between, and answers `overlay_moved` otherwise. An older lg drops the
-//! field and moves unchecked; its answer then has no `guarded`.
+//! field and moves unchecked; its answer then has no `guarded`. Since
+//! littleguy #124, `overlay_active` also names the `head` of the move it
+//! reports, so the owner can see a later move away and back to the same
+//! version. An older lg leaves it out.
 //!
 //! The requests are a closed set. There is no `approve`, no `deny` and no
 //! `overlay_rollback`: the MUD never approves a tool call for an agent,
@@ -325,6 +328,13 @@ pub enum OwnerResponse {
         /// was exactly from it. An lg before #122 never says so.
         #[serde(default)]
         guarded: bool,
+        /// The `seq` of the move this answer reports (littleguy #124), or
+        /// the head as it stands when the version was already active. lg
+        /// never names the head of a later move. It is `None` from an lg
+        /// before #124, before the first move, and when lg cannot tell
+        /// that the head belongs to this move.
+        #[serde(default)]
+        head: Option<u64>,
     },
     /// The pointer moved after the read that `expected` copied, so lg did
     /// not move it now: nothing changed.

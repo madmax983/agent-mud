@@ -23,6 +23,16 @@
 //! - `pointer_verdict` (phase 4): `Same` exactly when lg's version is the
 //!   expected one; `OwnLate` only for a version the Steward gave up on;
 //!   every other move is a human's (`lemma_every_foreign_move_is_human`).
+//! - `head_verdict` (lg #124): the pointer check with heads. The Steward's
+//!   own version at its own head is `Same` (`lemma_an_unmoved_head_is_same`);
+//!   at another head, with both heads known, it is a human's move away and
+//!   back (`lemma_a_move_away_and_back_is_human`), unless it is the one
+//!   move of a late activate of that version; with a head unknown on
+//!   either side, or another version, it is exactly `pointer_verdict`
+//!   (`lemma_an_unknown_head_is_the_version_check`,
+//!   `lemma_another_version_is_the_version_check`). `head_went_back`
+//!   says a reset store: lg names a head below the Steward's own, or none;
+//!   a head at or above it never is (`lemma_a_risen_head_is_no_reset`).
 //! - `lost_verdict` (lg #122): an activate whose answer never came is
 //!   "not applied" only while lg shows the pointer it read, and with the
 //!   guard only while the head has not moved
@@ -410,6 +420,198 @@ pub const fn one_move(before: Option<u64>, after: Option<u64>) -> (r: bool)
     }
 }
 // mirror-end one_move
+
+/// lg names a head, the Steward knows its own, and they differ: someone
+/// moved the pointer since the Steward's own move.
+pub open spec fn spec_head_moved(
+    lg_head: Option<u64>,
+    lg_named: bool,
+    own_head: Option<u64>,
+) -> bool {
+    lg_named && own_head is Some && lg_head != own_head
+}
+
+pub open spec fn spec_head_verdict(
+    lg: Option<u64>,
+    lg_head: Option<u64>,
+    lg_named: bool,
+    expected: Option<u64>,
+    own_head: Option<u64>,
+    lg_is_late: bool,
+) -> PointerVerdict {
+    if lg == expected && spec_head_moved(lg_head, lg_named, own_head) {
+        if lg is Some && lg_is_late && spec_one_move(own_head, lg_head) {
+            PointerVerdict::OwnLate
+        } else {
+            PointerVerdict::Human
+        }
+    } else {
+        spec_pointer_verdict(lg, expected, lg_is_late)
+    }
+}
+
+// mirror-begin head_verdict
+/// The pointer check on lg's pointer `(lg, lg_head)` against the
+/// Steward's `expected` version and `own_head`, the head of its own last
+/// move to it (littleguy #124).
+///
+/// `lg_named` says lg named a head now, and `own_head` is `None` while the
+/// Steward knows no head of its own. With both known, the same version at
+/// another head is a move since the Steward's own and back to it: a
+/// human's, unless it is the one move of a late activate of that version
+/// ([`one_move`] from `own_head`). Every other case is the version check
+/// of [`pointer_verdict`], as before #124.
+#[must_use]
+pub const fn head_verdict(
+    lg: Option<u64>,
+    lg_head: Option<u64>,
+    lg_named: bool,
+    expected: Option<u64>,
+    own_head: Option<u64>,
+    lg_is_late: bool,
+) -> (r: PointerVerdict)
+    ensures
+        r == spec_head_verdict(lg, lg_head, lg_named, expected, own_head, lg_is_late),
+        !lg_named || own_head is None ==> r == spec_pointer_verdict(lg, expected, lg_is_late),
+        lg != expected ==> r == spec_pointer_verdict(lg, expected, lg_is_late),
+        (r is Same) ==> lg == expected && !spec_head_moved(lg_head, lg_named, own_head),
+        (r is OwnLate) ==> lg_is_late && lg is Some,
+{
+    let same_version = match (lg, expected) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    let moved = if lg_named {
+        match (own_head, lg_head) {
+            (Some(h), Some(a)) => a != h,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    } else {
+        false
+    };
+    if same_version && moved {
+        let own_late = match lg {
+            Some(_) => lg_is_late && one_move(own_head, lg_head),
+            None => false,
+        };
+        if own_late {
+            PointerVerdict::OwnLate
+        } else {
+            PointerVerdict::Human
+        }
+    } else {
+        pointer_verdict(lg, expected, lg_is_late)
+    }
+}
+// mirror-end head_verdict
+
+/// The Steward's own version at its own head: `Same`, late or not.
+pub proof fn lemma_an_unmoved_head_is_same(v: Option<u64>, h: u64, lg_is_late: bool)
+    ensures
+        spec_head_verdict(v, Some(h), true, v, Some(h), lg_is_late) is Same,
+{
+}
+
+/// The Steward's own version at another head, with both heads known, is a
+/// human's move away and back, unless it is the one move of a late
+/// activate of that version.
+pub proof fn lemma_a_move_away_and_back_is_human(
+    v: Option<u64>,
+    lg_head: Option<u64>,
+    own: u64,
+    lg_is_late: bool,
+)
+    requires
+        lg_head != Some(own),
+        !(lg_is_late && spec_one_move(Some(own), lg_head)),
+    ensures
+        spec_head_verdict(v, lg_head, true, v, Some(own), lg_is_late) is Human,
+{
+}
+
+/// With a head unknown on either side, the verdict is the version check
+/// of `pointer_verdict`: nothing regresses from before #124.
+pub proof fn lemma_an_unknown_head_is_the_version_check(
+    lg: Option<u64>,
+    lg_head: Option<u64>,
+    lg_named: bool,
+    expected: Option<u64>,
+    own_head: Option<u64>,
+    lg_is_late: bool,
+)
+    requires
+        !lg_named || own_head is None,
+    ensures
+        spec_head_verdict(lg, lg_head, lg_named, expected, own_head, lg_is_late)
+            == spec_pointer_verdict(lg, expected, lg_is_late),
+{
+}
+
+/// Another version is judged by the version check alone, heads or not:
+/// a late activate one move past its guard stays the Steward's own.
+pub proof fn lemma_another_version_is_the_version_check(
+    lg: Option<u64>,
+    lg_head: Option<u64>,
+    lg_named: bool,
+    expected: Option<u64>,
+    own_head: Option<u64>,
+    lg_is_late: bool,
+)
+    requires
+        lg != expected,
+    ensures
+        spec_head_verdict(lg, lg_head, lg_named, expected, own_head, lg_is_late)
+            == spec_pointer_verdict(lg, expected, lg_is_late),
+{
+}
+
+pub open spec fn spec_head_went_back(
+    own_head: Option<u64>,
+    lg_head: Option<u64>,
+    lg_named: bool,
+) -> bool {
+    lg_named && match own_head {
+        Some(h) => match lg_head {
+            Some(a) => a < h,
+            None => true,
+        },
+        None => false,
+    }
+}
+
+// mirror-begin head_went_back
+/// Whether lg's head `lg_head` is below `own_head`, or gone, while lg
+/// names a head: lg's store was reset. Within one store the head only
+/// rises.
+#[must_use]
+pub const fn head_went_back(own_head: Option<u64>, lg_head: Option<u64>, lg_named: bool) -> (r: bool)
+    ensures
+        r == spec_head_went_back(own_head, lg_head, lg_named),
+        r ==> lg_named && own_head is Some,
+{
+    if lg_named {
+        match (own_head, lg_head) {
+            (Some(h), Some(a)) => a < h,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    } else {
+        false
+    }
+}
+// mirror-end head_went_back
+
+/// A head at or above the Steward's own is never a reset: the move of a
+/// human, or of the Steward's own late activate, raises it.
+pub proof fn lemma_a_risen_head_is_no_reset(own: u64, lg: u64, lg_named: bool)
+    requires
+        own <= lg,
+    ensures
+        !spec_head_went_back(Some(own), Some(lg), lg_named),
+{
+}
 
 // mirror-begin lost_verdict_enum
 /// What lg's pointer, read again, says of an activate whose answer never

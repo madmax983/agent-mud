@@ -1654,6 +1654,30 @@ async fn stale_reads_move_nothing(sock: &Path, baseline: u64, a: u64) {
     );
 }
 
+/// Activates `baseline` from no version and no move yet, as `overlays`
+/// names it (lg #122). Returns the head lg names for that move (lg #124).
+async fn first_guarded_move(sock: &Path, baseline: u64) -> u64 {
+    use owner::{OwnerRequest as Req, OwnerResponse as Resp, request};
+    let req = Req::OverlayActivate {
+        version: baseline,
+        expected: Some(read_pointer(sock).await),
+    };
+    let on = request(sock, &req, Duration::from_secs(30)).await.unwrap();
+    let Resp::OverlayActive {
+        version,
+        previous: None,
+        guarded: true,
+        head: Some(first),
+    } = on
+    else {
+        panic!(
+            "this lg checks the pointer it is given, and names the head of its move (lg #124): {on:?}"
+        );
+    };
+    assert_eq!(version, baseline);
+    first
+}
+
 #[tokio::test]
 async fn a_real_lg_with_refine_takes_overlay_requests() {
     use owner::{OwnerRequest as Req, OwnerResponse as Resp, request};
@@ -1707,21 +1731,7 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
     let Resp::OverlayStored { version: baseline } = ask(put("")).await else {
         panic!("{}", log());
     };
-    let on = ask(Req::OverlayActivate {
-        version: baseline,
-        // No version and no move yet, as `overlays` named it (lg #122).
-        expected: Some(read_pointer(&sock).await),
-    })
-    .await;
-    assert_eq!(
-        on,
-        Resp::OverlayActive {
-            version: baseline,
-            previous: None,
-            guarded: true,
-        },
-        "this lg checks the pointer it is given"
-    );
+    let first = first_guarded_move(&sock, baseline).await;
     let menu = crate::steward::vet::default_menu();
     let text = crate::steward::vet::render_guardrails(&menu, &["brevity".to_owned()]);
     let Resp::OverlayStored { version: a } = ask(put(&text)).await else {
@@ -1738,7 +1748,11 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
     assert_eq!(entry.author, "operator:mud");
     let read = read_pointer(&sock).await;
     assert_eq!(read.active, Some(baseline));
-    assert!(read.head.is_some(), "the first move set the head");
+    assert_eq!(
+        read.head,
+        Some(first),
+        "the head of the first move, as its answer named it"
+    );
     let on = ask(Req::OverlayActivate {
         version: a,
         expected: Some(read),
@@ -1750,7 +1764,9 @@ async fn a_real_lg_with_refine_takes_overlay_requests() {
             version: a,
             previous: Some(baseline),
             guarded: true,
-        }
+            head: Some(first + 1),
+        },
+        "one move past the head it read"
     );
     stale_reads_move_nothing(&sock, baseline, a).await;
     mind.shutdown().await;

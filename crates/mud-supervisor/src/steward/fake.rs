@@ -6,11 +6,13 @@
 //! (applied at once, answered long after the client gave up), or answer
 //! it with lg's "not a proposed goal" after something else decided first.
 //!
-//! Its overlay pointer is lg's of littleguy #122: `overlays` names the
-//! `head` (the number of the last move), and an `overlay_activate` with
+//! Its overlay pointer is lg's of littleguy #124: `overlays` names the
+//! `head` (the number of the last move), an `overlay_activate` with
 //! `expected` moves only from that pointer, else it answers
-//! `overlay_moved`. With [`FakeState::old`] it is an lg before #122: no
-//! head, `expected` dropped, every move unchecked.
+//! `overlay_moved`, and `overlay_active` names the head of its move. With
+//! [`FakeBuild::Guarded`] it is lg #122, whose `overlay_active` names no
+//! head. With [`FakeBuild::Old`] it is an lg before #122: no head,
+//! `expected` dropped, every move unchecked.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -104,6 +106,17 @@ pub enum ProposeMode {
     Slow(Duration, String),
 }
 
+/// Which lg build the fake daemon answers as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeBuild {
+    /// littleguy #124: `overlay_active` names the head of its move.
+    Head,
+    /// littleguy #122: guarded, but `overlay_active` names no head.
+    Guarded,
+    /// An lg before #122: no `head`, no guard, no `guarded`.
+    Old,
+}
+
 /// One overlay version.
 #[derive(Debug, Clone)]
 pub struct FakeVersion {
@@ -137,8 +150,8 @@ pub struct FakeState {
     pub activate_modes: VecDeque<ActivateMode>,
     /// Activates held in the queue, with the `expected` each sent.
     pub held: Vec<(u64, Option<Value>)>,
-    /// An lg before littleguy #122: no `head`, no guard, no `guarded`.
-    pub old: bool,
+    /// The lg build it answers as.
+    pub build: FakeBuild,
     /// Whether the next `overlay_put` is stored but never answered.
     pub drop_put: bool,
     /// One mode per `refine_propose`; then `kept`.
@@ -160,7 +173,7 @@ impl Default for FakeState {
             moves: Vec::new(),
             activate_modes: VecDeque::new(),
             held: Vec::new(),
-            old: false,
+            build: FakeBuild::Head,
             drop_put: false,
             propose_modes: VecDeque::new(),
         }
@@ -225,10 +238,15 @@ impl FakeState {
         previous
     }
 
+    /// Whether it answers as an lg before #122.
+    fn old(&self) -> bool {
+        self.build == FakeBuild::Old
+    }
+
     /// The head of lg #122: the number of the last move, `None` before the
     /// first (and from an older lg).
     pub fn head(&self) -> Option<u64> {
-        if self.old || self.moves.is_empty() {
+        if self.old() || self.moves.is_empty() {
             None
         } else {
             u64::try_from(self.moves.len()).ok()
@@ -238,7 +256,7 @@ impl FakeState {
     /// Whether an activate that sent `expected` may move now: always on an
     /// older lg, which drops it, and on lg #122 only from that pointer.
     fn may_move(&self, expected: Option<&Value>) -> bool {
-        let Some(x) = expected.filter(|_| !self.old) else {
+        let Some(x) = expected.filter(|_| !self.old()) else {
             return true;
         };
         x["active"].as_u64() == self.active && x["head"].as_u64() == self.head()
@@ -250,12 +268,15 @@ impl FakeState {
             return json!({ "kind": "overlay_moved", "version": version, "active": self.active, "head": self.head() }).to_string();
         }
         let previous = self.activate(version);
-        if expected.is_some() && !self.old {
-            json!({ "kind": "overlay_active", "version": version, "previous": previous, "guarded": true }).to_string()
-        } else {
-            json!({ "kind": "overlay_active", "version": version, "previous": previous })
-                .to_string()
+        let mut answer =
+            json!({ "kind": "overlay_active", "version": version, "previous": previous });
+        if expected.is_some() && !self.old() {
+            answer["guarded"] = json!(true);
         }
+        if self.build == FakeBuild::Head {
+            answer["head"] = json!(self.head());
+        }
+        answer.to_string()
     }
 
     /// Runs the activates held in the queue, as lg's loop would.
@@ -287,7 +308,7 @@ impl FakeState {
                     .unwrap_or_default(),
             })).collect::<Vec<_>>(),
         });
-        if !self.old {
+        if !self.old() {
             listing["head"] = json!(self.head());
         }
         listing
@@ -663,7 +684,17 @@ impl FakeDaemon {
 
     /// Makes this an lg before littleguy #122.
     pub fn make_old(&self) {
-        self.state.lock().unwrap().old = true;
+        self.state.lock().unwrap().build = FakeBuild::Old;
+    }
+
+    /// Makes this lg #122 before #124: no head in `overlay_active`.
+    pub fn make_no_move_head(&self) {
+        self.state.lock().unwrap().build = FakeBuild::Guarded;
+    }
+
+    /// The head lg's `overlays` names now.
+    pub fn head(&self) -> Option<u64> {
+        self.state.lock().unwrap().head()
     }
 
     /// The `expected` of every `overlay_activate` line, in order.

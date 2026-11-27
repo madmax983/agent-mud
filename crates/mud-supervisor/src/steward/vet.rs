@@ -18,8 +18,8 @@
 //! [`render_free`].
 //!
 //! [`goal_verdict`], [`council_majority`], [`refine_due`],
-//! [`pointer_verdict`], [`one_move`], [`lost_verdict`], [`overlay_verdict`] and
-//! [`FREE_MIN_MEMBERS`] are
+//! [`pointer_verdict`], [`one_move`], [`head_verdict`], [`head_went_back`],
+//! [`lost_verdict`], [`overlay_verdict`] and [`FREE_MIN_MEMBERS`] are
 //! mirrored in `formal/verus/src/steward.rs`; the text between the mirror
 //! markers must match it.
 
@@ -213,6 +213,74 @@ pub const fn one_move(before: Option<u64>, after: Option<u64>) -> bool {
     }
 }
 // mirror-end one_move
+
+// mirror-begin head_verdict
+/// The pointer check on lg's pointer `(lg, lg_head)` against the
+/// Steward's `expected` version and `own_head`, the head of its own last
+/// move to it (littleguy #124).
+///
+/// `lg_named` says lg named a head now, and `own_head` is `None` while the
+/// Steward knows no head of its own. With both known, the same version at
+/// another head is a move since the Steward's own and back to it: a
+/// human's, unless it is the one move of a late activate of that version
+/// ([`one_move`] from `own_head`). Every other case is the version check
+/// of [`pointer_verdict`], as before #124.
+#[must_use]
+pub const fn head_verdict(
+    lg: Option<u64>,
+    lg_head: Option<u64>,
+    lg_named: bool,
+    expected: Option<u64>,
+    own_head: Option<u64>,
+    lg_is_late: bool,
+) -> PointerVerdict {
+    let same_version = match (lg, expected) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    let moved = if lg_named {
+        match (own_head, lg_head) {
+            (Some(h), Some(a)) => a != h,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    } else {
+        false
+    };
+    if same_version && moved {
+        let own_late = match lg {
+            Some(_) => lg_is_late && one_move(own_head, lg_head),
+            None => false,
+        };
+        if own_late {
+            PointerVerdict::OwnLate
+        } else {
+            PointerVerdict::Human
+        }
+    } else {
+        pointer_verdict(lg, expected, lg_is_late)
+    }
+}
+// mirror-end head_verdict
+
+// mirror-begin head_went_back
+/// Whether lg's head `lg_head` is below `own_head`, or gone, while lg
+/// names a head: lg's store was reset. Within one store the head only
+/// rises.
+#[must_use]
+pub const fn head_went_back(own_head: Option<u64>, lg_head: Option<u64>, lg_named: bool) -> bool {
+    if lg_named {
+        match (own_head, lg_head) {
+            (Some(h), Some(a)) => a < h,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    } else {
+        false
+    }
+}
+// mirror-end head_went_back
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // mirror-begin lost_verdict_enum
@@ -1606,6 +1674,51 @@ mod tests {
     }
 
     #[test]
+    fn head_verdict_cases() {
+        let v = |lg, lg_head, own_head, late| {
+            head_verdict(Some(lg), lg_head, true, Some(3), own_head, late)
+        };
+        assert_eq!(v(3, Some(2), Some(2), false), PointerVerdict::Same);
+        assert_eq!(
+            v(3, Some(4), Some(2), false),
+            PointerVerdict::Human,
+            "away and back"
+        );
+        assert_eq!(
+            v(3, Some(4), Some(2), true),
+            PointerVerdict::Human,
+            "two moves are not one late move"
+        );
+        assert_eq!(
+            v(3, Some(3), Some(2), true),
+            PointerVerdict::OwnLate,
+            "one late move of this version"
+        );
+        assert_eq!(
+            v(3, Some(9), None, false),
+            PointerVerdict::Same,
+            "no head yet"
+        );
+        assert_eq!(v(1, Some(9), Some(2), true), PointerVerdict::OwnLate);
+        assert_eq!(v(1, Some(2), Some(2), false), PointerVerdict::Human);
+        assert_eq!(
+            head_verdict(Some(3), None, false, Some(3), Some(2), false),
+            PointerVerdict::Same,
+            "an older lg names no head: by version"
+        );
+        assert_eq!(
+            head_verdict(Some(3), None, true, Some(3), Some(2), false),
+            PointerVerdict::Human,
+            "a head gone is a reset, and never Same"
+        );
+        assert!(head_went_back(Some(4), Some(3), true));
+        assert!(head_went_back(Some(4), None, true));
+        assert!(!head_went_back(Some(4), Some(4), true));
+        assert!(!head_went_back(Some(4), None, false));
+        assert!(!head_went_back(None, None, true));
+    }
+
+    #[test]
     fn overlay_verdict_holds_declines_and_activates() {
         let v = |ok, yes, members, paused, normal| {
             overlay_verdict(ok, yes, members, FREE_MIN_MEMBERS, paused, normal)
@@ -1723,6 +1836,49 @@ mod tests {
                 one_move(before, after),
                 after == Some(before.map_or(1, |h| h + 1))
             );
+        }
+
+        #[test]
+        fn head_verdict_sees_a_move_away_and_back_and_falls_back_without_heads(
+            lg in proptest::option::of(0u64..4),
+            lg_head in proptest::option::of(0u64..6),
+            named in any::<bool>(),
+            expected in proptest::option::of(0u64..4),
+            own_head in proptest::option::of(0u64..6),
+            late in any::<bool>(),
+        ) {
+            let v = head_verdict(lg, lg_head, named, expected, own_head, late);
+            let by_version = pointer_verdict(lg, expected, late);
+            if !named || own_head.is_none() || lg != expected {
+                prop_assert_eq!(v, by_version, "the version check, as before #124");
+            }
+            if v == PointerVerdict::Same {
+                prop_assert!(lg == expected);
+                if named && own_head.is_some() {
+                    prop_assert_eq!(lg_head, own_head, "same means the same head");
+                }
+            }
+            let moved = named && own_head.is_some() && lg_head != own_head;
+            if lg == expected && moved {
+                let next = Some(own_head.map_or(1, |h| h + 1));
+                let own = late && lg.is_some() && lg_head == next;
+                prop_assert_eq!(
+                    v,
+                    if own { PointerVerdict::OwnLate } else { PointerVerdict::Human },
+                    "a move since the Steward's own"
+                );
+            }
+        }
+
+        #[test]
+        fn head_went_back_only_below_the_own_head(
+            own in proptest::option::of(0u64..6),
+            lg in proptest::option::of(0u64..6),
+            named in any::<bool>(),
+        ) {
+            let back = head_went_back(own, lg, named);
+            let want = named && own.is_some_and(|h| lg.is_none_or(|a| a < h));
+            prop_assert_eq!(back, want);
         }
 
         #[test]

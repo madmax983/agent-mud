@@ -2,6 +2,9 @@
 
 Status: accepted
 
+Amended 2026-11-27: the Steward stores the head of its own move and sees a
+move away and back between two passes (littleguy #124).
+
 ## Context
 
 littleguy keeps some decisions for its owner: the goals an agent proposes
@@ -139,8 +142,10 @@ also sends the pointer it read (`expected`), and lg refuses a move from a
 pointer that moved (amended below):
 
 - **The pointer check**, every pass: `overlays` (a read beside lg's loop)
-  and the proved `pointer_verdict(lg, pointer, lg is late)`. `Same`:
-  nothing. `OwnLate` (an activate the Steward gave up on applied later):
+  and the proved `pointer_verdict(lg, pointer, lg is late)`, since
+  littleguy #124 inside the proved `head_verdict`, which also compares
+  lg's head with the head of the Steward's own move (amended below).
+  `Same`: nothing. `OwnLate` (an activate the Steward gave up on applied later):
   a text is undone (`late_undone`); a move to `{}` is adopted when no
   text of the Steward's was active, and otherwise taken as a human's
   Roll back (paused `unconfirmed`, the text vetoed), because the Steward's
@@ -242,8 +247,8 @@ pointer that moved (amended below):
   boot and publishes `resumed`; the Steward warns at every boot while it
   names an entity that is not paused. A resume never clears `vetoed`.
 - **Observer.** Overlay events (`activated`, `paused`, `restored`,
-  `moved`, `unguarded`, `unconfirmed`, `late_undone`, `kept`, `declined`,
-  `resumed`, `reset`, `stuck`) and, per agent, the pointer, the baseline version, what lg's
+  `moved`, `unguarded`, `no_head`, `unconfirmed`, `late_undone`, `kept`,
+  `declined`, `resumed`, `reset`, `stuck`) and, per agent, the pointer, the baseline version, what lg's
   Roll back would do (to the baseline only when the Steward's last
   confirmed move left it), the pause, and the Steward's versions with the
   text each holds as put, newest first, escaped.
@@ -394,3 +399,87 @@ the real-lg end-to-end test
 `a_human_move_before_a_real_guarded_activate_is_refused_and_pauses`,
 where a person activates lg's proposal between the Steward's read and its
 activate and lg answers `overlay_moved`.
+
+## Amended 2026-11-27: the head of the Steward's own move (littleguy #124)
+
+littleguy #124 (commit `6678a9b`, ADR 0013 of littleguy amended
+2026-11-26) adds `head` to `overlay_active` (and to `overlay_rollback`,
+which the MUD never sends): the `seq` of the move the answer reports, or
+the head as it stands when the version was already active. It is absent
+from an older lg, before the first move, and whenever lg cannot tell that
+the head belongs to this move (another process moved in between, or the
+read after the swap failed). It never names the head of a later move. CI
+pins this commit now.
+
+**The gap it closes.** After a guarded activate landed, the row kept only
+the version, and each pass compared versions. A person who moved the
+pointer away and back between two passes (Roll back, then activate the
+Steward's version again; or activate another version, then the
+Steward's) left the same version active at a larger head, and the
+Steward missed that veto. A lost answer was already settled by heads; the
+steady-state pass was not.
+
+- **The row stores the head of its own move** (`pointer_head`, next to
+  `pointer`, with a serde default so an older row loads with it unknown).
+  It is set from the `head` of each guarded `overlay_active` the Steward
+  gets (the baseline, a Clear, a text, an undo, a restore), from the read
+  head of a lost guarded move to `{}` that `lost_verdict` takes as applied
+  (one move past the guard, so the head is that move's), and from the
+  pointer the Steward adopts after a human's move. A store reset forgets
+  it with the rest.
+- **Each pass compares heads**, and so does the re-read before each
+  activate: the proved `head_verdict(lg, lg head, lg named a head,
+  pointer, own head, lg is late)`. With both heads known, the same version
+  at another head is a move since the Steward's own: a human's, so refine
+  pauses (`moved away_and_back`, then `paused rolled_back`), the pointer
+  is never moved, the text the person returned to stays theirs and is not
+  vetoed, and each late text sent from the Steward's pointer, which may
+  have run and been rolled back, is vetoed. The exception is the one move
+  of a late activate of that very version (one move past its guard and
+  the Steward's head, the late-list rule): it is the Steward's own, and
+  nothing is undone. The same version at the same head is `Same`. A head
+  unknown on either side, or another version, is exactly
+  `pointer_verdict`, the version check of before #124; proved
+  (`lemma_an_unmoved_head_is_same`, `lemma_a_move_away_and_back_is_human`,
+  `lemma_an_unknown_head_is_the_version_check`,
+  `lemma_another_version_is_the_version_check`).
+- **A head that went down or vanished** while lg names one is a reset
+  store (the proved `head_went_back`; the head only rises in one store),
+  even when the versions and authors match: the existing reset path runs.
+- **Adoption.** When the row knows no head of its own (a row from before
+  #124, an answer without a head, an unguarded or lost answer), a pass
+  whose read agrees with the pointer takes the read head as its own. That
+  read races a person: a move away and back after the Steward's move and
+  before that read is taken as the Steward's own. This is exactly what
+  every pass did before #124, so adoption loses nothing; it misses only a
+  move away and back before the first read that names a head, and sees
+  every move after it. The answer's own head has no such race, which is
+  why #124 puts it in the answer.
+- **An older lg.** An lg at #122 answers a guarded activate without a
+  head: the Steward logs and publishes `no_head old_lg` once per daemon
+  start and adopts the head from the next agreeing read. An lg before
+  #122 names no head anywhere: the check is by version alone, as before,
+  and nothing is adopted. #124 adds no part to `lg.toml`, so
+  `compat::Optional` is unchanged.
+- **What ask 14 still lacks.** A lost answer still cannot tell the
+  Steward's own move to a version from a person's one move to it: #124
+  names the head only in an answer that arrives.
+
+Tests: `a_move_away_and_back_between_passes_is_a_human_veto`,
+`a_move_away_and_back_on_the_baseline_pauses_before_any_text`,
+`a_move_away_and_back_between_the_pass_read_and_the_activate_read_is_seen`,
+`a_late_text_run_and_rolled_back_between_passes_is_vetoed`,
+`no_move_between_passes_is_the_same_pointer_and_refine_goes_on`,
+`an_answer_without_a_head_checks_by_version_until_a_read_gives_one`,
+`an_older_lg_names_no_head_and_is_checked_by_version`,
+`an_older_row_adopts_the_head_of_the_first_agreeing_read`,
+`an_own_late_activate_one_move_past_its_guard_is_still_its_own`,
+`a_late_move_onto_the_version_the_steward_holds_is_its_own`,
+`a_head_below_the_steward_s_own_is_a_reset_store` and
+`a_reset_store_forgets_the_head` against the fake daemon; the wire test
+`an_activation_answer_reads_the_head_of_its_move`; the row test
+`an_older_overlay_row_reads_with_no_head`; the real-lg tests
+`a_real_lg_with_refine_takes_overlay_requests` (the head of each move)
+and `a_real_move_away_and_back_between_passes_pauses_refine`, where a
+person presses Roll back and activates the Steward's text again on a real
+lg between two passes.

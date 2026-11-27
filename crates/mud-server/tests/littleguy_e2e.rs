@@ -659,6 +659,113 @@ async fn a_real_refine_propose_reaches_a_menu_activation() {
     s.stop().await;
 }
 
+/// Waits up to 180 s for the next overlay event of `entity` on `obs` with
+/// `action` and `code`, and collects every overlay event before it into
+/// `seen` as `"action code"`. `None` at the timeout.
+async fn overlay_event(
+    obs: &mut tokio::sync::broadcast::Receiver<Arc<ObserverEvent>>,
+    entity: &EntityId,
+    action: &str,
+    code: &str,
+    seen: &mut Vec<String>,
+) -> Option<mud_supervisor::steward::StewardEvent> {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            match obs.recv().await {
+                Ok(ev) => {
+                    if let ObserverEvent::Steward(e) = &*ev
+                        && &e.entity == entity
+                        && e.item == "overlay"
+                    {
+                        seen.push(format!("{} {}", e.action, e.code));
+                        if e.action == action && e.code == code {
+                            return Some(e.clone());
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_move_away_and_back_between_passes_pauses_refine() {
+    let Ok(bin) = std::env::var("LG_BIN") else {
+        eprintln!("LG_BIN is not set: skipping the real move away and back check");
+        return;
+    };
+    let stub = ModelStub::start(Arc::new(menu_reply)).await.unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let lg = lg_on_stub(&bin, bins.path());
+    let s = serve_menu_refine(&lg, &stub).await;
+    let steward = s.built.steward.clone().expect("the Steward runs");
+    let torin = EntityId::from("torin");
+    let socket = s.dir.path().join("torin").join("lg.sock");
+    let mut obs = s.built.mud.sup.subscribe();
+    let clock = steward.spawn();
+    s.built.mud.sup.fire_macro_tick(&torin);
+    let mut seen = Vec::new();
+    let found = overlay_event(&mut obs, &torin, "activated", "text", &mut seen).await;
+    assert!(
+        found.is_some(),
+        "no menu text was activated: {seen:?}\n{}",
+        s.log("torin")
+    );
+    // The Steward stores the head the real lg named for its move (#124).
+    let row = steward.row(&torin).await.unwrap();
+    let listed = blocking_owner_line(&socket, r#"{"kind":"overlays"}"#).unwrap();
+    let text = listed["active"].as_u64().expect("lg runs a version");
+    assert_eq!(row.overlay.pointer, Some(text));
+    assert_eq!(
+        row.overlay.pointer_head,
+        listed["head"].as_u64(),
+        "the head of the Steward's own move: {row:?}"
+    );
+    assert!(!seen.iter().any(|l| l == "no_head old_lg"), "{seen:?}");
+    // Stop the Steward's clock: the test runs each pass from here.
+    for t in &clock {
+        t.abort();
+    }
+    for t in clock {
+        let _ = t.await;
+    }
+    steward.pass().await;
+    assert!(steward.row(&torin).await.unwrap().overlay.paused.is_none());
+    // Between two passes a person presses Roll back and activates the
+    // text again on lg's pages: the same version, two moves on.
+    let back = blocking_owner_line(&socket, r#"{"kind":"overlay_rollback"}"#).unwrap();
+    assert_eq!(back["kind"], "overlay_active", "{back}");
+    let again = blocking_owner_line(
+        &socket,
+        &format!(r#"{{"kind":"overlay_activate","version":{text}}}"#),
+    )
+    .unwrap();
+    assert_eq!(again["version"].as_u64(), Some(text), "{again}");
+    let now = blocking_owner_line(&socket, r#"{"kind":"overlays"}"#).unwrap();
+    assert_eq!(now["active"].as_u64(), Some(text));
+    steward.pass().await;
+    let paused = overlay_event(&mut obs, &torin, "paused", "rolled_back", &mut seen).await;
+    assert!(paused.is_some(), "refine never paused: {seen:?}");
+    assert!(seen.iter().any(|l| l == "moved away_and_back"), "{seen:?}");
+    let row = steward.row(&torin).await.unwrap();
+    assert_eq!(row.overlay.pointer, Some(text), "the person's choice");
+    assert_eq!(row.overlay.pointer_head, now["head"].as_u64());
+    assert_eq!(
+        row.overlay.active.as_ref().map(|a| a.version),
+        Some(text),
+        "the text the person returned to stays"
+    );
+    steward.pass().await;
+    let after = blocking_owner_line(&socket, r#"{"kind":"overlays"}"#).unwrap();
+    assert_eq!(after["head"], now["head"], "nothing moves it");
+    s.stop().await;
+}
+
 /// One owner line to lg's socket at `socket`, blocking, and its answer:
 /// what a person's click on lg's pages sends. `None` when lg does not
 /// answer.

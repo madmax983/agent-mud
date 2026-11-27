@@ -153,7 +153,63 @@ fn guarded_cases() -> Vec<(OwnerRequest, &'static str, &'static str)> {
             r#"{"kind":"overlay_activate","version":1,"expected":{"active":2,"head":8}}"#,
             r#"{"kind":"overlay_moved","version":1,"active":null,"head":null}"#,
         ),
+        (
+            OwnerRequest::OverlayActivate {
+                version: 3,
+                expected: Some(ExpectedPointer {
+                    active: Some(2),
+                    head: Some(7),
+                }),
+            },
+            r#"{"kind":"overlay_activate","version":3,"expected":{"active":2,"head":7}}"#,
+            r#"{"kind":"overlay_active","version":3,"previous":2,"guarded":true,"head":8}"#,
+        ),
     ]
+}
+
+#[test]
+fn an_activation_answer_reads_the_head_of_its_move() {
+    let read = |line: &str| serde_json::from_str::<OwnerResponse>(line).unwrap();
+    assert_eq!(
+        read(r#"{"kind":"overlay_active","version":2,"previous":1,"guarded":true,"head":5}"#),
+        OwnerResponse::OverlayActive {
+            version: 2,
+            previous: Some(1),
+            guarded: true,
+            head: Some(5),
+        },
+        "lg #124: guarded, with the head of its move"
+    );
+    assert_eq!(
+        read(r#"{"kind":"overlay_active","version":2,"previous":1,"guarded":true}"#),
+        OwnerResponse::OverlayActive {
+            version: 2,
+            previous: Some(1),
+            guarded: true,
+            head: None,
+        },
+        "lg #122, or a move lg could not tell apart: no head"
+    );
+    assert_eq!(
+        read(r#"{"kind":"overlay_active","version":2,"previous":null}"#),
+        OwnerResponse::OverlayActive {
+            version: 2,
+            previous: None,
+            guarded: false,
+            head: None,
+        },
+        "an lg before #122: neither"
+    );
+    assert_eq!(
+        read(r#"{"kind":"overlay_active","version":2,"previous":1,"head":9}"#),
+        OwnerResponse::OverlayActive {
+            version: 2,
+            previous: Some(1),
+            guarded: false,
+            head: Some(9),
+        },
+        "an unguarded move of lg #124 names its head too"
+    );
 }
 
 #[tokio::test]
@@ -206,6 +262,7 @@ async fn owner_requests_speak_the_socket_protocol() {
             version: 2,
             previous: None,
             guarded: false,
+            head: None,
         },
         "an lg before #122 writes no guarded: unchecked"
     );
@@ -224,7 +281,19 @@ async fn owner_requests_speak_the_socket_protocol() {
             version: 3,
             previous: Some(2),
             guarded: true,
-        }
+            head: None,
+        },
+        "lg #122 names no head of its move"
+    );
+    assert_eq!(
+        answers[15],
+        OwnerResponse::OverlayActive {
+            version: 3,
+            previous: Some(2),
+            guarded: true,
+            head: Some(8),
+        },
+        "lg #124 names the head of its move"
     );
     assert_eq!(
         answers[13],
@@ -383,6 +452,7 @@ async fn a_slow_loop_job_answers_on_its_connection() {
             version: 4,
             previous: Some(3),
             guarded: false,
+            head: None,
         }
     );
     task.await.unwrap();

@@ -59,12 +59,19 @@ issues and PRs, never as patches. Each is worked around here until it
 lands.
 
 - **Done: an expected pointer on `overlay_activate` (ask 13).** littleguy
-  #122 (`c507731`, the commit CI pins): `overlays` answers `head`, and
+  #122 (`c507731`): `overlays` answers `head`, and
   `overlay_activate` takes `expected: {"active", "head"}`, checked in the
   store's swap. The Steward sends it on every activate, so a human move
   between its read and its activate is refused (`overlay_moved`), not
   undone after the fact. The phase 4 `previous` check stays only for an
   older lg, which answers without `guarded`.
+- **Done: the head of a move in `overlay_active`.** littleguy #124
+  (`6678a9b`, the commit CI pins) names the `head` of the move each
+  `overlay_active` reports. The Steward stores it as the head of its own
+  move and compares it each pass, so a person who moves the pointer away
+  and back between two passes is seen as a veto (ADR 0015, amended
+  2026-11-27). An lg at #122 still works, checked by version alone until
+  a read gives a head.
 - **Open: the activation log on the socket (ask 14).** The head says that
   the pointer moved after a read, which settles a lost answer when lg
   shows the read pointer (not applied) or the read version with a new
@@ -72,8 +79,9 @@ lands.
   lg shows the activate's own version, the Steward's move and a human's
   move to that version look the same, so the Steward still fails safe
   (undo a text and pause; take a `{}` off a text as a Roll back). It
-  needs each move's `from`, `to`, `seq` and author on the socket, or an
-  `overlay_active` that names the new `head`.
+  needs each move's `from`, `to`, `seq` and author on the socket: the
+  head of #124 comes only in an answer that arrives, so a lost answer
+  stays as it was.
 - **Open: dropping a queued activate whose client is gone (ask 15).** It
   would end the late list.
 - **Open: a version and features answer before the config (ask 18).**

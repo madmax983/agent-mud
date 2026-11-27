@@ -24,8 +24,12 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 /// Its `lg serve` reads every section the MUD writes and speaks every
 /// request it sends. CI pins it (`.github/workflows/ci.yml`), and the
 /// README and `mud.toml.example` name it; a test checks that all of them
-/// agree.
-pub const LG_MIN_COMMIT: &str = "c507731f7a8930444931c60169931d657cecec73";
+/// agree. It is littleguy #124: `overlay_active` names the head of its
+/// move, so the Steward sees a move away and back between two passes. An
+/// lg at #122 still serves the MUD, and the Steward checks the overlay
+/// pointer by version alone there. No part of `lg.toml` changed, so
+/// [`Optional`] did not.
+pub const LG_MIN_COMMIT: &str = "6678a9bce1567a0f0bbd4f1f3928f47101a09230";
 
 /// The README section that says how to build and install `lg`.
 pub const README_INSTALL: &str = "README.md#install-littleguy";
